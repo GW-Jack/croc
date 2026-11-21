@@ -19929,6 +19929,8 @@ pub const HostedProc = struct {
     order_key_len: u32,
     proc: canonical.ProcedureValueRef,
     template: canonical.ProcedureTemplateRef,
+    /// Declared `suspending`: the host may pause the calling task.
+    suspending: bool,
 
     /// The proc's deterministic ordering key bytes within its table's pool.
     pub fn orderKey(self: HostedProc, table: *const HostedProcTable) []const u8 {
@@ -19957,6 +19959,7 @@ pub const HostedProcTable = struct {
         external_symbol_name: canonical.ExternalSymbolNameId,
         proc: canonical.ProcedureValueRef,
         template: canonical.ProcedureTemplateRef,
+        suspending: bool,
         sort_key: []const u8,
     };
 
@@ -19996,6 +19999,7 @@ pub const HostedProcTable = struct {
                         .proc_base = template_ref.proc_base,
                     },
                     .template = template_ref,
+                    .suspending = hosted.suspending,
                     .sort_key = try hostedProcSortKey(allocator, module, hosted.symbol_name),
                 });
             }
@@ -20025,6 +20029,7 @@ pub const HostedProcTable = struct {
                 .order_key_len = @intCast(candidate.sort_key.len),
                 .proc = candidate.proc,
                 .template = candidate.template,
+                .suspending = candidate.suspending,
             });
         }
 
@@ -36833,6 +36838,8 @@ fn scanLoweringVisibleNames(module_env: *const ModuleEnv, visitor: anytype) Allo
             .diag_mutually_recursive_type_aliases,
             .diag_deprecated_number_suffix,
             .diag_range_op_chained,
+            .diag_suspending_not_hosted,
+            .diag_suspending_not_effectful,
             .diag_unnamed_field_cannot_have_default,
             .diag_default_not_allowed_in_structural_record,
             .diag_default_not_allowed_on_local_type_decl,
@@ -39841,8 +39848,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // `serialized_layout_version` only for semantic changes the structural hash
     // cannot observe, as documented at that discriminant.
     const golden: [32]u8 = .{
-        0x39, 0x2D, 0xA5, 0x30, 0xD8, 0x77, 0x37, 0xAF, 0xC1, 0xA9, 0x58, 0x70, 0xC3, 0x62, 0x2D, 0x79,
-        0x48, 0x01, 0x3A, 0x91, 0x8F, 0x2B, 0xE9, 0x68, 0x3E, 0xB7, 0x45, 0x19, 0xDD, 0x5B, 0x53, 0xC6,
+        0x39, 0x98, 0xAC, 0x39, 0xD6, 0x87, 0xF6, 0xDB, 0x91, 0x5E, 0x76, 0x51, 0x0D, 0xEE, 0xD0, 0x4C,
+        0x32, 0x10, 0x84, 0x78, 0x0E, 0x9F, 0x4C, 0xA9, 0x7A, 0x92, 0x3A, 0x4F, 0x26, 0x53, 0xED, 0xDF,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

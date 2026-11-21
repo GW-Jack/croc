@@ -443,7 +443,8 @@ pub const Constants = struct {
     /// candidates survive until request eligibility is known.
     /// 206: absent optional ids and indices are stored as zero.
     /// 207: module environments record the platform's concurrency mode.
-    pub const CACHE_VERSION = 207;
+    /// 208: hosted lambdas and checked hosted procedures carry `suspending`.
+    pub const CACHE_VERSION = 208;
 };
 
 /// Configuration for the Roc cache system.
