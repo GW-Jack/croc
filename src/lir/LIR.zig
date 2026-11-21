@@ -1086,6 +1086,12 @@ pub const EmissionUnit = enum(u32) {
     }
 };
 
+/// Whether a procedure may pause its task (design.md "Suspendability").
+pub const Suspends = enum(u8) {
+    never,
+    may,
+};
+
 /// Where the erased calls a callee left pending are run. A tail call through
 /// an erased function value cannot replace its caller's frame, because the
 /// erased-call runtime sits between the two and the callee returns its result
@@ -1235,6 +1241,9 @@ pub const CallExtra = struct {
     /// Set by the tail-drive pass on a call whose callee can return with
     /// an erased call pending.
     drive: PendingDrive = .none,
+    /// Set by `SuspensionMarks` on a call whose callee may suspend: a
+    /// suspension site (design.md "Suspendability").
+    suspension_site: bool = false,
 };
 
 /// The fields of `CFStmt.crash` that most crashes leave unset, stored out of
@@ -2077,6 +2086,12 @@ pub const LirProcSpec = struct {
     /// callers make a pending erased call before reading its result, and
     /// pass the cell it goes in (`takesPendingCell`).
     may_leave_pending: bool = false,
+    /// Whether a call to this procedure may pause its task (design.md
+    /// "Suspendability"). A body-less procedure's mark is a seed: LIR
+    /// construction sets it on a `suspending` hosted procedure, and a cached
+    /// body's producer commits it. `SuspensionMarks` computes it for every
+    /// procedure with a body.
+    suspends: Suspends = .never,
     /// Tail-recursion rewrite applied by the TRMC pass, if any.
     tail_transform: TailTransform = .none,
     /// Set by ARC on every procedure that makes or receives a same-SCC tail
@@ -2137,7 +2152,7 @@ pub const LirProcSpec = struct {
     capture_reuse_fn_params: u64 = 0,
 
     comptime {
-        std.debug.assert(@sizeOf(LirProcSpec) == 256);
+        std.debug.assert(@sizeOf(LirProcSpec) == 264);
     }
 
     /// The body ARC analyzes and places reference counts in. A static
