@@ -1260,6 +1260,7 @@ const FutureFields = struct {
             const reached = self.stack.items.len;
             try body_clone.appendSuccessors(store, &self.stack, cursor, gpa);
             switch (store.getCFStmtImmediate(cursor).*) {
+                .suspend_save, .suspend_return => dismantleInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
                 .set_local => |stmt| try self.addPredecessor(gpa, cursor, stmt.next, .rebind, @backingInt(stmt.target)),
                 .join => |stmt| try self.addPredecessor(gpa, cursor, stmt.remainder, .plain, 0),
                 .jump => |stmt| {
@@ -1461,6 +1462,8 @@ fn fieldObservedAfter(
             .debug,
             .expect,
             .expect_err,
+            .suspend_save,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .incref,
@@ -2474,6 +2477,7 @@ fn classifyStatement(
     const current_stmt = store.getCFStmtImmediate(current);
     body_clone.countStmtReads(store, operand_read_counts, current_stmt.*);
     switch (current_stmt.*) {
+        .suspend_save, .suspend_return => dismantleInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
         .init_uninitialized => |stmt| {
             try analysis.useWhole(current, stmt.target);
         },
@@ -2726,6 +2730,7 @@ fn operandSiteUse(
     stmt_id: LIR.CFStmtId,
 ) ?OperandUse {
     switch (store.getCFStmtImmediate(stmt_id).*) {
+        .suspend_save, .suspend_return => dismantleInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
         .assign_call => |stmt| {
             if (forest_mark[@backingInt(stmt.target)]) return null;
             const args = store.getLocalSpan(stmt.args);
@@ -2859,6 +2864,7 @@ fn forwardsWholeOnEveryReturn(
         for (analysis.mentions.group(member)) |mention| {
             const stmt_id: LIR.CFStmtId = @fromBackingInt(mention);
             switch (store.getCFStmtImmediate(stmt_id).*) {
+                .suspend_save, .suspend_return => dismantleInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
                 .assign_ref => |stmt| {
                     if (stmt.op.kind == .discriminant) continue;
                     const defines_member = forest_mark[@backingInt(stmt.target)] and switch (stmt.op.kind) {
@@ -3226,6 +3232,8 @@ const StatementFacts = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -3804,7 +3812,7 @@ pub fn compute(
     defer gpa.free(straight_next);
     for (straight_next, 0..) |*next, stmt_index| {
         next.* = switch (store.getCFStmtImmediate(@fromBackingInt(@intCast(stmt_index))).*) {
-            inline .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .debug, .expect, .incref, .decref, .decref_if_initialized, .free, .dyn => |stmt| .some(@backingInt(stmt.next)),
+            inline .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .debug, .expect, .incref, .decref, .decref_if_initialized, .free, .dyn, .suspend_save => |stmt| .some(@backingInt(stmt.next)),
             .set_local,
             .join,
             .switch_stmt,
@@ -3815,6 +3823,7 @@ pub fn compute(
             .ret,
             .crash,
             .expect_err,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             => .none,
@@ -4276,6 +4285,7 @@ pub fn compute(
                     candidate.join_starts.items[0]
                 else if (candidate.def_count == 1)
                     switch (store.getCFStmtImmediate(candidate.def_stmt.get().?).*) {
+                        .suspend_save, .suspend_return => dismantleInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
                         inline .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag => |stmt| stmt.next,
                         .assign_ref => |stmt| if (entry.view or
                             union_root != null or
@@ -4678,6 +4688,7 @@ pub fn compute(
                                     continue :chain;
                                 }
                                 switch (store.getCFStmtImmediate(cursor).*) {
+                                    .suspend_save, .suspend_return => dismantleInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
                                     inline .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .debug, .expect, .incref, .decref, .decref_if_initialized, .free, .dyn => |stmt| cursor = stmt.next,
                                     .set_local => |stmt| {
                                         // The value operand above still observes the old

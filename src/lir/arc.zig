@@ -2805,6 +2805,7 @@ const Inserter = struct {
         }
 
         var cloned: LIR.CFStmtId = switch (stmt) {
+            .suspend_save, .suspend_return => arcInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
             .assign_ref => |assign| blk: {
                 if (step.retain_assign_ref_target) next = try self.retainLocalIfRc(assign.target, .{ .stmt = at, .reason = .alias_bind }, next);
                 break :blk try self.store.addCFStmt(.{ .assign_ref = .{
@@ -3183,6 +3184,7 @@ const Inserter = struct {
 
             const stmt = self.store.getCFStmt(segment.cursor);
             switch (stmt) {
+                .suspend_save, .suspend_return => arcInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
                 .assign_ref => |assign| {
                     const step = try self.nextArcPlanStep(segment.plan_index, segment.cursor);
                     const any_views = self.dismantles.views.count() != 0;
@@ -6363,6 +6365,7 @@ const Inserter = struct {
         const gpa = self.emission_allocator;
         const node = self.store.getCFStmt(stmt);
         switch (node) {
+            .suspend_save, .suspend_return => arcInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
             .assign_ref => |assign| switch (assign.op.kind) {
                 .local => if (assign.op.source != assign.target and !self.isBindingBorrowed(assign.target)) try uses.append(gpa, assign.op.source),
                 .discriminant => {},
@@ -6449,6 +6452,7 @@ const Inserter = struct {
     fn appendStmtWalkSuccessors(self: *Inserter, stmt: LIR.CFStmtId, out: *std.ArrayList(LIR.CFStmtId)) Allocator.Error!void {
         const gpa = self.emission_allocator;
         switch (self.store.getCFStmtImmediate(stmt).*) {
+            .suspend_save, .suspend_return => arcInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
             inline .assign_ref,
             .assign_literal,
             .init_uninitialized,
@@ -7525,6 +7529,8 @@ const Inserter = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -7546,6 +7552,7 @@ const Inserter = struct {
             if (body_clone.definedTarget(current)) |target| setReadBeforeRebindDef(&graph, node_index, target);
             const reads = &graph.nodes.items[node_index].reads;
             switch (current) {
+                .suspend_save, .suspend_return => arcInvariant("suspend_save and suspend_return reach ARC only after ARC supports them"),
                 .assign_ref => |assign| {
                     if (!self.solution.isRepresentationAlias(assign.target)) {
                         try self.noteLivenessUseRefOp(reads, assign.op);
@@ -9291,6 +9298,8 @@ const ArcTest = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -9350,6 +9359,8 @@ const ArcTest = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .switch_stmt,
@@ -9453,6 +9464,8 @@ const ArcTest = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -9508,6 +9521,8 @@ const ArcTest = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -9570,6 +9585,8 @@ const ArcTest = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .switch_stmt,
@@ -9586,6 +9603,7 @@ const ArcTest = struct {
             if (body_clone.linearNextOrNull(stmt.*)) |next| {
                 cursor = next;
             } else switch (stmt.*) {
+                .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
                 .ret => {
                     if (before == .ret) return error.ExpectedRcBeforeStop;
                     return;
@@ -9663,6 +9681,8 @@ const ArcTest = struct {
                 .debug,
                 .expect,
                 .expect_err,
+                .suspend_save,
+                .suspend_return,
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
                 .incref,
@@ -9679,6 +9699,7 @@ const ArcTest = struct {
                 => {},
             }
             cursor = body_clone.linearNextOrNull(stmt.*) orelse return switch (stmt.*) {
+                .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
                 .jump => error.ExpectedConditionalDecref,
                 .init_uninitialized,
                 .assign_ref,
@@ -9719,6 +9740,7 @@ const ArcTest = struct {
     /// Whether `stmt` ends its path without a successor.
     fn fixtureTerminal(stmt: LIR.CFStmt) bool {
         return switch (stmt) {
+            .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
             .ret, .crash, .expect_err, .runtime_error, .comptime_exhaustiveness_failed => true,
             .init_uninitialized,
             .assign_ref,
@@ -9801,6 +9823,7 @@ test "ARC preserves erased callable repack reuse" {
     var remaining = f.store.cfStmtCount() + 1;
     while (remaining > 0) : (remaining -= 1) {
         switch (f.store.getCFStmtImmediate(cursor).*) {
+            .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
             .assign_packed_erased_fn => |assign_stmt| {
                 const assign = f.store.stmtRow(assign_stmt.data);
                 if (assign_stmt.target == new_callable) {
@@ -9933,6 +9956,7 @@ test "ARC runtime-checks erased callable repack from an ordinary parameter" {
     var remaining = f.store.cfStmtCount() + 1;
     while (remaining > 0) : (remaining -= 1) {
         switch (f.store.getCFStmtImmediate(cursor).*) {
+            .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
             .assign_packed_erased_fn => |assign_stmt| {
                 const assign = f.store.stmtRow(assign_stmt.data);
                 try testing.expectEqual(old_callable, assign.reuse.get().?);
@@ -10030,6 +10054,8 @@ test "ARC transfers erased call ownership from an explicit outer source" {
             .debug,
             .expect,
             .expect_err,
+            .suspend_save,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .switch_stmt,
@@ -10123,6 +10149,8 @@ test "ARC borrows an erased call's closure that is read after the call" {
             .set_local,
             .debug,
             .expect_err,
+            .suspend_save,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .switch_stmt,
@@ -10180,6 +10208,7 @@ test "ARC retains an erased callable whose repack input is used later" {
     var remaining = f.store.cfStmtCount() + 1;
     while (remaining > 0) : (remaining -= 1) {
         switch (f.store.getCFStmtImmediate(cursor).*) {
+            .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
             .assign_packed_erased_fn => |assign_stmt| {
                 const assign = f.store.stmtRow(assign_stmt.data);
                 try testing.expectEqual(old_callable, assign.reuse.get().?);
@@ -15248,6 +15277,7 @@ fn expectDecrefBeforeStmt(f: *const ArcTest, start: LIR.CFStmtId, local: LIR.Loc
         const stmt = f.store.getCFStmtImmediate(cursor);
         if (stmt.* == stop_tag) return error.DecrefNotBeforeStop;
         switch (stmt.*) {
+            .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
             inline .decref, .decref_if_initialized => |rc| {
                 if (rc.value == local) return;
                 cursor = rc.next;
@@ -15639,6 +15669,8 @@ test "RC sublist of a dying unique argument passed to a non-inlined callee consu
             .debug,
             .expect,
             .expect_err,
+            .suspend_save,
+            .suspend_return,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .decref_if_initialized,
@@ -15655,6 +15687,7 @@ test "RC sublist of a dying unique argument passed to a non-inlined callee consu
         };
         cursor = f.store.getProcSpecImmediate(target_proc).body.get().?;
         const emitted_op = while (true) switch (f.store.getCFStmtImmediate(cursor).*) {
+            .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
             .assign_low_level => |assign| {
                 if (assign.target == slice) break assign.op;
                 cursor = assign.next;
@@ -16192,6 +16225,7 @@ test "RC outcome restitution preserves List Str on failure and seeds the success
             break;
         }
         cursor = switch (stmt) {
+            .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
             inline .assign_ref, .assign_literal, .assign_list, .assign_struct, .assign_tag, .set_local, .debug, .expect, .incref, .decref, .decref_if_initialized, .dyn, .free => |linear| linear.next,
             .init_uninitialized,
             .assign_call,
@@ -16946,6 +16980,7 @@ test "RC outcome restitution releases every returned argument before a nested jo
             break;
         }
         cursor = switch (stmt) {
+            .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
             .join => |join| join.remainder,
             inline .assign_ref, .assign_literal, .assign_list, .assign_struct, .assign_tag, .set_local, .debug, .expect, .incref, .decref, .decref_if_initialized, .dyn, .free => |linear| linear.next,
             .init_uninitialized,
@@ -16979,6 +17014,7 @@ test "RC outcome restitution releases every returned argument before a nested jo
             break;
         }
         cursor = switch (stmt) {
+            .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
             .join => |join| join.remainder,
             inline .assign_ref, .assign_literal, .assign_list, .assign_struct, .assign_tag, .set_local, .debug, .expect, .incref, .decref, .decref_if_initialized, .dyn, .free => |linear| linear.next,
             .init_uninitialized,
@@ -19151,6 +19187,7 @@ test "RC field take restores the exact aggregate field on checked failure withou
                 break;
             }
             cursor = switch (stmt) {
+                .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
                 inline .assign_ref, .assign_literal, .assign_list, .assign_struct, .assign_tag, .set_local, .debug, .expect, .incref, .decref, .decref_if_initialized, .dyn, .free => |linear| linear.next,
                 .init_uninitialized,
                 .assign_call,
@@ -19305,6 +19342,7 @@ test "RC specialization: caller body survives variant proc append" {
     var remaining = f.store.cfStmtCount() + 1;
     while (remaining > 0) : (remaining -= 1) {
         switch (f.store.getCFStmtImmediate(cursor).*) {
+            .suspend_save, .suspend_return => unreachable, // test fixtures never build suspension statements
             .assign_call => |assign| {
                 if (assign.target == result) {
                     try testing.expectEqual(variant, assign.proc);
@@ -20452,7 +20490,7 @@ const DynFixture = struct {
                     try testing.expectEqual(self.dynamic, rc.rc.concrete.layout_idx);
                 },
                 .free => |rc| try testing.expect(self.f.store.getLocal(rc.value).dyn == null),
-                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .expect_err, .dyn, .runtime_error, .comptime_exhaustiveness_failed, .decref_if_initialized, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => {},
+                .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .expect_err, .dyn, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .decref_if_initialized, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => {},
             }
         }
     }
@@ -20565,7 +20603,7 @@ test "only a consumer that counts string literals as image data drops their rele
     defer walk.deinit();
     while (try walk.next()) |stmt_id| switch (f.store.getCFStmt(stmt_id)) {
         .incref, .decref, .decref_if_initialized, .free => return error.TestUnexpectedResult,
-        .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .expect_err, .dyn, .runtime_error, .comptime_exhaustiveness_failed, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => {},
+        .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .expect_err, .dyn, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => {},
     };
 }
 
@@ -20600,7 +20638,7 @@ test "ARC places no reference counts around a callable read from a type table" {
             const op = d.f.store.stmtRow(dyn_stmt.data);
             if (op == .call_erased and op.call_erased.reuse_closure) transfers += 1;
         },
-        .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .expect_err, .runtime_error, .comptime_exhaustiveness_failed, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => {},
+        .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => {},
     };
     try testing.expectEqual(@as(usize, 1), transfers);
 }

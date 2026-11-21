@@ -8615,6 +8615,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     .debug,
                     .expect,
                     .expect_err,
+                    .suspend_save,
+                    .suspend_return,
                     .runtime_error,
                     .comptime_exhaustiveness_failed,
                     .incref,
@@ -21387,6 +21389,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             try self.emitTrap();
                         },
 
+                        // Milestone 1 implements suspension on the interpreter only
+                        // (design.md "What Implements It First").
+                        .suspend_save, .suspend_return => @panic("TODO: the dev backend does not implement suspension yet"),
                         .runtime_error => {
                             try self.emitRocCrash("hit a runtime error");
                             try self.emitTrap();
