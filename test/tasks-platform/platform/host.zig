@@ -12,6 +12,10 @@
 //! `I32` is the exit status. A crashed root prints
 //! its message and exits with status 1. After a root that finishes, the host
 //! fails the run unless every allocation it served was released.
+//!
+//! `--alloc=cache` serves allocations from per-size free lists that only the
+//! scheduler thread may use, for measuring what allocation costs a pause
+//! (design.md "The Reference Platform", "Measuring records").
 
 const std = @import("std");
 const shim_io = @import("shim_io");
@@ -46,9 +50,56 @@ const HostEnv = struct {
     live_allocations: std.atomic.Value(i64) = .init(0),
 
     pub fn rocAllocator(_: *HostEnv) std.mem.Allocator {
-        return std.heap.c_allocator;
+        return switch (g_alloc_mode) {
+            .malloc => std.heap.c_allocator,
+            .cache => .{ .ptr = undefined, .vtable = &cache_vtable },
+        };
     }
 };
+
+const AllocMode = enum { malloc, cache };
+
+var g_alloc_mode: AllocMode = .malloc;
+
+/// The `--alloc=cache` allocator: a free list per 16-byte size class up to
+/// `cache_max`, backed by `malloc`. Freed blocks are kept, never returned.
+/// Only the scheduler thread may use it, which the benchmark guarantees by
+/// running no worker operation.
+const cache_granule = 16;
+const cache_max = 1024;
+const FreeBlock = struct { next: ?*FreeBlock };
+var g_free_lists: [cache_max / cache_granule]?*FreeBlock = @splat(null);
+var g_scheduler_thread: std.Thread.Id = undefined;
+
+const cache_vtable: std.mem.Allocator.VTable = .{
+    .alloc = cacheAlloc,
+    .resize = std.mem.Allocator.noResize,
+    .remap = std.mem.Allocator.noRemap,
+    .free = cacheFree,
+};
+
+fn cacheClass(len: usize, alignment: std.mem.Alignment) ?usize {
+    if (len == 0 or len > cache_max or alignment.toByteUnits() > cache_granule) return null;
+    return (len - 1) / cache_granule;
+}
+
+fn cacheAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+    std.debug.assert(std.Thread.getCurrentId() == g_scheduler_thread); // rationale: --alloc=cache is for programs that allocate only on the scheduler
+    const class = cacheClass(len, alignment) orelse return std.heap.c_allocator.rawAlloc(len, alignment, ret_addr);
+    if (g_free_lists[class]) |block| {
+        g_free_lists[class] = block.next;
+        return @ptrCast(block);
+    }
+    return std.heap.c_allocator.rawAlloc((class + 1) * cache_granule, .fromByteUnits(cache_granule), ret_addr);
+}
+
+fn cacheFree(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+    std.debug.assert(std.Thread.getCurrentId() == g_scheduler_thread); // rationale: --alloc=cache is for programs that allocate only on the scheduler
+    const class = cacheClass(memory.len, alignment) orelse return std.heap.c_allocator.rawFree(memory, alignment, ret_addr);
+    const block: *FreeBlock = @ptrCast(@alignCast(memory.ptr));
+    block.next = g_free_lists[class];
+    g_free_lists[class] = block;
+}
 
 const callbacks = host_alloc.Callbacks(HostEnv);
 
@@ -208,6 +259,24 @@ fn hostedSleepMillis(task: *RocTask, out: *anyopaque, millis: u64) callconv(.c) 
     return park(task, out, .{ .sleep = millis });
 }
 
+/// The task that called `Scheduler.yield!` in the resume now running, which
+/// the scheduler readies itself once that resume returns.
+var g_yielded: ?*RocTask = null;
+
+/// `RocPoll roc_tasks_scheduler_yield(RocTask *task, void *out)`.
+fn hostedSchedulerYield(task: *RocTask, _: *anyopaque) callconv(.c) u32 {
+    std.debug.assert(g_yielded == null); // rationale: a task waits on at most one call
+    g_yielded = task;
+    return poll_pending;
+}
+
+/// `uint64_t roc_tasks_clock_monotonic_ns(void)`, an ordinary hosted call.
+fn hostedClockMonotonicNs() callconv(.c) u64 {
+    var ts: std.c.timespec = undefined;
+    std.debug.assert(std.c.clock_gettime(.MONOTONIC, &ts) == 0); // rationale: the monotonic clock always exists on the platform's targets
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
 /// `void roc_tasks_stdout_line(RocStr line)`, an ordinary hosted call.
 fn hostedStdoutLine(line: RocStr) callconv(.c) void {
     std.Io.File.stdout().writeStreamingAll(io(), line.asSlice()) catch {};
@@ -234,6 +303,8 @@ comptime {
     @export(&hostedFileReadUtf8, .{ .name = "roc_tasks_file_read_utf8", .visibility = .hidden });
     @export(&hostedSleepMillis, .{ .name = "roc_tasks_sleep_millis", .visibility = .hidden });
     @export(&hostedStdoutLine, .{ .name = "roc_tasks_stdout_line", .visibility = .hidden });
+    @export(&hostedSchedulerYield, .{ .name = "roc_tasks_scheduler_yield", .visibility = .hidden });
+    @export(&hostedClockMonotonicNs, .{ .name = "roc_tasks_clock_monotonic_ns", .visibility = .hidden });
     @export(&taskAbort, .{ .name = builtins.shim_symbols.roc_task_abort, .visibility = .hidden });
     @export(&taskReady, .{ .name = builtins.shim_symbols.roc_task_ready, .visibility = .hidden });
     host_alloc.exportRuntimeSymbols(getOps, .{});
@@ -343,7 +414,19 @@ comptime {
     @export(&main, .{ .name = "main" });
 }
 
-fn main(_: c_int, _: [*][*:0]u8) callconv(.c) c_int {
+fn main(argc: c_int, argv: [*][*:0]u8) callconv(.c) c_int {
+    for (argv[1..@intCast(argc)]) |arg_z| {
+        const arg = std.mem.span(arg_z);
+        if (std.mem.eql(u8, arg, "--alloc=malloc")) {
+            g_alloc_mode = .malloc;
+        } else if (std.mem.eql(u8, arg, "--alloc=cache")) {
+            g_alloc_mode = .cache;
+        } else {
+            std.debug.print("Error: bad argument '{s}'\nUsage: <app> [--alloc=malloc | --alloc=cache]\n", .{arg});
+            return 1;
+        }
+    }
+    g_scheduler_thread = std.Thread.getCurrentId();
     return platformMain() catch |err| {
         std.debug.print("HOST ERROR: {s}\n", .{@errorName(err)});
         return 1;
@@ -366,8 +449,13 @@ fn platformMain() HostError!c_int {
     const root = roc_main(&exit_code);
     var status = roc_task_resume(root);
     while (status == @backingInt(TaskStatus.pending)) {
-        // The root parked on one call; resume it once a worker's wake hands
-        // it back.
+        if (g_yielded) |task| {
+            // A yield parked the task with no worker: wake it now, after the
+            // park, so the wake hands it back through `roc_task_ready`.
+            g_yielded = null;
+            roc_task_wake(task);
+        }
+        // The root parked on one call; resume it once a wake hands it back.
         const task = g_ready.pop();
         std.debug.assert(task == root); // rationale: without spawning, the root is the only task
         status = roc_task_resume(task);

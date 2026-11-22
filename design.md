@@ -34459,6 +34459,50 @@ status:
 
 The host links libc on every target, for threads and a thread-safe `malloc`.
 
+**Measuring records.** A pause at depth *d* allocates *d* records with
+`roc_alloc`, and the resume releases them with `roc_dealloc`. Records are
+released by the runtime, which holds their only reference, so the task
+could serve them itself and keep the allocator off the pause path. That
+lands only if a measurement says it pays. The platform gives that
+measurement two things:
+
+- `Scheduler.yield! : () => {}` suspends, and the scheduler wakes the task
+  itself once the resume has parked it, with no worker, so a pause costs
+  only the runtime's work;
+- `Clock.monotonic_ns! : () => U64`, an ordinary hosted call.
+
+`bench_pause.roc` times pauses at depths 1, 4 and 16. The host's
+`--alloc=malloc` (the default) serves allocations from libc. Its
+`--alloc=cache` serves them from per-size free lists that only the
+scheduler thread may use, so an allocation that hits the cache costs about
+what a task's own record cache would. The time a pause saves under `cache`
+is an upper bound on what serving records from the task could save. That
+is built only if the bound is a large share of the pause, measured with a
+ReleaseFast compiler on LLVM.
+
+The first measurement (ReleaseFast compiler, LLVM, arm64 macOS; median of
+seven runs of 200,000 pauses) puts allocation at most of a pause:
+
+| Nest | `malloc` | `cache` | Saved |
+|---|---|---|---|
+| 1 | 64 ns | 31 ns | 52% |
+| 4 | 174 ns | 68 ns | 61% |
+| 16 | 660 ns | 214 ns | 68% |
+
+Each nested record costs about 40 ns under `malloc` and 12 ns under
+`cache`.
+
+A last-in, first-out buffer does not fit how records are released. One
+suspension pushes its records innermost first, and the resume reverses
+them so the innermost runs first. So within one suspension, records are
+released in the order they were allocated. And the record a resume calls
+is released after that call, which may have pushed new records. Freed
+records would sit beneath live outer ones, such as a loop's caller, and
+in a loop that pauses, a stack would grow by a suspension's records every
+iteration. So what comes next is a per-task record cache, measured against
+both: a free list per size class in the task, which keeps released records
+for the task's next suspension and gives them back when the task is freed.
+
 ### Persisted Data
 
 - Checked modules gain the `suspending` mark on hosted declarations and the
