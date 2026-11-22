@@ -26,6 +26,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compiler_rt = @import("compiler_rt_128.zig");
 const shim_symbols = @import("shim_symbols.zig");
+const task_crash_exit = @import("task_crash_exit.zig");
 
 // `callconv(.c)` wrappers matching each compiler-rt symbol's ABI. The
 // underlying implementations decompose to 64-bit arithmetic only, so
@@ -139,6 +140,9 @@ pub fn resolve(name: []const u8) ?usize {
     inline for (c_routines) |routine| {
         if (std.mem.eql(u8, name, routine)) return @intFromPtr(@extern(*const anyopaque, .{ .name = routine }));
     }
+    // The private runtime's crash-exit routines, which the merged builtins
+    // call (task_crash_exit.zig).
+    if (task_crash_exit.resolveLinked(name)) |address| return address;
     if (builtin.os.tag.isDarwin()) {
         // Darwin codegen also emits the libc __bzero entry point.
         if (std.mem.eql(u8, name, "bzero") or std.mem.eql(u8, name, "__bzero")) return @intFromPtr(&host_routines.bzero);

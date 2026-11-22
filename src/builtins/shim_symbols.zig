@@ -32,8 +32,10 @@ pub const roc_entrypoint_from_image = "roc_entrypoint_from_image";
 pub const roc_task_resume = "roc_task_resume";
 /// Tells a parked task the host wrote its pending hosted result.
 pub const roc_task_wake = "roc_task_wake";
-/// Frees a task after it finished or was cancelled.
+/// Frees a task after it finished, was cancelled or crashed.
 pub const roc_task_free = "roc_task_free";
+/// The message of a task that crashed (design.md "The Task Runtime").
+pub const roc_task_crash_message = "roc_task_crash_message";
 /// Cancels a parked task; a `Tasks` program defines it (design.md "Host
 /// Contract").
 pub const roc_task_cancel = "roc_task_cancel";
@@ -169,6 +171,10 @@ pub const llvm_private_runtime_set = c_memory_set ++ c_math_set ++ [_][:0]const 
     // x64 MinGW.
     "__chkstk",
     "___chkstk_ms",
+    // A task's crash exit (design.md "The Task Runtime").
+    "roc_task_crash_exits",
+    "roc_task_setjmp",
+    "roc_task_longjmp",
 };
 
 /// Export the six fixed host callbacks using canonical names. Callback types

@@ -5933,7 +5933,7 @@ fn addEvalWasmRuntimeModules(
     name: []const u8,
     optimize: OptimizeMode,
 ) struct { builtins: *std.Build.Module } {
-    const builtins_obj = addBuiltinsObject(b, roc_modules, b.fmt("roc_builtins_{s}_eval", .{name}), "src/builtins/static_lib.zig", target, optimize, false, false);
+    const builtins_obj = addBuiltinsObject(b, roc_modules, b.fmt("roc_builtins_{s}_eval", .{name}), "src/builtins/static_lib.zig", target, optimize, false, false, true);
 
     const compiler_rt_obj = b.addObject(.{
         .name = b.fmt("compiler_rt_{s}_eval", .{name}),
@@ -6194,7 +6194,10 @@ fn addLlvmPrivateRuntimeBitcode(b: *std.Build, runtime_target: roc_target.RocTar
             .pic = true,
             .single_threaded = true,
             .no_builtin = true,
-            .imports = &.{.{ .name = "compiler_rt", .module = compiler_rt_module }},
+            .imports = &.{
+                .{ .name = "compiler_rt", .module = compiler_rt_module },
+                .{ .name = "sljmp", .module = b.createModule(.{ .root_source_file = b.path("src/sljmp/mod.zig") }) },
+            },
         }),
     });
     obj.root_module.stack_check = false;
@@ -6225,10 +6228,16 @@ fn addWasmStaticLibRun(
 /// no-op tracy stub (so host_abi.zig can `@import("tracy")` without the real
 /// tracy module, which requires build_options), the vendored float
 /// formatters, and shim I/O.
-fn addBuiltinsImports(b: *std.Build, roc_modules: modules.RocModules, module: *std.Build.Module) void {
+/// `task_host_calls` says whether a builtins object root defines the host's
+/// task calls (`builtins_object_options`, read by `static_lib.zig`).
+fn addBuiltinsImports(b: *std.Build, roc_modules: modules.RocModules, module: *std.Build.Module, task_host_calls: bool) void {
     module.addImport("tracy", b.createModule(.{ .root_source_file = b.path("src/builtins/tracy_stub.zig") }));
+    const object_options = b.addOptions();
+    object_options.addOption(bool, "task_host_calls", task_host_calls);
+    module.addOptions("builtins_object_options", object_options);
     module.addImport("vendor_parse_float", roc_modules.vendor_parse_float);
     module.addImport("vendor_ryu", roc_modules.vendor_ryu);
+    module.addImport("sljmp", roc_modules.sljmp);
     module.addImport("shim_io", b.createModule(.{ .root_source_file = b.path("src/shim_io.zig") }));
 }
 
@@ -6247,6 +6256,10 @@ fn addBuiltinsObject(
     optimize: OptimizeMode,
     bundle_compiler_rt: bool,
     wasm_stack_checks: bool,
+    /// Whether the object defines the host's task calls (`roc_task_resume`
+    /// and its siblings). The interpreter shim's does not: the shim defines
+    /// them from the interpreter's own copy of the builtins.
+    task_host_calls: bool,
 ) *Step.Compile {
     std.debug.assert(!wasm_stack_checks or target.result.cpu.arch == .wasm32);
     const obj = b.addObject(.{
@@ -6263,7 +6276,7 @@ fn addBuiltinsObject(
             .pic = !wasm_stack_checks,
         }),
     });
-    addBuiltinsImports(b, roc_modules, obj.root_module);
+    addBuiltinsImports(b, roc_modules, obj.root_module, task_host_calls);
     obj.bundle_compiler_rt = bundle_compiler_rt;
     // One section per function and datum, so a program's link keeps only
     // the builtins it reaches.
@@ -6294,7 +6307,7 @@ fn addBoxyRuntimeObject(
 ) *Step.Compile {
     std.debug.assert(!wasm_stack_checks or target.result.cpu.arch == .wasm32);
     const builtins_module = b.createModule(.{ .root_source_file = b.path("src/builtins/mod.zig") });
-    addBuiltinsImports(b, roc_modules, builtins_module);
+    addBuiltinsImports(b, roc_modules, builtins_module, true);
     builtins_module.addImport("roc_str_view", roc_modules.roc_str_view);
     const shape_module = b.createModule(.{ .root_source_file = b.path("src/layout/shape.zig") });
     const value_rules_module = b.createModule(.{ .root_source_file = b.path("src/postcheck/value_rules/mod.zig") });
@@ -6350,7 +6363,7 @@ fn addBuiltinsBitcode(
             .single_threaded = true,
         }),
     });
-    addBuiltinsImports(b, roc_modules, obj.root_module);
+    addBuiltinsImports(b, roc_modules, obj.root_module, true);
     obj.root_module.omit_frame_pointer = true;
     obj.root_module.stack_check = false;
     if (link_libc) |link| obj.root_module.link_libc = link;
@@ -6414,7 +6427,7 @@ fn addMainExe(
     // This RocOps-ABI object is not linked into built executables (the dev
     // backend links the extern-ABI object below, the LLVM backend merges
     // builtins into the app object), so it does not need compiler-rt.
-    const builtins_obj = addBuiltinsObject(b, roc_modules, "roc_builtins", "src/builtins/static_lib.zig", builtins_target, optimize, false, false);
+    const builtins_obj = addBuiltinsObject(b, roc_modules, "roc_builtins", "src/builtins/static_lib.zig", builtins_target, optimize, false, false, true);
 
     // Extern-symbol-mode builtins object: same builtins, but host operations
     // go through linker-resolved symbols (the symbol ABI) instead of RocOps.
@@ -6426,7 +6439,7 @@ fn addMainExe(
     // link's --gc-sections drops the unused ones. macOS is excluded: it always
     // links -lSystem (which provides libm) and `-fcompiler-rt` for a macOS
     // target crashes the Zig compiler under the build server (--listen).
-    const builtins_extern_obj = addBuiltinsObject(b, roc_modules, "roc_builtins_extern", "src/builtins/extern_static_lib.zig", builtins_target, optimize, target.result.os.tag != .macos, false);
+    const builtins_extern_obj = addBuiltinsObject(b, roc_modules, "roc_builtins_extern", "src/builtins/extern_static_lib.zig", builtins_target, optimize, target.result.os.tag != .macos, false, true);
 
     const shim_host_abi_module = b.createModule(.{
         .root_source_file = b.path("src/shim_host_abi.zig"),
@@ -6469,7 +6482,11 @@ fn addMainExe(
     interpreter_shim_lib.root_module.addImport("compiled_builtins", compiled_builtins_module);
     interpreter_shim_lib.step.dependOn(&write_compiled_builtins.step);
     // Include the pre-built builtins object
-    interpreter_shim_lib.root_module.addObjectFile(builtins_obj.getEmittedBin());
+    // The shim defines the host's task calls from the interpreter's copy of
+    // the builtins, so its builtins object leaves them out (design.md "The
+    // Task Runtime").
+    const interpreter_shim_builtins_obj = addBuiltinsObject(b, roc_modules, "roc_builtins_interpreter_shim", "src/builtins/static_lib.zig", builtins_target, optimize, false, false, false);
+    interpreter_shim_lib.root_module.addObjectFile(interpreter_shim_builtins_obj.getEmittedBin());
     interpreter_shim_lib.bundle_compiler_rt = true;
     // The link inputs `roc` embeds are digested once here (see
     // src/build/embedded_digests.zig), so `roc run` never rehashes them.
@@ -6765,7 +6782,7 @@ fn addMainExe(
         // Build builtins object file for this target.
         // Non-extern (RocOps-ABI) object is not linked into executables; only
         // wasm32 merges compiler-rt below for the eval/REPL pipeline.
-        const cross_builtins_obj = addBuiltinsObject(b, roc_modules, b.fmt("roc_builtins_{s}", .{cross_target.name}), "src/builtins/static_lib.zig", cross_resolved_target, optimize, false, false);
+        const cross_builtins_obj = addBuiltinsObject(b, roc_modules, b.fmt("roc_builtins_{s}", .{cross_target.name}), "src/builtins/static_lib.zig", cross_resolved_target, optimize, false, false, true);
 
         const cross_wasm32_compiler_rt_obj: ?*Step.Compile = if (cross_is_wasm) blk: {
             const compiler_rt_obj = b.addObject(.{
@@ -6815,7 +6832,7 @@ fn addMainExe(
         }
 
         // Extern-symbol-mode builtins object for this target (the symbol ABI).
-        const cross_builtins_extern_obj = addBuiltinsObject(b, roc_modules, b.fmt("roc_builtins_extern_{s}", .{cross_target.name}), "src/builtins/extern_static_lib.zig", cross_resolved_target, optimize, cross_bundle_compiler_rt, false);
+        const cross_builtins_extern_obj = addBuiltinsObject(b, roc_modules, b.fmt("roc_builtins_extern_{s}", .{cross_target.name}), "src/builtins/extern_static_lib.zig", cross_resolved_target, optimize, cross_bundle_compiler_rt, false, true);
         // This object links into -nostdlib executables, and a freestanding
         // default-platform program has no libc at all, so nothing in the link
         // defines the stack protector's `__stack_chk_fail` and
@@ -6860,7 +6877,7 @@ fn addMainExe(
         // linked instead of them when a platform reserves low memory (see
         // `src/builtins/stack_guard.zig`).
         if (cross_is_wasm) {
-            const checked_builtins_obj = addBuiltinsObject(b, roc_modules, b.fmt("roc_builtins_extern_stack_checked_{s}", .{cross_target.name}), "src/builtins/extern_static_lib_stack_checked.zig", cross_resolved_target, optimize, cross_bundle_compiler_rt, true);
+            const checked_builtins_obj = addBuiltinsObject(b, roc_modules, b.fmt("roc_builtins_extern_stack_checked_{s}", .{cross_target.name}), "src/builtins/extern_static_lib_stack_checked.zig", cross_resolved_target, optimize, cross_bundle_compiler_rt, true, true);
             embedded_digests.addArg(b.fmt("builtins_extern_stack_checked_{s}", .{cross_target.name}));
             embedded_digests.addFileArg(checked_builtins_obj.getEmittedBin());
             _ = embedded_assets.addCopyFile(

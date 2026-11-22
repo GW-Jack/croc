@@ -44,6 +44,21 @@ else if (has_macos_impl)
 else
     &stubSetjmp;
 
+/// Naked routines that need no C library, for an object that exports them
+/// under names of its own (the LLVM private runtime): `naked.setjmp_routine`
+/// is the setjmp routine itself, and `naked.longjmp` restores the
+/// `naked.JmpBuf` it filled. macOS uses the Linux routines, which save exactly the
+/// callee-saved registers of the SysV x86_64 and AAPCS64 calling conventions
+/// that macOS also follows, so the object needs no `_setjmp` from libSystem.
+pub const naked = if (has_windows_x64_impl)
+    @import("windows.zig")
+else if (has_windows_aarch64_impl)
+    @import("windows_aarch64.zig")
+else if (has_linux_impl or (has_macos_impl and (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64)))
+    @import("linux.zig")
+else
+    @compileError("no naked setjmp routines on this platform");
+
 /// Restores execution context from the buffer, causing setjmp to return with the given value.
 pub const longjmp = if (has_windows_x64_impl)
     @import("windows.zig").longjmp

@@ -7,6 +7,8 @@ pub const decimal_parse = @import("decimal_parse.zig");
 pub const native_runtime_libcalls = @import("native_runtime_libcalls.zig");
 pub const host_abi = @import("host_abi.zig");
 pub const task = @import("task.zig");
+/// The jump routines of a task's crash exit (design.md "The Task Runtime").
+pub const task_crash_exit = @import("task_crash_exit.zig");
 pub const in_process_host = @import("in_process_host.zig");
 pub const shim_symbols = @import("shim_symbols.zig");
 pub const dec = @import("dec.zig");

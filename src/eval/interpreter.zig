@@ -4390,6 +4390,11 @@ pub const Interpreter = struct {
         const ret_sa = self.helper.sizeAlignOf(ret_layout);
         const ret_buf = try self.allocAlignedByteSlice(@max(ret_sa.size, 1), ret_sa.alignment);
 
+        // A crash in the host ends the process, not the running task
+        // (design.md "The Task Runtime"): the call runs with no task, and a
+        // crash leaves none, so the crash reaches the host's `roc_crashed`.
+        const running_task = builtins.task.hostEnter();
+
         var crash_boundary = self.enterCrashBoundary();
         defer crash_boundary.deinit();
         if (crash_boundary.set() != 0) return self.crashError();
@@ -4441,6 +4446,7 @@ pub const Interpreter = struct {
         }
 
         if (self.roc_env.crashed) return self.crashError();
+        builtins.task.hostLeave(running_task);
         if (ret_sa.size == 0) return Value.zst;
 
         const result = try self.alloc(ret_layout);

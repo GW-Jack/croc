@@ -312,8 +312,15 @@ comptime {
     @export(&shimEntrypoint, .{ .name = shim_symbols.roc_entrypoint });
     @export(&shimEntrypointFromImage, .{ .name = shim_symbols.roc_entrypoint_from_image });
     // A `Tasks` platform's host drives its tasks with `roc_task_resume`,
-    // `roc_task_wake` and `roc_task_free`. The builtins object this archive
-    // bundles exports them (design.md "Host Contract").
+    // `roc_task_wake`, `roc_task_free` and `roc_task_crash_message`
+    // (design.md "Host Contract"). They come from the interpreter's copy of
+    // the builtins, not from the builtins object this archive bundles (which
+    // leaves them out), so a resume and the interpreter's crashes share one
+    // running task (design.md "The Task Runtime").
+    @export(&builtins.task.host_calls.resumeTask, .{ .name = shim_symbols.roc_task_resume });
+    @export(&builtins.task.host_calls.wake, .{ .name = shim_symbols.roc_task_wake });
+    @export(&builtins.task.host_calls.free, .{ .name = shim_symbols.roc_task_free });
+    @export(&builtins.task.host_calls.crashMessage, .{ .name = shim_symbols.roc_task_crash_message });
 }
 
 fn shimGetOps() callconv(.c) *anyopaque {

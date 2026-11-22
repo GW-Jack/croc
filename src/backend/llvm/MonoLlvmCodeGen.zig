@@ -410,6 +410,10 @@ pub const MonoLlvmCodeGen = struct {
     /// Whether the module creates a task, and so defines the host's task
     /// calls for the host.
     defines_task_host_calls: bool = false,
+    /// Whether the program creates a task, so its crashes go through the
+    /// `task_crash` builtin, which ends the running task rather than the
+    /// process (design.md "The Task Runtime").
+    crashes_reach_tasks: bool = false,
     /// How many enclosing cold switch arms the statement being emitted sits
     /// under. Non-zero routes builtin calls through preserve_most shims.
     cold_depth: u32 = 0,
@@ -826,6 +830,7 @@ pub const MonoLlvmCodeGen = struct {
         self.cold_shims = @splat(null);
         self.slot_drop_adapters.clearRetainingCapacity();
         self.defines_task_host_calls = false;
+        self.crashes_reach_tasks = self.store.createsTask();
         self.cold_depth = 0;
         self.clearStaticBytes();
         self.static_refcounted_backings.clearRetainingCapacity();
@@ -5444,8 +5449,9 @@ pub const MonoLlvmCodeGen = struct {
     }
 
     /// Define the host's task calls, which a program that creates a task
-    /// exports (design.md "Backends"): `roc_task_resume`, `roc_task_wake` and
-    /// `roc_task_free`, each a call to its builtin. Linking the builtins keeps
+    /// exports (design.md "Backends"): `roc_task_resume`, `roc_task_wake`,
+    /// `roc_task_free` and `roc_task_crash_message`, each a call to its
+    /// builtin. Linking the builtins keeps
     /// only what the program defines, so the program defines these for the
     /// host. `roc_task_cancel` calls its builtin with the host's
     /// `roc_task_abort`. Runs after the procs, when no function is
@@ -5453,19 +5459,25 @@ pub const MonoLlvmCodeGen = struct {
     fn defineTaskHostCalls(self: *MonoLlvmCodeGen) Error!void {
         const builder = self.builder orelse return error.CompilationFailed;
         const ptr_ty = try self.ptrType();
-        const calls = [_]struct { name: []const u8, builtin: BuiltinSymbol, ret: LlvmBuilder.Type }{
-            .{ .name = builtins.shim_symbols.roc_task_resume, .builtin = .task_resume, .ret = .i32 },
-            .{ .name = builtins.shim_symbols.roc_task_wake, .builtin = .task_wake, .ret = .void },
-            .{ .name = builtins.shim_symbols.roc_task_free, .builtin = .task_free, .ret = .void },
+        const calls = [_]struct { name: []const u8, builtin: BuiltinSymbol, ret: LlvmBuilder.Type, args: usize }{
+            .{ .name = builtins.shim_symbols.roc_task_resume, .builtin = .task_resume, .ret = .i32, .args = 1 },
+            .{ .name = builtins.shim_symbols.roc_task_wake, .builtin = .task_wake, .ret = .void, .args = 1 },
+            .{ .name = builtins.shim_symbols.roc_task_free, .builtin = .task_free, .ret = .void, .args = 1 },
+            // (task, *len) -> the message's bytes
+            .{ .name = builtins.shim_symbols.roc_task_crash_message, .builtin = .task_crash_message, .ret = ptr_ty, .args = 2 },
         };
+        const ptr_params = [_]LlvmBuilder.Type{ ptr_ty, ptr_ty };
         for (calls) |call| {
-            const target = try self.declareBuiltin(call.builtin, call.ret, &.{ptr_ty});
-            const fn_ty = builder.fnType(call.ret, &.{ptr_ty}, .normal) catch return error.OutOfMemory;
+            const params = ptr_params[0..call.args];
+            const target = try self.declareBuiltin(call.builtin, call.ret, params);
+            const fn_ty = builder.fnType(call.ret, params, .normal) catch return error.OutOfMemory;
             const func = builder.addFunction(fn_ty, builder.strtabString(call.name) catch return error.OutOfMemory, .default) catch return error.OutOfMemory;
             var wip = LlvmBuilder.WipFunction.init(builder, .{ .function = func, .strip = true }) catch return error.OutOfMemory;
             defer wip.deinit();
             wip.cursor = .{ .block = wip.block(0, "entry") catch return error.OutOfMemory };
-            const result = wip.call(.normal, .ccc, .none, target.typeOf(builder), target.toValue(builder), &.{wip.arg(0)}, "") catch return error.OutOfMemory;
+            var args: [ptr_params.len]LlvmBuilder.Value = undefined;
+            for (args[0..call.args], 0..) |*arg, index| arg.* = wip.arg(@intCast(index));
+            const result = wip.call(.normal, .ccc, .none, target.typeOf(builder), target.toValue(builder), args[0..call.args], "") catch return error.OutOfMemory;
             if (call.ret == .void) {
                 _ = wip.retVoid() catch return error.OutOfMemory;
             } else {
@@ -9782,6 +9794,11 @@ pub const MonoLlvmCodeGen = struct {
     fn emitStaticRocOpsMessageCall(self: *MonoLlvmCodeGen, callback: RocOpsCallback, msg: []const u8) Error!void {
         const builder, const wip = try self.builderAndWip();
         const ptr_ty = try self.ptrType();
+        if (callback == .crashed and self.crashes_reach_tasks) {
+            const msg_ptr = try self.staticBytes(msg);
+            const msg_len = builder.intValue(self.ptrSizedIntType(), msg.len) catch return error.OutOfMemory;
+            return self.callBuiltinVoid(.task_crash, &.{ ptr_ty, self.ptrSizedIntType() }, &.{ msg_ptr, msg_len });
+        }
         // The host's runtime symbol: symbol(bytes: [*]const u8, len: usize).
         const fn_ty = builder.fnType(.void, &.{ ptr_ty, self.ptrSizedIntType() }, .normal) catch return error.OutOfMemory;
         const func = try self.declareExternSymbol(callback.symbolName(), fn_ty);
@@ -15164,7 +15181,11 @@ pub const MonoLlvmCodeGen = struct {
         const fn_ty = builder.fnType(ret_ty, param_types.items, .normal) catch return error.OutOfMemory;
         const attrs = attrs_wip.finish(builder) catch return error.OutOfMemory;
         const callee = (try self.declareHostSymbol(self.store.getString(hosted.symbol), fn_ty)).toValue(builder);
+        // A crash in the host ends the process, not the running task
+        // (design.md "The Task Runtime"), so the call runs with no task.
+        const running_task = if (self.crashes_reach_tasks) try self.callBuiltin(.task_host_enter, ptr_ty, &.{}, &.{}) else null;
         const result = wip.call(.normal, .ccc, attrs, fn_ty, callee, call_args.items, "") catch return error.OutOfMemory;
+        if (running_task) |task| try self.callBuiltinVoid(.task_host_leave, &.{ptr_ty}, &.{task});
 
         // Register return: store each piece back into the result slot at its byte offset.
         if (ret_registers) |registers| {

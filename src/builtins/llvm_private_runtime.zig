@@ -15,6 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compiler_rt = @import("compiler_rt");
+const task_crash_exit = @import("task_crash_exit.zig");
 
 /// The runtime must not pull in Zig's panic formatting machinery.
 pub const panic = std.debug.no_panic;
@@ -25,6 +26,13 @@ comptime {
     if (builtin.os.tag.isDarwin()) {
         @export(&bzero, .{ .name = "bzero", .linkage = .weak, .visibility = .hidden });
     }
+    // A task's crash exit (task_crash_exit.zig): the portable builtins call
+    // these, so every target defines them, and one without naked routines
+    // reports that it has no crash exits.
+    const crash_exit = task_crash_exit.linked_definitions;
+    @export(&crash_exit.crashExits, .{ .name = "roc_task_crash_exits", .visibility = .hidden });
+    @export(crash_exit.setjmp, .{ .name = "roc_task_setjmp", .visibility = .hidden });
+    @export(&crash_exit.longjmp, .{ .name = "roc_task_longjmp", .visibility = .hidden });
 }
 
 /// Darwin targets lower a zero fill of unknown length to `bzero`, which

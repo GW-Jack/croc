@@ -7,6 +7,7 @@
 
 const std = @import("std");
 
+const crash_exit = @import("task_crash_exit.zig");
 const erased_callable = @import("erased_callable.zig");
 const utils = @import("utils.zig");
 
@@ -22,6 +23,7 @@ pub const Status = enum(u8) {
     pending,
     done,
     cancelled,
+    crashed,
 };
 
 /// One saved record: a boxed erased callable's data pointer, holding one
@@ -47,7 +49,7 @@ pub const BufferLayout = struct {
 
 /// The C-ABI task calls a backend's runtime exports to the host (design.md
 /// "Host Contract"). `roc_task_resume` returns a `RocTaskStatus`, a C enum:
-/// `PENDING`, `DONE`, `CANCELLED` in `Status` order.
+/// `PENDING`, `DONE`, `CANCELLED`, `CRASHED` in `Status` order.
 pub const host_calls = struct {
     pub fn resumeTask(task: *RocTask) callconv(.c) u32 {
         return @backingInt(task.resumeTask());
@@ -60,7 +62,51 @@ pub const host_calls = struct {
     pub fn free(task: *RocTask) callconv(.c) void {
         task.free();
     }
+
+    /// `roc_task_crash_message`: the message of a task that crashed, as the
+    /// bytes and length of a UTF-8 string the task owns until it is freed.
+    pub fn crashMessage(task: *RocTask, len: *usize) callconv(.c) [*]const u8 {
+        if (task.status != .crashed) utils.builtinInvariant(task.ops, "the crash message of a task that did not crash was read");
+        len.* = task.crash_message_len;
+        return task.crash_message;
+    }
 };
+
+/// The task whose resume is running, which a crash exits to. A `Tasks`
+/// program's resumes never overlap (design.md "The Task Runtime"), so one
+/// pointer per process is enough.
+var running: ?*RocTask = null;
+
+/// Take the crash exit of the running task, if there is one and the target
+/// has crash exits: keep `msg` in the task and jump back to its resume.
+/// Returns otherwise, and the caller hands the crash to the host.
+pub fn crashRunning(msg: []const u8) void {
+    const task = running orelse return;
+    if (!crash_exit.available()) return;
+    // A crash while copying the message must reach the host, not loop.
+    running = null;
+    const copy: [*]u8 = @ptrCast(task.ops.alloc(1, @max(msg.len, 1)));
+    @memcpy(copy[0..msg.len], msg);
+    task.crash_message = copy;
+    task.crash_message_len = msg.len;
+    crash_exit.jump(&task.crash_jmp);
+}
+
+/// Clear the running task for a hosted call and return it, so a crash in
+/// the host ends the process rather than the task: the host's frames sit
+/// between the task's resume and the crash, and the exit would skip them.
+pub fn hostEnter() ?*RocTask {
+    const task = running;
+    running = null;
+    return task;
+}
+
+/// Restore the running task `hostEnter` returned once the hosted call is
+/// back.
+pub fn hostLeave(task: ?*RocTask) void {
+    std.debug.assert(running == null); // rationale: hostEnter cleared it, and any resume ends by clearing it
+    running = task;
+}
 
 /// Where compiled code finds the three fields the `task_*` low-level
 /// operations reach, for a target whose pointers are `pointer_size` bytes
@@ -114,6 +160,13 @@ pub const RocTask = extern struct {
     result_buffer_size: usize,
     result_buffer_alignment: usize,
     ops: *RocOps,
+    /// Where a crash in this task's resume jumps back to.
+    crash_jmp: crash_exit.Buffer,
+    /// The record whose call is running, which a crash releases.
+    running_record: [*]u8,
+    /// A crashed task's message, which it owns.
+    crash_message: [*]const u8,
+    crash_message_len: usize,
 
     /// A task whose list holds `start`, the root's start record, and whose
     /// outermost record writes to `root_result`. The host's first resume
@@ -135,6 +188,10 @@ pub const RocTask = extern struct {
             .result_buffer_size = buffers.result_buffer_size,
             .result_buffer_alignment = buffers.result_buffer_alignment,
             .ops = ops,
+            .crash_jmp = undefined,
+            .running_record = undefined,
+            .crash_message = undefined,
+            .crash_message_len = 0,
         };
         task.pushRecord(start, null);
         return task;
@@ -159,22 +216,43 @@ pub const RocTask = extern struct {
     }
 
     /// `roc_task_resume`: run records, innermost first, until the list is
-    /// empty or the task pauses again.
+    /// empty, the task pauses again or it crashes.
     pub fn resumeTask(self: *RocTask) Status {
-        if (self.status != .pending) utils.builtinInvariant(self.ops, "a finished or cancelled task was resumed");
+        if (self.status != .pending) utils.builtinInvariant(self.ops, "a finished, cancelled or crashed task was resumed");
         self.pending = 0;
         self.woken = false;
+        const exits = crash_exit.available();
         while (self.len > 0) {
             self.len -= 1;
             const entry = self.entries[self.len];
             const base = self.len;
+            if (exits) {
+                // Kept in the task, since a crash exit restores no local.
+                self.running_record = entry.record;
+                running = self;
+                if (crash_exit.save(&self.crash_jmp) != 0) return self.crashed();
+            }
             self.call(entry.record, if (base == 0) self.root_result else self.result_buffer);
+            running = null;
             std.mem.reverse(Entry, self.entries[base..self.len]);
             erased_callable.decref(entry.record, self.ops);
             if (self.pending != 0) return .pending;
         }
         self.status = .done;
         return .done;
+    }
+
+    /// Back from a crash exit: the records saved at call sites are
+    /// consistent, so release them all; what the running frames owned is
+    /// leaked.
+    fn crashed(self: *RocTask) Status {
+        erased_callable.decref(self.running_record, self.ops);
+        while (self.len > 0) {
+            self.len -= 1;
+            erased_callable.decref(self.entries[self.len].record, self.ops);
+        }
+        self.status = .crashed;
+        return .crashed;
     }
 
     /// `roc_task_wake`: the host wrote the hosted slot.
@@ -206,6 +284,7 @@ pub const RocTask = extern struct {
         if (self.status == .pending) utils.builtinInvariant(self.ops, "a task was freed before it finished or was cancelled");
         const ops = self.ops;
         if (self.capacity > 0) ops.dealloc(@ptrCast(self.entries), @alignOf(Entry));
+        if (self.status == .crashed) ops.dealloc(@ptrCast(@constCast(self.crash_message)), 1);
         freeBuffer(ops, self.hosted_slot, self.hosted_slot_size, self.hosted_slot_alignment);
         freeBuffer(ops, self.result_buffer, self.result_buffer_size, self.result_buffer_alignment);
         ops.dealloc(@ptrCast(self), @alignOf(RocTask));
@@ -260,6 +339,11 @@ const TestStep = extern struct {
     pauses: bool,
     /// What it writes through the result pointer.
     result: u8,
+    /// Crash after saving, instead of pausing or writing a result.
+    crashes: bool = false,
+    /// With `crashes`, crash this many frames down a chain of calls that
+    /// each hold values across the next (`crashDeep`).
+    crash_depth: u8 = 0,
 };
 
 const TestLog = struct {
@@ -269,6 +353,8 @@ const TestLog = struct {
     var drops: usize = 0;
     var slot_drops: usize = 0;
     var aborts: usize = 0;
+    /// What `crashDeep` would return; never written, since it crashes.
+    var deep_sink: u64 = 0;
 
     fn reset() void {
         call_count = 0;
@@ -278,15 +364,33 @@ const TestLog = struct {
     }
 };
 
-fn testStepCall(_: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {
+fn testStepCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {
     const step: *const TestStep = @ptrCast(@alignCast(capture.?));
     const task: *RocTask = @as(*const *RocTask, @ptrCast(@alignCast(args.?))).*;
     TestLog.calls[TestLog.call_count] = step.id;
     TestLog.results_written_to[TestLog.call_count] = ret;
     TestLog.call_count += 1;
     for (step.saves) |save| if (save) |record| task.pushRecord(record, &testSlotDrop);
+    if (step.crashes and step.crash_depth > 0) TestLog.deep_sink = @call(.never_inline, crashDeep, .{ ops, step.crash_depth, step.id });
+    if (step.crashes) ops.crash("a record crashed");
     if (step.pauses) task.setPending();
     ret.?[0] = step.result;
+}
+
+/// A chain of `depth` frames, each holding integer and float values across
+/// the next call, so the callee-saved registers and the stack are live
+/// when the bottom one crashes.
+fn crashDeep(ops: *RocOps, depth: u8, seed: u64) u64 {
+    if (depth == 0) {
+        ops.crash("a record crashed deep");
+        return seed;
+    }
+    const a = seed *% 0x9e3779b97f4a7c15 +% depth;
+    const b = a ^ (a >> 29);
+    const c = b *% 0xbf58476d1ce4e5b9;
+    const f: f64 = @floatFromInt(a >> 11);
+    const below = @call(.never_inline, crashDeep, .{ ops, depth - 1, c });
+    return a +% b +% c +% below +% @as(u64, @intFromFloat(f * 0.5));
 }
 
 fn testStepDrop(_: ?[*]u8, _: *RocOps) callconv(.c) void {
@@ -436,6 +540,109 @@ test "the host's C calls resume, wake and free a task and report its status as a
     try std.testing.expectEqual(@as(u8, 20), root[0]);
     host_calls.free(task);
     try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
+}
+
+test "a crash in a resumed record ends its task, releases every record and keeps the message" {
+    if (!crash_exit.available()) return error.SkipZigTest;
+    var test_env = utils.TestEnv.init(std.testing.allocator);
+    defer test_env.deinit();
+    const ops = test_env.getOps();
+    TestLog.reset();
+    // 1 saves 2 then 3 and pauses. Resumed, 2 crashes: 2 (running) and 3
+    // (waiting) are released, and 3 never runs.
+    const inner = testRecord(ops, .{ .id = 2, .saves = .{ null, null }, .pauses = false, .result = 0, .crashes = true });
+    const outer = testRecord(ops, .{ .id = 3, .saves = .{ null, null }, .pauses = false, .result = 30 });
+    var root: [1]u8 = .{0};
+    const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ inner, outer }, .pauses = true, .result = 0 }), &root, test_buffers);
+
+    try std.testing.expectEqual(Status.pending, task.resumeTask());
+    task.wake();
+    try std.testing.expectEqual(@as(u32, 3), host_calls.resumeTask(task));
+    try std.testing.expectEqual(Status.crashed, task.status);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, TestLog.calls[0..TestLog.call_count]);
+    try std.testing.expectEqual(@as(usize, 3), TestLog.drops);
+    try std.testing.expectEqual(@as(u8, 0), root[0]);
+    var len: usize = undefined;
+    const message = host_calls.crashMessage(task, &len);
+    try std.testing.expectEqualStrings("a record crashed", message[0..len]);
+    try std.testing.expectEqual(@as(?*RocTask, null), running);
+    host_calls.free(task);
+    try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
+}
+
+test "a crash after a record saved others releases those too" {
+    if (!crash_exit.available()) return error.SkipZigTest;
+    var test_env = utils.TestEnv.init(std.testing.allocator);
+    defer test_env.deinit();
+    const ops = test_env.getOps();
+    TestLog.reset();
+    // The start record saves 2 and then crashes before it can pause.
+    const saved = testRecord(ops, .{ .id = 2, .saves = .{ null, null }, .pauses = false, .result = 0 });
+    var root: [1]u8 = .{0};
+    const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ saved, null }, .pauses = false, .result = 0, .crashes = true }), &root, test_buffers);
+
+    try std.testing.expectEqual(Status.crashed, task.resumeTask());
+    try std.testing.expectEqualSlices(u8, &.{1}, TestLog.calls[0..TestLog.call_count]);
+    try std.testing.expectEqual(@as(usize, 2), TestLog.drops);
+    task.free();
+    try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
+}
+
+test "a crash several frames deep leaves the resume's caller's values intact" {
+    if (!crash_exit.available()) return error.SkipZigTest;
+    var test_env = utils.TestEnv.init(std.testing.allocator);
+    defer test_env.deinit();
+    const ops = test_env.getOps();
+    TestLog.reset();
+    var root: [1]u8 = .{0};
+    const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ null, null }, .pauses = false, .result = 0, .crashes = true, .crash_depth = 8 }), &root, test_buffers);
+
+    // Values computed at run time and used after the resume, so they live
+    // in callee-saved registers or this frame across it.
+    var seed: u64 = 0x0123_4567_89ab_cdef;
+    std.mem.doNotOptimizeAway(&seed);
+    const v0 = seed *% 3;
+    const v1 = seed ^ 0xffff_0000_ffff_0000;
+    const v2 = seed >> 7;
+    const v3 = v0 +% v1;
+    const v4 = v1 *% v2;
+    const v5 = v2 ^ v3;
+    const f0: f64 = @floatFromInt(seed >> 12);
+    const f1 = f0 * 1.5;
+    const f2 = f1 - f0 / 3.0;
+
+    const status = @call(.never_inline, host_calls.resumeTask, .{task});
+
+    try std.testing.expectEqual(@as(u32, 3), status);
+    try std.testing.expectEqual(seed *% 3, v0);
+    try std.testing.expectEqual(seed ^ 0xffff_0000_ffff_0000, v1);
+    try std.testing.expectEqual(seed >> 7, v2);
+    try std.testing.expectEqual(v0 +% v1, v3);
+    try std.testing.expectEqual(v1 *% v2, v4);
+    try std.testing.expectEqual(v2 ^ v3, v5);
+    try std.testing.expectEqual(@as(f64, @floatFromInt(seed >> 12)), f0);
+    try std.testing.expectEqual(f0 * 1.5, f1);
+    try std.testing.expectEqual(f1 - f0 / 3.0, f2);
+    var len: usize = undefined;
+    const message = host_calls.crashMessage(task, &len);
+    try std.testing.expectEqualStrings("a record crashed deep", message[0..len]);
+    try std.testing.expectEqual(@as(?*RocTask, null), running);
+    host_calls.free(task);
+    try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
+}
+
+test "a hosted call runs with no running task, so a crash in it reaches the host" {
+    var task: RocTask = undefined;
+    running = &task;
+    defer running = null;
+    const saved = hostEnter();
+    try std.testing.expectEqual(@as(?*RocTask, &task), saved);
+    try std.testing.expectEqual(@as(?*RocTask, null), running);
+    // With no running task, a crash returns to its caller, which hands it
+    // to the host, rather than jumping to `task`'s exit.
+    crashRunning("the host crashed");
+    hostLeave(saved);
+    try std.testing.expectEqual(@as(?*RocTask, &task), running);
 }
 
 test "FieldOffsets is where RocTask keeps its first three fields, scaled by the pointer size" {

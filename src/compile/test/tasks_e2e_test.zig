@@ -38,6 +38,23 @@ const expected_trace = [_][]const u8{ "log(" ++ url ++ ")", "fetch(" ++ url ++ "
 /// `fetch_both!` calls `fetch!` twice, so the task pauses twice.
 const pause_count = 2;
 
+/// The URL a run passes to the root. The crash runs add a marker saying
+/// where the program crashes.
+var root_url: []const u8 = url;
+
+/// Where the crash fixture crashes, chosen by a marker in its URL, and how
+/// many fetches it makes first.
+const CrashPoint = struct { marker: []const u8, message: []const u8, fetches: usize };
+const crash_app_path = "test/postcheck/suspension_crash/app.roc";
+const crash_points = [_]CrashPoint{
+    .{ .marker = "#before", .message = "crashed before the first pause", .fetches = 0 },
+    .{ .marker = "#between", .message = "crashed between the pauses", .fetches = 1 },
+    .{ .marker = "#after", .message = "crashed after the last pause", .fetches = 2 },
+};
+
+/// The runtime's `roc_task_resume`, as a host links it.
+const ResumeFn = *const fn (*RocTask) callconv(.c) u32;
+
 const E2eError = std.mem.Allocator.Error || eval.LirInterpreter.Error || eval.RuntimeHostEnv.LeakError || error{ TestUnexpectedResult, TestExpectedEqual };
 
 /// One interpreter over the lowered program, with the test host's handler.
@@ -78,6 +95,11 @@ const Run = struct {
         return &task_test_host.nativeCancel;
     }
 
+    /// The interpreter runs on this process's runtime.
+    fn resumeFn(_: Program) ResumeFn {
+        return &builtins.task.host_calls.resumeTask;
+    }
+
     /// Make the root's task by calling the program's root, the task entry
     /// `E(url, result_out)` the continuation pass put in the root's place
     /// (design.md "Host Contract"): it creates the task, whose result goes
@@ -89,7 +111,7 @@ const Run = struct {
         // The root returns the task, not the program's `Str`.
         try std.testing.expectEqual(@import("layout").Idx.opaque_ptr, entry.ret_layout);
         const ops = self.runtime.get_ops();
-        const url_str = RocStr.fromSlice(url, ops);
+        const url_str = RocStr.fromSlice(root_url, ops);
         var entry_args = EntryArgs{ .url = url_str, .result_out = result };
         var task: *RocTask = undefined;
         _ = try self.interpreter.eval(.{
@@ -113,8 +135,11 @@ const LlvmProgram = struct {
     image: eval.InspectedRun.LlvmImage,
     /// The program's `roc_task_cancel`.
     cancel: task_test_host.CancelFn,
+    /// The program's `roc_task_resume`, from the builtins it links
+    /// privately, whose crash exits its own crashes reach.
+    resume_task: ResumeFn,
 
-    fn init(self: *LlvmProgram, lowered: *const lir.CheckedPipeline.LoweredProgram) (eval.InspectedRun.LlvmError || error{MissingTaskCancel})!void {
+    fn init(self: *LlvmProgram, lowered: *const lir.CheckedPipeline.LoweredProgram) (eval.InspectedRun.LlvmError || error{MissingTaskCall})!void {
         self.lowered = lowered;
         self.static_data = try harness.nativeStaticData(lowered);
         errdefer harness.freeNativeStaticData(self.static_data);
@@ -129,7 +154,11 @@ const LlvmProgram = struct {
         }, .{ .resolve = task_test_host.resolveCAbiSymbol });
         self.cancel = self.image.lib.lookup(task_test_host.CancelFn, builtins.shim_symbols.roc_task_cancel) orelse {
             self.image.deinit();
-            return error.MissingTaskCancel;
+            return error.MissingTaskCall;
+        };
+        self.resume_task = self.image.lib.lookup(ResumeFn, builtins.shim_symbols.roc_task_resume) orelse {
+            self.image.deinit();
+            return error.MissingTaskCall;
         };
     }
 
@@ -171,6 +200,10 @@ const LlvmRun = struct {
         return program.cancel;
     }
 
+    fn resumeFn(program: Program) ResumeFn {
+        return program.resume_task;
+    }
+
     /// Make the root's task by calling the compiled task entry
     /// `E(url, result_out)` through its entrypoint wrapper.
     fn startRoot(self: *LlvmRun, program: Program, result: *RocStr) E2eError!*RocTask {
@@ -178,7 +211,7 @@ const LlvmRun = struct {
         const entry = store.getProcSpec(program.lowered.lir_result.root_procs.items[0]);
         try std.testing.expectEqual(@import("layout").Idx.opaque_ptr, entry.ret_layout);
         const ops = self.runtime.get_ops();
-        const url_str = RocStr.fromSlice(url, ops);
+        const url_str = RocStr.fromSlice(root_url, ops);
         var entry_args = EntryArgs{ .url = url_str, .result_out = result };
         var task: *RocTask = undefined;
         const call = program.image.entry() catch return error.TestUnexpectedResult;
@@ -254,6 +287,11 @@ const DevRun = struct {
         return &task_test_host.nativeCancel;
     }
 
+    /// A dev image loaded in this process calls this process's builtins.
+    fn resumeFn(_: Program) ResumeFn {
+        return &builtins.task.host_calls.resumeTask;
+    }
+
     /// Make the root's task by calling the compiled task entry
     /// `E(url, result_out)` through its entrypoint wrapper.
     fn startRoot(self: *DevRun, program: Program, result: *RocStr) E2eError!*RocTask {
@@ -261,7 +299,7 @@ const DevRun = struct {
         const entry = store.getProcSpec(program.lowered.lir_result.root_procs.items[0]);
         try std.testing.expectEqual(@import("layout").Idx.opaque_ptr, entry.ret_layout);
         const ops = self.runtime.get_ops();
-        const url_str = RocStr.fromSlice(url, ops);
+        const url_str = RocStr.fromSlice(root_url, ops);
         var entry_args = EntryArgs{ .url = url_str, .result_out = result };
         var task: *RocTask = undefined;
         program.image.entry()(@ptrCast(&task), @ptrCast(&entry_args));
@@ -631,6 +669,88 @@ fn cancelAt(comptime R: type, program: R.Program, pause: u32, woken: bool) E2eEr
     try run.runtime.checkForLeaks();
 }
 
+/// Crash at `point`: the task reports `CRASHED` with the program's message,
+/// no hosted call follows the crash, and freeing the task releases exactly
+/// the runtime's own allocations. The records were released by the crash
+/// (task.zig's tests count them); what the crashed frames owned stays live.
+fn crashAt(comptime R: type, program: R.Program, point: CrashPoint) E2eError!void {
+    const marked_url = try std.mem.concat(std.testing.allocator, u8, &.{ url, point.marker });
+    defer std.testing.allocator.free(marked_url);
+    root_url = marked_url;
+    defer root_url = url;
+    var run: R = undefined;
+    try run.init(program, .pause);
+    defer run.deinit();
+    var result: RocStr = RocStr.empty();
+    const task = try run.startRoot(program, &result);
+    const resume_task = R.resumeFn(program);
+    var status = resume_task(task);
+    while (status == @backingInt(builtins.task.Status.pending)) {
+        try run.host.finish();
+        status = resume_task(task);
+    }
+    try std.testing.expectEqual(@as(u32, @backingInt(builtins.task.Status.crashed)), status);
+    try std.testing.expectEqualStrings(point.message, task.crash_message[0..task.crash_message_len]);
+
+    try std.testing.expectEqual(1 + point.fetches, run.host.trace.items.len);
+    const log_line = try std.fmt.allocPrint(std.testing.allocator, "log({s})", .{marked_url});
+    defer std.testing.allocator.free(log_line);
+    try std.testing.expectEqualStrings(log_line, run.host.trace.items[0]);
+
+    const own: usize = @as(usize, 2) + @intFromBool(task.hosted_slot_size > 0) + @intFromBool(task.result_buffer_size > 0) + @intFromBool(task.capacity > 0);
+    const live = run.runtime.live_count;
+    task.free();
+    try std.testing.expectEqual(live - own, run.runtime.live_count);
+    if (task_test_host.c_abi_failure) |err| return err;
+
+    // The crash leaves the runtime usable: a task started after it on the
+    // same run finishes.
+    root_url = url;
+    var next_result: RocStr = RocStr.empty();
+    const next = try run.startRoot(program, &next_result);
+    status = resume_task(next);
+    while (status == @backingInt(builtins.task.Status.pending)) {
+        try run.host.finish();
+        status = resume_task(next);
+    }
+    try std.testing.expectEqual(@as(u32, @backingInt(builtins.task.Status.done)), status);
+    try std.testing.expect(std.mem.endsWith(u8, next_result.asSlice(), "!"));
+    next.free();
+    next_result.decref(run.runtime.get_ops());
+    if (task_test_host.c_abi_failure) |err| return err;
+}
+
+fn checkCrashes(comptime R: type, program: R.Program) E2eError!void {
+    for (crash_points) |point| crashAt(R, program, point) catch |err| {
+        std.log.err("crashing {s} failed: {s}", .{ point.marker, @errorName(err) });
+        return err;
+    };
+}
+
+fn crashAll(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    checkCrashes(Run, lowered) catch return error.TestUnexpectedResult;
+}
+
+fn crashAllLlvm(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    var program: LlvmProgram = undefined;
+    program.init(lowered) catch |err| {
+        std.log.err("compiling the crashing Tasks program with LLVM failed: {s}", .{@errorName(err)});
+        return error.TestUnexpectedResult;
+    };
+    defer program.deinit();
+    checkCrashes(LlvmRun, &program) catch return error.TestUnexpectedResult;
+}
+
+fn crashAllDev(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    var program: DevProgram = undefined;
+    program.init(lowered) catch |err| {
+        std.log.err("compiling the crashing Tasks program with the dev backend failed: {s}", .{@errorName(err)});
+        return error.TestUnexpectedResult;
+    };
+    defer program.deinit();
+    checkCrashes(DevRun, &program) catch return error.TestUnexpectedResult;
+}
+
 fn runAll(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
     checkAll(Run, lowered) catch |err| {
         std.log.err("tasks end-to-end run failed: {s}", .{@errorName(err)});
@@ -698,4 +818,23 @@ test "a Tasks program compiled by the dev backend pauses and cancels as it does 
 
 test "a Tasks program compiled by the wasm backend pauses and cancels as it does on the interpreter, with no leaks" {
     try harness.runAppPathLoweredInspection(app_path, .{ .specialization_strategy = .lss, .target_usize = .u32 }, runAllWasm);
+}
+
+test "a crash inside a Tasks program ends its task with CRASHED and its message, before, between and after its pauses" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    if (!builtins.task_crash_exit.available()) return error.SkipZigTest;
+    try harness.runAppPathLoweredInspection(crash_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, crashAll);
+}
+
+test "a crash inside a Tasks program compiled by LLVM ends its task as it does on the interpreter" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    if (!builtins.task_crash_exit.available()) return error.SkipZigTest;
+    try harness.runAppPathLoweredInspection(crash_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, crashAllLlvm);
+}
+
+test "a crash inside a Tasks program compiled by the dev backend ends its task as it does on the interpreter" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    if (!builtins.task_crash_exit.available()) return error.SkipZigTest;
+    if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
+    try harness.runAppPathLoweredInspection(crash_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, crashAllDev);
 }

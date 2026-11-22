@@ -50,6 +50,12 @@ pub const JmpBuf = [30]u64;
 
 /// Naked function implementation for setjmp.
 /// Saves all callee-saved registers per Windows x64 ABI.
+/// The setjmp routine itself, as a naked function another object can export
+/// under a name of its own: a call to it saves the caller's frame, as a call
+/// to `setjmp` does. A wrapper around `setjmp` would save its own frame,
+/// which is gone once it returns.
+pub const setjmp_routine = &setjmpImpl;
+
 fn setjmpImpl() callconv(.naked) void {
     // Windows x64: first arg in RCX, return in EAX
     asm volatile (

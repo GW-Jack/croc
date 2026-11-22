@@ -8757,6 +8757,7 @@ fn wasmAppExports(
         shim_symbols.roc_task_resume,
         shim_symbols.roc_task_wake,
         shim_symbols.roc_task_free,
+        shim_symbols.roc_task_crash_message,
         shim_symbols.roc_task_cancel,
     };
     const symbols = try ctx.arena.alloc([]const u8, app.len + task_calls.len);

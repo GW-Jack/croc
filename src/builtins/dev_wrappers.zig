@@ -1441,6 +1441,34 @@ pub fn roc_builtins_task_free(roc_task: *task.RocTask) callconv(.c) void {
     task.host_calls.free(roc_task);
 }
 
+/// A crash in a program that creates a task: it ends the running task when
+/// there is one, and otherwise reaches the host's `roc_crashed` (design.md
+/// "The Task Runtime"). Compiled crash sites of such a program call this in
+/// place of `roc_crashed`.
+pub fn roc_builtins_task_crash(msg_bytes: [*]const u8, msg_len: usize) callconv(.c) void {
+    in_process_host.ops().crash(msg_bytes[0..msg_len]);
+}
+
+/// Before a hosted call in a program that creates a task: clear the running
+/// task, so a crash in the host reaches the host's `roc_crashed` rather than
+/// the task's exit, and return it for `roc_builtins_task_host_leave`
+/// (design.md "The Task Runtime").
+pub fn roc_builtins_task_host_enter() callconv(.c) ?*task.RocTask {
+    return task.hostEnter();
+}
+
+/// After a hosted call: restore the running task that
+/// `roc_builtins_task_host_enter` returned.
+pub fn roc_builtins_task_host_leave(roc_task: ?*task.RocTask) callconv(.c) void {
+    task.hostLeave(roc_task);
+}
+
+/// `roc_task_crash_message` under its builtin name; see
+/// `roc_builtins_task_resume`.
+pub fn roc_builtins_task_crash_message(roc_task: *task.RocTask, len: *usize) callconv(.c) [*]const u8 {
+    return task.host_calls.crashMessage(roc_task, len);
+}
+
 /// `roc_task_cancel`'s body, with the host's `roc_task_abort` as `abort`: a
 /// `Tasks` program defines `roc_task_cancel` as a call to this (design.md
 /// "Backends").

@@ -34009,17 +34009,17 @@ RocTaskStatus roc_task_resume(RocTask *task);
 void roc_task_wake(RocTask *task);            /* any thread: *out is written */
 void roc_task_cancel(RocTask *root);          /* between resumes: request it */
 void roc_task_free(RocTask *root);            /* once, after it ends */
-RocStr roc_task_crash_message(RocTask *root); /* after CRASHED; borrowed */
+const char *roc_task_crash_message(RocTask *root, size_t *len); /* after CRASHED */
 void roc_task_ready(RocTask *task);           /* host: resume it once */
 void roc_task_abort(RocTask *task);           /* host: abandon its operation */
 ```
 
 The builtins object exports `roc_task_resume`, `roc_task_wake` and
 `roc_task_free` (`RocTask.host_calls`). Each program binary defines them
-exactly once, since a second definition collides in the link: the
-interpreter shim gets them by bundling that object, and the machine-code
-shim, which links no builtins object, defines them by forwarding to the
-program image (Backends).
+exactly once, since a second definition collides in the link. The
+interpreter shim and the machine-code shim define them from the copy of the
+builtins that runs the program's records (One runtime per process,
+Backends).
 `roc_task_cancel` calls the host's `roc_task_abort`, which only the host of
 a `Tasks` platform defines. So a `Tasks` program defines `roc_task_cancel`
 itself rather than getting it from the builtins object, and a program of
@@ -34168,10 +34168,22 @@ depend on the target. The two routines are internal to each program:
 - On a target without `src/sljmp`, `roc_task_crash_exits` is false, and a
   crash goes to the host's `roc_crashed` as before.
 
+The routines save and restore the target ABI's callee-saved registers, the
+stack pointer and the return address, and nothing else: on x86_64, RBX, RBP
+and R12–R15; on arm64, X19–X30 and D8–D15, which are Apple's callee-saved
+set too (macOS uses the same routines as Linux, and neither touches the
+platform register X18). The return address is restored exactly as saved,
+with the stack pointer it was saved with, so a frame that signs its return
+address authenticates it as before. They save no signal mask: a crash
+exit never crosses a signal handler, since Roc code does not run in one,
+and the mask on entry to the resume is the mask after the jump.
+
 Values held only by the native frames that were running are leaked, since
 their state is unknown, and nothing else is (R5). The root's result storage
-stays unwritten. `roc_task_crash_message` returns the message, borrowed
-from the task until it is freed.
+stays unwritten. `roc_task_crash_message` returns the message's UTF-8
+bytes and sets its length; the task owns them until it is freed. A `RocStr`
+would need a reference-count header the host must never touch, so the
+message is plain bytes.
 
 Every crash of a `Tasks` program reaches the running task as follows:
 - **`roc_builtins_task_crash(msg, len)`, a registry builtin.** It takes the
@@ -34197,11 +34209,18 @@ path, which every program shares.
 **One runtime per process.** The running task is a builtins global.
 Resumes of a `Tasks` program never overlap (P10), so one pointer is enough;
 `ParallelTasks` makes it thread-local. Each process has exactly one copy
-of it. In a dev `roc run`, the machine-code shim the host links and the
-program image each carry builtins. So the shim's `roc_task_resume`,
-`roc_task_wake`, `roc_task_free` and `roc_task_crash_message` forward to the
-image's definitions, as the shim forwards the program's entrypoints. The
-runtime that runs a task's records is then the one its crashes reach.
+of it. Where a link holds two copies of the builtins, the host's task calls
+come from the copy that runs the records. The interpreter shim bundles a
+builtins object beside the interpreter's own copy, so that object leaves
+the task calls out and the shim defines them from the interpreter's copy.
+In a dev `roc run`, the machine-code shim the host links carries
+builtins, and the shim defines the host's task calls. A run image lowered
+whole resolves its builtin calls to the shim's own, so the image's crash
+sites and the host's resumes share one copy. A run image composed from unit
+images carries the support image's builtins as a second copy, but only a
+`.boxy` run is composed, and the dev backend rejects a `Tasks` program
+under `.boxy`. When it accepts one, the composer must name the support
+image's task calls in the image and the shim must forward to them.
 
 **Conformance.** The host's obligations are checked by a *conformance
 harness*: a Debug runtime with monitors that record every ABI event and
@@ -34288,16 +34307,17 @@ byte:
   `task_hosted_slot(task)`.
 - **The host's calls.** A compiled `Tasks` program gets `roc_task_resume`,
   `roc_task_wake` and `roc_task_free` from the builtins object linked into
-  it, so every backend links the same symbols. The interpreter shim bundles
-  the same object, so the interpreter's host gets them the same way. LLVM
+  it, so every backend links the same symbols. The interpreter shim
+  defines them from the interpreter's own copy of the builtins, and the
+  object it bundles leaves them out (One runtime per process). LLVM
   links the builtins into the program privately, keeping only what the
   program itself defines, so a program that creates a task defines the three
   calls itself, each a call to its registry builtin
   (`roc_builtins_task_resume`, `_wake`, `_free`). A dev `roc run` loads
   the program's builtins with its image, after the host is linked, so the
-  machine-code shim the host links defines the three calls. For a program
-  that creates a task, each forwards to the image's own definition, so the
-  process has one runtime and one running task (The Task Runtime).
+  machine-code shim the host links defines the three calls from its own
+  builtins, which the image's builtin calls resolve to, so the process has
+  one runtime and one running task (One runtime per process).
 - **Cancelling.** `roc_task_cancel(task)` calls the registry builtin
   `roc_builtins_task_cancel(task, abort)`, `callconv(.c)`, with the host's
   `roc_task_abort` as `abort`; the builtin is `RocTask.cancel`. A `Tasks`

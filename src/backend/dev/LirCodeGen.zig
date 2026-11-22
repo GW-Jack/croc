@@ -517,6 +517,11 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// The LIR store containing expressions to compile
         store: *const LirStore,
 
+        /// Whether the program creates a task, so its crashes go through the
+        /// `task_crash` builtin, which ends the running task rather than the
+        /// process (design.md "The Task Runtime").
+        crashes_reach_tasks: bool,
+
         /// Layout store for accessing struct/tag field offsets
         layout_store: *const LayoutStore,
 
@@ -1253,6 +1258,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 .cpu_level = cpu_level,
                 .codegen = CodeGen.init(allocator),
                 .store = store,
+                .crashes_reach_tasks = store.createsTask(),
                 .layout_store = layout_store_opt,
                 .static_strings = static_strings,
                 .native_static_data = &.{},
@@ -1447,10 +1453,10 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// and target it generates for, and the policy and borrowed tables
         /// its owner set when it built the lane.
         const fragment_lane_kept_fields = [_][]const u8{
-            "allocator",                "cpu_level",              "store",                        "layout_store",
-            "static_strings",           "native_static_data",     "stack_plan_indexes",           "owns_stack_plan_indexes",
-            "stmt_histogram",           "generation_mode",        "erased_capture_prefix",        "enable_default_platform_runtime",
-            "relocatable_expect_sites", "hosted_symbol_resolver", "borrowed_static_data_symbols",
+            "allocator",                    "cpu_level",             "store",                           "crashes_reach_tasks",      "layout_store",
+            "static_strings",               "native_static_data",    "stack_plan_indexes",              "owns_stack_plan_indexes",  "stmt_histogram",
+            "generation_mode",              "erased_capture_prefix", "enable_default_platform_runtime", "relocatable_expect_sites", "hosted_symbol_resolver",
+            "borrowed_static_data_symbols",
         };
 
         /// The fields `resetFragmentLane` returns to their initial state.
@@ -14984,6 +14990,19 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 }
             }
 
+            // A crash in the host ends the process, not the running task
+            // (design.md "The Task Runtime"), so the call runs with no task.
+            // Called once the arguments are in memory, since it clobbers
+            // the caller-saved registers.
+            const running_task_slot: ?i32 = if (self.crashes_reach_tasks) blk: {
+                const task_slot = self.codegen.allocStackSlot(8);
+                var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+                defer builder.deinit();
+                try self.callBuiltin(&builder, .task_host_enter);
+                try self.emitStore(.w64, frame_ptr, task_slot, ret_reg_0);
+                break :blk task_slot;
+            } else null;
+
             // Native execution resolves the hosted symbol through the host
             // that will run the code; a host without it (compile-time
             // evaluation) makes every hosted call a crash.
@@ -15112,6 +15131,13 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         }
                     }
                 },
+            }
+
+            if (running_task_slot) |task_slot| {
+                var leave_builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+                defer leave_builder.deinit();
+                try leave_builder.addMemArg(frame_ptr, task_slot);
+                try self.callBuiltin(&leave_builder, .task_host_leave);
             }
 
             if (ret_size == 0) {
@@ -22741,14 +22767,21 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             try self.emitRocStaticMessageCall(.roc_expect_failed, "expect failed");
         }
 
-        /// Emit a `roc_crashed` call with a static message.
+        /// Emit a `roc_crashed` call with a static message, or in a program
+        /// that creates a task, a `task_crash` call.
         fn emitRocCrash(self: *Self, msg: []const u8) Allocator.Error!void {
-            try self.emitRocStaticMessageCall(.roc_crashed, msg);
+            if (!self.crashes_reach_tasks) return self.emitRocStaticMessageCall(.roc_crashed, msg);
+            try self.emitStaticMessageBuiltinCall(.task_crash, msg);
         }
 
         /// Crash at code checking rejected, through the builtin that records
         /// the fact before crashing.
         fn emitCheckedErrorCrash(self: *Self, msg: []const u8) Allocator.Error!void {
+            try self.emitStaticMessageBuiltinCall(.checked_error_crashed, msg);
+        }
+
+        /// Call `builtin_fn(bytes, len)` with a static message.
+        fn emitStaticMessageBuiltinCall(self: *Self, builtin_fn: BuiltinFn, msg: []const u8) Allocator.Error!void {
             try self.spillAllVectorLocals();
             const msg_reg = try self.allocTempGeneral();
             defer self.codegen.freeGeneral(msg_reg);
@@ -22757,7 +22790,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
             try builder.addRegArg(msg_reg);
             try builder.addImmArg(msg_len_val);
-            try self.callBuiltin(&builder, .checked_error_crashed);
+            try self.callBuiltin(&builder, builtin_fn);
         }
 
         fn emitTrap(self: *Self) Allocator.Error!void {

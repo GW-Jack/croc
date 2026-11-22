@@ -13,6 +13,12 @@ else
 /// Architecture-specific buffer that stores the machine state for setjmp/longjmp.
 pub const JmpBuf = Impl.JmpBuf;
 
+/// The setjmp routine itself, as a naked function another object can export
+/// under a name of its own: a call to it saves the caller's frame, as a call
+/// to `setjmp` does. A wrapper around `setjmp` would save its own frame,
+/// which is gone once it returns.
+pub const setjmp_routine = Impl.setjmp_routine;
+
 /// Saves the current execution context in `env` and returns 0 on the initial call.
 pub inline fn setjmp(env: *JmpBuf) c_int {
     return Impl.setjmp(env);
@@ -28,6 +34,8 @@ const X86_64 = struct {
 
     /// Linux x86_64 SysV state: RBX, RBP, R12-R15, RSP, RIP.
     pub const JmpBuf = [8]u64;
+
+    pub const setjmp_routine = &setjmpImpl;
 
     fn setjmpImpl() callconv(.naked) void {
         asm volatile (
@@ -81,6 +89,8 @@ const AArch64 = struct {
 
     /// Linux AArch64 state: X19-X30, SP, and D8-D15.
     pub const JmpBuf = [22]u64;
+
+    pub const setjmp_routine = &setjmpImpl;
 
     fn setjmpImpl() callconv(.naked) void {
         asm volatile (

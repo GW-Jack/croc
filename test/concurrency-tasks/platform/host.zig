@@ -10,7 +10,10 @@
 //! `roc_task_abort`; with `--cancel-woken-at N` it answers and wakes the task
 //! first, so the program releases the answer. It prints the result, or where
 //! it cancelled, and the number of pauses, and fails the run unless every
-//! allocation it served was freed.
+//! allocation it served was freed. A task that crashes ends with status
+//! CRASHED (design.md "The Task Runtime"): the host prints its message and
+//! fails the run, without the leak check, since a crash leaves what the
+//! crashed frames owned.
 
 const std = @import("std");
 const shim_io = @import("shim_io");
@@ -134,6 +137,7 @@ extern fn roc_task_resume(task: *RocTask) callconv(.c) u32;
 extern fn roc_task_wake(task: *RocTask) callconv(.c) void;
 extern fn roc_task_free(task: *RocTask) callconv(.c) void;
 extern fn roc_task_cancel(task: *RocTask) callconv(.c) void;
+extern fn roc_task_crash_message(task: *RocTask, len: *usize) callconv(.c) [*]const u8;
 
 // OS-specific entry point handling
 comptime {
@@ -167,7 +171,7 @@ fn usage(arg: []const u8) c_int {
     return 1;
 }
 
-const HostError = error{ TaskCancelled, UnexpectedStatus, Leaked };
+const HostError = error{ TaskCancelled, TaskCrashed, UnexpectedStatus, Leaked };
 
 fn platformMain() HostError!void {
     // Long enough that the string, and the answer built from it, live on the
@@ -180,6 +184,13 @@ fn platformMain() HostError!void {
         const status = roc_task_resume(task);
         if (status == @backingInt(TaskStatus.done)) break;
         if (status == @backingInt(TaskStatus.cancelled)) return error.TaskCancelled;
+        if (status == @backingInt(TaskStatus.crashed)) {
+            var len: usize = 0;
+            const message = roc_task_crash_message(task, &len);
+            std.debug.print("crashed after pause {d}: {s}\nfetches: {d}, pauses: {d}\n", .{ g_pauses, message[0..len], g_fetches, g_pauses });
+            roc_task_free(task);
+            return error.TaskCrashed;
+        }
         if (status != @backingInt(TaskStatus.pending)) return error.UnexpectedStatus;
         // The task paused on a fetch: answer it, then resume it.
         const pending = g_pending orelse return error.UnexpectedStatus;

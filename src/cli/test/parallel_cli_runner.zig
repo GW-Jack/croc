@@ -3279,11 +3279,17 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc run cancels a concurrency Tasks program after the host answered the fetch inside an app procedure on LLVM", .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=speed", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_fetch_twice.roc", .app_args = &.{ "--cancel-woken-at", "2" }, .contains = &.{.{ .stream = .stderr, .text = "cancelled at pause 2\nfetches: 2, pauses: 2\n" }}, .not_contains = &no_panic_or_invariant_needles } } },
     .{ .id = 0, .suite = .subcommands, .backend = .dev, .name = "roc build makes a concurrency Tasks executable on the dev backend that cancels parked inside an app procedure", .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app_fetch_twice.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{ "--cancel-at", "2" }, .stderr_contains = "cancelled at pause 2\nfetches: 2, pauses: 2\n" } } } } },
     .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc build makes a concurrency Tasks executable on LLVM that cancels parked inside an app procedure", .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app_fetch_twice.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{ "--cancel-at", "2" }, .stderr_contains = "cancelled at pause 2\nfetches: 2, pauses: 2\n" } } } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .interpreter, .name = "roc run ends a crashing concurrency Tasks program with status CRASHED on the interpreter against a host that pauses at every fetch", .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=interpreter", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_crash.roc", .app_args = &.{}, .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "crashed after pause 2: the app crashed after its fetch\nfetches: 2, pauses: 2\n" }, .{ .stream = .stderr, .text = "HOST ERROR: TaskCrashed" } }, .not_contains = &no_panic_or_invariant_needles } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .interpreter, .name = "roc run ends a crashing concurrency Tasks program with status CRASHED on the interpreter against a host that finishes every fetch at once", .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=interpreter", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_crash.roc", .app_args = &.{"--finish-at-once"}, .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "crashed after pause 0: the app crashed after its fetch\nfetches: 2, pauses: 0\n" }, .{ .stream = .stderr, .text = "HOST ERROR: TaskCrashed" } }, .not_contains = &no_panic_or_invariant_needles } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .dev, .name = "roc run ends a crashing concurrency Tasks program with status CRASHED on the dev backend against a host that pauses at every fetch", .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=dev", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_crash.roc", .app_args = &.{}, .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "crashed after pause 2: the app crashed after its fetch\nfetches: 2, pauses: 2\n" }, .{ .stream = .stderr, .text = "HOST ERROR: TaskCrashed" } }, .not_contains = &no_panic_or_invariant_needles } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .dev, .name = "roc run ends a crashing concurrency Tasks program with status CRASHED on the dev backend against a host that finishes every fetch at once", .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=dev", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_crash.roc", .app_args = &.{"--finish-at-once"}, .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "crashed after pause 0: the app crashed after its fetch\nfetches: 2, pauses: 0\n" }, .{ .stream = .stderr, .text = "HOST ERROR: TaskCrashed" } }, .not_contains = &no_panic_or_invariant_needles } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc run ends a crashing concurrency Tasks program with status CRASHED on LLVM against a host that pauses at every fetch", .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=speed", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_crash.roc", .app_args = &.{}, .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "crashed after pause 2: the app crashed after its fetch\nfetches: 2, pauses: 2\n" }, .{ .stream = .stderr, .text = "HOST ERROR: TaskCrashed" } }, .not_contains = &no_panic_or_invariant_needles } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc run ends a crashing concurrency Tasks program with status CRASHED on LLVM against a host that finishes every fetch at once", .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=speed", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_crash.roc", .app_args = &.{"--finish-at-once"}, .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "crashed after pause 0: the app crashed after its fetch\nfetches: 2, pauses: 0\n" }, .{ .stream = .stderr, .text = "HOST ERROR: TaskCrashed" } }, .not_contains = &no_panic_or_invariant_needles } } },
     // A `Tasks` program built for wasm32 runs inside a wasm host that
     // pauses, answers at once, and cancels parked and woken tasks.
-    .{ .id = 0, .suite = .subcommands, .name = "roc build makes a concurrency Tasks wasm32 module on the dev backend that pauses, resumes and cancels with no leaks", .timeout_ms = 600_000, .backend = .dev, .body = .{ .custom = .tasks_wasm_dev } },
-    .{ .id = 0, .suite = .subcommands, .name = "roc build makes a concurrency Tasks wasm32 module on LLVM (size) that pauses, resumes and cancels with no leaks", .timeout_ms = 600_000, .backend = .size, .body = .{ .custom = .tasks_wasm_size } },
-    .{ .id = 0, .suite = .subcommands, .name = "roc build makes a concurrency Tasks wasm32 module on LLVM (speed) that pauses, resumes and cancels with no leaks", .timeout_ms = 600_000, .backend = .speed, .body = .{ .custom = .tasks_wasm_speed } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc build makes a concurrency Tasks wasm32 module on the dev backend that pauses, resumes and cancels with no leaks, and ends a crashing one with its message", .timeout_ms = 600_000, .backend = .dev, .body = .{ .custom = .tasks_wasm_dev } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc build makes a concurrency Tasks wasm32 module on LLVM (size) that pauses, resumes and cancels with no leaks, and ends a crashing one with its message", .timeout_ms = 600_000, .backend = .size, .body = .{ .custom = .tasks_wasm_size } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc build makes a concurrency Tasks wasm32 module on LLVM (speed) that pauses, resumes and cancels with no leaks, and ends a crashing one with its message", .timeout_ms = 600_000, .backend = .speed, .body = .{ .custom = .tasks_wasm_speed } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check writes parse errors to stderr", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/has_parse_error.roc", .exit = .failure, .stderr_min_len = 1, .contains_any = &.{.{ .needles = &parse_error_needles }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "direct roc rejects compiler-owned glue platform as hostless", .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "src/glue/src/DebugGlue.roc", .exit = .failure, .stderr_min_len = 1, .contains = &.{ .{ .stream = .stderr, .text = "empty targets section" }, .{ .stream = .stderr, .text = "roc glue" } }, .not_contains = &.{ .{ .stream = .stderr, .text = "expected platform string" }, .{ .stream = .stderr, .text = "panic" }, .{ .stream = .stderr, .text = "unreachable" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check displays correct file path in parse error messages", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/has_parse_error.roc", .exit = .failure, .stderr_min_len = 1, .contains = &.{.{ .stream = .stderr, .text = "has_parse_error.roc" }}, .not_contains = &.{.{ .stream = .stderr, .text = "\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa" }} } } },
@@ -15711,6 +15717,48 @@ fn customTasksWasm(
             return customFailure(allocator, timer, "Tasks wasm run (mode {d}, pause {d}) left {d} allocations outstanding", .{ run.mode, run.pause, outstanding });
         }
     }
+    return customTasksWasmCrash(io, allocator, env, timer, timeout_ms, opt_arg);
+}
+
+/// `test/concurrency-tasks/app_crash.roc` built for wasm32: wasm has no
+/// crash exit (design.md "The Task Runtime"), so the crash after the task's
+/// last pause reaches the host's `roc_crashed` while the task runs, and the
+/// run ends there with the program's message.
+fn customTasksWasmCrash(
+    io: std.Io,
+    allocator: Allocator,
+    env: *const CaseEnv,
+    timer: *harness.Timer,
+    timeout_ms: u64,
+    opt_arg: []const u8,
+) ?TestResult {
+    const output_path = std.fs.path.join(allocator, &.{ env.dirs.work_dir, "tasks-crash.wasm" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate wasm output path: {}", .{err});
+    defer allocator.free(output_path);
+    const output_arg = outputArg(allocator, output_path) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate wasm output argument: {}", .{err});
+    defer allocator.free(output_arg);
+
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "build", "--target=wasm32", opt_arg, "--specialize=yes", "--no-cache", output_arg },
+        .roc_file = "test/concurrency-tasks/app_crash.roc",
+        .exit = .success,
+        .contains = &.{.{ .stream = .stdout, .text = "successfully building" }},
+        .not_contains = &.{.{ .stream = .stderr, .text = "panic" }},
+    })) |failure| return failure;
+    if (validateWasmOutput(io, allocator, timer, output_path)) |failure| return failure;
+
+    var wasm = setupGlueRuntimeWasm(io, allocator, output_path) catch |err|
+        return customFailure(allocator, timer, "failed to load the crashing Tasks wasm module: {}", .{err});
+    defer wasm.deinit();
+    glue_runtime_wasm_host_context.last_panic_len = 0;
+    if (callGlueRuntimeWasmMain(&wasm, allocator)) |result| {
+        return customFailure(allocator, timer, "the crashing Tasks wasm run returned \"{s}\" instead of crashing", .{result});
+    } else |_| {}
+    const message = glue_runtime_wasm_host_context.last_panic[0..glue_runtime_wasm_host_context.last_panic_len];
+    if (std.mem.find(u8, message, "the app crashed after its fetch") == null) {
+        return customFailure(allocator, timer, "the crashing Tasks wasm run panicked with \"{s}\", not the program's message", .{message});
+    }
     return null;
 }
 
@@ -19612,6 +19660,9 @@ const GlueRuntimeWasmCallError = bytebox.TrapError || error{
 
 const GlueRuntimeWasmHostContext = struct {
     memory: ?*bytebox.MemoryInstance = null,
+    /// The start of the last `roc_panic` message, for a case that checks it.
+    last_panic: [256]u8 = undefined,
+    last_panic_len: usize = 0,
 
     fn readString(self: *GlueRuntimeWasmHostContext, ptr: i32, len: i32) []const u8 {
         if (self.memory) |memory| {
@@ -19628,6 +19679,8 @@ const GlueRuntimeWasmHostContext = struct {
         const self: *GlueRuntimeWasmHostContext = @ptrCast(@alignCast(ctx));
         const msg = self.readString(params[0].I32, params[1].I32);
         std.debug.print("[glue wasm panic] {s}\n", .{msg});
+        self.last_panic_len = @min(msg.len, self.last_panic.len);
+        @memcpy(self.last_panic[0..self.last_panic_len], msg[0..self.last_panic_len]);
         return error.RocPanic;
     }
 

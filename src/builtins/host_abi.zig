@@ -190,6 +190,9 @@ pub const RocOps = extern struct {
     /// returns anyway, the trap after the call terminates the process instead
     /// of letting the caller run on past a failed operation.
     pub fn crash(self: *RocOps, msg: []const u8) noreturn {
+        // Inside a task's resume, the crash ends that task instead
+        // (design.md "The Task Runtime").
+        @import("task.zig").crashRunning(msg);
         if (comptime host_role == .platform) {
             extern_host.roc_crashed(msg.ptr, msg.len);
         } else {

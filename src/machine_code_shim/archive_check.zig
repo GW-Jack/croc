@@ -44,6 +44,7 @@ const exports = [_][]const u8{
     symbols.roc_task_resume,
     symbols.roc_task_wake,
     symbols.roc_task_free,
+    symbols.roc_task_crash_message,
     symbols.roc_builtins_task_cancel,
 };
 const imports = symbols.runtime_set ++ .{

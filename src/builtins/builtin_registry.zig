@@ -140,6 +140,10 @@ pub const BuiltinFn = enum {
     task_resume,
     task_wake,
     task_free,
+    task_crash_message,
+    task_crash,
+    task_host_enter,
+    task_host_leave,
     task_cancel,
     hot_reload_enter,
     hot_reload_leave,
@@ -329,6 +333,10 @@ pub const BuiltinFn = enum {
             .task_resume,
             .task_wake,
             .task_free,
+            .task_crash_message,
+            .task_crash,
+            .task_host_enter,
+            .task_host_leave,
             .task_cancel,
             .native_callable_call,
             .native_callable_defer,
@@ -542,7 +550,8 @@ pub fn exportWrappers(comptime set: ExportSet) void {
 }
 
 /// The host's task calls (design.md "Host Contract", "Backends"):
-/// `roc_task_resume`, `roc_task_wake` and `roc_task_free`, in every payload,
+/// `roc_task_resume`, `roc_task_wake`, `roc_task_free` and
+/// `roc_task_crash_message`, in every payload,
 /// so a compiled `Tasks` program links the same ones on every backend. The
 /// interpreter shim exports the same functions.
 pub fn exportTaskHostCalls() void {
@@ -551,6 +560,7 @@ pub fn exportTaskHostCalls() void {
     @export(&task.host_calls.resumeTask, .{ .name = shim_symbols.roc_task_resume });
     @export(&task.host_calls.wake, .{ .name = shim_symbols.roc_task_wake });
     @export(&task.host_calls.free, .{ .name = shim_symbols.roc_task_free });
+    @export(&task.host_calls.crashMessage, .{ .name = shim_symbols.roc_task_crash_message });
 }
 
 // Overflow-arithmetic exports (`roc__num_*` scheme) present in every payload.

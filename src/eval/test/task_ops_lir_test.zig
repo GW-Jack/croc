@@ -122,6 +122,10 @@ fn bareTask(hosted_slot: [*]u8, result_buffer: [*]u8) RocTask {
         .result_buffer_size = 0,
         .result_buffer_alignment = 1,
         .ops = undefined,
+        .crash_jmp = undefined,
+        .running_record = undefined,
+        .crash_message = undefined,
+        .crash_message_len = 0,
     };
 }
 

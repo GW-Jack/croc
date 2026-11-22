@@ -330,7 +330,7 @@ pub const ModuleType = enum {
             },
             .builtins => .{
                 .root = "src/builtins/mod.zig",
-                .deps = &.{.tracy},
+                .deps = &.{ .tracy, .sljmp },
                 // `roc_str_view` lets a `builtins` test assert that the
                 // default-platform `RocStr` view matches the canonical `RocStr`.
                 .extra_imports = &.{ "vendor_parse_float", "vendor_ryu", "roc_str_view" },
