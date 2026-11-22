@@ -54,6 +54,7 @@ test "builtins tests" {
     std.testing.refAllDecls(@import("hash.zig"));
     std.testing.refAllDecls(@import("host_abi.zig"));
     std.testing.refAllDecls(@import("task.zig"));
+    std.testing.refAllDecls(@import("task_wake_test.zig"));
     std.testing.refAllDecls(@import("in_process_host.zig"));
     std.testing.refAllDecls(@import("shim_symbols.zig"));
     std.testing.refAllDecls(@import("list.zig"));

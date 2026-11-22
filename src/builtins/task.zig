@@ -44,7 +44,7 @@ pub const ReadyFn = *const fn (*RocTask) callconv(.c) void;
 
 /// The wake word's parked bit (design.md "The Task Runtime"). The low bits
 /// count completions the host published and no resume has consumed yet.
-const wake_parked: u32 = 1 << 31;
+pub const wake_parked: u32 = 1 << 31;
 
 /// A host broke the host contract (design.md "Host Contract"). A runtime
 /// with safety checks crashes with the obligation's message; one without
