@@ -8659,6 +8659,7 @@ fn generateCFStmtNode(self: *Self, work: *std.ArrayList(StmtWork), wa: Allocator
                 .reuse = assign.reuse,
                 .reuse_unique = assign.reuse_unique,
                 .frame = assign.frame,
+                .task = @as(?ProcLocalId, null),
             });
             try self.bindAssignedLocal(assign_stmt.target);
             try work.append(wa, .{ .node = .{ .stmt_id = assign_stmt.next, .stop = stop } });
@@ -10668,7 +10669,8 @@ fn dynTargetAddressLocal(t: DynTarget) ?u32 {
 }
 
 /// Pack `save`'s record, the resume entry over the struct of saved values,
-/// on the heap and push it onto `task`'s list with its slot release.
+/// in memory `task` allocates (design.md "The Task Runtime", "Record
+/// cache"), and push it onto `task`'s list with its slot release.
 fn generateSuspendSave(self: *Self, task: ProcLocalId, save: LIR.SuspendSaveData) Allocator.Error!void {
     self.requireBuiltinCalls("suspend_save");
     const capture_size = try self.layoutStorageByteSize(save.capture_layout);
@@ -10690,6 +10692,7 @@ fn generateSuspendSave(self: *Self, task: ProcLocalId, save: LIR.SuspendSaveData
         .reuse = @as(@FieldType(LIR.PackedErasedFnData, "reuse"), .none),
         .reuse_unique = false,
         .frame = false,
+        .task = @as(?ProcLocalId, task),
     });
     const record = try self.emitSetNewLocal(.i32);
     try self.emitProcLocal(task);
@@ -10709,7 +10712,10 @@ const PackedCapture = union(enum) {
 
 /// Pack an erased callable. `c.target_layout` is the target local's layout,
 /// or null for a `suspend_save` record, which has no target.
+/// `c.task` is set only for a `suspend_save` record, which has no target and
+/// whose memory that task allocates.
 fn generatePackedErasedFn(self: *Self, c: anytype) Allocator.Error!void {
+    std.debug.assert((c.task != null) == (c.target_layout == null)); // rationale: only a suspend_save record has no target, and the task allocates exactly those
     if (builtin.mode == .debug) if (c.target_layout) |target_layout| {
         const target_layout_val = self.getLayoutStore().getLayout(target_layout);
         if (target_layout_val.tag != .erased_callable) {
@@ -10754,6 +10760,11 @@ fn generatePackedErasedFn(self: *Self, c: anytype) Allocator.Error!void {
         try self.emitFpOffset(offset + prefix - wasm_word_size);
         try self.emitI32Const(@intCast(builtins.utils.targetRefcountFrame(wasm_word_size)));
         try self.emitStoreOpSized(.i32, 4, 0);
+    } else if (c.task) |task| {
+        try self.emitProcLocal(task);
+        try self.emitI32Const(@intCast(builtins.erased_callable.payloadSizeFor(wasm_word_size, capture_size)));
+        try self.emitBuiltinCall(.task_alloc_record);
+        try self.emitLocalSet(payload_ptr);
     } else if (c.reuse.get()) |reuse| {
         const reuse_ptr = try self.emitProcLocalToNewLocal(reuse, .i32);
 

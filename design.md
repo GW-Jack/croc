@@ -33980,9 +33980,9 @@ Cancelling a task is a request that its next resume finishes (The Task
 Runtime). That resume runs no Roc code. If the host had already written the
 hosted slot, it releases that result with the release the innermost record
 names for it. Then it releases every record, so a cancelled task leaks
-nothing its Roc code owned. Freeing a task frees its buffers and its list;
-a finished task's list is empty, and a cancelled or crashed one's was
-released.
+nothing its Roc code owned. Freeing a task frees its buffers, its list and
+its record cache; a finished task's list is empty, and a cancelled or
+crashed one's was released.
 
 ### Host Contract
 
@@ -34223,6 +34223,32 @@ images carries the support image's builtins as a second copy, but only a
 under `.boxy`. When it accepts one, the composer must name the support
 image's task calls in the image and the shim must forward to them.
 
+**Record cache.** A pause allocates a record per paused frame, and the
+next resume releases them, so most of a pause's cost was the allocator
+(The Reference Platform, "Measuring records"). A task therefore keeps
+the records it releases and allocates new ones from them:
+
+- `task_alloc_record(task, payload_size)` serves a payload of up to 512
+  bytes from a free list per 16-byte size class, or allocates one with
+  `roc_alloc` at the class's full size when that list is empty. A larger
+  payload is allocated at its own size. The record comes back with one
+  reference, and the word before its reference count holds its class, or
+  zero for a payload too large to cache.
+- Each list entry says whether its task allocated the record.
+  `suspend_save` pushes only records its task allocated, and the start
+  record is the one the task did not. A release of a record its task
+  allocated runs the capture's `on_drop` and then puts the memory on its
+  class's list, or frees it if its class is zero. A release of the start
+  record is an ordinary release of a boxed erased callable.
+- Freeing the task frees every cached record.
+
+Records are released in the order the resume runs them, not the reverse
+of their allocation order, so free lists fit where a stack would not.
+The cache only grows to the most records the task held at once. Only
+resumes and a cancel touch it, and those never overlap (P10), so it needs
+no lock. A Debug runtime traps on a record that has more than one reference
+when it is released.
+
 **Conformance.** The host's obligations are checked by a *conformance
 harness*: a Debug runtime with monitors that record every ABI event and
 trap, naming the obligation, at the first violation. A suite of
@@ -34262,12 +34288,13 @@ byte:
 - **Records.** A record, the start record included, is a boxed erased
   callable: the allocation `assign_packed_erased_fn` makes, with its
   `Payload` header (`callable_fn_ptr`, `on_drop`, `on_copy`,
-  `capture_size`) followed by the capture. It is always heap-allocated with
-  one reference. A backend never gives a record a frame slot or repacks a
-  reused allocation for it, even where it would for another packed
-  callable. Its function is the
-  resume entry `R(f, k)`, or the start procedure, compiled with the
-  erased-callable ABI:
+  `capture_size`) followed by the capture. It always has one reference,
+  which the task's list holds. The start record is heap-allocated by the
+  root's caller; every other record is allocated by its task (Record
+  cache). A backend never gives a record a frame slot or repacks a reused
+  allocation for it, even where it would for another packed callable. Its
+  function is the resume entry `R(f, k)`, or the start procedure, compiled
+  with the erased-callable ABI:
   `fn(ops, ret, args, capture, reuse, out_desc) callconv(.c)`.
   - `args` points at an argument struct whose one field is the task.
   - `capture` is the record's capture, borrowed for the call.
@@ -34282,8 +34309,11 @@ byte:
   The interpreter's records differ only behind the header: their function
   is the interpreter's trampoline, and their capture carries the
   interpreter's context.
-- **`suspend_save`.** Compiled code packs the record as above, then calls
-  the builtin `roc_builtins_task_push_record(task, record, slot_drop)`,
+- **`suspend_save`.** Compiled code gets the record's memory from
+  `roc_builtins_task_alloc_record(task, payload_size)`, `callconv(.c)`,
+  where `payload_size` is `payloadSizeFor(word, capture_size)`. It packs
+  the record there as above, then calls the builtin
+  `roc_builtins_task_push_record(task, record, slot_drop)`,
   `callconv(.c)`, and the task's list takes the record's reference. The
   saved values are read into the capture, never addressed, so a backend
   need not treat them as address-taken. `slot_drop` is null for a
@@ -34499,9 +34529,23 @@ released in the order they were allocated. And the record a resume calls
 is released after that call, which may have pushed new records. Freed
 records would sit beneath live outer ones, such as a loop's caller, and
 in a loop that pauses, a stack would grow by a suspension's records every
-iteration. So what comes next is a per-task record cache, measured against
-both: a free list per size class in the task, which keeps released records
-for the task's next suspension and gives them back when the task is freed.
+iteration. So the task keeps a record cache instead (The Task Runtime,
+"Record cache"), measured against both modes below.
+
+With the record cache, the same benchmark ran interleaved with the
+compiler that has no cache, so all three columns share the machine's
+load (median of seven runs, ns per pause):
+
+| Nest | No cache, `malloc` | No cache, `cache` | Record cache |
+|---|---|---|---|
+| 1 | 56 ns | 29 ns | 20 ns |
+| 4 | 167 ns | 64 ns | 42 ns |
+| 16 | 616 ns | 200 ns | 124 ns |
+
+A nested record now costs about 7 ns. That is below the host cache's
+bound, since a cached record makes no call through `roc_alloc` at all.
+With the record cache, the host's two modes time the same, so a pause no
+longer reaches the host's allocator.
 
 ### Persisted Data
 

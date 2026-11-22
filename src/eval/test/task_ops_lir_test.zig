@@ -131,6 +131,8 @@ fn bareTask(hosted_slot: [*]u8, result_buffer: [*]u8) RocTask {
         .running_record = undefined,
         .crash_message = undefined,
         .crash_message_len = 0,
+        .running_from_task = false,
+        .record_cache = @splat(null),
     };
 }
 

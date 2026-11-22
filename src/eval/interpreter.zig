@@ -1308,6 +1308,15 @@ pub const Interpreter = struct {
         return builtins.utils.allocateWithRefcount(data_bytes, element_alignment, elements_refcounted, &self.roc_ops);
     }
 
+    /// A `suspend_save` record's memory, from its task (design.md "The Task
+    /// Runtime", "Record cache").
+    fn allocTaskRecord(self: *LirInterpreter, task: *RocTask, payload_size: usize) Error![*]u8 {
+        var crash_boundary = self.enterCrashBoundary();
+        defer crash_boundary.deinit();
+        if (crash_boundary.set() != 0) return self.crashError();
+        return task.allocRecord(payload_size);
+    }
+
     fn marshalAbiArgs(self: *LirInterpreter, arg_ptr: ?*anyopaque, arg_layouts: []const layout_mod.Idx) Error![]Value {
         const arg_count = arg_layouts.len;
         if (arg_count == 0) return &.{};
@@ -2795,12 +2804,13 @@ pub const Interpreter = struct {
                 },
                 .suspend_save => |save| {
                     const data = self.store.stmtRow(save.data);
-                    const record = try self.packRecord(frame, current, data);
+                    const task = taskOf(self.readPointerInt(try self.getLocalChecked(frame, save.task)));
+                    const record = try self.packRecord(frame, current, data, task);
                     const slot_drop: ?builtins.task.SlotDropFn = switch (data.slot_drop) {
                         .none => null,
                         .rc_helper => &interpreterSlotDrop,
                     };
-                    taskOf(self.readPointerInt(try self.getLocalChecked(frame, save.task))).pushRecord(record, slot_drop);
+                    task.pushRecord(record, slot_drop);
                     current = save.next;
                 },
                 .suspend_return => {
@@ -3951,7 +3961,7 @@ pub const Interpreter = struct {
             try self.getLocalChecked(frame, capture_local)
         else
             null;
-        const data_ptr = try self.packErasedCallable(frame, stmt_id, assign, capture_value, 0);
+        const data_ptr = try self.packErasedCallable(frame, stmt_id, assign, capture_value, 0, null);
         const result = try self.alloc(target_layout);
         self.writeBoxedDataPointer(result, data_ptr);
         return result;
@@ -3968,8 +3978,9 @@ pub const Interpreter = struct {
     /// The record `suspend_save` packs: an erased callable of the resume
     /// entry whose capture is the saved values at the capture layout. A
     /// hosted site's record also holds the hosted result's layout, for the
-    /// release a cancelled task gives the slot.
-    fn packRecord(self: *LirInterpreter, frame: *Frame, stmt_id: CFStmtId, data: LIR.SuspendSaveData) Error![*]u8 {
+    /// release a cancelled task gives the slot. `task` allocates the record
+    /// (design.md "The Task Runtime", "Record cache").
+    fn packRecord(self: *LirInterpreter, frame: *Frame, stmt_id: CFStmtId, data: LIR.SuspendSaveData, task: *RocTask) Error![*]u8 {
         const capture_value: ?Value = if (self.helper.sizeOf(data.capture_layout) > 0)
             try self.evalStructLiteral(frame, data.saved, data.capture_layout)
         else
@@ -3986,7 +3997,7 @@ pub const Interpreter = struct {
             .capture = .none,
             .capture_layout = if (capture_value != null) .some(data.capture_layout) else .none,
             .on_drop = data.on_drop,
-        }, capture_value, prefix);
+        }, capture_value, prefix, task);
         switch (data.slot_drop) {
             .none => {},
             .rc_helper => |helper| @as(*align(1) u32, @ptrCast(builtins.erased_callable.capturePtr(record) + erased_callable_context_capture_offset)).* = @backingInt(helper.layout_idx),
@@ -4014,7 +4025,8 @@ pub const Interpreter = struct {
 
     /// Build the erased callable `assign` describes over `capture_value`,
     /// with `prefix` interpreter-private bytes between its context and its
-    /// capture value, and return its data pointer.
+    /// capture value, and return its data pointer. `task` is set only for a
+    /// `suspend_save` record, whose memory that task allocates.
     fn packErasedCallable(
         self: *LirInterpreter,
         frame: *Frame,
@@ -4022,6 +4034,7 @@ pub const Interpreter = struct {
         assign: anytype,
         capture_value: ?Value,
         prefix: usize,
+        task: ?*RocTask,
     ) Error![*]u8 {
         const has_capture = capture_value != null;
         if (has_capture != (assign.capture_layout != .none)) {
@@ -4075,11 +4088,14 @@ pub const Interpreter = struct {
                 builtins.erased_callable.payload_alignment,
                 builtins.erased_callable.allocation_has_refcounted_children,
             );
-        } else try self.allocRocDataWithRc(
-            builtins.erased_callable.payloadSize(capture_size),
-            builtins.erased_callable.payload_alignment,
-            builtins.erased_callable.allocation_has_refcounted_children,
-        );
+        } else if (task) |record_task|
+            try self.allocTaskRecord(record_task, builtins.erased_callable.payloadSize(capture_size))
+        else
+            try self.allocRocDataWithRc(
+                builtins.erased_callable.payloadSize(capture_size),
+                builtins.erased_callable.payload_alignment,
+                builtins.erased_callable.allocation_has_refcounted_children,
+            );
 
         const capture_drop_kind: ErasedCallableCaptureDrop = switch (assign.on_drop) {
             .none => .none,

@@ -718,7 +718,7 @@ fn crashAt(comptime R: type, program: R.Program, point: CrashPoint) E2eError!voi
     defer std.testing.allocator.free(log_line);
     try std.testing.expectEqualStrings(log_line, run.host.trace.items[0]);
 
-    const own: usize = @as(usize, 2) + @intFromBool(task.hosted_slot_size > 0) + @intFromBool(task.result_buffer_size > 0) + @intFromBool(task.capacity > 0);
+    const own: usize = @as(usize, 2) + @intFromBool(task.hosted_slot_size > 0) + @intFromBool(task.result_buffer_size > 0) + @intFromBool(task.capacity > 0) + task.cachedRecordCount();
     const live = run.runtime.live_count;
     task.free();
     try std.testing.expectEqual(live - own, run.runtime.live_count);

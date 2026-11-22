@@ -14659,8 +14659,13 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             reuse_unique: bool,
             /// The permanent slot of a frame packing (`stack_alloca_slots`).
             frame_slot: ?i32,
+            /// For a `suspend_save` record, the stack slot holding the task
+            /// pointer: the task allocates the record (design.md "The Task
+            /// Runtime", "Record cache").
+            task_slot: ?i32,
         ) Allocator.Error!ValueLocation {
             const frame = frame_slot != null;
+            std.debug.assert((task_slot != null) == (target_layout == null)); // rationale: only a suspend_save record has no target, and the task allocates exactly those
             if (target_layout) |target_layout_idx| {
                 const target_layout_val = self.layout_store.getLayout(target_layout_idx);
                 if (builtin.mode == .debug and target_layout_val.tag != .erased_callable) {
@@ -14812,6 +14817,13 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 try self.emitAddPtrImmAny(reg, frame_ptr, storage_slot + prefix);
                 try self.emitStore(.w64, frame_ptr, heap_ptr_slot, reg);
                 self.codegen.freeGeneral(reg);
+            } else if (task_slot) |task_ptr_slot| {
+                var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+                defer builder.deinit();
+                try builder.addMemArg(frame_ptr, task_ptr_slot);
+                try builder.addImmArg(@intCast(payload_size));
+                try self.callBuiltin(&builder, .task_alloc_record);
+                try self.emitStore(.w64, frame_ptr, heap_ptr_slot, ret_reg_0);
             } else {
                 var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
                 defer builder.deinit();
@@ -21313,6 +21325,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                 assign.reuse_unique,
                                 if (assign.frame) self.stack_alloca_slots.get(assign_stmt.target) orelse unreachable // the proc prescan reserves a slot for every frame packing's target
                                 else null,
+                                null,
                             );
                             try self.bindAssignedLocal(assign_stmt.target, value_loc);
                             try work.append(wa, .{ .node = assign_stmt.next });
@@ -21492,6 +21505,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                 .fields = save.saved,
                                 .target_layout = save.capture_layout,
                             }) };
+                            const task_slot = try self.ensureOnStack(try self.emitValueLocal(save_stmt.task), 8);
                             const record_loc = try self.generatePackedErasedFn(
                                 save.proc,
                                 capture,
@@ -21502,9 +21516,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                 null,
                                 false,
                                 null,
+                                task_slot,
                             );
                             const record_slot = try self.ensureOnStack(record_loc, 8);
-                            const task_slot = try self.ensureOnStack(try self.emitValueLocal(save_stmt.task), 8);
                             // The slot release is the hosted result's host-drop
                             // adapter, as a capture's `on_drop` is: it takes
                             // the slot first and ignores what follows.

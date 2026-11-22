@@ -32,7 +32,42 @@ pub const Status = enum(u8) {
 pub const Entry = extern struct {
     record: [*]u8,
     slot_drop: ?SlotDropFn,
+    /// Whether the task allocated the record (`allocRecord`), so releasing
+    /// it returns it to the task's record cache. Only the start record is
+    /// not (design.md "The Task Runtime", "Record cache").
+    from_task: bool,
 };
+
+/// The record cache's size classes: a payload of up to `record_class_bytes *
+/// record_classes` bytes is served from the free list of its class.
+const record_class_bytes = 16;
+const record_classes = 32;
+
+/// A record's class, 1 to `record_classes`, or 0 for a payload too large to
+/// cache.
+fn recordClass(payload_size: usize) u32 {
+    if (payload_size == 0 or payload_size > record_class_bytes * record_classes) return 0;
+    return @intCast((payload_size + record_class_bytes - 1) / record_class_bytes);
+}
+
+/// The word before a record's reference count, which an allocation with
+/// one reference leaves unused (`utils.allocateWithRefcount` with alignment
+/// `erased_callable.payload_alignment`): `allocRecord` keeps the record's
+/// class there.
+fn recordClassWord(record: [*]u8) *u32 {
+    return @ptrCast(@alignCast(record - erased_callable.payload_alignment));
+}
+
+/// A cached record's link to the next one of its class, kept in its payload.
+fn recordNext(record: [*]u8) *?[*]u8 {
+    return @ptrCast(@alignCast(record));
+}
+
+comptime {
+    // The class word and the reference count must not overlap.
+    std.debug.assert(@sizeOf(u32) + @sizeOf(usize) <= erased_callable.payload_alignment);
+    std.debug.assert(!erased_callable.allocation_has_refcounted_children);
+}
 
 /// The host's `roc_task_abort`: abandon the operation a cancelled task is
 /// parked on (design.md "Host Contract").
@@ -184,6 +219,11 @@ pub const RocTask = extern struct {
     /// A crashed task's message, which it owns.
     crash_message: [*]const u8,
     crash_message_len: usize,
+    /// Whether the running record is one the task allocated.
+    running_from_task: bool,
+    /// Released records the task allocated, by class, for its next
+    /// suspensions (design.md "The Task Runtime", "Record cache").
+    record_cache: [record_classes]?[*]u8,
 
     /// A task whose list holds `start`, the root's start record, and whose
     /// outermost record writes to `root_result`. The host's first resume
@@ -210,8 +250,10 @@ pub const RocTask = extern struct {
             .running_record = undefined,
             .crash_message = undefined,
             .crash_message_len = 0,
+            .running_from_task = false,
+            .record_cache = @splat(null),
         };
-        task.pushRecord(start, null);
+        task.push(.{ .record = start, .slot_drop = null, .from_task = false });
         return task;
     }
 
@@ -225,12 +267,57 @@ pub const RocTask = extern struct {
         self.pending = 1;
     }
 
-    /// What `suspend_save` does with the record it packs: the list takes the
-    /// record's one reference.
+    /// `task_alloc_record`: memory for a record of `payload_size` bytes with
+    /// one reference, from the record cache when its class has one.
+    pub fn allocRecord(self: *RocTask, payload_size: usize) [*]u8 {
+        const class = recordClass(payload_size);
+        if (class != 0) {
+            if (self.record_cache[class - 1]) |record| {
+                // Its reference count is still the one it was released with.
+                self.record_cache[class - 1] = recordNext(record).*;
+                return record;
+            }
+        }
+        const size = if (class == 0) payload_size else class * record_class_bytes;
+        const record = utils.allocateWithRefcount(size, erased_callable.payload_alignment, erased_callable.allocation_has_refcounted_children, self.ops);
+        recordClassWord(record).* = class;
+        return record;
+    }
+
+    /// What `suspend_save` does with the record it packed in memory from
+    /// `allocRecord`: the list takes the record's one reference.
     pub fn pushRecord(self: *RocTask, record: [*]u8, slot_drop: ?SlotDropFn) void {
+        self.push(.{ .record = record, .slot_drop = slot_drop, .from_task = true });
+    }
+
+    /// How many released records the cache holds: the allocations freeing
+    /// the task releases beyond its own.
+    pub fn cachedRecordCount(self: *const RocTask) usize {
+        var count: usize = 0;
+        for (self.record_cache) |head| {
+            var next = head;
+            while (next) |record| : (next = recordNext(record).*) count += 1;
+        }
+        return count;
+    }
+
+    fn push(self: *RocTask, entry: Entry) void {
         if (self.len == self.capacity) self.grow();
-        self.entries[self.len] = .{ .record = record, .slot_drop = slot_drop };
+        self.entries[self.len] = entry;
         self.len += 1;
+    }
+
+    /// Release a record the list held: run its capture's `on_drop` and keep
+    /// its memory for the task's next suspension, or, for the start record,
+    /// release it as any boxed erased callable.
+    fn releaseRecord(self: *RocTask, record: [*]u8, from_task: bool) void {
+        if (!from_task) return erased_callable.decref(record, self.ops);
+        std.debug.assert(utils.isUnique(record, self.ops)); // rationale: the list holds a record's only reference (design.md "Backends")
+        if (erased_callable.payloadPtr(record).on_drop) |on_drop| on_drop(erased_callable.capturePtr(record), self.ops);
+        const class = recordClassWord(record).*;
+        if (class == 0) return utils.freeDataPtrC(record, erased_callable.payload_alignment, erased_callable.allocation_has_refcounted_children, self.ops);
+        recordNext(record).* = self.record_cache[class - 1];
+        self.record_cache[class - 1] = record;
     }
 
     /// `roc_task_resume`: run records, innermost first, until the list is
@@ -255,13 +342,14 @@ pub const RocTask = extern struct {
             if (exits) {
                 // Kept in the task, since a crash exit restores no local.
                 self.running_record = entry.record;
+                self.running_from_task = entry.from_task;
                 running = self;
                 if (crash_exit.save(&self.crash_jmp) != 0) return self.crashed();
             }
             self.call(entry.record, if (base == 0) self.root_result else self.result_buffer);
             running = null;
             std.mem.reverse(Entry, self.entries[base..self.len]);
-            erased_callable.decref(entry.record, self.ops);
+            self.releaseRecord(entry.record, entry.from_task);
             if (self.pending != 0) {
                 if (self.park()) return .pending;
                 // The completion came before the park: run on, from the
@@ -277,10 +365,10 @@ pub const RocTask = extern struct {
     /// consistent, so release them all; what the running frames owned is
     /// leaked.
     fn crashed(self: *RocTask) Status {
-        erased_callable.decref(self.running_record, self.ops);
+        self.releaseRecord(self.running_record, self.running_from_task);
         while (self.len > 0) {
             self.len -= 1;
-            erased_callable.decref(self.entries[self.len].record, self.ops);
+            self.releaseRecord(self.entries[self.len].record, self.entries[self.len].from_task);
         }
         self.status = .crashed;
         return .crashed;
@@ -332,7 +420,7 @@ pub const RocTask = extern struct {
         }
         while (self.len > 0) {
             self.len -= 1;
-            erased_callable.decref(self.entries[self.len].record, self.ops);
+            self.releaseRecord(self.entries[self.len].record, self.entries[self.len].from_task);
         }
         self.status = .cancelled;
     }
@@ -341,6 +429,12 @@ pub const RocTask = extern struct {
     pub fn free(self: *RocTask) void {
         if (self.status == .pending) utils.builtinInvariant(self.ops, "a task was freed before it finished or was cancelled");
         const ops = self.ops;
+        for (&self.record_cache) |*list| {
+            while (list.*) |record| {
+                list.* = recordNext(record).*;
+                utils.freeDataPtrC(record, erased_callable.payload_alignment, erased_callable.allocation_has_refcounted_children, ops);
+            }
+        }
         if (self.capacity > 0) ops.dealloc(@ptrCast(self.entries), @alignOf(Entry));
         if (self.status == .crashed) ops.dealloc(@ptrCast(@constCast(self.crash_message)), 1);
         freeBuffer(ops, self.hosted_slot, self.hosted_slot_size, self.hosted_slot_alignment);
@@ -434,7 +528,7 @@ fn testStepCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, 
     TestLog.calls[TestLog.call_count] = step.id;
     TestLog.results_written_to[TestLog.call_count] = ret;
     TestLog.call_count += 1;
-    for (step.saves) |save| if (save) |record| task.pushRecord(record, &testSlotDrop);
+    for (step.saves) |save| if (save) |record| task.pushRecord(testMoveIntoTask(task, record), &testSlotDrop);
     if (step.crashes and step.crash_depth > 0) TestLog.deep_sink = @call(.never_inline, crashDeep, .{ ops, step.crash_depth, step.id });
     if (step.crashes) ops.crash("a record crashed");
     if (step.pauses) {
@@ -474,6 +568,16 @@ fn testAbort(_: *RocTask) callconv(.c) void {
 
 fn testReady(_: *RocTask) callconv(.c) void {
     TestLog.readies += 1;
+}
+
+/// A copy of `record` in memory `task` allocates, as `suspend_save` packs
+/// one, with the original freed. Tests build records before their task.
+fn testMoveIntoTask(task: *RocTask, record: [*]u8) [*]u8 {
+    const size = erased_callable.payloadSize(erased_callable.payloadPtr(record).capture_size);
+    const moved = task.allocRecord(size);
+    @memcpy(moved[0..size], record[0..size]);
+    utils.freeDataPtrC(record, erased_callable.payload_alignment, erased_callable.allocation_has_refcounted_children, task.ops);
+    return moved;
 }
 
 fn testRecord(ops: *RocOps, step: TestStep) [*]u8 {
@@ -553,6 +657,47 @@ test "records a resumed record saves go before the records still waiting" {
 
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 4, 5, 9 }, TestLog.calls[0..TestLog.call_count]);
     try std.testing.expectEqual(@as(u8, 90), root[0]);
+    task.free();
+    try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
+}
+
+test "a task reuses a released record's memory for its next record of that size class, and frees the rest with itself" {
+    var test_env = utils.TestEnv.init(std.testing.allocator);
+    defer test_env.deinit();
+    const ops = test_env.getOps();
+    TestLog.reset();
+    var root: [1]u8 = .{0};
+    const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ null, null }, .pauses = false, .result = 10 }), &root, test_buffers);
+    try std.testing.expectEqual(Status.done, task.resumeTask());
+    const step: TestStep = .{ .id = 2, .saves = .{ null, null }, .pauses = false, .result = 0 };
+
+    // A released record goes to its class's list, not back to the
+    // allocator, and the next record of that class takes its memory.
+    const first = testMoveIntoTask(task, testRecord(ops, step));
+    const allocations = test_env.getAllocationCount();
+    const drops = TestLog.drops;
+    task.releaseRecord(first, true);
+    try std.testing.expectEqual(drops + 1, TestLog.drops);
+    try std.testing.expectEqual(allocations, test_env.getAllocationCount());
+    const second = testMoveIntoTask(task, testRecord(ops, step));
+    try std.testing.expectEqual(first, second);
+    try std.testing.expectEqual(allocations, test_env.getAllocationCount());
+
+    // A record of another class gets fresh memory.
+    const wider = testMoveIntoTask(task, erased_callable.allocate(&testStepCall, &testStepDrop, @sizeOf(TestStep) + record_class_bytes, ops));
+    try std.testing.expect(wider != second);
+    try std.testing.expectEqual(allocations + 1, test_env.getAllocationCount());
+
+    // One past the largest class is freed on release.
+    const huge = testMoveIntoTask(task, erased_callable.allocate(&testStepCall, &testStepDrop, record_classes * record_class_bytes, ops));
+    try std.testing.expectEqual(allocations + 2, test_env.getAllocationCount());
+    task.releaseRecord(huge, true);
+    try std.testing.expectEqual(allocations + 1, test_env.getAllocationCount());
+
+    // Freeing the task frees what its cache holds.
+    task.releaseRecord(second, true);
+    task.releaseRecord(wider, true);
+    try std.testing.expectEqual(drops + 4, TestLog.drops);
     task.free();
     try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
 }
@@ -790,7 +935,11 @@ test "compiled code's task builtins create a task with the entered ops and push 
     try std.testing.expectEqual(@as(usize, 1), task.len);
     try std.testing.expectEqual(start, task.entries[0].record);
 
-    const record = testRecord(ops, .{ .id = 2, .saves = .{ null, null }, .pauses = false, .result = 20 });
+    const size = erased_callable.payloadSize(@sizeOf(TestStep));
+    const record = dev_wrappers.roc_builtins_task_alloc_record(task, size);
+    const built = testRecord(ops, .{ .id = 2, .saves = .{ null, null }, .pauses = false, .result = 20 });
+    @memcpy(record[0..size], built[0..size]);
+    utils.freeDataPtrC(built, erased_callable.payload_alignment, erased_callable.allocation_has_refcounted_children, ops);
     dev_wrappers.roc_builtins_task_push_record(task, record, &testSlotDrop);
     try std.testing.expectEqual(@as(usize, 2), task.len);
     try std.testing.expectEqual(record, task.entries[1].record);

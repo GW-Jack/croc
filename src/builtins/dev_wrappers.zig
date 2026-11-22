@@ -1417,6 +1417,13 @@ pub fn roc_builtins_task_create(start: [*]u8, root_result: [*]u8, hosted_slot_si
     });
 }
 
+/// Where `suspend_save` packs its record: `payload_size` bytes with one
+/// reference, from the task's record cache when it has one of that size
+/// (design.md "The Task Runtime", "Record cache").
+pub fn roc_builtins_task_alloc_record(roc_task: *task.RocTask, payload_size: usize) callconv(.c) [*]u8 {
+    return roc_task.allocRecord(payload_size);
+}
+
 /// What `suspend_save` does with the record it packs: the task's list takes
 /// the record's one reference, with the hosted result's release for a hosted
 /// site's record.

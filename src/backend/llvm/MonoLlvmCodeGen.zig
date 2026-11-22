@@ -5355,14 +5355,16 @@ pub const MonoLlvmCodeGen = struct {
         try self.materializeLocalIfDeferred(task);
         const word = self.targetWordSize();
         const capture_size = self.layoutByteSize(data.capture_layout);
+        // The task allocates the record (design.md "The Task Runtime",
+        // "Record cache").
+        const task_ptr = try self.loadPointer(self.slot(task).ptr);
         const record = try self.callBuiltin(
-            .allocate_with_refcount,
+            .task_alloc_record,
             ptr_ty,
-            &.{ self.ptrSizedIntType(), .i32, .i1 },
+            &.{ ptr_ty, self.ptrSizedIntType() },
             &.{
+                task_ptr,
                 builder.intValue(self.ptrSizedIntType(), builtins.erased_callable.payloadSizeFor(word, capture_size)) catch return error.OutOfMemory,
-                builder.intValue(.i32, builtins.erased_callable.payload_alignment) catch return error.OutOfMemory,
-                builder.intValue(.i1, 0) catch return error.OutOfMemory,
             },
         );
         const proc_fn = self.proc_registry.get(@backingInt(data.proc)) orelse return error.CompilationFailed;
@@ -5386,7 +5388,7 @@ pub const MonoLlvmCodeGen = struct {
             .none => builder.nullValue(ptr_ty) catch return error.OutOfMemory,
             .rc_helper => |helper_key| try self.declareSlotDropAdapter(helper_key),
         };
-        try self.callBuiltinVoid(.task_push_record, &.{ ptr_ty, ptr_ty, ptr_ty }, &.{ try self.loadPointer(self.slot(task).ptr), record, slot_drop });
+        try self.callBuiltinVoid(.task_push_record, &.{ ptr_ty, ptr_ty, ptr_ty }, &.{ task_ptr, record, slot_drop });
     }
 
     /// `suspend_return` (design.md "Backends"): return from a paused frame

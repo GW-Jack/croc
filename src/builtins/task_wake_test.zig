@@ -101,7 +101,7 @@ fn stepCall(_: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?[*
     const task: *RocTask = @as(*const *RocTask, @ptrCast(@alignCast(args.?))).*;
     if (step.slot.answer != step.expect_answer) wrong_answers += 1;
     if (step.next) |next| {
-        task.pushRecord(next, null);
+        task.pushRecord(moveIntoTask(task, next), null);
         task.setPending();
         // The hosted call returns PENDING: the operation is started, and a
         // worker may finish it at once.
@@ -114,6 +114,16 @@ fn stepCall(_: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?[*
 }
 
 fn stepDrop(_: ?[*]u8, _: *RocOps) callconv(.c) void {}
+
+/// A copy of `bytes` in memory `task` allocates, as `suspend_save` packs a
+/// record, with the original freed. Records are built before their task.
+fn moveIntoTask(task: *RocTask, bytes: [*]u8) [*]u8 {
+    const size = erased_callable.payloadSize(erased_callable.payloadPtr(bytes).capture_size);
+    const moved = task.allocRecord(size);
+    @memcpy(moved[0..size], bytes[0..size]);
+    utils.freeDataPtrC(bytes, erased_callable.payload_alignment, erased_callable.allocation_has_refcounted_children, task.ops);
+    return moved;
+}
 
 fn record(ops: *RocOps, step: Step) [*]u8 {
     const bytes = erased_callable.allocate(&stepCall, &stepDrop, @sizeOf(Step), ops);
