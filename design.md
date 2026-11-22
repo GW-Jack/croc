@@ -33932,9 +33932,8 @@ count:
   alignments as `U64` operands.
 
 The runtime's `RocTask` (`src/builtins/task.zig`) fixes where these live.
-The interpreter, the dev backend and LLVM implement the operations against
-it. The wasm backend stops with a not-yet-implemented panic until it
-supports `Tasks`, which the CLI rejects for it.
+The interpreter and every compiling backend implement the operations
+against it (Backends).
 
 Resuming a task clears its pending flag and repeats, until the list is empty
 or the task pauses again: take the innermost record and call it with the
@@ -33957,8 +33956,8 @@ when the list is empty once the record is taken. The records a call saves
 are pushed as they are made, innermost first; when the call returns, the
 runtime reverses them, so the innermost of them is taken next.
 
-Waking a task records that the host wrote the hosted slot, and clears with
-the next resume.
+Waking a task records that the host wrote the hosted slot. The resume that
+follows consumes it (The Task Runtime).
 
 A root in a `Tasks` build is a task from the start. For each `provides`
 root of a `Tasks` build, the pass makes a start procedure and a task entry,
@@ -33977,13 +33976,13 @@ Contract shows. The host's first resume runs the start record. A root that
 is not a `provides` entry never suspends, since nothing else reaches a
 `suspending` hosted procedure.
 
-Cancelling a parked task asks the host to abandon the operation it is parked
-on (`roc_task_abort`) and releases its records. If the host had already
-written the hosted slot, the runtime releases that result too, with the
-release the innermost record names for it, so a cancelled task leaks nothing
-its Roc code owned. A woken task's operation is finished, so cancelling it
-asks the host for nothing. Freeing a task frees its buffers and its list; a
-finished task's list is empty, and a cancelled one's was released.
+Cancelling a task is a request that its next resume finishes (The Task
+Runtime). That resume runs no Roc code. If the host had already written the
+hosted slot, it releases that result with the release the innermost record
+names for it. Then it releases every record, so a cancelled task leaks
+nothing its Roc code owned. Freeing a task frees its buffers and its list;
+a finished task's list is empty, and a cancelled or crashed one's was
+released.
 
 ### Host Contract
 
@@ -34002,11 +34001,15 @@ task instead of its result, and writes the result to `result_out`, whose
 contents are defined only once the task reports `DONE`:
 
 ```c
+typedef enum {
+    ROC_TASK_PENDING, ROC_TASK_DONE, ROC_TASK_CANCELLED, ROC_TASK_CRASHED
+} RocTaskStatus;
 RocTask *roc_main(RocList args, MainResult *result_out);
-RocTaskStatus roc_task_resume(RocTask *task); /* PENDING, DONE, CANCELLED */
-void roc_task_wake(RocTask *task);            /* its pending result is ready */
-void roc_task_cancel(RocTask *task);          /* release a parked task */
-void roc_task_free(RocTask *task);            /* after DONE or CANCELLED */
+RocTaskStatus roc_task_resume(RocTask *task);
+void roc_task_wake(RocTask *task);            /* any thread: *out is written */
+void roc_task_cancel(RocTask *root);          /* between resumes: request it */
+void roc_task_free(RocTask *root);            /* once, after it ends */
+RocStr roc_task_crash_message(RocTask *root); /* after CRASHED; borrowed */
 void roc_task_ready(RocTask *task);           /* host: resume it once */
 void roc_task_abort(RocTask *task);           /* host: abandon its operation */
 ```
@@ -34015,17 +34018,200 @@ The builtins object exports `roc_task_resume`, `roc_task_wake` and
 `roc_task_free` (`RocTask.host_calls`). Each program binary defines them
 exactly once, since a second definition collides in the link: the
 interpreter shim gets them by bundling that object, and the machine-code
-shim, which links no builtins object, defines them itself (Backends).
+shim, which links no builtins object, defines them by forwarding to the
+program image (Backends).
 `roc_task_cancel` calls the host's `roc_task_abort`, which only the host of
 a `Tasks` platform defines. So a `Tasks` program defines `roc_task_cancel`
 itself rather than getting it from the builtins object, and a program of
 another mode neither defines it nor refers to `roc_task_abort` (Backends).
 
-The host resumes a root once after creating it and once for each
-`roc_task_ready`, never from inside a hosted call or another resume. These
-symbols join the fixed runtime set and the glue templates of opting-in
-platforms. Waking, the wake protocol between threads, child tasks and crash
-exits are part of the task runtime, which extends this contract.
+These symbols join the fixed runtime set, and the glue templates of a
+`Tasks` platform declare all of them with `RocTask`, `RocPoll` and
+`RocTaskStatus`. `roc_task_ready` and `roc_task_abort` are the host's; a
+`Tasks` platform's host must define both.
+
+A host keeps these obligations. Breaking one is undefined behavior, like a
+`roc_alloc` that returns null; the conformance harness (The Task Runtime)
+checks them.
+
+- **P1, resume discipline.** Resume a root once after creating it and once
+  for each `roc_task_ready`. Never resume from inside a hosted call or
+  inside another resume.
+- **P2, handoff ordering.** A resume on another thread happens-after the
+  event that readied the task. Any mutex or queue handoff provides it.
+- **P3, completion.** After `ROC_PENDING`, write `*out` exactly once, then
+  call `roc_task_wake` exactly once.
+- **P4, abort finality.** After `roc_task_abort` returns, never write that
+  task's slot or wake it, and release a result that arrives late. A host
+  meets this by writing the result and waking while it holds the
+  operation's lock, which `roc_task_abort` also takes. `roc_task_abort` may
+  come after the host already wrote the result and woke the task, since a
+  cancel can race the completion. Abort is then a no-op, and the runtime
+  releases the result.
+- **P5, ownership.** Release hosted arguments exactly once, even when the
+  operation finishes later. What is written to `*out` passes to Roc.
+- **P6, cross-thread allocation.** Allow an allocation to be released on
+  another thread, or keep every task on one allocator's thread.
+- **P7, liveness.** Eventually resume every readied task, and finish or
+  abort every pending operation.
+- **P8, root lifecycle.** After a terminal status, read `result_out` only
+  after `DONE`, and the crash message only after `CRASHED`. Then free the
+  root exactly once and never use it again; that includes never cancelling
+  it.
+- **P10, serial resumes.** Never run two resumes of a `Tasks` program at
+  the same time; each resume happens-after the previous one ends.
+
+(P9 of the proposal, region reclamation, is a choice a platform makes, not
+an obligation of this contract.) Child tasks extend this contract when
+concurrent loops are implemented.
+
+### The Task Runtime
+
+**The wake word.** The pending flag is what compiled code tests, and
+resuming clears it. Whether a paused task may run again is held separately,
+in an atomic word of the task's one wait source: its hosted operation. A
+child-task running set will be a second kind of wait source with a word of
+its own, and a task waits on exactly one at a time. The word holds a
+*parked* bit and a *count* of completions that are published but not yet
+consumed. A hosted completion may come from any thread, so the word is
+atomic even in `Tasks` builds. It is the only field of a task that two
+threads touch. It changes in exactly these ways:
+
+- `roc_task_wake`, after the host writes `*out`, increments the count and
+  clears the parked bit in one read-modify-write with release ordering. It
+  calls `roc_task_ready` only if the bit was set.
+- When a record's call returns with the pending flag set, the resume loop
+  parks with a compare-and-swap that sets the parked bit only while the
+  count is zero, with acquire ordering. If it succeeds, the resume returns
+  `PENDING`. If not, the host finished before its hosted function
+  returned. The loop then consumes that completion, clears the pending
+  flag and runs the next record, which is the hosted site's resume entry.
+- A resume of a readied task consumes the one completion. The count goes
+  from one to zero with acquire ordering, so the slot the host wrote is
+  visible.
+
+So each park gets exactly one `roc_task_ready`, and a completion that
+arrives before the task parks is never lost (R1 of the proposal). A Debug
+runtime traps on any other transition:
+- a wake while a completion is already counted. This is a rule of the
+  hosted operation's word, which has at most one operation in flight; a
+  running set's word may count many;
+- a resume of a task that is neither new nor readied. `RocTask` keeps a
+  `started` flag for this, since a new task's word is the same as a
+  readied one's;
+- a park without the pending flag.
+
+**Cancellation.** `roc_task_cancel(root)` may be called between resumes of
+that root, never during one. It marks the task cancelled, then:
+
+- **If the task is parked with no completion counted,** it clears the
+  parked bit, calls `roc_task_abort`, then calls `roc_task_ready`.
+- **If a completion is counted,** the wake has readied the task already,
+  or is about to.
+- **If the task is new,** the host resumes it anyway.
+
+A Debug runtime traps on a cancel of a task that has reported a terminal
+status (P8).
+
+The next resume of a cancelled task runs no Roc code. It does three
+things:
+1. it releases the counted hosted result, if any, with the innermost
+   record's `slot_drop`;
+2. it releases every record;
+3. it returns `CANCELLED`.
+
+A completion that races the request is safe for two reasons. Under P4 the
+host writes and wakes while holding the lock that `roc_task_abort` takes.
+And whichever of the two clears the parked bit is the one that readies the
+task. A host that cancels keeps resuming the root when it is readied,
+until the root reports a terminal status.
+
+**Crash exits.** A crash inside a task exits back to the `roc_task_resume`
+that is running it.
+- On targets `src/sljmp` supports, before running a record, the resume
+  saves a jump buffer in the task and makes the task the process's
+  *running task*.
+- On every other target, including wasm, a crash ends the process as it
+  does without tasks.
+
+A crash while a task is running does two things:
+- it copies its message into an allocation the task owns. `roc_alloc`
+  never returns failure: a host that cannot allocate stops the program as
+  `roc_crashed` does. So an allocation failure here ends the process, as
+  any allocation failure does;
+- it jumps to the task's buffer.
+
+A crash in host code never takes the exit, since it would jump across the
+host's own frames: its locks, its destructors, a handoff half done. So in a
+program that creates a task, each hosted call is bracketed by two builtin
+calls. `task_host_enter` clears the running task and returns it, and
+`task_host_leave` restores it. The interpreter does the same around its
+hosted-call handler. A crash inside a hosted function therefore reaches
+`roc_crashed` and ends the process, as it does without tasks.
+
+The resume then:
+1. marks the task crashed, so it is never resumed again;
+2. releases every record left in the list exactly, along with the record
+   whose call crashed. The list holds each one's only reference, and no
+   record holds a native-frame address;
+3. clears the running task and returns `CRASHED`.
+
+The jump buffer is a fixed-size, 16-byte-aligned area of `RocTask`. It is
+as large as the largest `src/sljmp` buffer, so the task's layout does not
+depend on the target. The two routines are internal to each program:
+`roc_task_setjmp(buf)` and `roc_task_longjmp(buf)`, plus
+`roc_task_crash_exits`, which reports whether the target has them.
+- A builtins object built for one target defines them from `src/sljmp`.
+- LLVM's builtins bitcode is portable, so its program gets them from the
+  per-target private runtime, with internal linkage like the other private
+  routines.
+- On a target without `src/sljmp`, `roc_task_crash_exits` is false, and a
+  crash goes to the host's `roc_crashed` as before.
+
+Values held only by the native frames that were running are leaked, since
+their state is unknown, and nothing else is (R5). The root's result storage
+stays unwritten. `roc_task_crash_message` returns the message, borrowed
+from the task until it is freed.
+
+Every crash of a `Tasks` program reaches the running task as follows:
+- **`roc_builtins_task_crash(msg, len)`, a registry builtin.** It takes the
+  crash exit when a task is running, and otherwise calls the host's
+  `roc_crashed`.
+- **`RocOps.crash` in builtins** makes the same check, for every program.
+  That is one load on a path that never returns.
+- **Compiled crash sites.** A program that creates a task
+  (`LirStore.createsTask`) calls the builtin from each `crash` statement
+  and each overflow or bounds trap, in place of `roc_crashed`.
+
+So a program that creates no task keeps its LIR and its own code byte for
+byte. Only the builtins it links change, by that one check on the crash
+path, which every program shares.
+- **The interpreter.** Its crash comes back to the erased-callable
+  trampoline that ran the record as `error.Crash`, after Zig's error
+  unwinding has run the interpreter's own cleanup. Only then does the
+  trampoline call `RocOps.crash`, so the exit leaves from the trampoline,
+  and the interpreter's structures stay consistent for the next task it
+  runs. Compiled frames are skipped by the jump, and the values they held
+  are leaked.
+
+**One runtime per process.** The running task is a builtins global.
+Resumes of a `Tasks` program never overlap (P10), so one pointer is enough;
+`ParallelTasks` makes it thread-local. Each process has exactly one copy
+of it. In a dev `roc run`, the machine-code shim the host links and the
+program image each carry builtins. So the shim's `roc_task_resume`,
+`roc_task_wake`, `roc_task_free` and `roc_task_crash_message` forward to the
+image's definitions, as the shim forwards the program's entrypoints. The
+runtime that runs a task's records is then the one its crashes reach.
+
+**Conformance.** The host's obligations are checked by a *conformance
+harness*: a Debug runtime with monitors that record every ABI event and
+trap, naming the obligation, at the first violation. A suite of
+adversarial hosts each breaks one checkable obligation (P1, P3, P4, P5, P8,
+P10). Each must be caught by name, and every conforming host must pass. The
+conforming hosts include one that finishes operations on a worker thread
+and one that finishes before its hosted function returns. A native
+reference platform, whose scheduler wakes tasks from a worker pool, runs
+through the same harness.
 
 ### Backends
 
@@ -34109,9 +34295,9 @@ byte:
   calls itself, each a call to its registry builtin
   (`roc_builtins_task_resume`, `_wake`, `_free`). A dev `roc run` loads
   the program's builtins with its image, after the host is linked, so the
-  machine-code shim the host links defines the three calls instead. The
-  runtime keeps nothing outside the task that a second copy would split, so the shim's copy and the
-  image's agree on every task.
+  machine-code shim the host links defines the three calls. For a program
+  that creates a task, each forwards to the image's own definition, so the
+  process has one runtime and one running task (The Task Runtime).
 - **Cancelling.** `roc_task_cancel(task)` calls the registry builtin
   `roc_builtins_task_cancel(task, abort)`, `callconv(.c)`, with the host's
   `roc_task_abort` as `abort`; the builtin is `RocTask.cancel`. A `Tasks`
@@ -34187,6 +34373,8 @@ The first implementation supports `concurrency: Tasks` under `.lss` on the
 interpreter, then on LLVM and the dev backend for native targets (Backends).
 Until the rest exists:
 
+- a crash on a target without `src/sljmp`, including wasm, ends the process
+  rather than its task;
 - the CLI reports `concurrency: Tasks` with `--specialize=no` (`.boxy`), or
   on the dev backend or LLVM for a wasm target, as an unsupported option
   combination. Discovery reads the mode from the platform header, and the
@@ -34236,6 +34424,15 @@ compiled away in release builds.
 - **Constant-space tail calls.** A tail site has no pending test, no
   continuation and no record, and every call between continuations is a tail
   site.
+- **Exactly-once readiness.** A Debug runtime traps on every wake-word
+  transition outside The Task Runtime's list. A stress test runs the word on
+  real threads under ThreadSanitizer.
+- **Cancellation and crash containment.** A cancelled task runs no Roc code
+  and releases each record and any counted hosted result exactly once. A
+  crashed task is never resumed, its records are released exactly, and the
+  only live allocations it leaves belong to the frames that were running.
+  Tests cancel at every pause, with and without a completion in flight, and
+  crash before, between and after pauses.
 - **Resume fidelity.** Every resume entry calls the continuation of its own
   site with its captures in the continuation's argument order.
 
