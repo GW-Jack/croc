@@ -16,6 +16,7 @@
 const std = @import("std");
 const dev_wrappers = @import("dev_wrappers.zig");
 const num = @import("num.zig");
+const shim_symbols = @import("shim_symbols.zig");
 const RocList = @import("list.zig").RocList;
 const RocStr = @import("str.zig").RocStr;
 
@@ -550,18 +551,34 @@ pub fn exportWrappers(comptime set: ExportSet) void {
 }
 
 /// The host's task calls (design.md "Host Contract", "Backends"):
-/// `roc_task_resume`, `roc_task_wake`, `roc_task_free` and
-/// `roc_task_crash_message`, in every payload,
+/// `roc_task_resume`, `roc_task_free` and `roc_task_crash_message`, in every
+/// payload,
 /// so a compiled `Tasks` program links the same ones on every backend. The
 /// interpreter shim exports the same functions.
 pub fn exportTaskHostCalls() void {
     const task = @import("task.zig");
-    const shim_symbols = @import("shim_symbols.zig");
     @export(&task.host_calls.resumeTask, .{ .name = shim_symbols.roc_task_resume });
-    @export(&task.host_calls.wake, .{ .name = shim_symbols.roc_task_wake });
     @export(&task.host_calls.free, .{ .name = shim_symbols.roc_task_free });
     @export(&task.host_calls.crashMessage, .{ .name = shim_symbols.roc_task_crash_message });
 }
+
+/// A task call a `Tasks` program defines over a builtin (design.md
+/// "Backends"): `name(task)` is `builtin(task, host_fn)`, with the address of
+/// the host's `host_fn`. The builtins never link a host symbol themselves;
+/// the program that needs the host's function does.
+pub const ProgramTaskCall = struct {
+    name: [:0]const u8,
+    builtin: BuiltinFn,
+    host_fn: [:0]const u8,
+};
+
+/// Every `ProgramTaskCall`: `roc_task_wake` tells the host a woken parked
+/// task is ready through `roc_task_ready`; `roc_task_cancel` abandons a
+/// parked task's operation through `roc_task_abort`.
+pub const program_task_calls = [_]ProgramTaskCall{
+    .{ .name = shim_symbols.roc_task_wake, .builtin = .task_wake, .host_fn = shim_symbols.roc_task_ready },
+    .{ .name = shim_symbols.roc_task_cancel, .builtin = .task_cancel, .host_fn = shim_symbols.roc_task_abort },
+};
 
 // Overflow-arithmetic exports (`roc__num_*` scheme) present in every payload.
 // One table drives both the `@export`s and the allowlist names, so the two

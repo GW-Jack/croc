@@ -133,6 +133,8 @@ const LlvmProgram = struct {
     lowered: *const lir.CheckedPipeline.LoweredProgram,
     static_data: []static_data.StaticDataExport,
     image: eval.InspectedRun.LlvmImage,
+    /// The program's `roc_task_wake`.
+    wake: task_test_host.WakeFn,
     /// The program's `roc_task_cancel`.
     cancel: task_test_host.CancelFn,
     /// The program's `roc_task_resume`, from the builtins it links
@@ -152,6 +154,10 @@ const LlvmProgram = struct {
             .static_data = self.static_data,
             .static_data_value_count = program.static_data_values.items.len,
         }, .{ .resolve = task_test_host.resolveCAbiSymbol });
+        self.wake = self.image.lib.lookup(task_test_host.WakeFn, builtins.shim_symbols.roc_task_wake) orelse {
+            self.image.deinit();
+            return error.MissingTaskCall;
+        };
         self.cancel = self.image.lib.lookup(task_test_host.CancelFn, builtins.shim_symbols.roc_task_cancel) orelse {
             self.image.deinit();
             return error.MissingTaskCall;
@@ -178,10 +184,12 @@ const LlvmRun = struct {
     host: TestHost,
     entered: builtins.in_process_host.Saved,
 
-    fn init(self: *LlvmRun, _: Program, mode: task_test_host.Mode) E2eError!void {
+    fn init(self: *LlvmRun, program: Program, mode: task_test_host.Mode) E2eError!void {
         self.runtime = eval.RuntimeHostEnv.init(std.testing.allocator);
         const ops = self.runtime.get_ops();
         self.host = TestHost.init(std.testing.allocator, ops, mode);
+        // The host wakes through the program's own `roc_task_wake`.
+        self.host.wake = program.wake;
         self.entered = builtins.in_process_host.enter(ops, null);
         self.host.enterCAbi();
         task_test_host.c_abi_failure = null;
@@ -340,7 +348,7 @@ const WasmProgram = struct {
 
 /// The export the wasm module gives the task entry.
 const wasm_entry = "roc_task_entry";
-const task_calls = [_][]const u8{ builtins.shim_symbols.roc_task_resume, builtins.shim_symbols.roc_task_wake, builtins.shim_symbols.roc_task_free };
+const task_calls = [_][]const u8{ builtins.shim_symbols.roc_task_resume, builtins.shim_symbols.roc_task_free };
 
 /// The size of a wasm32 `Str`, and the tag a seamless slice's allocation
 /// pointer carries.
@@ -362,6 +370,8 @@ const WasmRun = struct {
     pauses: u32 = 0,
     /// How many paused operations a cancel abandoned.
     aborts: u32 = 0,
+    /// How many times a wake told the host a parked task is ready.
+    readies: u32 = 0,
     /// The first error a hosted call hit, which it cannot return.
     failure: ?E2eError = null,
 
@@ -373,6 +383,7 @@ const WasmRun = struct {
             .{ .name = "roc_host_fetch", .params = &fetch_params, .results = &.{.I32}, .callback = fetch, .context = self },
             .{ .name = "roc_host_log", .params = &task_params, .results = &.{}, .callback = log, .context = self },
             .{ .name = builtins.shim_symbols.roc_task_abort, .params = &task_params, .results = &.{}, .callback = abort, .context = self },
+            .{ .name = builtins.shim_symbols.roc_task_ready, .params = &task_params, .results = &.{}, .callback = ready, .context = self },
         }) catch return error.TestUnexpectedResult;
     }
 
@@ -497,6 +508,12 @@ const WasmRun = struct {
         self.decrefStrValue(pending.url);
     }
 
+    /// `void roc_task_ready(RocTask *task)`: a woken task was parked.
+    fn ready(context: ?*anyopaque, _: *wasm_runner.ModuleInstance, _: [*]const wasm_runner.Val, _: [*]wasm_runner.Val) error{}!void {
+        const self: *WasmRun = @ptrCast(@alignCast(context));
+        self.readies += 1;
+    }
+
     fn call(self: *WasmRun, name: []const u8, task: u32, returns: []wasm_runner.Val) E2eError!void {
         self.session.invoke(name, &.{.{ .I32 = @bitCast(task) }}, returns) catch return error.TestUnexpectedResult;
         if (self.failure) |err| return err;
@@ -591,6 +608,8 @@ fn runToEndWasm(program: *const WasmProgram, mode: task_test_host.Mode) E2eError
     try std.testing.expectEqual(expected_trace.len, run.trace.items.len);
     for (expected_trace, run.trace.items) |want, got_entry| try std.testing.expectEqualStrings(want, got_entry);
     try std.testing.expectEqual(@as(u32, if (mode == .pause) pause_count else 0), run.pauses);
+    // Every pause parks the task, and each wake of a parked task readies it.
+    try std.testing.expectEqual(run.pauses, run.readies);
     try std.testing.expectEqual(@as(i64, 0), run.session.liveAllocations());
 }
 
@@ -654,6 +673,8 @@ fn runToEnd(comptime R: type, program: R.Program, mode: task_test_host.Mode) E2e
     result.decref(run.runtime.get_ops());
     try expectTrace(&run.host);
     try std.testing.expectEqual(@as(u32, if (mode == .pause) pause_count else 0), run.host.pauses);
+    // Every pause parks the task, and each wake of a parked task readies it.
+    try std.testing.expectEqual(run.host.pauses, run.host.readies);
     try run.runtime.checkForLeaks();
 }
 

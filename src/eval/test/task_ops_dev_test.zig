@@ -122,7 +122,7 @@ test "a task paused at a hosted call resumes from its record and returns the roo
     // The host finishes: it writes the result and wakes the task, which
     // resumes in g's continuation with x restored from the record.
     @as(*align(1) u64, @ptrCast(host.slot.?)).* = 22;
-    task.wake();
+    task.wake(&lir_test.readyTask);
     try std.testing.expectEqual(builtins.task.Status.done, task.resumeTask());
     try std.testing.expectEqual(@as(u64, 42), root);
     try std.testing.expectEqual(@as(u32, 1), host.calls);
@@ -148,7 +148,7 @@ test "a task paused inside a called procedure resumes in its caller's continuati
     try std.testing.expectEqual(@as(u64, 20), host.x);
     try std.testing.expectEqual(@as(usize, 2), task.len);
     @as(*align(1) u64, @ptrCast(host.slot.?)).* = 22;
-    task.wake();
+    task.wake(&lir_test.readyTask);
     try std.testing.expectEqual(builtins.task.Status.done, task.resumeTask());
     try std.testing.expectEqual(@as(u64, 42), root);
     try std.testing.expectEqual(@as(u32, 1), host.calls);
@@ -174,7 +174,7 @@ test "cancelling a woken task releases the hosted result in its slot and its rec
     const text = builtins.str.RocStr.fromSlice("a string too long to be small", f.runtime_env.get_ops());
     try std.testing.expect(!text.isSmallStr());
     @as(*align(1) builtins.str.RocStr, @ptrCast(PausingHost.seen.slot.?)).* = text;
-    task.wake();
+    task.wake(&lir_test.readyTask);
     task.cancel(&lir_test.abortUnexpected);
     try std.testing.expectEqual(builtins.task.Status.cancelled, task.status);
     task.free();

@@ -3,7 +3,9 @@
 //! It calls `roc_main`, which returns a task, and drives that task with
 //! `roc_task_resume`. Every `roc_host_fetch` call parks: the host answers it
 //! on the next turn of its loop, writing the result to the call's `out` and
-//! waking the task. With `--finish-at-once` it answers every call during the
+//! waking the task through the program's `roc_task_wake`, which hands the
+//! parked task back through the host's `roc_task_ready`; the loop resumes
+//! only a task that was handed back. With `--finish-at-once` it answers every call during the
 //! call instead, so the same app runs both ways. With `--cancel-at N` it
 //! cancels the task through the program's `roc_task_cancel` at its Nth pause
 //! instead of answering, so the program aborts the fetch through the host's
@@ -91,6 +93,9 @@ var g_cancel_at: ?u32 = null;
 var g_cancel_woken = false;
 var g_fetches: u32 = 0;
 var g_pauses: u32 = 0;
+/// The host's ready queue: the task `roc_task_ready` handed back, which the
+/// loop resumes next. One task, so one slot.
+var g_ready: ?*RocTask = null;
 
 /// The answer to `fetch!(url)`. It owns `url`.
 fn answer(url: RocStr) RocStr {
@@ -126,9 +131,18 @@ fn taskAbort(task: *RocTask) callconv(.c) void {
     url.decref(&g_roc_ops);
 }
 
+/// `void roc_task_ready(RocTask *task)`, which every `Tasks` host defines
+/// (design.md "Host Contract"): a wake found the task parked, so it may be
+/// resumed. Queue it for the loop.
+fn taskReady(task: *RocTask) callconv(.c) void {
+    std.debug.assert(g_ready == null);
+    g_ready = task;
+}
+
 comptime {
     @export(&hostedFetch, .{ .name = "roc_host_fetch", .visibility = .hidden });
     @export(&taskAbort, .{ .name = builtins.shim_symbols.roc_task_abort, .visibility = .hidden });
+    @export(&taskReady, .{ .name = builtins.shim_symbols.roc_task_ready, .visibility = .hidden });
     host_alloc.exportRuntimeSymbols(getOps, .{});
 }
 
@@ -171,7 +185,7 @@ fn usage(arg: []const u8) c_int {
     return 1;
 }
 
-const HostError = error{ TaskCancelled, TaskCrashed, UnexpectedStatus, Leaked };
+const HostError = error{ TaskCancelled, TaskCrashed, UnexpectedStatus, NotReady, Leaked };
 
 fn platformMain() HostError!void {
     // Long enough that the string, and the answer built from it, live on the
@@ -200,6 +214,9 @@ fn platformMain() HostError!void {
             g_pending = null;
             pending.out.* = answer(pending.url);
             roc_task_wake(pending.task);
+            // The task was parked, so the wake handed it back.
+            if (g_ready != pending.task) return error.NotReady;
+            g_ready = null;
         }
         if (cancelling) {
             // Unwoken, the program aborts the fetch through `taskAbort`.

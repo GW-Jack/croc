@@ -20,7 +20,7 @@ const Allocator = std.mem.Allocator;
 
 const layout = @import("layout");
 const lir = @import("lir");
-const shim_symbols = @import("builtins").shim_symbols;
+const program_task_calls = @import("builtins").builtin_registry.program_task_calls;
 const CoreCtx = @import("ctx").CoreCtx;
 const LirStore = lir.LirStore;
 const LirProcSpec = lir.LirProcSpec;
@@ -917,11 +917,11 @@ fn compileWithCodeGen(
             return CompilationError.OutOfMemory;
         };
     }
-    // A `Tasks` program's own `roc_task_cancel` (design.md "Backends").
-    if (lir_store.createsTask()) {
-        const export_info = final.generateTaskCancel() catch return CompilationError.OutOfMemory;
+    // A `Tasks` program's own `ProgramTaskCall`s (design.md "Backends").
+    if (lir_store.createsTask()) for (program_task_calls) |call| {
+        const export_info = final.generateProgramTaskCall(call) catch return CompilationError.OutOfMemory;
         appendDefinition(allocator, &final.codegen.symbols, &symbols, .{
-            .name = shim_symbols.roc_task_cancel,
+            .name = call.name,
             .offset = export_info.offset,
             .size = export_info.size,
             .is_global = true,
@@ -935,7 +935,7 @@ fn compileWithCodeGen(
             .epilogue_offset = export_info.epilogue_offset,
             .uses_frame_pointer = export_info.uses_frame_pointer,
         }) catch return CompilationError.OutOfMemory;
-    }
+    };
     if (timing) |timings| timings.finish(entrypoint_instructions_started_ns, .entrypoint_instructions);
 
     // Get generated code and relocations
@@ -1475,11 +1475,11 @@ fn compilePiecesWithCodeGen(
     for (entrypoints) |entrypoint| {
         _ = codegen.generateEntrypointWrapper(entrypoint.symbol_name, entrypoint.proc, entrypoint.arg_layouts, entrypoint.ret_layout) catch return CompilationError.OutOfMemory;
     }
-    // A `Tasks` program's own `roc_task_cancel` (design.md "Backends"). A
-    // run image's comes from the generated platform shim module instead.
-    if (!internal_entrypoints and lir_store.createsTask()) {
-        _ = codegen.generateTaskCancel() catch return CompilationError.OutOfMemory;
-    }
+    // A `Tasks` program's own `ProgramTaskCall`s (design.md "Backends"). A
+    // run image's come from the generated platform shim module instead.
+    if (!internal_entrypoints and lir_store.createsTask()) for (program_task_calls) |call| {
+        _ = codegen.generateProgramTaskCall(call) catch return CompilationError.OutOfMemory;
+    };
     codegen.generation_mode = .object_file;
     if (timing) |timings| timings.finish(entrypoint_instructions_started_ns, .entrypoint_instructions);
     const extraction_started_ns = if (timing) |timings| timings.start() else 0;

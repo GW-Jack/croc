@@ -3,7 +3,8 @@
 //! `wasm_main`.
 //!
 //! `wasm_configure(mode, pause)` picks how the next `wasm_main` runs:
-//! - 0: answer every `roc_host_fetch` on the next turn of the loop;
+//! - 0: answer every `roc_host_fetch` on the next turn of the loop, waking
+//!   the task, which the program hands back through `roc_task_ready`;
 //! - 1: answer every fetch during the call;
 //! - 2: cancel at pause `pause` before answering, so the program aborts the
 //!   fetch through `roc_task_abort`;
@@ -170,9 +171,21 @@ fn taskAbort(task: *RocTask) callconv(.c) void {
     url.decref(&roc_ops);
 }
 
+/// The host's ready queue: the task `roc_task_ready` handed back, which the
+/// loop resumes next. One task, so one slot.
+var ready: ?*RocTask = null;
+
+/// `void roc_task_ready(RocTask *task)`: a wake found the task parked, so
+/// it may be resumed. Queue it for the loop.
+fn taskReady(task: *RocTask) callconv(.c) void {
+    if (ready != null) @panic("roc_task_ready while a task is already queued");
+    ready = task;
+}
+
 comptime {
     @export(&hostedFetch, .{ .name = "roc_host_fetch", .visibility = .hidden });
     @export(&taskAbort, .{ .name = shim_symbols.roc_task_abort, .visibility = .hidden });
+    @export(&taskReady, .{ .name = shim_symbols.roc_task_ready, .visibility = .hidden });
 }
 
 extern fn roc_main(url: RocStr, result_out: *RocStr) callconv(.c) *RocTask;
@@ -197,6 +210,7 @@ export fn wasm_configure(new_mode: u32, pause: u32) void {
 /// Run the app once and return the address of its report.
 export fn wasm_main() [*]const u8 {
     pending = null;
+    ready = null;
     fetches = 0;
     pauses = 0;
     // Long enough that the string, and the answer built from it, live on the
@@ -216,6 +230,9 @@ export fn wasm_main() [*]const u8 {
             pending = null;
             parked.out.* = answer(parked.url);
             roc_task_wake(parked.task);
+            // The task was parked, so the wake handed it back.
+            if (ready != parked.task) @panic("a woken parked task was not handed back");
+            ready = null;
         }
         if (cancelling) {
             roc_task_cancel(task);

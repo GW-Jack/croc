@@ -34014,16 +34014,17 @@ void roc_task_ready(RocTask *task);           /* host: resume it once */
 void roc_task_abort(RocTask *task);           /* host: abandon its operation */
 ```
 
-The builtins object exports `roc_task_resume`, `roc_task_wake` and
-`roc_task_free` (`RocTask.host_calls`). Each program binary defines them
-exactly once, since a second definition collides in the link. The
-interpreter shim and the machine-code shim define them from the copy of the
-builtins that runs the program's records (One runtime per process,
-Backends).
-`roc_task_cancel` calls the host's `roc_task_abort`, which only the host of
-a `Tasks` platform defines. So a `Tasks` program defines `roc_task_cancel`
-itself rather than getting it from the builtins object, and a program of
-another mode neither defines it nor refers to `roc_task_abort` (Backends).
+The builtins object exports `roc_task_resume` and `roc_task_free`
+(`RocTask.host_calls`). Each program binary defines them exactly once, since
+a second definition collides in the link. The interpreter shim and the
+machine-code shim define them from the copy of the builtins that runs the
+program's records (One runtime per process, Backends).
+`roc_task_wake` calls the host's `roc_task_ready` and `roc_task_cancel`
+calls the host's `roc_task_abort`, which only the host of a `Tasks`
+platform defines. The builtins never refer to a host symbol, so a `Tasks`
+program defines both calls itself (its program task calls), each a call
+to its registry builtin with the host's function, and a program of another
+mode neither defines them nor refers to the host's two (Backends).
 
 These symbols join the fixed runtime set, and the glue templates of a
 `Tasks` platform declare all of them with `RocTask`, `RocPoll` and
@@ -34305,36 +34306,39 @@ byte:
   `RocPoll`: 0 is `ROC_READY` and 1 is `ROC_PENDING`. The site's switch
   takes 0 as ready and every other value as pending. `out` is
   `task_hosted_slot(task)`.
-- **The host's calls.** A compiled `Tasks` program gets `roc_task_resume`,
-  `roc_task_wake` and `roc_task_free` from the builtins object linked into
-  it, so every backend links the same symbols. The interpreter shim
-  defines them from the interpreter's own copy of the builtins, and the
-  object it bundles leaves them out (One runtime per process). LLVM
-  links the builtins into the program privately, keeping only what the
-  program itself defines, so a program that creates a task defines the three
-  calls itself, each a call to its registry builtin
-  (`roc_builtins_task_resume`, `_wake`, `_free`). A dev `roc run` loads
-  the program's builtins with its image, after the host is linked, so the
-  machine-code shim the host links defines the three calls from its own
-  builtins, which the image's builtin calls resolve to, so the process has
-  one runtime and one running task (One runtime per process).
-- **Cancelling.** `roc_task_cancel(task)` calls the registry builtin
-  `roc_builtins_task_cancel(task, abort)`, `callconv(.c)`, with the host's
-  `roc_task_abort` as `abort`; the builtin is `RocTask.cancel`. A `Tasks`
-  program defines it where the program's own symbols live:
-  - LLVM, in the program's module, beside the other three calls;
+- **The host's calls.** A compiled `Tasks` program gets `roc_task_resume`
+  and `roc_task_free` from the builtins object linked into it, so every
+  backend links the same symbols. The interpreter shim defines them from
+  the interpreter's own copy of the builtins, and the object it bundles
+  leaves them out (One runtime per process). LLVM links the builtins into
+  the program privately, keeping only what the program itself defines, so a
+  program that creates a task defines these calls itself, each a call to
+  its registry builtin (`roc_builtins_task_resume`, `_free`). A dev
+  `roc run` loads the program's builtins with its image, after the host is
+  linked, so the machine-code shim the host links defines these calls from
+  its own builtins, which the image's builtin calls resolve to, so the
+  process has one runtime and one running task (One runtime per process).
+- **Program task calls.** `roc_task_wake(task)` calls the registry builtin
+  `roc_builtins_task_wake(task, ready)` with the host's `roc_task_ready`
+  as `ready` (`RocTask.wake`), and `roc_task_cancel(task)` calls
+  `roc_builtins_task_cancel(task, abort)` with the host's
+  `roc_task_abort` as `abort` (`RocTask.cancel`), both `callconv(.c)`.
+  One table, `builtin_registry.program_task_calls`, lists them, and every
+  backend defines each the same way, where the program's own symbols live:
+  - LLVM, in the program's module, beside the host's calls;
   - the dev backend's object file (`roc build --opt=dev`), beside its
     entrypoint wrappers, in the same frame they get. The builtins object it
-    links defines the other three calls in every payload;
-  - wasm, in the final module, which imports `roc_task_abort` from `env`
-    like a hosted function, puts it in the table, and exports
-    `roc_task_cancel`;
+    links defines the host's calls in every payload;
+  - wasm, in the final module, which imports `roc_task_ready` and
+    `roc_task_abort` from `env` like hosted functions, puts them in the
+    table, and exports `roc_task_wake` and `roc_task_cancel`;
   - a shim build (the interpreter's, or the dev backend's run image), in the
     generated platform shim module, which the CLI generates knowing whether
     the program creates a task (`LirStore.createsTask`). The shim archive
-    defines the builtin: the interpreter shim's builtins object exports
+    defines the builtins: the interpreter shim's builtins object exports
     every core wrapper, and the machine-code shim exports
-    `roc_builtins_task_cancel` beside the three calls.
+    `roc_builtins_task_wake` and `roc_builtins_task_cancel` beside the
+    host's calls.
 
   The CLI's `Tasks` fixture host cancels through `roc_task_cancel` at a
   chosen pause, before and after waking the task, on every backend the CLI
@@ -34353,8 +34357,8 @@ byte:
     root, at a tail site, and an erased-ABI procedure stores its result
     through `ret` after its body.
 
-  A final wasm module exports the merged builtins' `roc_task_resume`,
-  `roc_task_wake` and `roc_task_free` by those names, next to its
+  A final wasm module exports the merged builtins' `roc_task_resume` and
+  `roc_task_free` by those names, and the program task calls, next to its
   entrypoints.
 - **Builtins.** `roc_builtins_task_create` and
   `roc_builtins_task_push_record` are registry builtins, one wrapper each,
@@ -34374,11 +34378,11 @@ at each pause as the others do.
 The CLI builds a `Tasks` program for wasm32 on every backend, as a sealed
 relocatable object that the platform's `host.wasm` links against:
 - the object's public definitions add the task calls the host's code calls
-  (`roc_task_resume`, `roc_task_wake` and `roc_task_free` from the merged
-  builtins, and the program's `roc_task_cancel`), and its allowed imports
-  add `roc_task_abort`, which the host defines;
-- in a relocatable object, `roc_task_cancel` is a global symbol under its
-  own name, and it names `roc_task_abort`'s table slot by a
+  (`roc_task_resume` and `roc_task_free` from the merged builtins, and the
+  program's `roc_task_wake` and `roc_task_cancel`), and its allowed imports
+  add `roc_task_ready` and `roc_task_abort`, which the host defines;
+- in a relocatable object, each program task call is a global symbol under
+  its own name, and it names its host function's table slot by a
   `table_index_rel_sleb` relocation against the import's symbol, as any
   function whose address the object takes.
 

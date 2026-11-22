@@ -4,8 +4,10 @@
 //! the same outcomes as the interpreter's, from records compiled code packs
 //! inside wasm memory.
 //!
-//! A task is cancelled through the module's own `roc_task_cancel`, which
-//! calls the host's `roc_task_abort` (design.md "Backends").
+//! A task is woken through the module's own `roc_task_wake`, which calls
+//! the host's `roc_task_ready` for a parked task, and cancelled through its
+//! `roc_task_cancel`, which calls the host's `roc_task_abort` (design.md
+//! "Backends").
 
 const std = @import("std");
 const builtins = @import("builtins");
@@ -37,6 +39,9 @@ const PausingHost = struct {
     /// The task the last `roc_task_abort` was given.
     aborted: u32 = 0,
     aborts: u32 = 0,
+    /// The task the last `roc_task_ready` was given.
+    readied: u32 = 0,
+    readies: u32 = 0,
 
     fn pause(context: ?*anyopaque, _: *wasm_runner.ModuleInstance, params: [*]const Val, results: [*]Val) error{}!void {
         const self: *PausingHost = @ptrCast(@alignCast(context));
@@ -52,6 +57,13 @@ const PausingHost = struct {
         const self: *PausingHost = @ptrCast(@alignCast(context));
         self.aborts += 1;
         self.aborted = @bitCast(params[0].I32);
+    }
+
+    /// `void roc_task_ready(RocTask *task)`.
+    fn ready(context: ?*anyopaque, _: *wasm_runner.ModuleInstance, params: [*]const Val, _: [*]Val) error{}!void {
+        const self: *PausingHost = @ptrCast(@alignCast(context));
+        self.readies += 1;
+        self.readied = @bitCast(params[0].I32);
     }
 };
 
@@ -72,7 +84,7 @@ const WasmRun = struct {
         const objects = eval.InspectedRun.wasmRuntimeObjects(.default);
         const module = try codegen.generateEntrypointModule(
             &.{.{ .symbol_name = "roc_task_entry", .proc = entry, .arg_layouts = &.{ .u64, .opaque_ptr }, .ret_layout = .opaque_ptr }},
-            &.{ shim_symbols.roc_task_resume, shim_symbols.roc_task_wake, shim_symbols.roc_task_free },
+            &.{ shim_symbols.roc_task_resume, shim_symbols.roc_task_free },
             objects.builtins,
             objects.boxy_runtime,
         );
@@ -88,6 +100,12 @@ const WasmRun = struct {
             .params = &.{.I32},
             .results = &.{},
             .callback = PausingHost.abort,
+            .context = &self.host,
+        }, .{
+            .name = shim_symbols.roc_task_ready,
+            .params = &.{.I32},
+            .results = &.{},
+            .callback = PausingHost.ready,
             .context = &self.host,
         } });
     }
@@ -135,7 +153,12 @@ test "a task paused at a hosted call resumes from its record and returns the roo
     // The host finishes: it writes the result and wakes the task, which
     // resumes in g's continuation with x restored from the record.
     std.mem.writeInt(u64, run.session.memory()[run.host.slot..][0..8], 22, .little);
+    try std.testing.expectEqual(@as(u32, 0), run.host.readies);
     try run.call(shim_symbols.roc_task_wake, task);
+    // The task was parked, so the wake readies it through the host's
+    // `roc_task_ready`.
+    try std.testing.expectEqual(@as(u32, 1), run.host.readies);
+    try std.testing.expectEqual(task, run.host.readied);
     try std.testing.expectEqual(Status.done, try run.resumeTask(task));
     try std.testing.expectEqual(@as(u64, 42), std.mem.readInt(u64, run.session.memory()[root..][0..8], .little));
     try std.testing.expectEqual(@as(u32, 1), run.host.calls);

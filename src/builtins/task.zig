@@ -38,6 +38,21 @@ pub const Entry = extern struct {
 /// parked on (design.md "Host Contract").
 pub const AbortFn = *const fn (*RocTask) callconv(.c) void;
 
+/// The host's `roc_task_ready`: resume the task once (design.md "Host
+/// Contract"). The runtime calls it from `wake` exactly once per park.
+pub const ReadyFn = *const fn (*RocTask) callconv(.c) void;
+
+/// The wake word's parked bit (design.md "The Task Runtime"). The low bits
+/// count completions the host published and no resume has consumed yet.
+const wake_parked: u32 = 1 << 31;
+
+/// A host broke the host contract (design.md "Host Contract"). A runtime
+/// with safety checks crashes with the obligation's message; one without
+/// does no check, and the caller carries on as the contract assumes.
+fn hostViolation(ops: *RocOps, comptime message: []const u8) void {
+    if (std.debug.runtime_safety) ops.crash("host contract violated: " ++ message);
+}
+
 /// The sizes and alignments of a task's two buffers, which the continuation
 /// pass records as program constants.
 pub const BufferLayout = struct {
@@ -53,10 +68,6 @@ pub const BufferLayout = struct {
 pub const host_calls = struct {
     pub fn resumeTask(task: *RocTask) callconv(.c) u32 {
         return @backingInt(task.resumeTask());
-    }
-
-    pub fn wake(task: *RocTask) callconv(.c) void {
-        task.wake();
     }
 
     pub fn free(task: *RocTask) callconv(.c) void {
@@ -145,8 +156,14 @@ pub const RocTask = extern struct {
     /// suspend, and where its caller's resume entry reads it.
     result_buffer: [*]u8,
 
-    /// Whether the host wrote the hosted slot since the last resume.
-    woken: bool,
+    /// The wake word of the task's one wait source, its hosted operation:
+    /// `wake_parked` while the task is parked, and a count of completions
+    /// published and not yet consumed (design.md "The Task Runtime"). The
+    /// only field two threads touch, so only atomic operations reach it.
+    wake_word: u32,
+    /// Whether the host's first resume has run; a later resume needs a
+    /// `roc_task_ready`.
+    started: bool,
     /// `pending` while the task can be resumed or cancelled.
     status: Status,
     /// Where the outermost record writes the root's result.
@@ -177,7 +194,8 @@ pub const RocTask = extern struct {
             .pending = 0,
             .hosted_slot = allocBuffer(ops, buffers.hosted_slot_size, buffers.hosted_slot_alignment),
             .result_buffer = allocBuffer(ops, buffers.result_buffer_size, buffers.result_buffer_alignment),
-            .woken = false,
+            .wake_word = 0,
+            .started = false,
             .status = .pending,
             .root_result = root_result,
             .entries = undefined,
@@ -219,8 +237,16 @@ pub const RocTask = extern struct {
     /// empty, the task pauses again or it crashes.
     pub fn resumeTask(self: *RocTask) Status {
         if (self.status != .pending) utils.builtinInvariant(self.ops, "a finished, cancelled or crashed task was resumed");
+        if (self.started) {
+            // Readied: the host's one completion is counted and the parked
+            // bit is clear. Consuming it with acquire ordering makes the
+            // hosted slot the host wrote visible.
+            const word = @atomicRmw(u32, &self.wake_word, .Xchg, 0, .acquire);
+            if (word != 1) hostViolation(self.ops, "a task was resumed without a roc_task_ready (P1)");
+        } else {
+            self.started = true;
+        }
         self.pending = 0;
-        self.woken = false;
         const exits = crash_exit.available();
         while (self.len > 0) {
             self.len -= 1;
@@ -236,7 +262,12 @@ pub const RocTask = extern struct {
             running = null;
             std.mem.reverse(Entry, self.entries[base..self.len]);
             erased_callable.decref(entry.record, self.ops);
-            if (self.pending != 0) return .pending;
+            if (self.pending != 0) {
+                if (self.park()) return .pending;
+                // The completion came before the park: run on, from the
+                // hosted site's resume entry.
+                self.pending = 0;
+            }
         }
         self.status = .done;
         return .done;
@@ -255,10 +286,37 @@ pub const RocTask = extern struct {
         return .crashed;
     }
 
-    /// `roc_task_wake`: the host wrote the hosted slot.
-    pub fn wake(self: *RocTask) void {
-        if (self.status != .pending or self.pending == 0) utils.builtinInvariant(self.ops, "a task was woken while not parked");
-        self.woken = true;
+    /// Park the task on its hosted operation: set the parked bit, but only
+    /// while no completion is counted. False when the host already woke the
+    /// task (a host that finished on another thread before the hosted
+    /// function returned); the resume then consumes that completion and
+    /// carries on, so it is never lost and no `roc_task_ready` is due.
+    fn park(self: *RocTask) bool {
+        const seen = @cmpxchgStrong(u32, &self.wake_word, 0, wake_parked, .acq_rel, .acquire) orelse return true;
+        if (seen != 1) hostViolation(self.ops, "a task was woken more than once for one operation (P3)");
+        @atomicStore(u32, &self.wake_word, 0, .monotonic);
+        return false;
+    }
+
+    /// `roc_task_wake`, from any thread: the host wrote the hosted slot.
+    /// Count the completion and clear the parked bit in one atomic step
+    /// with release ordering, so the slot is visible to the resume that
+    /// consumes it; if the task was parked, it is ready to resume, so tell
+    /// the host once through `ready_fn`, the host's `roc_task_ready`.
+    ///
+    /// The task has one wait source, so a completion is never counted
+    /// twice: the swap's result is 0 (running, not yet parked) or
+    /// `wake_parked`. A milestone 4 running set has a word of its own,
+    /// whose count may exceed one.
+    pub fn wake(self: *RocTask, ready_fn: ReadyFn) void {
+        const word = @atomicRmw(u32, &self.wake_word, .Xchg, 1, .release);
+        if (word & ~wake_parked != 0) hostViolation(self.ops, "a task was woken more than once for one operation (P3)");
+        if (word & wake_parked != 0) ready_fn(self);
+    }
+
+    /// Whether the host's completion is counted and not consumed.
+    fn woken(self: *RocTask) bool {
+        return @atomicLoad(u32, &self.wake_word, .acquire) & ~wake_parked != 0;
     }
 
     /// `roc_task_cancel`: abandon the parked task's operation with `abort`
@@ -266,7 +324,7 @@ pub const RocTask = extern struct {
     /// the host wrote and every record.
     pub fn cancel(self: *RocTask, abort: AbortFn) void {
         if (self.status != .pending or self.pending == 0) utils.builtinInvariant(self.ops, "a task was cancelled while not parked");
-        if (self.woken) {
+        if (self.woken()) {
             const innermost = self.entries[self.len - 1];
             if (innermost.slot_drop) |slot_drop| slot_drop(self.hosted_slot, innermost.record, self.ops);
         } else {
@@ -344,6 +402,10 @@ const TestStep = extern struct {
     /// With `crashes`, crash this many frames down a chain of calls that
     /// each hold values across the next (`crashDeep`).
     crash_depth: u8 = 0,
+    /// With `pauses`, wake the task before returning, as a host that
+    /// finished the operation on another thread before the hosted function
+    /// returned does.
+    wakes_early: bool = false,
 };
 
 const TestLog = struct {
@@ -353,6 +415,7 @@ const TestLog = struct {
     var drops: usize = 0;
     var slot_drops: usize = 0;
     var aborts: usize = 0;
+    var readies: usize = 0;
     /// What `crashDeep` would return; never written, since it crashes.
     var deep_sink: u64 = 0;
 
@@ -361,6 +424,7 @@ const TestLog = struct {
         drops = 0;
         slot_drops = 0;
         aborts = 0;
+        readies = 0;
     }
 };
 
@@ -373,7 +437,10 @@ fn testStepCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, 
     for (step.saves) |save| if (save) |record| task.pushRecord(record, &testSlotDrop);
     if (step.crashes and step.crash_depth > 0) TestLog.deep_sink = @call(.never_inline, crashDeep, .{ ops, step.crash_depth, step.id });
     if (step.crashes) ops.crash("a record crashed");
-    if (step.pauses) task.setPending();
+    if (step.pauses) {
+        task.setPending();
+        if (step.wakes_early) task.wake(&testReady);
+    }
     ret.?[0] = step.result;
 }
 
@@ -403,6 +470,10 @@ fn testSlotDrop(_: [*]u8, _: [*]u8, _: *RocOps) callconv(.c) void {
 
 fn testAbort(_: *RocTask) callconv(.c) void {
     TestLog.aborts += 1;
+}
+
+fn testReady(_: *RocTask) callconv(.c) void {
+    TestLog.readies += 1;
 }
 
 fn testRecord(ops: *RocOps, step: TestStep) [*]u8 {
@@ -448,7 +519,7 @@ test "a resume runs an unwind's records innermost first, the outermost into the 
 
     try std.testing.expectEqual(Status.pending, task.resumeTask());
     try std.testing.expectEqual(@as(usize, 2), task.len);
-    task.wake();
+    task.wake(&testReady);
     try std.testing.expectEqual(Status.done, task.resumeTask());
 
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, TestLog.calls[0..TestLog.call_count]);
@@ -475,9 +546,9 @@ test "records a resumed record saves go before the records still waiting" {
     const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ inner, outer }, .pauses = true, .result = 0 }), &root, test_buffers);
 
     try std.testing.expectEqual(Status.pending, task.resumeTask());
-    task.wake();
+    task.wake(&testReady);
     try std.testing.expectEqual(Status.pending, task.resumeTask());
-    task.wake();
+    task.wake(&testReady);
     try std.testing.expectEqual(Status.done, task.resumeTask());
 
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 4, 5, 9 }, TestLog.calls[0..TestLog.call_count]);
@@ -516,7 +587,7 @@ test "cancelling a woken task releases the hosted result instead of aborting" {
     const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ inner, null }, .pauses = true, .result = 0 }), &root, test_buffers);
 
     try std.testing.expectEqual(Status.pending, task.resumeTask());
-    task.wake();
+    task.wake(&testReady);
     task.cancel(&testAbort);
     try std.testing.expectEqual(@as(usize, 0), TestLog.aborts);
     try std.testing.expectEqual(@as(usize, 1), TestLog.slot_drops);
@@ -525,7 +596,7 @@ test "cancelling a woken task releases the hosted result instead of aborting" {
     try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
 }
 
-test "the host's C calls resume, wake and free a task and report its status as a C enum" {
+test "the host's C calls resume and free a task and report its status as a C enum" {
     var test_env = utils.TestEnv.init(std.testing.allocator);
     defer test_env.deinit();
     const ops = test_env.getOps();
@@ -535,10 +606,57 @@ test "the host's C calls resume, wake and free a task and report its status as a
     const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ inner, null }, .pauses = true, .result = 10 }), &root, test_buffers);
 
     try std.testing.expectEqual(@as(u32, 0), host_calls.resumeTask(task));
-    host_calls.wake(task);
+    task.wake(&testReady);
     try std.testing.expectEqual(@as(u32, 1), host_calls.resumeTask(task));
     try std.testing.expectEqual(@as(u8, 20), root[0]);
     host_calls.free(task);
+    try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
+}
+
+test "each park gets exactly one roc_task_ready, from the wake" {
+    var test_env = utils.TestEnv.init(std.testing.allocator);
+    defer test_env.deinit();
+    const ops = test_env.getOps();
+    TestLog.reset();
+    // Pauses twice: 1 saves 2, which saves 3; each pause parks once.
+    const last = testRecord(ops, .{ .id = 3, .saves = .{ null, null }, .pauses = false, .result = 30 });
+    const middle = testRecord(ops, .{ .id = 2, .saves = .{ last, null }, .pauses = true, .result = 0 });
+    var root: [1]u8 = .{0};
+    const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ middle, null }, .pauses = true, .result = 0 }), &root, test_buffers);
+
+    try std.testing.expectEqual(Status.pending, task.resumeTask());
+    try std.testing.expectEqual(wake_parked, task.wake_word);
+    try std.testing.expectEqual(@as(usize, 0), TestLog.readies);
+    task.wake(&testReady);
+    try std.testing.expectEqual(@as(u32, 1), task.wake_word);
+    try std.testing.expectEqual(@as(usize, 1), TestLog.readies);
+    try std.testing.expectEqual(Status.pending, task.resumeTask());
+    task.wake(&testReady);
+    try std.testing.expectEqual(@as(usize, 2), TestLog.readies);
+    try std.testing.expectEqual(Status.done, task.resumeTask());
+    try std.testing.expectEqual(@as(u32, 0), task.wake_word);
+    try std.testing.expectEqual(@as(u8, 30), root[0]);
+    task.free();
+    try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
+}
+
+test "a completion that arrives before the task parks is consumed by the same resume, with no roc_task_ready" {
+    var test_env = utils.TestEnv.init(std.testing.allocator);
+    defer test_env.deinit();
+    const ops = test_env.getOps();
+    TestLog.reset();
+    // 1 saves 2 and pauses, but its host finished first: the resume runs
+    // straight on into 2 instead of returning PENDING.
+    const inner = testRecord(ops, .{ .id = 2, .saves = .{ null, null }, .pauses = false, .result = 20 });
+    var root: [1]u8 = .{0};
+    const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ inner, null }, .pauses = true, .result = 0, .wakes_early = true }), &root, test_buffers);
+
+    try std.testing.expectEqual(Status.done, task.resumeTask());
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, TestLog.calls[0..TestLog.call_count]);
+    try std.testing.expectEqual(@as(usize, 0), TestLog.readies);
+    try std.testing.expectEqual(@as(u32, 0), task.wake_word);
+    try std.testing.expectEqual(@as(u8, 20), root[0]);
+    task.free();
     try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
 }
 
@@ -556,7 +674,7 @@ test "a crash in a resumed record ends its task, releases every record and keeps
     const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ inner, outer }, .pauses = true, .result = 0 }), &root, test_buffers);
 
     try std.testing.expectEqual(Status.pending, task.resumeTask());
-    task.wake();
+    task.wake(&testReady);
     try std.testing.expectEqual(@as(u32, 3), host_calls.resumeTask(task));
     try std.testing.expectEqual(Status.crashed, task.status);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, TestLog.calls[0..TestLog.call_count]);

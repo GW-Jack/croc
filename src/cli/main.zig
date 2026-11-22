@@ -1395,8 +1395,8 @@ fn generatePlatformHostShimFromLirData(
     defer codegen.deinit();
 
     // A `Tasks` program's own symbols live in this module in a shim build,
-    // `roc_task_cancel` among them (design.md "Backends").
-    const defines_task_cancel = store.createsTask();
+    // its `ProgramTaskCall`s among them (design.md "Backends").
+    const defines_program_task_calls = store.createsTask();
     var bitcode_result = codegen.generateInterpreterShimModule(
         "roc_platform_shim",
         shim_entrypoints,
@@ -1404,7 +1404,7 @@ fn generatePlatformHostShimFromLirData(
         package_symbols,
         embedded_lir_image,
         default_run_start,
-        defines_task_cancel,
+        defines_program_task_calls,
     ) catch |err| {
         return ctx.fail(.{ .shim_generation_failed = .{ .err = err } });
     };
@@ -1431,7 +1431,7 @@ fn generatePlatformHostShimFromLirData(
     hash.update(&image_len_bytes);
     hash.update(if (embedded_lir_image != null) "embed" else "dispatch");
     hash.update(if (default_run_start) "default-run-start" else "host-provided-start");
-    hash.update(if (defines_task_cancel) "task-cancel" else "no-task-cancel");
+    hash.update(if (defines_program_task_calls) "program-task-calls" else "no-program-task-calls");
     for (entrypoint_names) |name| {
         hash.update(name);
         hash.update(&[_]u8{0});
@@ -8731,20 +8731,21 @@ fn wasmRocHostRequirements(
     store: *const lir.LirStore,
 ) std.mem.Allocator.Error![]const []const u8 {
     const hosted = try hostedSymbolsFromLir(arena, store);
-    // A `Tasks` program's `roc_task_cancel` calls the host's
-    // `roc_task_abort` (design.md "Host Contract").
-    const task_abort: []const []const u8 = if (store.createsTask()) &.{shim_symbols.roc_task_abort} else &.{};
-    const requirements = try arena.alloc([]const u8, hosted.len + host_symbols.runtime_symbols.len + task_abort.len);
+    // A `Tasks` program's `ProgramTaskCall`s call the host's
+    // `roc_task_ready` and `roc_task_abort` (design.md "Host Contract").
+    const program_task_calls = &builtins_registry.program_task_calls;
+    const task_host_fns = if (store.createsTask()) program_task_calls.len else 0;
+    const requirements = try arena.alloc([]const u8, hosted.len + host_symbols.runtime_symbols.len + task_host_fns);
     @memcpy(requirements[0..hosted.len], hosted);
     @memcpy(requirements[hosted.len..][0..host_symbols.runtime_symbols.len], &host_symbols.runtime_symbols);
-    @memcpy(requirements[hosted.len + host_symbols.runtime_symbols.len ..], task_abort);
+    for (requirements[hosted.len + host_symbols.runtime_symbols.len ..], program_task_calls[0..task_host_fns]) |*requirement, call| requirement.* = call.host_fn;
     return requirements;
 }
 
 /// The public definitions of a sealed wasm app object: its entrypoints and
 /// exported static data, and, for a `Tasks` program, the task calls the
 /// host's code calls (design.md "Host Contract"), which the object defines
-/// (the merged builtins' three and the program's `roc_task_cancel`).
+/// (the merged builtins' three and the program's `ProgramTaskCall`s).
 fn wasmAppExports(
     ctx: *CliCtx,
     store: *const lir.LirStore,

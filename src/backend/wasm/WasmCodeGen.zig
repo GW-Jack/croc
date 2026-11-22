@@ -18,6 +18,7 @@ const base = @import("base");
 const collections = @import("collections");
 const numeric_conversion = base.numeric_conversion;
 const builtins = @import("builtins");
+const program_task_calls = builtins.builtin_registry.program_task_calls;
 const layout = @import("layout");
 /// Dec's scaling factor (10^18) as an i64, sourced from the canonical Dec type.
 const dec_one_i64: i64 = @intCast(builtins.dec.RocDec.one_point_zero_i128);
@@ -382,12 +383,13 @@ tail_drivers: std.ArrayList(TailDriver) = .empty,
 /// names as its slot release, by the helper's atomic cache key, registered
 /// with its table slot before any body is generated (design.md "Backends").
 slot_drop_adapters: std.AutoArrayHashMapUnmanaged(u64, SlotDropAdapter) = .empty,
-/// The host's `roc_task_abort`, imported when the program creates a task
-/// (design.md "Backends").
-task_abort: ?HostedSymbolTarget = null,
-/// The program's `roc_task_cancel`, defined after the procedure bodies when
-/// it imports `roc_task_abort`.
-task_cancel: ?index_types.DefinedFunction = null,
+/// The host function each `ProgramTaskCall` passes (`roc_task_ready`,
+/// `roc_task_abort`), imported when the program creates a task (design.md
+/// "Backends").
+task_host_fns: ?[program_task_calls.len]HostedSymbolTarget = null,
+/// The program's `ProgramTaskCall`s, defined after the procedure bodies when
+/// it imports their host functions.
+program_task_call_fns: ?[program_task_calls.len]index_types.DefinedFunction = null,
 /// Where the current proc keeps its return value until epilogue time: a wasm
 /// local, or in split mode a frame slot every function of the family reads.
 proc_return: Storage.LocalInfo = .{ .idx = 0, .val_type = .i32 },
@@ -2056,7 +2058,9 @@ fn finishFinalModule(self: *Self) Allocator.Error![]u8 {
         const hosted_proc = spec.hosted.get() orelse continue;
         try hosted.append(self.allocator, self.store.getString(hosted_proc.symbol));
     }
-    if (self.task_abort != null) try hosted.append(self.allocator, builtins.shim_symbols.roc_task_abort);
+    if (self.task_host_fns != null) {
+        for (program_task_calls) |call| try hosted.append(self.allocator, call.host_fn);
+    }
     self.module.verifyNoBuiltinImports(hosted.items) catch {
         wasmInvariantFmt("WASM/codegen invariant violated: eval module retains a builtin host import", .{});
     };
@@ -2120,8 +2124,10 @@ pub fn generateEntrypointModule(
     for (entrypoints, wrappers) |entry, wrapper| {
         self.module.addExport(entry.symbol_name, .func, wrapper) catch return error.OutOfMemory;
     }
-    if (self.task_cancel) |cancel| {
-        self.module.addExport(builtins.shim_symbols.roc_task_cancel, .func, cancel.function.raw()) catch return error.OutOfMemory;
+    if (self.program_task_call_fns) |fns| {
+        for (program_task_calls, fns) |call, defined| {
+            self.module.addExport(call.name, .func, defined.function.raw()) catch return error.OutOfMemory;
+        }
     }
     for (runtime_exports) |name| {
         const symbol = self.module.findDefinedFunctionSymbolExact(name) catch |err| wasmInvariantFmt(
@@ -6514,27 +6520,34 @@ pub fn compileAllProcSpecs(self: *Self, proc_specs: []const LirProcSpec) Allocat
     try self.compileProcBodies(proc_specs);
     try self.compileTailDrivers();
     try self.compileSlotDropAdapters();
-    try self.compileTaskCancel();
+    try self.compileProgramTaskCalls();
 }
 
-/// Define `roc_task_cancel(task)`, once, when the program imports the
-/// host's `roc_task_abort`: a call to the builtin `task_cancel` with the
-/// abort's table slot (design.md "Backends"). No body calls it, so it is
-/// made after the bodies. Its symbol is global under its own name, so a
+/// Define each `ProgramTaskCall` `name(task)`, once, when the program
+/// imports the host functions: a call to its builtin with the host
+/// function's table slot (design.md "Backends"). No body calls them, so they
+/// are made after the bodies. Each symbol is global under its own name, so a
 /// relocatable object keeps it public for the host's link, and a final
 /// module exports it.
-fn compileTaskCancel(self: *Self) Allocator.Error!void {
-    const abort = self.task_abort orelse return;
-    if (self.task_cancel != null) return;
+fn compileProgramTaskCalls(self: *Self) Allocator.Error!void {
+    const host_fns = self.task_host_fns orelse return;
+    if (self.program_task_call_fns != null) return;
+    var fns: [program_task_calls.len]index_types.DefinedFunction = undefined;
+    inline for (program_task_calls, 0..) |call, i| {
+        fns[i] = try self.compileProgramTaskCall(call, host_fns[i]);
+    }
+    self.program_task_call_fns = fns;
+}
+
+fn compileProgramTaskCall(self: *Self, comptime call: builtins.builtin_registry.ProgramTaskCall, host_fn: HostedSymbolTarget) Allocator.Error!index_types.DefinedFunction {
     const type_idx = try self.internFuncType(&.{.i32}, &.{});
     const defined = self.module.addDefinedFunction(type_idx) catch return error.OutOfMemory;
-    _ = try self.addTrackedDefinedFunctionSymbol(defined, builtins.shim_symbols.roc_task_cancel, 0);
-    // A relocatable object names the abort's slot by its symbol.
-    if (!self.function_symbols_by_index.contains(abort.func_idx)) {
-        try self.recordFunctionSymbol(abort.func_idx, abort.symbol);
+    _ = try self.addTrackedDefinedFunctionSymbol(defined, call.name, 0);
+    // A relocatable object names the host function's slot by its symbol.
+    if (!self.function_symbols_by_index.contains(host_fn.func_idx)) {
+        try self.recordFunctionSymbol(host_fn.func_idx, host_fn.symbol);
     }
-    const abort_slot = self.module.addTableElement(abort.func_idx) catch return error.OutOfMemory;
-    self.task_cancel = defined;
+    const host_fn_slot = self.module.addTableElement(host_fn.func_idx) catch return error.OutOfMemory;
     const saved = self.saveState() catch return error.OutOfMemory;
     errdefer self.abandonState(saved);
     try self.beginFunction(defined.local);
@@ -6546,12 +6559,13 @@ fn compileTaskCancel(self: *Self) Allocator.Error!void {
     self.current_proc_id = null;
     const task = (try self.allocAnonymousLocals(.i32, 1))[0];
     try self.emitLocalGet(task);
-    try self.emitFunctionTableIndexConst(abort_slot);
-    try self.emitBuiltinCall(.task_cancel);
+    try self.emitFunctionTableIndexConst(host_fn_slot);
+    try self.emitBuiltinCall(BuiltinSignatures.kindOf(call.builtin));
     self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
     try self.encodeLocalsDecl(&self.currentBody().preamble, 1);
     self.endFunction();
     self.restoreState(saved);
+    return defined;
 }
 
 /// A slot-release adapter: its function, its table slot, and the RC helper
@@ -7924,8 +7938,12 @@ pub fn registerHostedSymbolTargets(self: *Self, proc_specs: []const LIR.LirProcS
             .symbol = imported.symbol,
         });
     }
-    if (self.task_abort == null and self.store.createsTask()) {
-        self.task_abort = try self.resolveSymbolTarget(builtins.shim_symbols.roc_task_abort, &.{.i32}, &.{});
+    if (self.task_host_fns == null and self.store.createsTask()) {
+        var host_fns: [program_task_calls.len]HostedSymbolTarget = undefined;
+        for (program_task_calls, &host_fns) |call, *host_fn| {
+            host_fn.* = try self.resolveSymbolTarget(call.host_fn, &.{.i32}, &.{});
+        }
+        self.task_host_fns = host_fns;
     }
 }
 

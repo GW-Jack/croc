@@ -22827,13 +22827,13 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             } });
         }
 
-        /// Generate a `Tasks` program's `roc_task_cancel(task)`: a call to the
-        /// builtin `task_cancel` with the host's `roc_task_abort` (design.md
-        /// "Backends", Cancelling). An object file defines it when the program
-        /// creates a task; a shim build's platform shim module defines it
-        /// instead.
-        pub fn generateTaskCancel(self: *Self) Allocator.Error!ExportedSymbol {
-            return self.generateExportedFunction(builtins.shim_symbols.roc_task_cancel, .task_cancel);
+        /// Generate one of a `Tasks` program's `ProgramTaskCall`s,
+        /// `name(task)`: a call to its builtin with the host's `host_fn`
+        /// (design.md "Backends"). An object file defines them when the
+        /// program creates a task; a shim build's platform shim module
+        /// defines them instead.
+        pub fn generateProgramTaskCall(self: *Self, call: builtins.builtin_registry.ProgramTaskCall) Allocator.Error!ExportedSymbol {
+            return self.generateExportedFunction(call.name, .{ .program_task_call = call });
         }
 
         /// What an exported function's body does inside the frame
@@ -22845,23 +22845,23 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 arg_layouts: []const layout.Idx,
                 ret_layout: layout.Idx,
             },
-            /// `roc_task_cancel` (`generateTaskCancel`).
-            task_cancel,
+            /// A `ProgramTaskCall` (`generateProgramTaskCall`).
+            program_task_call: builtins.builtin_registry.ProgramTaskCall,
         };
 
-        /// `roc_task_cancel`'s body: the task, which arrives in the first
-        /// argument register, and the address of the host's `roc_task_abort`,
+        /// A `ProgramTaskCall`'s body: the task, which arrives in the first
+        /// argument register, and the address of the host's `host_fn`,
         /// passed to the builtin from the callee-saved `task_reg` and
-        /// `abort_reg`.
-        fn generateTaskCancelBody(self: *Self, task_reg: GeneralReg, abort_reg: GeneralReg) Allocator.Error!void {
+        /// `host_fn_reg`.
+        fn generateProgramTaskCallBody(self: *Self, call: builtins.builtin_registry.ProgramTaskCall, task_reg: GeneralReg, host_fn_reg: GeneralReg) Allocator.Error!void {
             try self.codegen.emit.movRegReg(.w64, task_reg, EmitType.CC.PARAM_REGS[0]);
-            const abort = try self.codegen.symbols.intern(self.allocator, builtins.shim_symbols.roc_task_abort, .shared);
-            try self.codegen.emitLoadDataAddress(abort_reg, abort);
+            const host_fn = try self.codegen.symbols.intern(self.allocator, call.host_fn, .shared);
+            try self.codegen.emitLoadDataAddress(host_fn_reg, host_fn);
             var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
             defer builder.deinit();
             try builder.addRegArg(task_reg);
-            try builder.addRegArg(abort_reg);
-            try self.callBuiltin(&builder, .task_cancel);
+            try builder.addRegArg(host_fn_reg);
+            try self.callBuiltin(&builder, call.builtin);
         }
 
         fn generateExportedFunction(self: *Self, symbol_name: []const u8, body: ExportedBody) Allocator.Error!ExportedSymbol {
@@ -22927,7 +22927,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             // inside generateEntrypointBodyCAbi.
                             try self.generateEntrypointBodyCAbi(entry.proc, entry.arg_layouts, entry.ret_layout, .X20, &incoming_stack_copies);
                         },
-                        .task_cancel => try self.generateTaskCancelBody(.X20, .X21),
+                        .program_task_call => |call| try self.generateProgramTaskCallBody(call, .X20, .X21),
                     }
 
                     const body_epilogue_offset = self.codegen.currentOffset();
@@ -23018,7 +23018,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             // inside generateEntrypointBodyCAbi.
                             try self.generateEntrypointBodyCAbi(entry.proc, entry.arg_layouts, entry.ret_layout, .RBX, &incoming_stack_copies);
                         },
-                        .task_cancel => try self.generateTaskCancelBody(.RBX, .R13),
+                        .program_task_call => |call| try self.generateProgramTaskCallBody(call, .RBX, .R13),
                     }
 
                     const body_epilogue_offset = self.codegen.currentOffset();

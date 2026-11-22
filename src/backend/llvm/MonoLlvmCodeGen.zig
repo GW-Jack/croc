@@ -914,7 +914,7 @@ pub const MonoLlvmCodeGen = struct {
     /// wrappers under the provides symbols (dispatching into the prelinked
     /// interpreter), the hosted dispatch table built from the platform's
     /// hosted-section symbols, optionally the embedded LIR image, and a
-    /// `Tasks` program's `roc_task_cancel`.
+    /// `Tasks` program's `roc_task_wake` and `roc_task_cancel`.
     pub fn generateInterpreterShimModule(
         self: *MonoLlvmCodeGen,
         module_name: []const u8,
@@ -924,8 +924,8 @@ pub const MonoLlvmCodeGen = struct {
         image: ?[]const u8,
         default_run_start: bool,
         /// Whether the program creates a task, so the module defines its
-        /// `roc_task_cancel` (`LirStore.createsTask`).
-        defines_task_cancel: bool,
+        /// `ProgramTaskCall`s (`LirStore.createsTask`).
+        defines_program_task_calls: bool,
     ) Error!GenerateResult {
         self.reset();
 
@@ -1032,7 +1032,7 @@ pub const MonoLlvmCodeGen = struct {
             );
         }
 
-        if (defines_task_cancel) try self.defineTaskCancel();
+        if (defines_program_task_calls) try self.defineProgramTaskCalls();
 
         if (default_run_start) {
             try self.emitDefaultRunStartModuleAsm(&builder);
@@ -5449,19 +5449,16 @@ pub const MonoLlvmCodeGen = struct {
     }
 
     /// Define the host's task calls, which a program that creates a task
-    /// exports (design.md "Backends"): `roc_task_resume`, `roc_task_wake`,
-    /// `roc_task_free` and `roc_task_crash_message`, each a call to its
-    /// builtin. Linking the builtins keeps
-    /// only what the program defines, so the program defines these for the
-    /// host. `roc_task_cancel` calls its builtin with the host's
-    /// `roc_task_abort`. Runs after the procs, when no function is
-    /// mid-emission.
+    /// exports (design.md "Backends"): `roc_task_resume`, `roc_task_free` and
+    /// `roc_task_crash_message`, each a call to its builtin. Linking the
+    /// builtins keeps only what the program defines, so the program defines
+    /// these for the host, and its `ProgramTaskCall`s. Runs after the procs,
+    /// when no function is mid-emission.
     fn defineTaskHostCalls(self: *MonoLlvmCodeGen) Error!void {
         const builder = self.builder orelse return error.CompilationFailed;
         const ptr_ty = try self.ptrType();
         const calls = [_]struct { name: []const u8, builtin: BuiltinSymbol, ret: LlvmBuilder.Type, args: usize }{
             .{ .name = builtins.shim_symbols.roc_task_resume, .builtin = .task_resume, .ret = .i32, .args = 1 },
-            .{ .name = builtins.shim_symbols.roc_task_wake, .builtin = .task_wake, .ret = .void, .args = 1 },
             .{ .name = builtins.shim_symbols.roc_task_free, .builtin = .task_free, .ret = .void, .args = 1 },
             // (task, *len) -> the message's bytes
             .{ .name = builtins.shim_symbols.roc_task_crash_message, .builtin = .task_crash_message, .ret = ptr_ty, .args = 2 },
@@ -5485,26 +5482,29 @@ pub const MonoLlvmCodeGen = struct {
             }
             wip.finish() catch return error.OutOfMemory;
         }
-        try self.defineTaskCancel();
+        try self.defineProgramTaskCalls();
     }
 
-    /// Define `roc_task_cancel(task)`, a call to the builtin `task_cancel`
-    /// with the host's `roc_task_abort` (design.md "Backends", Cancelling):
-    /// in a `Tasks` program's module, or in the platform shim module of a
-    /// shim build, whose shim archive defines the builtin.
-    fn defineTaskCancel(self: *MonoLlvmCodeGen) Error!void {
+    /// Define each `ProgramTaskCall` `name(task)` as a call to its builtin
+    /// with the host's `host_fn` (design.md "Backends"): `roc_task_wake`
+    /// with `roc_task_ready`, `roc_task_cancel` with `roc_task_abort`. In a
+    /// `Tasks` program's module, or in the platform shim module of a shim
+    /// build, whose shim archive defines the builtins.
+    fn defineProgramTaskCalls(self: *MonoLlvmCodeGen) Error!void {
         const builder = self.builder orelse return error.CompilationFailed;
         const ptr_ty = try self.ptrType();
-        const cancel = try self.declareBuiltin(.task_cancel, .void, &.{ ptr_ty, ptr_ty });
-        const abort_ty = builder.fnType(.void, &.{ptr_ty}, .normal) catch return error.OutOfMemory;
-        const abort = try self.declareHostSymbol(builtins.shim_symbols.roc_task_abort, abort_ty);
-        const func = builder.addFunction(abort_ty, builder.strtabString(builtins.shim_symbols.roc_task_cancel) catch return error.OutOfMemory, .default) catch return error.OutOfMemory;
-        var wip = LlvmBuilder.WipFunction.init(builder, .{ .function = func, .strip = true }) catch return error.OutOfMemory;
-        defer wip.deinit();
-        wip.cursor = .{ .block = wip.block(0, "entry") catch return error.OutOfMemory };
-        _ = wip.call(.normal, .ccc, .none, cancel.typeOf(builder), cancel.toValue(builder), &.{ wip.arg(0), abort.toValue(builder) }, "") catch return error.OutOfMemory;
-        _ = wip.retVoid() catch return error.OutOfMemory;
-        wip.finish() catch return error.OutOfMemory;
+        const fn_ty = builder.fnType(.void, &.{ptr_ty}, .normal) catch return error.OutOfMemory;
+        for (builtins.builtin_registry.program_task_calls) |call| {
+            const target = try self.declareBuiltin(call.builtin, .void, &.{ ptr_ty, ptr_ty });
+            const host_fn = try self.declareHostSymbol(call.host_fn, fn_ty);
+            const func = builder.addFunction(fn_ty, builder.strtabString(call.name) catch return error.OutOfMemory, .default) catch return error.OutOfMemory;
+            var wip = LlvmBuilder.WipFunction.init(builder, .{ .function = func, .strip = true }) catch return error.OutOfMemory;
+            defer wip.deinit();
+            wip.cursor = .{ .block = wip.block(0, "entry") catch return error.OutOfMemory };
+            _ = wip.call(.normal, .ccc, .none, target.typeOf(builder), target.toValue(builder), &.{ wip.arg(0), host_fn.toValue(builder) }, "") catch return error.OutOfMemory;
+            _ = wip.retVoid() catch return error.OutOfMemory;
+            wip.finish() catch return error.OutOfMemory;
+        }
     }
 
     /// The adapter `suspend_save` hands the task runtime for a hosted result

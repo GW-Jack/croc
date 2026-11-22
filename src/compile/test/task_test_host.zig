@@ -44,6 +44,10 @@ pub const TestHost = struct {
     pauses: u32 = 0,
     /// How many paused operations a cancel abandoned.
     aborts: u32 = 0,
+    /// How many times a wake told the host a parked task is ready.
+    readies: u32 = 0,
+    /// The task's `roc_task_wake`: a program's own, or `nativeWake`.
+    wake: WakeFn = &nativeWake,
 
     pub fn init(allocator: std.mem.Allocator, ops: *RocOps, mode: Mode) TestHost {
         return .{ .allocator = allocator, .ops = ops, .mode = mode };
@@ -131,7 +135,9 @@ pub const TestHost = struct {
         self.pending = null;
         pending.out.* = try self.answer(pending.url);
         pending.url.decref(self.ops);
-        pending.task.wake();
+        active_host = self;
+        self.wake(pending.task);
+        active_host = null;
     }
 
     /// Run `task` to its end, finishing every paused operation.
@@ -167,6 +173,15 @@ pub const TestHost = struct {
     }
 };
 
+/// `roc_task_wake`: a program's own, or `nativeWake`.
+pub const WakeFn = *const fn (*RocTask) callconv(.c) void;
+
+/// Wake with the test host's `roc_task_ready`, as a program's
+/// `roc_task_wake` does, for a run whose program defines none.
+pub fn nativeWake(task: *RocTask) callconv(.c) void {
+    task.wake(&readyTask);
+}
+
 /// `roc_task_cancel`: a program's own, or `nativeCancel`.
 pub const CancelFn = *const fn (*RocTask) callconv(.c) void;
 
@@ -176,7 +191,8 @@ pub fn nativeCancel(task: *RocTask) callconv(.c) void {
     task.cancel(&abortPending);
 }
 
-/// The host a cancel's abort reaches: `roc_task_abort` takes only the task.
+/// The host a wake's ready or a cancel's abort reaches: `roc_task_ready`
+/// and `roc_task_abort` take only the task.
 var active_host: ?*TestHost = null;
 
 /// The host compiled code's hosted calls reach, between `enterCAbi` and
@@ -186,12 +202,14 @@ var c_abi_host: ?*TestHost = null;
 /// The first error a C-ABI hosted call hit, which it cannot return.
 pub var c_abi_failure: ?eval.Interpreter.Error = null;
 
-/// Bind the fixture's hosted symbols, and the host's `roc_task_abort`, for
+/// Bind the fixture's hosted symbols, and the host's `roc_task_ready` and
+/// `roc_task_abort`, for
 /// an object compiled code is loaded from, to the C-ABI functions that reach
 /// the entered host.
 pub fn resolveCAbiSymbol(_: ?*anyopaque, name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "roc_host_fetch")) return @intFromPtr(&cAbiFetch);
     if (std.mem.eql(u8, name, "roc_host_log")) return @intFromPtr(&cAbiLog);
+    if (std.mem.eql(u8, name, builtins.shim_symbols.roc_task_ready)) return @intFromPtr(&readyTask);
     if (std.mem.eql(u8, name, builtins.shim_symbols.roc_task_abort)) return @intFromPtr(&abortPending);
     return null;
 }
@@ -209,6 +227,12 @@ fn cAbiLog(text: RocStr) callconv(.c) void {
     c_abi_host.?.log(text) catch |err| {
         if (c_abi_failure == null) c_abi_failure = err;
     };
+}
+
+/// `void roc_task_ready(RocTask *task)`: the task the host just woke was
+/// parked, so the host may resume it. The driver resumes it next.
+fn readyTask(_: *RocTask) callconv(.c) void {
+    active_host.?.readies += 1;
 }
 
 /// `void roc_task_abort(RocTask *task)`.

@@ -104,6 +104,10 @@ pub const Fixture = struct {
     }
 };
 
+/// The host's `roc_task_ready` for a test that resumes the task itself
+/// right after waking it.
+pub fn readyTask(_: *RocTask) callconv(.c) void {}
+
 /// A task with the fields the operations read and nothing the runtime uses:
 /// these tests run no records.
 fn bareTask(hosted_slot: [*]u8, result_buffer: [*]u8) RocTask {
@@ -111,7 +115,8 @@ fn bareTask(hosted_slot: [*]u8, result_buffer: [*]u8) RocTask {
         .pending = 0,
         .hosted_slot = hosted_slot,
         .result_buffer = result_buffer,
-        .woken = false,
+        .wake_word = 0,
+        .started = false,
         .status = .pending,
         .root_result = undefined,
         .entries = undefined,
@@ -395,7 +400,7 @@ test "a task paused at a hosted call resumes from its record and returns the roo
     // The host finishes: it writes the result and wakes the task, which
     // resumes in g's continuation with x restored from the record.
     @as(*align(1) u64, @ptrCast(host.slot.?)).* = 22;
-    task.wake();
+    task.wake(&readyTask);
     try std.testing.expectEqual(builtins.task.Status.done, task.resumeTask());
     try std.testing.expectEqual(@as(u64, 42), root);
     try std.testing.expectEqual(@as(u32, 1), host.calls);
@@ -422,7 +427,7 @@ test "a task paused inside a called procedure resumes in its caller's continuati
     try std.testing.expectEqual(@as(usize, 2), task.len);
 
     @as(*align(1) u64, @ptrCast(host.slot.?)).* = 22;
-    task.wake();
+    task.wake(&readyTask);
     try std.testing.expectEqual(builtins.task.Status.done, task.resumeTask());
     try std.testing.expectEqual(@as(u64, 42), root);
     task.free();
@@ -447,7 +452,7 @@ test "cancelling a woken task releases the hosted result in its slot and its rec
     const text = builtins.str.RocStr.fromSlice("a string too long to be small", f.runtime_env.get_ops());
     try std.testing.expect(!text.isSmallStr());
     @as(*align(1) builtins.str.RocStr, @ptrCast(host.slot.?)).* = text;
-    task.wake();
+    task.wake(&readyTask);
     task.cancel(&abortUnexpected);
     try std.testing.expectEqual(builtins.task.Status.cancelled, task.status);
     task.free();

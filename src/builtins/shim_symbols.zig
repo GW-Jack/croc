@@ -30,8 +30,14 @@ pub const roc_entrypoint_from_image = "roc_entrypoint_from_image";
 /// Runs a parked or new task until it finishes or pauses again (design.md
 /// "Host Contract").
 pub const roc_task_resume = "roc_task_resume";
-/// Tells a parked task the host wrote its pending hosted result.
+/// Tells a task the host wrote its pending hosted result; a `Tasks` program
+/// defines it (design.md "Host Contract").
 pub const roc_task_wake = "roc_task_wake";
+/// The host's: a woken parked task is ready to resume.
+pub const roc_task_ready = "roc_task_ready";
+/// The registry builtin `task_wake`, which the shims export so a shim
+/// build's platform shim module can define `roc_task_wake` over it.
+pub const roc_builtins_task_wake = "roc_builtins_task_wake";
 /// Frees a task after it finished, was cancelled or crashed.
 pub const roc_task_free = "roc_task_free";
 /// The message of a task that crashed (design.md "The Task Runtime").

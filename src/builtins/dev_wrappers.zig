@@ -1431,9 +1431,11 @@ pub fn roc_builtins_task_resume(roc_task: *task.RocTask) callconv(.c) u32 {
     return task.host_calls.resumeTask(roc_task);
 }
 
-/// `roc_task_wake` under its builtin name; see `roc_builtins_task_resume`.
-pub fn roc_builtins_task_wake(roc_task: *task.RocTask) callconv(.c) void {
-    task.host_calls.wake(roc_task);
+/// `roc_task_wake`'s body, with the host's `roc_task_ready` as `ready`: a
+/// `Tasks` program defines `roc_task_wake` as a call to this (design.md
+/// "Backends").
+pub fn roc_builtins_task_wake(roc_task: *task.RocTask, ready: task.ReadyFn) callconv(.c) void {
+    roc_task.wake(ready);
 }
 
 /// `roc_task_free` under its builtin name; see `roc_builtins_task_resume`.
