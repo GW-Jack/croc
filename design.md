@@ -34413,6 +34413,52 @@ Until the rest exists:
   dev backend's not-yet-implemented panics are the precedent. Erased calls
   become suspension sites, and the panic goes, when `.boxy` is supported.
 
+### The Reference Platform
+
+`test/tasks-platform/` is a native `Tasks` platform whose host is written
+the way a production host would be. The CLI tests run it on the
+interpreter, the dev backend and LLVM, and the ReleaseFast benchmarks run
+on it. It offers:
+
+- `Stdout.line! : Str => {}`, an ordinary hosted call;
+- `Stdin.line! : () => Str`, suspending, `""` at end of input;
+- `File.read_utf8! : Str => Try(Str, [FileErr(Str)])`, suspending; the
+  error carries the reason;
+- `Sleep.millis! : U64 => {}`, suspending.
+
+The root is `main! : () => I32`, and the host exits with its value.
+
+**Threads.** The host's main thread is the *scheduler*: it creates the
+root, resumes it and is the only thread that runs Roc code, so resumes
+never overlap (P10). A fixed pool of *workers* runs the blocking
+operations. A suspending call copies what its operation needs out of its
+arguments, releases them on the scheduler thread (P5), queues a job and
+returns `ROC_PENDING`. A worker runs the job, builds its result with
+`roc_alloc` and writes `*out`. So a Roc value is allocated on a worker
+thread but released on the scheduler thread, and its refcount is only ever
+touched on the scheduler thread. The host's allocator is thread-safe (P6).
+Each queue is a mutex and a condition variable. The ready queue orders the
+worker's write before the resume (P2), and the wake word orders a
+completion that arrives before the park.
+
+**Readying.** The worker that finished a job calls `roc_task_wake`. If
+the task had parked, the wake calls the host's `roc_task_ready` on that
+worker's thread, and it puts the task on the scheduler's ready queue. The
+scheduler resumes only tasks it takes off that queue (P1). A worker that
+finishes before the task parks readies nothing: the resume still running
+consumes the completion and carries on instead of pausing.
+
+**Supervision.** The scheduler resumes the root until it reports a terminal
+status:
+- on `DONE` it reads the exit code, frees the root, stops the workers and
+  checks that every allocation it served was released;
+- on `CRASHED` it prints the message to stderr, frees the root and exits
+  with status 1, without the leak check;
+- the host never cancels, so `CANCELLED` and `roc_task_abort` are
+  unreachable; its `roc_task_abort` panics.
+
+The host links libc on every target, for threads and a thread-safe `malloc`.
+
 ### Persisted Data
 
 - Checked modules gain the `suspending` mark on hosted declarations and the

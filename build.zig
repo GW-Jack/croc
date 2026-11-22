@@ -295,7 +295,7 @@ comptime {
 }
 
 /// Test platform directories that need host libraries built
-const all_test_platform_dirs = [_][]const u8{ "str", "int", "fx", "fx-open", "dylib", "archive", "alloc-count", "box-model-uniqueness", "concurrency-tasks" };
+const all_test_platform_dirs = [_][]const u8{ "str", "int", "fx", "fx-open", "dylib", "archive", "alloc-count", "box-model-uniqueness", "concurrency-tasks", "tasks-platform" };
 
 fn mustUseLlvm(target: ResolvedTarget) bool {
     return target.result.os.tag == .macos and target.result.cpu.arch == .x86_64;
@@ -342,6 +342,9 @@ fn configureBackend(step: *Step.Compile, target: ResolvedTarget) void {
 
 const TestHostOptions = struct {
     uses_stack_handler: bool = false,
+    /// The host runs threads, so it links libc for them and for a
+    /// thread-safe `malloc`.
+    uses_threads: bool = false,
     /// Extra source files compiled as their own objects and added to the host
     /// archive as separate members, for platforms that test multi-member hosts.
     extra_sources: []const []const u8 = &.{},
@@ -359,6 +362,18 @@ fn testPlatformUsesStackHandler(platform_dir: []const u8) bool {
     return std.mem.eql(u8, platform_dir, "fx") or std.mem.eql(u8, platform_dir, "fx-open");
 }
 
+/// The reference `Tasks` platform runs its blocking operations on a worker
+/// pool (design.md "The Reference Platform").
+fn testPlatformUsesThreads(platform_dir: []const u8) bool {
+    return std.mem.eql(u8, platform_dir, "tasks-platform");
+}
+
+/// The reference `Tasks` platform declares no Windows targets: its host
+/// links libc for threads, `malloc` and `nanosleep`.
+fn testPlatformHasWindowsHost(platform_dir: []const u8) bool {
+    return !std.mem.eql(u8, platform_dir, "tasks-platform");
+}
+
 fn testPlatformRequiresSectionDceHost(platform_dir: []const u8) bool {
     return std.mem.eql(u8, platform_dir, "dylib") or std.mem.eql(u8, platform_dir, "archive");
 }
@@ -371,7 +386,7 @@ fn muslBaselineTestTargetName(target_name: []const u8) ?[]const u8 {
 }
 
 fn testHostNeedsLibc(options: TestHostOptions, target: ResolvedTarget) bool {
-    if (!options.uses_stack_handler) return false;
+    if (!options.uses_stack_handler and !options.uses_threads) return false;
 
     return switch (target.result.os.tag) {
         .linux,
@@ -1331,7 +1346,7 @@ fn createTestPlatformHostLib(
             // a Zig runtime; keep safe-mode stack probes out of that ABI.
             .stack_check = if (isGlibcTestHost(host_target)) false else null,
             .pic = true, // Enable Position Independent Code for PIE compatibility
-            // Only linked so host code can set up stack overflow handling.
+            // Linked for stack overflow handling or for threads.
             .link_libc = testHostNeedsLibc(options, host_target),
         }),
     });
@@ -1434,6 +1449,7 @@ fn buildAndCopyTestPlatformHostLib(
 ) *Step {
     const options = TestHostOptions{
         .uses_stack_handler = testPlatformUsesStackHandler(platform_dir),
+        .uses_threads = testPlatformUsesThreads(platform_dir),
         .extra_sources = testPlatformExtraHostSources(platform_dir),
     };
     // The dylib/archive tests assert that unused hosted symbols and their
@@ -1720,7 +1736,7 @@ fn setupTestPlatforms(
             // Allocation-sensitive test platforms declare fx's musl runtime
             // objects as link inputs; copy them alongside their host library
             // rather than committing more copies of the same binaries.
-            if ((std.mem.eql(u8, platform_dir, "alloc-count") or std.mem.eql(u8, platform_dir, "box-model-uniqueness") or std.mem.eql(u8, platform_dir, "concurrency-tasks")) and std.mem.endsWith(u8, cross_target.name, "musl")) {
+            if ((std.mem.eql(u8, platform_dir, "alloc-count") or std.mem.eql(u8, platform_dir, "box-model-uniqueness") or std.mem.eql(u8, platform_dir, "concurrency-tasks") or std.mem.eql(u8, platform_dir, "tasks-platform")) and std.mem.endsWith(u8, cross_target.name, "musl")) {
                 const copy_musl_runtime = b.addWriteFiles();
                 test_fixtures.copy(
                     copy_musl_runtime,
@@ -1745,6 +1761,7 @@ fn setupTestPlatforms(
             if (platform_filter) |filter| {
                 if (!std.mem.eql(u8, platform_dir, filter)) continue;
             }
+            if (!testPlatformHasWindowsHost(platform_dir)) continue;
             const copy_step = buildAndCopyTestPlatformHostLib(
                 b,
                 platform_dir,
