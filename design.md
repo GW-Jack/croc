@@ -33587,9 +33587,10 @@ The allowed replacement is explicit stage ownership:
 A platform may let a hosted call finish later: the host returns before the
 result is ready, the Roc code that made the call pauses, and the host resumes
 it once the result has been written. This section is the compiler side of
-that. It covers one task at a time: a root that pauses at its hosted calls
-and resumes where it paused. Child tasks, concurrent loops and shared state
-build on it and are specified separately when they are implemented.
+that. It covers a root that pauses at its hosted calls and resumes where it
+paused, and the plans and concurrent loops that run work as child tasks
+(Plans And Concurrent Loops, Child Tasks). Shared state builds on it and is
+specified separately when it is implemented.
 
 A task pauses only at a *suspension site*, a call the compiler knows may
 return before its result is ready. Pausing saves, in a heap *record*, the
@@ -33984,6 +33985,171 @@ nothing its Roc code owned. Freeing a task frees its buffers, its list and
 its record cache; a finished task's list is empty, and a cancelled or
 crashed one's was released.
 
+### Plans And Concurrent Loops
+
+A *plan* is an inert value describing work to run concurrently. A
+*concurrent loop* runs it: `for! x in plan { body }` starts the plan's
+entries and runs the body once for each result, in the order the entries
+finish. Leaving the loop by `break`, `return` or `?` cancels the entries
+still running and waits until they've stopped. Reaching the end means every
+entry finished. An entry's crash crashes the loop's task with the same
+message, and the body never sees it.
+
+**Plans.** `Concurrently(a)` is an opaque nominal type in Builtin.roc, a
+tree of tags:
+- `Each(List(() => a))`;
+- `Cat(Concurrently(a), Concurrently(a))`;
+- `Limit(U64, Concurrently(a))`;
+- `Shielded(Concurrently(a))`;
+- `Background(Concurrently(a))`.
+
+It is built by pure functions:
+- `List.concurrently`;
+- `limit`, which crashes when its limit is 0;
+- `shielded`;
+- `background`;
+- `concat`.
+
+A plan is ordinary Roc data, reference counted like any value. Building,
+storing or returning one runs nothing, and its closures' lambda sets flow
+through it under `.lss` as through any other value.
+
+The combinators mean:
+- `limit(n)`: at most `n` of the plan's entries run at once, and the next
+  starts as soon as one finishes;
+- `shielded()`: an exit waits for its entries that have begun instead of
+  cancelling them;
+- `background()`: its entries don't keep the loop going. Once only
+  background entries are left, they are cancelled and the loop ends;
+- `concat`: one plan's entries, then the other's.
+
+A pure Builtin function flattens a plan into its entries in input order.
+Each entry carries the limits it is under (outermost first) and its shield
+and background marks. The flattened plan also gives the *root limit*, the
+plan's outermost node if that node is a `Limit`.
+
+**The protocol.** `for!` over a source whose checked type is
+`Concurrently(a)` takes the plan protocol. Any other source takes `.stream`
+and `.next!`, as before. Checking records the choice in the loop's
+`ForLoopDispatchPlan`, so nothing later reads the source's type to decide
+it. There is no implicit `.concurrently()` call, so a type of the
+program's own that makes plans is looped over as
+`for! x in v.concurrently()`. A source whose type is still a variable when
+checking resolves the loop's plan gets the stream protocol. If it later
+unifies with `Concurrently`, that is a type error asking for an
+annotation. Choosing per specialization in Monotype, where static dispatch
+already resolves, is the direction this will take.
+
+**`spawn`.** `spawn f`, with `f : () => a`, adds an entry to the innermost
+enclosing concurrent loop. It may appear inside plain `for`, `while`, `if`
+and `match`, but not inside a nested function or closure: the set of
+running entries has no name, so nothing can capture it. Checking reports
+`spawn` anywhere else as an error. Its value is `{}`. A spawned entry:
+- is unshielded and never background;
+- counts against the root limit if the plan has one. A plan whose
+  outermost node is not a `Limit`, such as `p.limit(2).shielded()`, spawns
+  under no limit.
+
+**Lowering.** Monotype lowers a concurrent loop to four operations on a
+*running set* `g`, a local no source expression names, plus an *exit
+sequence*:
+
+```text
+g = group(flatten(plan), entry_call)
+head:
+  match next(g)
+    Arrived(x) => body        # falling off the end of body goes to head
+    Ended      => after the loop
+exit: cancel_group(g); repeat next(g) until Ended, dropping what arrives
+```
+
+- Every edge out of the body other than a crash runs the exit sequence first:
+  `break`, `return`, `?`, and a `break` or `return` from a loop nested in the
+  body.
+- `spawn f` is `spawn_in(g, f)`.
+- `entry_call : (() => a) => a` is a procedure Monotype makes for the loop.
+  It calls one entry, and it is the only place the entries' lambda set is
+  dispatched.
+
+Each operation carries explicit `RcEffect` data, which ARC reads like any
+other operation's:
+- `group` consumes the flattened plan, and each entry closure moves into its
+  entry;
+- `spawn_in` consumes `f`;
+- `next` returns an owned `a`;
+- `cancel_group` releases the entries that haven't started.
+
+**Two forms.** The continuation pass gives each loop a form and records it on
+the loop's `group`; backends read the mark and never decide the form.
+
+A loop is *task-form* when its `entry_call`, or a function its body spawns,
+may suspend. Otherwise it is *sequential*. A task-form loop's `next` and its
+exit wait are suspension sites, so the procedure holding the loop may
+suspend, which can make other loops task-form. The pass extends
+Suspendability's fixpoint with this rule. The rule is monotone, so the
+least fixpoint is well defined. A `None` build has no `suspending`
+procedure, so all its loops are sequential.
+
+*Sequential form.* No task and no runtime call. The operations are ordinary
+LIR over a list:
+- `group` keeps the entries;
+- `next` takes the earliest entry that hasn't started, calls `entry_call` on
+  it directly and reports `Arrived`. Once every entry that hasn't started is
+  background, it drops them and reports `Ended`;
+- `spawn_in` appends;
+- `cancel_group` drops the entries that haven't started;
+- limits and shields change nothing.
+
+A background entry placed before the others still runs to completion when
+its turn comes, and the ones after the others are dropped. An entry's crash
+is a crash in the loop's task, with the entry's message, and the entries
+that hadn't started never run.
+
+This is the proposal's `None` build of a loop. It is also a valid schedule of
+a `Tasks` build: the host resumes the ready task that comes first in the task
+tree, and an entry that hasn't begun becomes ready only when its loop asks
+for the next result. A `Tasks` build uses it for every loop whose entries
+can't pause, so concurrency costs such a loop nothing.
+
+*Task form.* The running set is a runtime group, and each entry is a child
+task (Child Tasks). The child's start record is an erased callable whose
+capture is the entry closure. The pass makes one start procedure per item
+type, the same way it makes a root's: the procedure calls `entry_call` on
+its capture as a tail site and writes the result to the child's result
+destination. The operations:
+- `group` creates the group, with one block for all the entries and their
+  result slots. It fixes each entry's place in the task tree in input order,
+  and starts every entry whose limits have room;
+- `next` is a suspension site. It takes one report, moves the result out of
+  its slot, and parks on the group's wake word while no report is waiting;
+- `spawn_in` adds an entry under the root limit, if there is one, and starts
+  it when the limit has room;
+- `cancel_group` drops the entries that haven't started, and cancels the
+  running ones unless they are shielded and have begun.
+
+**The library.** Each of these is ordinary Builtin Roc written with a
+concurrent loop, so it gets both forms:
+- `Concurrently.all!` and `Concurrently.all_ok!`;
+- `Concurrent.all!`, `all_ok!`, `both!` and `race!`.
+
+How they work:
+- `all!` wraps each entry so its result carries its index, and stores each
+  arrival by index;
+- `all_ok!` returns at the first `Err` to arrive;
+- `race!` returns at the first arrival;
+- `both!` runs two entries over `[First(a), Second(b)]`.
+
+Results come back in input order, and background entries' results are left
+out.
+
+`Concurrent.supervise!(opts, f)` is not a loop:
+- In a `Tasks` build it always runs `f` as a child task, since only a
+  child's own resume can catch its crash. It uses the runtime's internal
+  `task_spawn` and `task_await`, whose report can be a crash that no
+  program sees. It starts `f` again after each crash until `max_restarts`
+  restarts have happened, then crashes with the last message.
+- In a `None` build it calls `f` once.
+
 ### Host Contract
 
 Shown in C. A suspending hosted function takes the task and the result
@@ -34014,17 +34180,23 @@ void roc_task_ready(RocTask *task);           /* host: resume it once */
 void roc_task_abort(RocTask *task);           /* host: abandon its operation */
 ```
 
-The builtins object exports `roc_task_resume` and `roc_task_free`
+The builtins object exports `roc_task_free` and `roc_task_crash_message`
 (`RocTask.host_calls`). Each program binary defines them exactly once, since
 a second definition collides in the link. The interpreter shim and the
 machine-code shim define them from the copy of the builtins that runs the
 program's records (One runtime per process, Backends).
-`roc_task_wake` calls the host's `roc_task_ready` and `roc_task_cancel`
-calls the host's `roc_task_abort`, which only the host of a `Tasks`
-platform defines. The builtins never refer to a host symbol, so a `Tasks`
-program defines both calls itself (its program task calls), each a call
-to its registry builtin with the host's function, and a program of another
-mode neither defines them nor refers to the host's two (Backends).
+`roc_task_resume`, `roc_task_wake` and `roc_task_cancel` need the host's
+`roc_task_ready` and `roc_task_abort`, which only the host of a `Tasks`
+platform defines:
+- the resume hands both to the runtime, which stores them on the task for
+  its children (Child Tasks);
+- wake calls `roc_task_ready`;
+- cancel calls `roc_task_abort` and `roc_task_ready`.
+
+The builtins never refer to a host symbol. So a `Tasks` program defines
+these three calls itself (its program task calls), each a call to its
+registry builtin with the host's functions. A program of another mode
+neither defines them nor refers to the host's two (Backends).
 
 These symbols join the fixed runtime set, and the glue templates of a
 `Tasks` platform declare all of them with `RocTask`, `RocPoll` and
@@ -34063,8 +34235,15 @@ checks them.
   the same time; each resume happens-after the previous one ends.
 
 (P9 of the proposal, region reclamation, is a choice a platform makes, not
-an obligation of this contract.) Child tasks extend this contract when
-concurrent loops are implemented.
+an obligation of this contract.)
+
+Child tasks (Child Tasks) need no new call. The runtime readies a child
+through `roc_task_ready`, and the host resumes it like a root, under the
+same obligations (P1, P2, P7, P10). A child's operation is aborted through
+`roc_task_abort` as a root's is. When a resume returns a terminal status for
+a child, the runtime has already freed it. The host must forget the
+pointer, and only a root's status ends the program. Cancelling, freeing or
+resuming a child after its terminal status breaks P8.
 
 ### The Task Runtime
 
@@ -34284,6 +34463,98 @@ compiler's mode, so the CLI cases of the native reference platform, whose
 scheduler wakes tasks from a worker pool, run with the monitors on in a
 Debug build.
 
+### Child Tasks
+
+A child task is a `RocTask` made from a start record, as a root is. Beyond a
+root's state it holds:
+- its parent, its group and its entry index;
+- its place in the task tree. Each task numbers its children with one
+  counter across all its loops, at `group` and at `spawn_in`, so the tree
+  order is creation order;
+- its own hosted slot and result buffer, with the program's constant sizes,
+  and the entry's result slot in the group's block as its result
+  destination;
+- the host's `ready` and `abort`.
+
+The host functions reach the runtime through the resume. With child tasks,
+`roc_task_resume` is a program task call, like wake and cancel:
+- each program defines it as `roc_builtins_task_resume(task, ready, abort)`,
+  with the host's `roc_task_ready` and `roc_task_abort`;
+- the runtime stores both on the task it resumes, and a child copies them
+  from its parent;
+- spawning a child, reporting to a parent and cancelling a child then need
+  no host symbol inside the builtins, and neither LIR nor `task_create`
+  changes.
+
+`started` is the shield rule's *begun*: an entry has begun once its task has
+run any code.
+
+**Starting and reporting.** Starting a child readies it through `ready`.
+When a resume finishes the child's code, the runtime:
+1. records the report: the result already in its slot, `Cancelled`, or
+   `Crashed` with the message;
+2. increments the group's count with release ordering, and readies the
+   parent only if the parent is parked on that group (exactly-once
+   readiness per wait source);
+3. frees the child before `roc_task_resume` returns its terminal status.
+
+A child's code can't finish while its own loops are open, since loops are
+lexical, so a child that finishes normally has no live descendants. A
+cancelled or crashed child first cancels its groups' entries and returns
+`ROC_TASK_PENDING` until they have all reported. A task reaches a terminal
+status only after all of its descendants have.
+
+**Wait sources.** A task parks on exactly one of these, each with a wake
+word of its own (parked bit and count):
+- its hosted operation;
+- one group, whose count may exceed 1;
+- a `supervise!` child.
+
+**Limits.** A group keeps a running count for each limit. When a child
+reports, the runtime decrements its limits' counts and starts the next
+eligible entry in input order at once, without waiting for the loop head.
+No limit ever has more running entries than it allows.
+
+**Background entries.** Once only background entries are left, `next` cancels
+them as an exit would, waits until they've reported, drops their reports, and
+reports `Ended`.
+
+**Cancellation.** Cancelling a task cancels the running entries of each of its
+groups and drops the entries that haven't started. The task reaches its
+terminal status after its children do. A child's pending operation is
+aborted through `abort`, as a root's is.
+
+**Crashes.** A child's crash exit catches the crash in its own resume, as a
+root's does. The child's descendants are cancelled, and once they have
+reported, the child reports `Crashed` to its group. The group's owner gets
+a crash pending with the same message. It runs no more Roc code, and how
+it gets there depends on where it is parked:
+- on that group: the report readies it;
+- on its own hosted operation: a loop body can call a `suspending` hosted
+  function while entries run, and that operation may never complete. So
+  the runtime does what a cancel does: it clears the parked bit with a
+  compare-and-swap, calls `abort` on the operation, then calls `ready`.
+
+On its next resume the owner releases a hosted result that was already
+counted, as a cancelled task does, and crashes at its wait with the child's
+message. No code runs in between, so this cannot be told apart from
+crashing there at once.
+
+The owner's crash then cancels all of its entries, shielded ones included,
+and propagates up the same way. Propagation stops at a `supervise!`, which
+takes the report as a crash, or at a root, which returns
+`ROC_TASK_CRASHED`.
+
+**Monitors.** The runtime monitors (Conformance) also check its own rules in
+safe builds:
+- the tree shape;
+- the limits;
+- exactly-once readiness for each wait source.
+
+A broken rule of the runtime's own is a `builtinInvariant`. A host's broken
+obligation, such as resuming a child that was already freed, is a
+`hostViolation`.
+
 ### Backends
 
 Every backend runs the same LIR against the same `RocTask`, so a task
@@ -34361,19 +34632,22 @@ byte:
   `RocPoll`: 0 is `ROC_READY` and 1 is `ROC_PENDING`. The site's switch
   takes 0 as ready and every other value as pending. `out` is
   `task_hosted_slot(task)`.
-- **The host's calls.** A compiled `Tasks` program gets `roc_task_resume`
-  and `roc_task_free` from the builtins object linked into it, so every
+- **The host's calls.** A compiled `Tasks` program gets `roc_task_free`
+  and `roc_task_crash_message` from the builtins object linked into it, so every
   backend links the same symbols. The interpreter shim defines them from
   the interpreter's own copy of the builtins, and the object it bundles
   leaves them out (One runtime per process). LLVM links the builtins into
   the program privately, keeping only what the program itself defines, so a
   program that creates a task defines these calls itself, each a call to
-  its registry builtin (`roc_builtins_task_resume`, `_free`). A dev
+  its registry builtin (`roc_builtins_task_free`, `_crash_message`). A dev
   `roc run` loads the program's builtins with its image, after the host is
   linked, so the machine-code shim the host links defines these calls from
   its own builtins, which the image's builtin calls resolve to, so the
   process has one runtime and one running task (One runtime per process).
-- **Program task calls.** `roc_task_wake(task)` calls the registry builtin
+- **Program task calls.** `roc_task_resume(task)` calls the registry builtin
+  `roc_builtins_task_resume(task, ready, abort)` with the host's
+  `roc_task_ready` and `roc_task_abort`, which the runtime stores on the
+  task (Child Tasks). `roc_task_wake(task)` calls the registry builtin
   `roc_builtins_task_wake(task, ready)` with the host's `roc_task_ready`
   as `ready` (`RocTask.wake`), and `roc_task_cancel(task)` calls
   `roc_builtins_task_cancel(task, abort, ready)` with the host's
@@ -34393,8 +34667,8 @@ byte:
     the program creates a task (`LirStore.createsTask`). The shim archive
     defines the builtins: the interpreter shim's builtins object exports
     every core wrapper, and the machine-code shim exports
-    `roc_builtins_task_wake` and `roc_builtins_task_cancel` beside the
-    host's calls.
+    `roc_builtins_task_resume`, `roc_builtins_task_wake` and
+    `roc_builtins_task_cancel` beside the host's calls.
 
   The CLI's `Tasks` fixture host cancels through `roc_task_cancel` at a
   chosen pause, before and after waking the task, on every backend the CLI
@@ -34414,8 +34688,9 @@ byte:
     root, at a tail site, and an erased-ABI procedure stores its result
     through `ret` after its body.
 
-  A final wasm module exports the merged builtins' `roc_task_resume` and
-  `roc_task_free` by those names, and the program task calls, next to its
+  A final wasm module exports the merged builtins' `roc_task_free` and
+  `roc_task_crash_message` by those names, and the program task calls
+  (`roc_task_resume`, `roc_task_wake`, `roc_task_cancel`), next to its
   entrypoints.
 - **Builtins.** `roc_builtins_task_create` and
   `roc_builtins_task_push_record` are registry builtins, one wrapper each,
@@ -34435,8 +34710,9 @@ at each pause as the others do.
 The CLI builds a `Tasks` program for wasm32 on every backend, as a sealed
 relocatable object that the platform's `host.wasm` links against:
 - the object's public definitions add the task calls the host's code calls
-  (`roc_task_resume` and `roc_task_free` from the merged builtins, and the
-  program's `roc_task_wake` and `roc_task_cancel`), and its allowed imports
+  (`roc_task_free` and `roc_task_crash_message` from the merged builtins,
+  and the program's `roc_task_resume`, `roc_task_wake` and
+  `roc_task_cancel`), and its allowed imports
   add `roc_task_ready` and `roc_task_abort`, which the host defines;
 - in a relocatable object, each program task call is a global symbol under
   its own name, and it names its host function's table slot by a
@@ -34620,6 +34896,18 @@ compiled away in release builds.
   crash before, between and after pauses.
 - **Resume fidelity.** Every resume entry calls the continuation of its own
   site with its captures in the continuation's argument order.
+- **Loop exits.** Every edge out of a concurrent loop's body other than a
+  crash passes through the loop's exit sequence. A running set is used only
+  by its own loop's four operations. The certifier checks both on LIR.
+- **Loop forms.** A loop is task-form exactly when its `entry_call`, or a
+  function its body spawns, may suspend. A sequential loop's `next` is no
+  suspension site.
+- **Sequential equivalence.** A `None` build's results and effects equal
+  a `Tasks` build's when the host finishes every hosted call in place and
+  resumes the ready task that comes first in the task tree. In-process
+  tests check it with a Zig test host. The host gets each task's tree path
+  from a test-only builtin, so no export is added and the runtime's symbol
+  set stays the same in every build mode.
 
 `ROC_LIR_DUMP` prints each procedure's `suspends` mark and each suspension
 site, so the pass's output can be read like any other LIR.
