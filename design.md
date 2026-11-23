@@ -33928,13 +33928,16 @@ differences:
 - Its saved values always include the loop id `id`, even where the code
   after the site never reads it, since the resume entry does.
 - Its result does not arrive anywhere while the task is parked: a report
-  only readies the task. So `R(f, k)` runs `group_next(id, task)` again for
-  `s`.
-  While that is still `group_pending`, which happens when the report that
-  readied the task was a cancelled entry's and another entry still runs,
-  `R(f, k)` sets the pending flag and saves the same values with itself.
-  Otherwise it calls `C(f, k)` with `s` in the result's place. The
-  continuation therefore never sees `group_pending`.
+  only readies the task. So `R(f, k)` loads only the saved values and calls
+  the site's *retry* `P(f, k)` with them and the task. `P` runs
+  `group_next(id, task)` again for `s`. While that is still
+  `group_pending`, which happens when the report that readied the task was
+  a cancelled entry's and another entry still runs, `P` sets the pending
+  flag and saves the same values with `R`. Otherwise it calls `C(f, k)`
+  with `s` in the result's place. The continuation therefore never sees
+  `group_pending`. `P` is a Roc-ABI procedure, so its park site's
+  `suspend_return` is in one, as everywhere else (Backends); `R` reaches
+  `P`, like `C`, at a tail site.
 
 ### Records And The Task
 

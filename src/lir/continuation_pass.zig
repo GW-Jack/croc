@@ -664,9 +664,9 @@ fn rewriteSite(store: *LirStore, layouts: *layout.Store, sink: *FrameSink, info:
 }
 
 /// `R(f, k)`: load the saved values and the call's result, then call
-/// `C(f, k)` with them and the task. At a park site the result is the
-/// status of `group_next` run again on the saved set; while it is still
-/// `group_pending`, `R` saves the same values with itself and returns.
+/// `C(f, k)` with them and the task. A park site has no result to load: `R`
+/// calls the site's retry (`buildParkRetry`) with the saved values and the
+/// task.
 fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Store, info: SiteInfo, origin: LIR.StmtOrigin) Allocator.Error!void {
     const entry = info.resume_entry.?;
     const ret_layout = store.getProcSpecImmediate(entry).ret_layout;
@@ -681,10 +681,6 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
             try self.frame.append(self.allocator, id);
             return id;
         }
-
-        fn newLocal(self: @This(), layout_idx: layout.Idx) Allocator.Error!LocalId {
-            return self.local(layout_idx);
-        }
     };
     const fresh = Fresh{ .store = store, .frame = &frame, .allocator = allocator };
 
@@ -692,7 +688,7 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
     const capture = try fresh.local(.opaque_ptr);
     const reuse = try fresh.local(try layouts.insertErasedCallable());
     const result_layout = store.getLocal(info.target).layout_idx;
-    const result = try fresh.local(result_layout);
+    const result: ?LocalId = if (info.kind == .park) null else try fresh.local(result_layout);
     const address: ?LocalId = if (info.kind == .park) null else try fresh.local(try layouts.insertPtr(result_layout));
     const value = try fresh.local(ret_layout);
 
@@ -700,37 +696,32 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
     defer fields.deinit(allocator);
     var call_args = try std.ArrayList(LocalId).initCapacity(allocator, info.live_after.len + 1);
     defer call_args.deinit(allocator);
-    var loop_id: ?LocalId = null;
     for (info.live_after) |live| {
         if (live == info.target) {
-            call_args.appendAssumeCapacity(result);
+            if (result) |loaded| call_args.appendAssumeCapacity(loaded);
         } else {
             const field = try fresh.local(store.getLocal(live).layout_idx);
             try fields.append(allocator, field);
             call_args.appendAssumeCapacity(field);
-            if (info.kind == .park and live == info.kind.park) loop_id = field;
         }
     }
-    const live_here = try allocator.dupe(LocalId, call_args.items);
-    defer allocator.free(live_here);
     call_args.appendAssumeCapacity(task);
 
+    const callee = switch (info.kind) {
+        .park => try buildParkRetry(allocator, store, info, origin),
+        .procedure, .hosted => info.continuation.?,
+    };
     const ret = try store.addCFStmt(.{ .ret = .{ .value = value } }, origin);
     const call = try store.addCFStmt(.{ .assign_call = .{
         .target = value,
-        .proc = info.continuation.?,
+        .proc = callee,
         .args = try store.addLocalSpan(call_args.items),
         .next = ret,
     } }, origin);
     var head = switch (info.kind) {
-        .park => blk: {
-            const edge = try pendingEdge(store, info, .{ .task = task, .target = result, .live = live_here, .proc = null, .args = .empty(), .extra = .none }, origin);
-            const branch = try parkBranch(store, fresh, task, result, edge, call, origin);
-            const id_field = loop_id orelse invariant("a park site's loop id is not among its saved values", .{});
-            break :blk try store.addLowLevelStmt(result, .group_next, &.{ id_field, task }, branch, origin);
-        },
+        .park => call,
         .procedure, .hosted => blk: {
-            const load = try store.addLowLevelStmt(result, .ptr_load, &.{address.?}, call, origin);
+            const load = try store.addLowLevelStmt(result.?, .ptr_load, &.{address.?}, call, origin);
             break :blk try store.addLowLevelStmt(address.?, if (info.kind == .hosted) .task_hosted_slot else .task_result_buffer, &.{task}, load, origin);
         },
     };
@@ -762,6 +753,73 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
     spec.erased_reuse_arg = .some(reuse);
     spec.erased_call_args = .some(try store.internErasedCallArgsPlan(layouts, &.{.opaque_ptr}));
     spec.shapes = spec.shapes.merged(store.shapes);
+}
+
+/// A park site's retry `P(f, k)`, which its resume entry `R` calls with the
+/// saved values and the task: run `group_next` again on the saved set, and
+/// while it is still `group_pending`, save the same values with `R` and
+/// return; otherwise call `C(f, k)` with the status as the site's result.
+/// `R` runs no park site of its own because `suspend_return` stays in
+/// Roc-ABI procedures (design.md "Backends"): an erased-ABI procedure stores
+/// its result through `ret` after its body.
+fn buildParkRetry(allocator: Allocator, store: *LirStore, info: SiteInfo, origin: LIR.StmtOrigin) Allocator.Error!ProcId {
+    const entry = info.resume_entry.?;
+    const ret_layout = store.getProcSpecImmediate(entry).ret_layout;
+    const retry = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .identity = store.getProcSpecImmediate(entry).identity.derived("retry", &.{}),
+        .args = .empty(),
+        .ret_layout = ret_layout,
+    }, store.procLoc(entry));
+    try nameDerived(allocator, store, retry, entry, "retry", null);
+
+    var frame = std.ArrayList(LocalId).empty;
+    defer frame.deinit(allocator);
+    var sink = FrameSink{ .store = store };
+    defer sink.locals.deinit(store.allocator);
+    const status = try freshLocal(store, &frame, allocator, store.getLocal(info.target).layout_idx);
+    const value = try freshLocal(store, &frame, allocator, ret_layout);
+    var params = std.ArrayList(LocalId).empty;
+    defer params.deinit(allocator);
+    var live = try std.ArrayList(LocalId).initCapacity(allocator, info.live_after.len + 1);
+    defer live.deinit(allocator);
+    var loop_id: ?LocalId = null;
+    for (info.live_after) |saved| {
+        if (saved == info.target) {
+            live.appendAssumeCapacity(status);
+        } else {
+            const param = try freshLocal(store, &frame, allocator, store.getLocal(saved).layout_idx);
+            try params.append(allocator, param);
+            live.appendAssumeCapacity(param);
+            if (saved == info.kind.park) loop_id = param;
+        }
+    }
+    const task = try freshLocal(store, &frame, allocator, .opaque_ptr);
+    try params.append(allocator, task);
+    const live_here = try allocator.dupe(LocalId, live.items);
+    defer allocator.free(live_here);
+    live.appendAssumeCapacity(task);
+
+    const ret = try store.addCFStmt(.{ .ret = .{ .value = value } }, origin);
+    const call = try store.addCFStmt(.{ .assign_call = .{
+        .target = value,
+        .proc = info.continuation.?,
+        .args = try store.addLocalSpan(live.items),
+        .next = ret,
+    } }, origin);
+    const edge = try pendingEdge(store, info, .{ .task = task, .target = status, .live = live_here, .proc = null, .args = .empty(), .extra = .none }, origin);
+    const branch = try parkBranch(store, &sink, task, status, edge, call, origin);
+    const id = loop_id orelse invariant("a park site's loop id is not among its saved values", .{});
+    const head = try store.addLowLevelStmt(status, .group_next, &.{ id, task }, branch, origin);
+    for (sink.locals.items) |local| try frame.append(allocator, local);
+
+    std.mem.sort(LocalId, frame.items, {}, localLessThan);
+    const spec = store.getProcSpecPtr(retry);
+    spec.args = try store.addLocalSpan(params.items);
+    spec.frame_locals = try store.addLocalSpan(frame.items);
+    spec.body = .some(head);
+    spec.shapes = spec.shapes.merged(store.shapes);
+    return retry;
 }
 
 /// Give a `suspending` hosted procedure the host's shape: the task and a
@@ -1153,6 +1211,10 @@ fn verify(allocator: Allocator, store: *const LirStore) Allocator.Error!void {
             if (stmt == .call) try calls.append(allocator, .{ .callee = stmt.call.proc, .tail = site.tail });
             if (site.tail) continue;
             const save_id = pendingSave(store, stmt) orelse invariant("continuation pass left a site that is not a tail site without its pending test", .{});
+            // design.md "Backends": an erased-ABI procedure stores its
+            // result through `ret` after its body, so `suspend_return`
+            // stays in Roc-ABI procedures.
+            if (proc.abi != .roc) invariant("a pending edge in an erased-ABI procedure", .{});
             const save = store.getCFStmtImmediate(save_id).suspend_save;
             const data = store.stmtRow(save.data);
             continuations.set(@backingInt(try verifyResumeEntry(allocator, store, data)));
@@ -1219,9 +1281,8 @@ fn pendingSave(store: *const LirStore, site: SiteStmt) ?CFStmtId {
 /// Check that the resume entry `data` names reads its captures as fields in
 /// order and passes them, with at most the call's result among them, then
 /// its task, to a procedure taking exactly those arguments. Returns that
-/// procedure, the site's continuation. A park site's resume entry runs
-/// `group_next` for its result and reaches the call on the switch's default
-/// branch; its pending branch is a park site of its own, checked as one.
+/// procedure: the site's continuation, or a park site's retry, whose own
+/// park site is checked as one.
 fn verifyResumeEntry(allocator: Allocator, store: *const LirStore, data: LIR.SuspendSaveData) Allocator.Error!ProcId {
     const entry = store.getProcSpecImmediate(data.proc);
     if (entry.abi != .erased_callable) invariant("a pending edge saves a procedure that is not an erased callable", .{});
@@ -1241,7 +1302,7 @@ fn verifyResumeEntry(allocator: Allocator, store: *const LirStore, data: LIR.Sus
                 at = read.next;
             },
             .assign_low_level => |op| {
-                if (op.op == .ptr_load or op.op == .group_next) result = op.target;
+                if (op.op == .ptr_load) result = op.target;
                 at = op.next;
             },
             .assign_struct => |zero_sized| {
@@ -1249,10 +1310,6 @@ fn verifyResumeEntry(allocator: Allocator, store: *const LirStore, data: LIR.Sus
                 at = zero_sized.next;
             },
             .assign_call => |found| break found,
-            .switch_stmt => |branch| {
-                if (result == null or branch.cond != result.?) invariant("a resume entry branches on something other than its park site's status", .{});
-                at = branch.default_branch;
-            },
             .init_uninitialized,
             .assign_literal,
             .assign_call_erased,
@@ -1272,6 +1329,7 @@ fn verifyResumeEntry(allocator: Allocator, store: *const LirStore, data: LIR.Sus
             .decref,
             .decref_if_initialized,
             .free,
+            .switch_stmt,
             .switch_initialized_payload,
             .str_match,
             .str_match_set,
