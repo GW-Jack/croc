@@ -34111,8 +34111,9 @@ that root, never during one. It marks the task cancelled, then:
   or is about to.
 - **If the task is new,** the host resumes it anyway.
 
-A second cancel before that resume changes nothing. A Debug runtime traps on a cancel of a task that has reported a terminal
-status (P8).
+A second cancel before that resume changes nothing. A runtime with
+monitors (Conformance) crashes on a cancel of a task that has reported a
+terminal status (P8).
 
 The next resume of a cancelled task runs no Roc code. It does three
 things:
@@ -34249,15 +34250,39 @@ resumes and a cancel touch it, and those never overlap (P10), so it needs
 no lock. A Debug runtime traps on a record that has more than one reference
 when it is released.
 
-**Conformance.** The host's obligations are checked by a *conformance
-harness*: a Debug runtime with monitors that record every ABI event and
-trap, naming the obligation, at the first violation. A suite of
-adversarial hosts each breaks one checkable obligation (P1, P3, P4, P5, P8,
-P10). Each must be caught by name, and every conforming host must pass. The
-conforming hosts include one that finishes operations on a worker thread
-and one that finishes before its hosted function returns. A native
-reference platform, whose scheduler wakes tasks from a worker pool, runs
-through the same harness.
+**Conformance.** A runtime with safety checks (`std.debug.runtime_safety`)
+runs *monitors* on the host's calls. A monitor crashes through the host's
+`roc_crashed`, never a task's crash exit, since a host may break the
+contract on any thread. The message names the obligation. Each check runs
+before the call changes the task. The monitors:
+- a resume without a ready (P1);
+- a resume inside its own task's resume, from a hosted call (P1). Each
+  resume claims a process-wide *resuming* task with a compare-and-swap;
+- a second wake for one operation (P3);
+- a wake after the cancel's `roc_task_abort` returned (P4);
+- a cancel or resume after a terminal status, a free before one, and a
+  resume, wake, cancel or free after the free (P8). Freed tasks are
+  remembered in a small ring, so this last check is best-effort;
+- two resumes at once (P10), found by the same claim.
+
+A release runtime has none of them and pays nothing.
+
+Some obligations have no runtime check:
+- a wake without writing `*out` (P3): any poison could be a real result;
+- reading `result_out` after `CANCELLED` (P8): the runtime never sees the
+  host's reads;
+- a skipped argument release (P5): the host's own leak check finds it.
+
+The *conformance harness* (`src/builtins/task_conformance_test.zig`)
+drives tasks with one adversarial host per checked obligation. Each host
+must be caught by name and then finish its task with nothing leaked.
+Conforming hosts must run with no crash: a single-threaded host, a host
+that finishes before its hosted function returns, and hosts that cancel.
+The threaded wake test drives a host that finishes operations on worker
+threads under ThreadSanitizer. The interpreter shim is built in the
+compiler's mode, so the CLI cases of the native reference platform, whose
+scheduler wakes tasks from a worker pool, run with the monitors on in a
+Debug build.
 
 ### Backends
 

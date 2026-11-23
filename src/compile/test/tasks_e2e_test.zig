@@ -54,7 +54,7 @@ const crash_points = [_]CrashPoint{
 };
 
 /// The runtime's `roc_task_resume`, as a host links it.
-const ResumeFn = *const fn (*RocTask) callconv(.c) u32;
+const ResumeFn = task_test_host.ResumeFn;
 
 const E2eError = std.mem.Allocator.Error || eval.LirInterpreter.Error || eval.RuntimeHostEnv.LeakError || error{ TestUnexpectedResult, TestExpectedEqual };
 
@@ -138,9 +138,11 @@ const LlvmProgram = struct {
     wake: task_test_host.WakeFn,
     /// The program's `roc_task_cancel`.
     cancel: task_test_host.CancelFn,
-    /// The program's `roc_task_resume`, from the builtins it links
-    /// privately, whose crash exits its own crashes reach.
+    /// The program's `roc_task_resume` and `roc_task_free`, from the
+    /// builtins it links privately, whose crash exits its own crashes
+    /// reach and which keep its tasks' monitor state.
     resume_task: ResumeFn,
+    free_task: task_test_host.FreeFn,
 
     fn init(self: *LlvmProgram, lowered: *const lir.CheckedPipeline.LoweredProgram) (eval.InspectedRun.LlvmError || error{MissingTaskCall})!void {
         self.lowered = lowered;
@@ -167,6 +169,10 @@ const LlvmProgram = struct {
             self.image.deinit();
             return error.MissingTaskCall;
         };
+        self.free_task = self.image.lib.lookup(task_test_host.FreeFn, builtins.shim_symbols.roc_task_free) orelse {
+            self.image.deinit();
+            return error.MissingTaskCall;
+        };
     }
 
     fn deinit(self: *LlvmProgram) void {
@@ -189,8 +195,11 @@ const LlvmRun = struct {
         self.runtime = eval.RuntimeHostEnv.init(std.testing.allocator);
         const ops = self.runtime.get_ops();
         self.host = TestHost.init(std.testing.allocator, ops, mode);
-        // The host wakes through the program's own `roc_task_wake`.
+        // The host wakes, resumes and frees through the program's own task
+        // calls.
         self.host.wake = program.wake;
+        self.host.resume_task = program.resume_task;
+        self.host.free_task = program.free_task;
         self.entered = builtins.in_process_host.enter(ops, null);
         self.host.enterCAbi();
         task_test_host.c_abi_failure = null;
@@ -680,7 +689,7 @@ fn runToEnd(comptime R: type, program: R.Program, mode: task_test_host.Mode) E2e
     var result: RocStr = RocStr.empty();
     const task = try run.startRoot(program, &result);
     try std.testing.expectEqual(builtins.task.Status.done, try run.host.drive(task));
-    task.free();
+    run.host.freeTask(task);
     try std.testing.expectEqualStrings(expected_result, result.asSlice());
     result.decref(run.runtime.get_ops());
     try expectTrace(&run.host);
@@ -697,7 +706,7 @@ fn cancelAt(comptime R: type, program: R.Program, pause: u32, woken: bool) E2eEr
     var result: RocStr = RocStr.empty();
     const task = try run.startRoot(program, &result);
     try std.testing.expectEqual(builtins.task.Status.cancelled, try run.host.driveAndCancel(task, pause, woken, R.cancelFn(program)));
-    task.free();
+    run.host.freeTask(task);
     try std.testing.expectEqual(@as(u32, if (woken or pause == 0) 0 else 1), run.host.aborts);
     try std.testing.expectEqual(pause, run.host.pauses);
     try std.testing.expectEqual(run.host.pauses, run.host.readies);
@@ -734,7 +743,7 @@ fn crashAt(comptime R: type, program: R.Program, point: CrashPoint) E2eError!voi
 
     const own: usize = @as(usize, 2) + @intFromBool(task.hosted_slot_size > 0) + @intFromBool(task.result_buffer_size > 0) + @intFromBool(task.capacity > 0) + task.cachedRecordCount();
     const live = run.runtime.live_count;
-    task.free();
+    run.host.freeTask(task);
     try std.testing.expectEqual(live - own, run.runtime.live_count);
     if (task_test_host.c_abi_failure) |err| return err;
 
@@ -750,7 +759,7 @@ fn crashAt(comptime R: type, program: R.Program, point: CrashPoint) E2eError!voi
     }
     try std.testing.expectEqual(@as(u32, @backingInt(builtins.task.Status.done)), status);
     try std.testing.expect(std.mem.endsWith(u8, next_result.asSlice(), "!"));
-    next.free();
+    run.host.freeTask(next);
     next_result.decref(run.runtime.get_ops());
     if (task_test_host.c_abi_failure) |err| return err;
 }

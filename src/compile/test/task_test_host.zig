@@ -48,6 +48,12 @@ pub const TestHost = struct {
     readies: u32 = 0,
     /// The task's `roc_task_wake`: a program's own, or `nativeWake`.
     wake: WakeFn = &nativeWake,
+    /// The runtime's `roc_task_resume` and `roc_task_free`: a program's
+    /// own when it links the builtins privately (LLVM), so one runtime
+    /// handles its tasks (design.md "Backends", One runtime per process),
+    /// or this process's.
+    resume_task: ResumeFn = &builtins.task.host_calls.resumeTask,
+    free_task: FreeFn = &builtins.task.host_calls.free,
 
     pub fn init(allocator: std.mem.Allocator, ops: *RocOps, mode: Mode) TestHost {
         return .{ .allocator = allocator, .ops = ops, .mode = mode };
@@ -140,12 +146,22 @@ pub const TestHost = struct {
         active_host = null;
     }
 
+    /// Resume `task` through the runtime that made it.
+    pub fn resumeTask(self: *TestHost, task: *RocTask) Status {
+        return @fromBackingInt(@as(u8, @intCast(self.resume_task(task))));
+    }
+
+    /// Free `task` through the runtime that made it.
+    pub fn freeTask(self: *TestHost, task: *RocTask) void {
+        self.free_task(task);
+    }
+
     /// Run `task` to its end, finishing every paused operation.
     pub fn drive(self: *TestHost, task: *RocTask) std.mem.Allocator.Error!Status {
-        var status = task.resumeTask();
+        var status = self.resumeTask(task);
         while (status == .pending) {
             try self.finish();
-            status = task.resumeTask();
+            status = self.resumeTask(task);
         }
         return status;
     }
@@ -161,9 +177,9 @@ pub const TestHost = struct {
             active_host = self;
             cancel(task);
             active_host = null;
-            return task.resumeTask();
+            return self.resumeTask(task);
         }
-        var status = task.resumeTask();
+        var status = self.resumeTask(task);
         var seen: u32 = 0;
         while (status == .pending) {
             seen += 1;
@@ -173,10 +189,10 @@ pub const TestHost = struct {
                 cancel(task);
                 active_host = null;
                 // Readied by the cancel, or by the wake before it.
-                return task.resumeTask();
+                return self.resumeTask(task);
             }
             try self.finish();
-            status = task.resumeTask();
+            status = self.resumeTask(task);
         }
         return status;
     }
@@ -184,6 +200,12 @@ pub const TestHost = struct {
 
 /// `roc_task_wake`: a program's own, or `nativeWake`.
 pub const WakeFn = *const fn (*RocTask) callconv(.c) void;
+
+/// `roc_task_resume`, which returns a `RocTaskStatus`.
+pub const ResumeFn = *const fn (*RocTask) callconv(.c) u32;
+
+/// `roc_task_free`.
+pub const FreeFn = *const fn (*RocTask) callconv(.c) void;
 
 /// Wake with the test host's `roc_task_ready`, as a program's
 /// `roc_task_wake` does, for a run whose program defines none.

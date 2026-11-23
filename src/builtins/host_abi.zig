@@ -193,6 +193,14 @@ pub const RocOps = extern struct {
         // Inside a task's resume, the crash ends that task instead
         // (design.md "The Task Runtime").
         @import("task.zig").crashRunning(msg);
+        self.crashHost(msg);
+    }
+
+    /// Crash to the host's `roc_crashed`, never through a task's crash exit:
+    /// for a host that broke the task host contract (design.md "Host
+    /// Contract"). Such a crash may come from any thread, while another
+    /// thread runs a task, so it must not take that task's exit.
+    pub fn crashHost(self: *RocOps, msg: []const u8) noreturn {
         if (comptime host_role == .platform) {
             extern_host.roc_crashed(msg.ptr, msg.len);
         } else {

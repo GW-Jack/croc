@@ -81,11 +81,56 @@ pub const ReadyFn = *const fn (*RocTask) callconv(.c) void;
 /// count completions the host published and no resume has consumed yet.
 pub const wake_parked: u32 = 1 << 31;
 
+/// Whether the runtime checks the host contract: the conformance monitors
+/// (design.md "The Task Runtime", "Conformance"). Only a runtime with safety
+/// checks does; a release runtime pays nothing for them.
+const monitors = std.debug.runtime_safety;
+
 /// A host broke the host contract (design.md "Host Contract"). A runtime
-/// with safety checks crashes with the obligation's message; one without
-/// does no check, and the caller carries on as the contract assumes.
+/// with monitors crashes with the obligation's message, through the host's
+/// `roc_crashed` and never a task's crash exit, since the host may break the
+/// contract on any thread. One without does no check, and the caller
+/// carries on as the contract assumes. Each check runs before the operation
+/// changes the task, so a host that survives the crash (the conformance
+/// harness) finds the task as it was.
 fn hostViolation(ops: *RocOps, comptime message: []const u8) void {
-    if (std.debug.runtime_safety) ops.crash("host contract violated: " ++ message);
+    if (monitors) ops.crashHost("host contract violated: " ++ message);
+}
+
+/// The task whose resume is running, claimed by every resume while the
+/// monitors are on: a resume that finds it taken overlapped another (P10),
+/// or ran inside its own task's resume, from a hosted call (P1).
+var resuming: ?*RocTask = null;
+
+/// Recently freed tasks, with their ops, so a host that uses a task after
+/// freeing it (P8) is caught while the address is remembered. `create`
+/// forgets an address the allocator hands out again. Only while the
+/// monitors are on.
+const freed_capacity = 64;
+var freed_tasks: [freed_capacity]usize = @splat(0);
+var freed_ops: [freed_capacity]usize = @splat(0);
+var freed_next: u32 = 0;
+
+fn noteFreed(task: *RocTask, ops: *RocOps) void {
+    if (!monitors) return;
+    const index = @atomicRmw(u32, &freed_next, .Add, 1, .monotonic) % freed_capacity;
+    @atomicStore(usize, &freed_ops[index], @intFromPtr(ops), .monotonic);
+    @atomicStore(usize, &freed_tasks[index], @intFromPtr(task), .release);
+}
+
+fn forgetFreed(task: *RocTask) void {
+    if (!monitors) return;
+    for (&freed_tasks) |*slot| _ = @cmpxchgStrong(usize, slot, @intFromPtr(task), 0, .monotonic, .monotonic);
+}
+
+/// Crash if `task` was freed (P8): `operation` is what the host did with it.
+fn checkNotFreed(task: *RocTask, comptime operation: []const u8) void {
+    if (!monitors) return;
+    for (&freed_tasks, &freed_ops) |*slot, *ops| {
+        if (@atomicLoad(usize, slot, .acquire) != @intFromPtr(task)) continue;
+        const freed_with: *RocOps = @ptrFromInt(@atomicLoad(usize, ops, .monotonic));
+        hostViolation(freed_with, "a task was " ++ operation ++ " after it was freed (P8)");
+    }
 }
 
 /// The sizes and alignments of a task's two buffers, which the continuation
@@ -204,6 +249,9 @@ pub const RocTask = extern struct {
     cancel_requested: bool,
     /// `pending` while the task can be resumed or cancelled.
     status: Status,
+    /// Whether a cancel's `roc_task_abort` returned, after which the host
+    /// must not wake the task (P4). Kept while the monitors are on.
+    aborted: bool,
     /// Where the outermost record writes the root's result.
     root_result: [*]u8,
     /// The records, innermost last.
@@ -241,6 +289,7 @@ pub const RocTask = extern struct {
             .started = false,
             .cancel_requested = false,
             .status = .pending,
+            .aborted = false,
             .root_result = root_result,
             .entries = undefined,
             .len = 0,
@@ -258,6 +307,7 @@ pub const RocTask = extern struct {
             .record_cache = @splat(null),
         };
         task.push(.{ .record = start, .slot_drop = null, .from_task = false });
+        forgetFreed(task);
         return task;
     }
 
@@ -327,18 +377,28 @@ pub const RocTask = extern struct {
     /// `roc_task_resume`: run records, innermost first, until the list is
     /// empty, the task pauses again or it crashes.
     pub fn resumeTask(self: *RocTask) Status {
-        if (self.status != .pending) utils.builtinInvariant(self.ops, "a finished, cancelled or crashed task was resumed");
+        checkNotFreed(self, "resumed");
+        if (monitors and self.status != .pending) {
+            hostViolation(self.ops, "a task was resumed after it ended (P8)");
+            return self.status;
+        }
+        self.claimResume();
+        defer self.releaseResume();
         if (self.started) {
             // Readied: the host's one completion is counted and the parked
             // bit is clear. Consuming it with acquire ordering makes the
             // hosted slot the host wrote visible. A cancel readies the task
             // with no completion unless one raced it.
-            const word = @atomicRmw(u32, &self.wake_word, .Xchg, 0, .acquire);
-            if (self.cancel_requested) {
-                if (word & wake_parked != 0) hostViolation(self.ops, "a task was resumed without a roc_task_ready (P1)");
-                return self.finishCancel(word != 0);
+            if (monitors) {
+                const seen = @atomicLoad(u32, &self.wake_word, .monotonic);
+                const readied = if (self.cancel_requested) seen & wake_parked == 0 else seen == 1;
+                if (!readied) {
+                    self.releaseResume();
+                    hostViolation(self.ops, "a task was resumed without a roc_task_ready (P1)");
+                }
             }
-            if (word != 1) hostViolation(self.ops, "a task was resumed without a roc_task_ready (P1)");
+            const word = @atomicRmw(u32, &self.wake_word, .Xchg, 0, .acquire);
+            if (self.cancel_requested) return self.finishCancel(word & ~wake_parked != 0);
         } else {
             self.started = true;
             if (self.cancel_requested) return self.finishCancel(false);
@@ -407,8 +467,10 @@ pub const RocTask = extern struct {
     /// `wake_parked`. A milestone 4 running set has a word of its own,
     /// whose count may exceed one.
     pub fn wake(self: *RocTask, ready_fn: ReadyFn) void {
+        checkNotFreed(self, "woken");
+        if (monitors and @atomicLoad(bool, &self.aborted, .monotonic)) hostViolation(self.ops, "a task was woken after its operation was aborted (P4)");
+        if (monitors and @atomicLoad(u32, &self.wake_word, .monotonic) & ~wake_parked != 0) hostViolation(self.ops, "a task was woken more than once for one operation (P3)");
         const word = @atomicRmw(u32, &self.wake_word, .Xchg, 1, .release);
-        if (word & ~wake_parked != 0) hostViolation(self.ops, "a task was woken more than once for one operation (P3)");
         if (word & wake_parked != 0) ready_fn(self);
     }
 
@@ -424,13 +486,30 @@ pub const RocTask = extern struct {
     /// the task. A wake that lands between the swap and `abort` counts its
     /// completion without readying; the cancelling resume releases it.
     pub fn cancel(self: *RocTask, abort: AbortFn, ready_fn: ReadyFn) void {
-        if (self.status != .pending) return hostViolation(self.ops, "a task was cancelled after it ended (P8)");
+        checkNotFreed(self, "cancelled");
+        if (monitors and self.status != .pending) return hostViolation(self.ops, "a task was cancelled after it ended (P8)");
         self.cancel_requested = true;
         if (!self.started) return;
         if (@cmpxchgStrong(u32, &self.wake_word, wake_parked, 0, .acq_rel, .monotonic) == null) {
             abort(self);
+            if (monitors) @atomicStore(bool, &self.aborted, true, .monotonic);
             ready_fn(self);
         }
+    }
+
+    /// Claim the process's one running resume for this task, while the
+    /// monitors are on (P1, P10).
+    fn claimResume(self: *RocTask) void {
+        if (!monitors) return;
+        const holder = @cmpxchgStrong(?*RocTask, &resuming, null, self, .acquire, .monotonic) orelse return;
+        if (holder == self) hostViolation(self.ops, "a task was resumed inside its own resume, from a hosted call (P1)");
+        hostViolation(self.ops, "two resumes ran at the same time (P10)");
+    }
+
+    /// Give up the claim, if this task holds it. Safe to call twice.
+    fn releaseResume(self: *RocTask) void {
+        if (!monitors) return;
+        _ = @cmpxchgStrong(?*RocTask, &resuming, self, null, .release, .monotonic);
     }
 
     /// A resume of a cancelled task: no Roc code runs. Release the hosted
@@ -452,7 +531,8 @@ pub const RocTask = extern struct {
 
     /// `roc_task_free`, after the task is done or cancelled.
     pub fn free(self: *RocTask) void {
-        if (self.status == .pending) utils.builtinInvariant(self.ops, "a task was freed before it finished or was cancelled");
+        checkNotFreed(self, "freed");
+        if (monitors and self.status == .pending) return hostViolation(self.ops, "a task was freed before it ended (P8)");
         const ops = self.ops;
         for (&self.record_cache) |*list| {
             while (list.*) |record| {
@@ -465,6 +545,7 @@ pub const RocTask = extern struct {
         freeBuffer(ops, self.hosted_slot, self.hosted_slot_size, self.hosted_slot_alignment);
         freeBuffer(ops, self.result_buffer, self.result_buffer_size, self.result_buffer_alignment);
         ops.dealloc(@ptrCast(self), @alignOf(RocTask));
+        noteFreed(self, ops);
     }
 
     fn call(self: *RocTask, record: [*]u8, ret: [*]u8) void {
