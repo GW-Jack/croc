@@ -43,6 +43,7 @@ pub fn writeProc(
     if (proc.tail_group.get()) |group| try writer.print(" tail_group={d}", .{@backingInt(group)});
     if (proc.tail_carry) try writer.writeAll(" tail_carry");
     if (proc.suspends == .may) try writer.writeAll(" suspends=may");
+    if (proc.running_set_helper != .none) try writer.print(" running_set_helper={s}", .{@tagName(proc.running_set_helper)});
     try writer.writeAll("\n");
 
     if (proc.body.get()) |body| {

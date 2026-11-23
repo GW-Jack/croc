@@ -114,7 +114,9 @@ pub const MAGIC: u32 = 0x52494c52; // "RLIR" in little-endian bytes.
 ///      call extras mark suspension sites (`suspension_site`).
 /// v87: `suspend_save` and `suspend_return` statements, and the
 ///      `SuspendSaveData` row column.
-pub const FORMAT_VERSION: u32 = 87;
+/// v88: procedure specs record which running-set helper they specialize
+///      (`running_set_helper`).
+pub const FORMAT_VERSION: u32 = 88;
 const StaticDataImage = @import("lir_image_static_data.zig").Schema(@This());
 
 /// Public `ImageError` declaration.
@@ -876,6 +878,7 @@ test "persisted image bytes do not depend on what store memory held before" {
             .args = .empty(),
             .body = .some(ret),
             .ret_layout = .u64,
+            .running_set_helper = .run_next,
         };
         try lowered.root_procs.append(gpa, proc);
 
@@ -901,6 +904,7 @@ test "persisted image bytes do not depend on what store memory held before" {
         try std.testing.expectEqual(layout_mod.Idx.u64, view.store.getLocal(local).layout_idx);
         try std.testing.expectEqual(@as(?LIR.CFStmtId, ret), view.store.getProcSpecImmediate(proc).body.get());
         try std.testing.expectEqual(name, view.store.getProcSpecImmediate(proc).name);
+        try std.testing.expectEqual(LIR.RunningSetHelper.run_next, view.store.getProcSpecImmediate(proc).running_set_helper);
         try std.testing.expectEqual(proc, view.root_procs[0]);
 
         images[built] = try gpa.alignedAlloc(u8, .@"16", fba.end_index);

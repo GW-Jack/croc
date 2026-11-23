@@ -34086,6 +34086,15 @@ exit: cancel_group(g); repeat next(g) until Ended, dropping what arrives
   It calls one entry, and it is the only place the entries' lambda set is
   dispatched.
 
+**Helper marks.** Every LIR specialization of a Builtin running-set helper
+records which helper it is in `LirProcSpec.running_set_helper`: `run_create`,
+`run_next`, `run_spawn`, `run_cancel` or `run_entry`, and `none` for every
+other procedure. LIR construction sets it from the helper's Builtin
+declaration; every copy of a procedure keeps it, and so do LIR images and the
+native cache. The continuation pass finds a loop's operations by this mark
+and the loop id each call passes first, never by a name or by a body's
+shape.
+
 Each operation carries explicit `RcEffect` data, which ARC reads like any
 other operation's:
 - `group` consumes the flattened plan, and each entry closure moves into its

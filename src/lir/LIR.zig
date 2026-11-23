@@ -1092,6 +1092,21 @@ pub const Suspends = enum(u8) {
     may,
 };
 
+/// Which Builtin running-set helper a procedure is a specialization of, if
+/// any (design.md "Plans And Concurrent Loops"). A concurrent loop's
+/// sequential form calls these helpers; the continuation pass finds a loop's
+/// calls by this mark and the loop id each call passes first, and promotes
+/// a loop whose entries may suspend to the task form. It never matches a
+/// helper by name or body.
+pub const RunningSetHelper = enum(u8) {
+    none,
+    run_create,
+    run_next,
+    run_spawn,
+    run_cancel,
+    run_entry,
+};
+
 /// Where the erased calls a callee left pending are run. A tail call through
 /// an erased function value cannot replace its caller's frame, because the
 /// erased-call runtime sits between the two and the callee returns its result
@@ -2125,6 +2140,9 @@ pub const LirProcSpec = struct {
     /// body's producer commits it. `SuspensionMarks` computes it for every
     /// procedure with a body.
     suspends: Suspends = .never,
+    /// Set by LIR construction on every specialization of a running-set
+    /// helper, and kept by every copy of the procedure.
+    running_set_helper: RunningSetHelper = .none,
     /// Tail-recursion rewrite applied by the TRMC pass, if any.
     tail_transform: TailTransform = .none,
     /// Set by ARC on every procedure that makes or receives a same-SCC tail
