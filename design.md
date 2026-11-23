@@ -33809,11 +33809,16 @@ any other chain of continuations is no longer than the number of sites in
 `f`.
 
 The construction is exact. `C(f, k)` takes its live values in ascending
-local order, then the task, and returns `f`'s result layout. A copy keeps
-the join identities of `f`, since it is a procedure of its own. The joins
+local order, then the task, and returns `f`'s result layout. The joins
 it declares around the copied code are the enclosing joins of the site
 that the copy can jump to, found by following jumps from the code after
 the call and from each such join's body, and nested as they are in `f`.
+They keep their identities from `f`, since the continuation is a procedure
+of its own. A join that the copied code itself declares gets a fresh
+identity, and the jumps inside it follow: one enclosing join's body can
+declare another that also wraps the copy, as a loop's body declares the
+join after a site within it, and a procedure declares each identity once.
+Each such body is its own copy, and no statement belongs to two.
 In every copy, the site `j` it stops at stays a call. Its pending edge
 saves `R(f, j)`, the same resume entry `f`'s own site `j` saves, so each
 site of `f` has one continuation and one resume entry however many copies

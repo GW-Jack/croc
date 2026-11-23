@@ -790,6 +790,8 @@ const JoinScopes = struct {
     parent_of: collections.DenseMapUnmanaged(LIR.JoinPointId, ?LIR.JoinPointId) = .empty,
     /// The innermost join enclosing each statement.
     innermost: collections.DenseMapUnmanaged(CFStmtId, ?LIR.JoinPointId) = .empty,
+    /// One more than the largest join identity in the body.
+    next_join_point: u32 = 0,
 
     fn build(allocator: Allocator, store: *const LirStore, body: CFStmtId) Allocator.Error!JoinScopes {
         var self = JoinScopes{ .allocator = allocator };
@@ -808,6 +810,7 @@ const JoinScopes = struct {
                 .join => |join| {
                     try self.join_of.put(allocator, join.id, item.stmt);
                     try self.parent_of.put(allocator, join.id, item.scope);
+                    self.next_join_point = @max(self.next_join_point, @backingInt(join.id) + 1);
                     try work.append(allocator, .{ .stmt = join.body, .scope = join.id });
                     try work.append(allocator, .{ .stmt = join.remainder, .scope = join.id });
                 },
@@ -887,7 +890,23 @@ const ContinuationRewriter = struct {
     ret_layout: layout.Idx,
     /// The task of the procedure being copied.
     task: LocalId,
+    /// The enclosing joins the copied code jumps to, which the continuation
+    /// wraps around it with their own identities.
     jump_targets: std.ArrayList(LIR.JoinPointId) = .empty,
+    /// The fresh identity of each join the copied code declares, while the
+    /// copy is inside it. A wrapped join's body can declare a join that also
+    /// wraps the copy, such as the join after a site nested in a loop's
+    /// body, so the copies get identities of their own.
+    renamed: collections.DenseMapUnmanaged(LIR.JoinPointId, LIR.JoinPointId) = .empty,
+    /// What `renamed` held for each join the copy is inside, innermost last.
+    shadowed: std.ArrayList(struct { id: LIR.JoinPointId, previous: ?LIR.JoinPointId }) = .empty,
+    next_join_point: u32,
+
+    fn deinit(self: *ContinuationRewriter) void {
+        self.jump_targets.deinit(self.allocator);
+        self.renamed.deinit(self.allocator);
+        self.shadowed.deinit(self.allocator);
+    }
 
     pub fn interceptStmt(self: *ContinuationRewriter, cloner: anytype, old_id: CFStmtId, stmt: LIR.CFStmt, origin: LIR.StmtOrigin) Allocator.Error!body_clone.Intercept {
         switch (stmt) {
@@ -936,8 +955,19 @@ const ContinuationRewriter = struct {
                 return .{ .done = try cloner.store.addCFStmt(head, origin) };
             },
             .jump => |jump| {
+                if (self.renamed.get(jump.target)) |fresh| {
+                    return .{ .done = try cloner.store.addCFStmt(.{ .jump = .{ .target = fresh } }, origin) };
+                }
                 try self.jump_targets.append(self.allocator, jump.target);
                 return .none;
+            },
+            .join => |join| {
+                if (self.next_join_point == std.math.maxInt(u32)) invariant("join-point id space exhausted", .{});
+                const fresh: LIR.JoinPointId = @fromBackingInt(self.next_join_point);
+                self.next_join_point += 1;
+                try self.shadowed.append(self.allocator, .{ .id = join.id, .previous = self.renamed.get(join.id) });
+                try self.renamed.put(self.allocator, join.id, fresh);
+                return body_clone.Intercept.two(join.body, join.remainder);
             },
             .init_uninitialized,
             .assign_ref,
@@ -964,13 +994,31 @@ const ContinuationRewriter = struct {
             .switch_initialized_payload,
             .str_match,
             .str_match_set,
-            .join,
             .ret,
             .suspend_save,
             .suspend_return,
             .crash,
             => return .none,
         }
+    }
+
+    /// A join the copy declares, with its fresh identity, once its body and
+    /// remainder are copied; the copy is outside it again.
+    pub fn finishIntercept(self: *ContinuationRewriter, cloner: anytype, _: CFStmtId, stmt: LIR.CFStmt, origin: LIR.StmtOrigin, cloned: []const CFStmtId) Allocator.Error!CFStmtId {
+        const join = switch (stmt) {
+            .join => |join| join,
+            .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .jump, .ret, .crash => unreachable, // interceptStmt returns children only for a join
+        };
+        const fresh = self.renamed.get(join.id).?;
+        const scope = self.shadowed.pop().?;
+        if (scope.previous) |previous| try self.renamed.put(self.allocator, join.id, previous) else _ = self.renamed.remove(join.id);
+        return try cloner.store.addCFStmt(.{ .join = .{
+            .id = fresh,
+            .params = try cloner.mapLocalSpan(join.params),
+            .extra = try cloner.mapJoinExtra(join.extra),
+            .body = cloned[0],
+            .remainder = cloned[1],
+        } }, origin);
     }
 };
 
@@ -991,9 +1039,10 @@ fn buildContinuation(
         .infos = infos,
         .ret_layout = ret_layout,
         .task = plan.task,
+        .next_join_point = scopes.next_join_point,
     }, allocator);
     defer cloner.deinit();
-    defer cloner.rewriter.jump_targets.deinit(allocator);
+    defer cloner.rewriter.deinit();
 
     var args = try std.ArrayList(LocalId).initCapacity(allocator, site.live_after.len + 1);
     defer args.deinit(allocator);
@@ -1013,6 +1062,10 @@ fn buildContinuation(
         const target = cloner.rewriter.jump_targets.items[next_target];
         if (bodies.contains(target) or !scopes.encloses(target, site.call)) continue;
         const join = store.getCFStmtImmediate(scopes.join_of.get(target).?).join;
+        // A body copies afresh what another copy already holds, such as a
+        // wrapped join's body inside the body of a loop that encloses it:
+        // two copies must not share a statement.
+        cloner.stmt_map.clearRetainingCapacity();
         try bodies.put(allocator, target, try cloner.cloneStmt(join.body));
         try wrapped.append(allocator, target);
     }
@@ -1060,10 +1113,31 @@ fn buildContinuation(
 /// not a tail site has its pending test and edge, that each edge saves
 /// exactly the values live after its site other than the result, that each
 /// resume entry calls its continuation with its captures in order, and that
-/// every call to a continuation is a tail site.
+/// every call to a continuation is a tail site. It also checks that no
+/// procedure declares one join identity twice, which a continuation's
+/// copies of its enclosing joins could.
 fn verify(allocator: Allocator, store: *const LirStore) Allocator.Error!void {
     var continuations = try std.DynamicBitSetUnmanaged.initEmpty(allocator, store.procSpecCount());
     defer continuations.deinit(allocator);
+    {
+        var declared = collections.DenseMapUnmanaged(LIR.JoinPointId, void).empty;
+        defer declared.deinit(allocator);
+        var work = std.ArrayList(CFStmtId).empty;
+        defer work.deinit(allocator);
+        for (0..store.procSpecCount()) |index| {
+            const body = store.getProcSpecImmediate(@fromBackingInt(@intCast(index))).body.get() orelse continue;
+            declared.clearRetainingCapacity();
+            try work.append(allocator, body);
+            while (work.pop()) |stmt_id| {
+                const stmt = store.getCFStmtImmediate(stmt_id).*;
+                if (stmt == .join) {
+                    const slot = try declared.getOrPut(allocator, stmt.join.id);
+                    if (slot.found_existing) invariant("continuation pass left a procedure that declares one join identity twice", .{});
+                }
+                try body_clone.appendSuccessors(store, &work, stmt_id, allocator);
+            }
+        }
+    }
     const Call = struct { callee: ProcId, tail: bool };
     var calls = std.ArrayList(Call).empty;
     defer calls.deinit(allocator);
