@@ -564,22 +564,49 @@ pub fn exportTaskHostCalls() void {
     @export(&task.host_calls.crashMessage, .{ .name = shim_symbols.roc_task_crash_message });
 }
 
+/// A host function a `ProgramTaskCall` passes to its builtin. Only the host
+/// of a `Tasks` platform defines these.
+pub const TaskHostFn = enum {
+    /// `roc_task_ready`: resume the task once.
+    ready,
+    /// `roc_task_abort`: abandon the task's operation.
+    abort,
+
+    pub fn symbol(self: TaskHostFn) [:0]const u8 {
+        return switch (self) {
+            .ready => shim_symbols.roc_task_ready,
+            .abort => shim_symbols.roc_task_abort,
+        };
+    }
+};
+
+/// Every `TaskHostFn`, in declaration order.
+pub const task_host_fns = std.enums.values(TaskHostFn);
+
 /// A task call a `Tasks` program defines over a builtin (design.md
-/// "Backends"): `name(task)` is `builtin(task, host_fn)`, with the address of
-/// the host's `host_fn`. The builtins never link a host symbol themselves;
-/// the program that needs the host's function does.
+/// "Backends"): `name(task)` is `builtin(task, host_fns...)`, with the
+/// addresses of the host's functions. The builtins never link a host symbol
+/// themselves; the program that needs the host's functions does.
 pub const ProgramTaskCall = struct {
     name: [:0]const u8,
     builtin: BuiltinFn,
-    host_fn: [:0]const u8,
+    host_fns: []const TaskHostFn,
 };
 
 /// Every `ProgramTaskCall`: `roc_task_wake` tells the host a woken parked
 /// task is ready through `roc_task_ready`; `roc_task_cancel` abandons a
-/// parked task's operation through `roc_task_abort`.
+/// parked task's operation through `roc_task_abort` and readies it through
+/// `roc_task_ready`.
 pub const program_task_calls = [_]ProgramTaskCall{
-    .{ .name = shim_symbols.roc_task_wake, .builtin = .task_wake, .host_fn = shim_symbols.roc_task_ready },
-    .{ .name = shim_symbols.roc_task_cancel, .builtin = .task_cancel, .host_fn = shim_symbols.roc_task_abort },
+    .{ .name = shim_symbols.roc_task_wake, .builtin = .task_wake, .host_fns = &.{.ready} },
+    .{ .name = shim_symbols.roc_task_cancel, .builtin = .task_cancel, .host_fns = &.{ .abort, .ready } },
+};
+
+/// The most host functions one `ProgramTaskCall` passes.
+pub const max_program_task_call_host_fns = blk: {
+    var max: usize = 0;
+    for (program_task_calls) |call| max = @max(max, call.host_fns.len);
+    break :blk max;
 };
 
 // Overflow-arithmetic exports (`roc__num_*` scheme) present in every payload.

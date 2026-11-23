@@ -7,9 +7,13 @@
 //!   the task, which the program hands back through `roc_task_ready`;
 //! - 1: answer every fetch during the call;
 //! - 2: cancel at pause `pause` before answering, so the program aborts the
-//!   fetch through `roc_task_abort`;
+//!   fetch through `roc_task_abort` and hands the task back through
+//!   `roc_task_ready`;
 //! - 3: answer and wake at pause `pause`, then cancel, so the program
 //!   releases the answer.
+//!
+//! A cancel is a request: the loop resumes the task once more, and that
+//! resume reports CANCELLED.
 //!
 //! `wasm_main` returns the text the native host prints (the result or where
 //! it cancelled, then the fetch and pause counts), copied out of the heap,
@@ -175,8 +179,8 @@ fn taskAbort(task: *RocTask) callconv(.c) void {
 /// loop resumes next. One task, so one slot.
 var ready: ?*RocTask = null;
 
-/// `void roc_task_ready(RocTask *task)`: a wake found the task parked, so
-/// it may be resumed. Queue it for the loop.
+/// `void roc_task_ready(RocTask *task)`: a wake found the task parked, or a
+/// cancel unparked it, so it may be resumed. Queue it for the loop.
 fn taskReady(task: *RocTask) callconv(.c) void {
     if (ready != null) @panic("roc_task_ready while a task is already queued");
     ready = task;
@@ -219,9 +223,15 @@ export fn wasm_main() [*]const u8 {
     var result: RocStr = undefined;
     const task = roc_main(url, &result);
 
+    var cancel_requested = false;
     while (true) {
         const status = roc_task_resume(task);
         if (status == @backingInt(TaskStatus.done)) break;
+        if (status == @backingInt(TaskStatus.cancelled) and cancel_requested) {
+            roc_task_free(task);
+            report("cancelled at pause {d}\nfetches: {d}, pauses: {d}\n", .{ pauses, fetches, pauses });
+            return &report_buf;
+        }
         if (status != @backingInt(TaskStatus.pending)) @panic("unexpected task status");
         const parked = pending orelse @panic("the task paused with no fetch pending");
         pauses += 1;
@@ -235,10 +245,14 @@ export fn wasm_main() [*]const u8 {
             ready = null;
         }
         if (cancelling) {
+            // Unwoken, the program aborts the fetch through `taskAbort` and
+            // hands the task back; woken, the wake already did.
+            cancel_requested = true;
             roc_task_cancel(task);
-            roc_task_free(task);
-            report("cancelled at pause {d}\nfetches: {d}, pauses: {d}\n", .{ pauses, fetches, pauses });
-            return &report_buf;
+            if (mode == .cancel_at) {
+                if (ready != task) @panic("a cancelled parked task was not handed back");
+                ready = null;
+            }
         }
     }
     roc_task_free(task);

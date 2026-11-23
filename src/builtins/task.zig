@@ -199,6 +199,9 @@ pub const RocTask = extern struct {
     /// Whether the host's first resume has run; a later resume needs a
     /// `roc_task_ready`.
     started: bool,
+    /// Whether the host asked to cancel the task (`roc_task_cancel`): its
+    /// next resume runs no Roc code and reports `cancelled`.
+    cancel_requested: bool,
     /// `pending` while the task can be resumed or cancelled.
     status: Status,
     /// Where the outermost record writes the root's result.
@@ -236,6 +239,7 @@ pub const RocTask = extern struct {
             .result_buffer = allocBuffer(ops, buffers.result_buffer_size, buffers.result_buffer_alignment),
             .wake_word = 0,
             .started = false,
+            .cancel_requested = false,
             .status = .pending,
             .root_result = root_result,
             .entries = undefined,
@@ -327,11 +331,17 @@ pub const RocTask = extern struct {
         if (self.started) {
             // Readied: the host's one completion is counted and the parked
             // bit is clear. Consuming it with acquire ordering makes the
-            // hosted slot the host wrote visible.
+            // hosted slot the host wrote visible. A cancel readies the task
+            // with no completion unless one raced it.
             const word = @atomicRmw(u32, &self.wake_word, .Xchg, 0, .acquire);
+            if (self.cancel_requested) {
+                if (word & wake_parked != 0) hostViolation(self.ops, "a task was resumed without a roc_task_ready (P1)");
+                return self.finishCancel(word != 0);
+            }
             if (word != 1) hostViolation(self.ops, "a task was resumed without a roc_task_ready (P1)");
         } else {
             self.started = true;
+            if (self.cancel_requested) return self.finishCancel(false);
         }
         self.pending = 0;
         const exits = crash_exit.available();
@@ -402,27 +412,42 @@ pub const RocTask = extern struct {
         if (word & wake_parked != 0) ready_fn(self);
     }
 
-    /// Whether the host's completion is counted and not consumed.
-    fn woken(self: *RocTask) bool {
-        return @atomicLoad(u32, &self.wake_word, .acquire) & ~wake_parked != 0;
+    /// `roc_task_cancel`, between resumes: request that the task's next
+    /// resume finish it (design.md "The Task Runtime", "Cancellation"). A
+    /// task parked with no completion counted is unparked here, its
+    /// operation abandoned with `abort` and the task readied with
+    /// `ready_fn`. One whose completion is counted was readied by its wake,
+    /// or is about to be, and a new task is resumed by the host anyway.
+    ///
+    /// Unparking is a compare-and-swap from parked to zero, so exactly one
+    /// of this and a racing wake clears the parked bit, and that one readies
+    /// the task. A wake that lands between the swap and `abort` counts its
+    /// completion without readying; the cancelling resume releases it.
+    pub fn cancel(self: *RocTask, abort: AbortFn, ready_fn: ReadyFn) void {
+        if (self.status != .pending) return hostViolation(self.ops, "a task was cancelled after it ended (P8)");
+        self.cancel_requested = true;
+        if (!self.started) return;
+        if (@cmpxchgStrong(u32, &self.wake_word, wake_parked, 0, .acq_rel, .monotonic) == null) {
+            abort(self);
+            ready_fn(self);
+        }
     }
 
-    /// `roc_task_cancel`: abandon the parked task's operation with `abort`
-    /// unless the host already finished it, then release the hosted result
-    /// the host wrote and every record.
-    pub fn cancel(self: *RocTask, abort: AbortFn) void {
-        if (self.status != .pending or self.pending == 0) utils.builtinInvariant(self.ops, "a task was cancelled while not parked");
-        if (self.woken()) {
+    /// A resume of a cancelled task: no Roc code runs. Release the hosted
+    /// result if a completion was counted (`completed`), with the release
+    /// the innermost record names for it, then every record.
+    fn finishCancel(self: *RocTask, completed: bool) Status {
+        if (completed) {
             const innermost = self.entries[self.len - 1];
             if (innermost.slot_drop) |slot_drop| slot_drop(self.hosted_slot, innermost.record, self.ops);
-        } else {
-            abort(self);
         }
         while (self.len > 0) {
             self.len -= 1;
             self.releaseRecord(self.entries[self.len].record, self.entries[self.len].from_task);
         }
+        self.pending = 0;
         self.status = .cancelled;
+        return .cancelled;
     }
 
     /// `roc_task_free`, after the task is done or cancelled.
@@ -702,7 +727,7 @@ test "a task reuses a released record's memory for its next record of that size 
     try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
 }
 
-test "cancelling a parked task aborts its operation and releases every record" {
+test "cancelling a parked task aborts its operation and readies it, and the next resume releases every record" {
     var test_env = utils.TestEnv.init(std.testing.allocator);
     defer test_env.deinit();
     const ops = test_env.getOps();
@@ -713,8 +738,12 @@ test "cancelling a parked task aborts its operation and releases every record" {
     const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ inner, outer }, .pauses = true, .result = 0 }), &root, test_buffers);
 
     try std.testing.expectEqual(Status.pending, task.resumeTask());
-    task.cancel(&testAbort);
+    task.cancel(&testAbort, &testReady);
     try std.testing.expectEqual(@as(usize, 1), TestLog.aborts);
+    try std.testing.expectEqual(@as(usize, 1), TestLog.readies);
+    // A request: nothing is released until the resume.
+    try std.testing.expectEqual(@as(usize, 1), TestLog.drops);
+    try std.testing.expectEqual(Status.cancelled, task.resumeTask());
     try std.testing.expectEqual(@as(usize, 0), TestLog.slot_drops);
     try std.testing.expectEqual(@as(usize, 3), TestLog.drops);
     try std.testing.expectEqualSlices(u8, &.{1}, TestLog.calls[0..TestLog.call_count]);
@@ -722,7 +751,7 @@ test "cancelling a parked task aborts its operation and releases every record" {
     try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
 }
 
-test "cancelling a woken task releases the hosted result instead of aborting" {
+test "cancelling a woken task neither aborts nor readies it again, and the resume releases the hosted result" {
     var test_env = utils.TestEnv.init(std.testing.allocator);
     defer test_env.deinit();
     const ops = test_env.getOps();
@@ -733,10 +762,78 @@ test "cancelling a woken task releases the hosted result instead of aborting" {
 
     try std.testing.expectEqual(Status.pending, task.resumeTask());
     task.wake(&testReady);
-    task.cancel(&testAbort);
+    task.cancel(&testAbort, &testReady);
     try std.testing.expectEqual(@as(usize, 0), TestLog.aborts);
+    try std.testing.expectEqual(@as(usize, 1), TestLog.readies);
+    try std.testing.expectEqual(Status.cancelled, task.resumeTask());
     try std.testing.expectEqual(@as(usize, 1), TestLog.slot_drops);
     try std.testing.expectEqual(@as(usize, 2), TestLog.drops);
+    try std.testing.expectEqualSlices(u8, &.{1}, TestLog.calls[0..TestLog.call_count]);
+    task.free();
+    try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
+}
+
+/// An abort that finds the host already finished: the completion took the
+/// operation's lock first, between the cancel's unpark and its abort.
+fn testAbortAfterWake(task: *RocTask) callconv(.c) void {
+    task.wake(&testReady);
+    TestLog.aborts += 1;
+}
+
+test "a completion that lands between a cancel's unpark and its abort is released by the cancelling resume, with one ready" {
+    var test_env = utils.TestEnv.init(std.testing.allocator);
+    defer test_env.deinit();
+    const ops = test_env.getOps();
+    TestLog.reset();
+    const inner = testRecord(ops, .{ .id = 2, .saves = .{ null, null }, .pauses = false, .result = 0 });
+    var root: [1]u8 = .{0};
+    const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ inner, null }, .pauses = true, .result = 0 }), &root, test_buffers);
+
+    try std.testing.expectEqual(Status.pending, task.resumeTask());
+    task.cancel(&testAbortAfterWake, &testReady);
+    // The wake found the task unparked, so only the cancel readied it.
+    try std.testing.expectEqual(@as(usize, 1), TestLog.readies);
+    try std.testing.expectEqual(Status.cancelled, task.resumeTask());
+    try std.testing.expectEqual(@as(usize, 1), TestLog.slot_drops);
+    try std.testing.expectEqual(@as(usize, 2), TestLog.drops);
+    task.free();
+    try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
+}
+
+test "a task cancelled before its first resume runs no record, and a second cancel changes nothing" {
+    var test_env = utils.TestEnv.init(std.testing.allocator);
+    defer test_env.deinit();
+    const ops = test_env.getOps();
+    TestLog.reset();
+    var root: [1]u8 = .{0};
+    const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ null, null }, .pauses = false, .result = 7 }), &root, test_buffers);
+
+    task.cancel(&testAbort, &testReady);
+    task.cancel(&testAbort, &testReady);
+    try std.testing.expectEqual(@as(usize, 0), TestLog.aborts);
+    try std.testing.expectEqual(@as(usize, 0), TestLog.readies);
+    try std.testing.expectEqual(Status.cancelled, task.resumeTask());
+    try std.testing.expectEqual(@as(usize, 0), TestLog.call_count);
+    try std.testing.expectEqual(@as(usize, 1), TestLog.drops);
+    try std.testing.expectEqual(@as(u8, 0), root[0]);
+    task.free();
+    try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
+}
+
+test "a second cancel of a parked task neither aborts nor readies it again" {
+    var test_env = utils.TestEnv.init(std.testing.allocator);
+    defer test_env.deinit();
+    const ops = test_env.getOps();
+    TestLog.reset();
+    var root: [1]u8 = .{0};
+    const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ null, null }, .pauses = true, .result = 0 }), &root, test_buffers);
+
+    try std.testing.expectEqual(Status.pending, task.resumeTask());
+    task.cancel(&testAbort, &testReady);
+    task.cancel(&testAbort, &testReady);
+    try std.testing.expectEqual(@as(usize, 1), TestLog.aborts);
+    try std.testing.expectEqual(@as(usize, 1), TestLog.readies);
+    try std.testing.expectEqual(Status.cancelled, task.resumeTask());
     task.free();
     try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
 }
@@ -945,9 +1042,9 @@ test "compiled code's task builtins create a task with the entered ops and push 
     try std.testing.expectEqual(record, task.entries[1].record);
     try std.testing.expectEqual(@as(?SlotDropFn, &testSlotDrop), task.entries[1].slot_drop);
 
-    // Parked and never resumed: cancelling releases both records.
-    task.setPending();
-    task.cancel(&testAbort);
+    // Cancelled before the first resume: that resume releases both records.
+    task.cancel(&testAbort, &testReady);
+    try std.testing.expectEqual(Status.cancelled, task.resumeTask());
     try std.testing.expectEqual(@as(usize, 2), TestLog.drops);
     task.free();
     try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());

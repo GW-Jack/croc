@@ -152,9 +152,17 @@ pub const TestHost = struct {
 
     /// Run `task` until its `pause`th pause (counting from 1), then cancel
     /// it there with `cancel`, before the host finishes the operation when
-    /// `woken` is false and after it when true. Returns the task's last
-    /// status: `.done` when it finished before that pause.
+    /// `woken` is false and after it when true, and resume it once more: a
+    /// cancel is a request the next resume carries out. Returns the task's
+    /// last status: `.done` when it finished before that pause. Pause 0
+    /// cancels before the first resume.
     pub fn driveAndCancel(self: *TestHost, task: *RocTask, pause: u32, woken: bool, cancel: CancelFn) std.mem.Allocator.Error!Status {
+        if (pause == 0) {
+            active_host = self;
+            cancel(task);
+            active_host = null;
+            return task.resumeTask();
+        }
         var status = task.resumeTask();
         var seen: u32 = 0;
         while (status == .pending) {
@@ -164,7 +172,8 @@ pub const TestHost = struct {
                 active_host = self;
                 cancel(task);
                 active_host = null;
-                return task.status;
+                // Readied by the cancel, or by the wake before it.
+                return task.resumeTask();
             }
             try self.finish();
             status = task.resumeTask();
@@ -185,14 +194,14 @@ pub fn nativeWake(task: *RocTask) callconv(.c) void {
 /// `roc_task_cancel`: a program's own, or `nativeCancel`.
 pub const CancelFn = *const fn (*RocTask) callconv(.c) void;
 
-/// Cancel with the test host's `roc_task_abort`, as a program's
-/// `roc_task_cancel` does, for a run whose program defines none.
+/// Cancel with the test host's `roc_task_abort` and `roc_task_ready`, as a
+/// program's `roc_task_cancel` does, for a run whose program defines none.
 pub fn nativeCancel(task: *RocTask) callconv(.c) void {
-    task.cancel(&abortPending);
+    task.cancel(&abortPending, &readyTask);
 }
 
-/// The host a wake's ready or a cancel's abort reaches: `roc_task_ready`
-/// and `roc_task_abort` take only the task.
+/// The host a wake's or a cancel's ready, or a cancel's abort, reaches:
+/// `roc_task_ready` and `roc_task_abort` take only the task.
 var active_host: ?*TestHost = null;
 
 /// The host compiled code's hosted calls reach, between `enterCAbi` and

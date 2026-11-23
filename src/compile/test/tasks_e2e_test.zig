@@ -3,9 +3,10 @@
 //! `suspending` hosted function compiles under `.lss` and runs on the
 //! interpreter as a task. A host that pauses at every suspending call gives
 //! the same result and the same hosted-call trace as a host that finishes
-//! each at once, and neither leaves a live allocation. Cancelling at each
-//! pause, before or after the host finishes the operation, also leaves
-//! none.
+//! each at once, and neither leaves a live allocation. Cancelling before
+//! the first resume, or at each pause before or after the host finishes the
+//! operation, is a request the next resume carries out: it reports
+//! `CANCELLED` and also leaves none.
 //!
 //! The program's root is the task entry the continuation pass builds: the
 //! test calls it as a host calls a `provides` entry and drives the task it
@@ -549,9 +550,14 @@ const WasmRun = struct {
     }
 
     /// Run the task until its `pause`th pause, then cancel it there with
-    /// the program's `roc_task_cancel`, as `TestHost.driveAndCancel` does.
-    /// Returns whether it reached that pause.
-    fn driveAndCancel(self: *WasmRun, task: u32, pause: u32, woken: bool) E2eError!bool {
+    /// the program's `roc_task_cancel` and resume it once more, as
+    /// `TestHost.driveAndCancel` does. Pause 0 cancels before the first
+    /// resume. Returns the task's last status.
+    fn driveAndCancel(self: *WasmRun, task: u32, pause: u32, woken: bool) E2eError!builtins.task.Status {
+        if (pause == 0) {
+            try self.call(builtins.shim_symbols.roc_task_cancel, task, &.{});
+            return self.resumeTask(task);
+        }
         var status = try self.resumeTask(task);
         var seen: u32 = 0;
         while (status == .pending) {
@@ -559,12 +565,13 @@ const WasmRun = struct {
             if (seen == pause) {
                 if (woken) try self.finish();
                 try self.call(builtins.shim_symbols.roc_task_cancel, task, &.{});
-                return true;
+                // Readied by the cancel, or by the wake before it.
+                return self.resumeTask(task);
             }
             try self.finish();
             status = try self.resumeTask(task);
         }
-        return false;
+        return status;
     }
 
     /// Call the task entry with the URL and the root result's storage, both
@@ -614,19 +621,23 @@ fn runToEndWasm(program: *const WasmProgram, mode: task_test_host.Mode) E2eError
 }
 
 /// Cancel the wasm-compiled program's task at its `pause`th pause through
-/// the module's `roc_task_cancel`, before or after the host finishes the
-/// operation: the host's `roc_task_abort` runs only before, and nothing is
-/// live after. Freeing the task succeeds only after it was cancelled.
+/// the module's `roc_task_cancel` (0: before its first resume), before or
+/// after the host finishes the operation, and resume it: it reports
+/// `CANCELLED`, the host's `roc_task_abort` runs only for a parked task the
+/// host had not finished, every pause was readied once, and nothing is
+/// live after.
 fn cancelAtWasm(program: *const WasmProgram, pause: u32, woken: bool) E2eError!void {
     var run: WasmRun = undefined;
     try run.init(program, .pause);
     defer run.deinit();
     const result = run.resultStorage();
     const task = try run.startRoot(program, result);
-    try std.testing.expect(try run.driveAndCancel(task, pause, woken));
+    try std.testing.expectEqual(builtins.task.Status.cancelled, try run.driveAndCancel(task, pause, woken));
     try run.call(builtins.shim_symbols.roc_task_free, task, &.{});
     run.session.free();
-    try std.testing.expectEqual(@as(u32, if (woken) 0 else 1), run.aborts);
+    try std.testing.expectEqual(@as(u32, if (woken or pause == 0) 0 else 1), run.aborts);
+    try std.testing.expectEqual(pause, run.pauses);
+    try std.testing.expectEqual(run.pauses, run.readies);
     try std.testing.expectEqual(@as(i64, 0), run.session.liveAllocations());
 }
 
@@ -643,8 +654,9 @@ fn runAllWasm(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerT
             return error.TestUnexpectedResult;
         };
     }
-    for (1..pause_count + 1) |pause| {
+    for (0..pause_count + 1) |pause| {
         for ([_]bool{ false, true }) |woken| {
+            if (pause == 0 and woken) continue;
             cancelAtWasm(&program, @intCast(pause), woken) catch |err| {
                 std.log.err("cancelling the wasm task at pause {d} (woken: {}) failed: {s}", .{ pause, woken, @errorName(err) });
                 return error.TestUnexpectedResult;
@@ -686,7 +698,9 @@ fn cancelAt(comptime R: type, program: R.Program, pause: u32, woken: bool) E2eEr
     const task = try run.startRoot(program, &result);
     try std.testing.expectEqual(builtins.task.Status.cancelled, try run.host.driveAndCancel(task, pause, woken, R.cancelFn(program)));
     task.free();
-    try std.testing.expectEqual(@as(u32, if (woken) 0 else 1), run.host.aborts);
+    try std.testing.expectEqual(@as(u32, if (woken or pause == 0) 0 else 1), run.host.aborts);
+    try std.testing.expectEqual(pause, run.host.pauses);
+    try std.testing.expectEqual(run.host.pauses, run.host.readies);
     try run.runtime.checkForLeaks();
 }
 
@@ -782,8 +796,11 @@ fn runAll(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLir
 fn checkAll(comptime R: type, program: R.Program) E2eError!void {
     try runToEnd(R, program, .ready);
     try runToEnd(R, program, .pause);
-    for (1..pause_count + 1) |pause| {
-        for ([_]bool{ false, true }) |woken| try cancelAt(R, program, @intCast(pause), woken);
+    for (0..pause_count + 1) |pause| {
+        for ([_]bool{ false, true }) |woken| {
+            if (pause == 0 and woken) continue;
+            try cancelAt(R, program, @intCast(pause), woken);
+        }
     }
     if (task_test_host.c_abi_failure) |err| return err;
 }

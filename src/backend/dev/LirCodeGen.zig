@@ -22842,7 +22842,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         }
 
         /// Generate one of a `Tasks` program's `ProgramTaskCall`s,
-        /// `name(task)`: a call to its builtin with the host's `host_fn`
+        /// `name(task)`: a call to its builtin with the host's functions
         /// (design.md "Backends"). An object file defines them when the
         /// program creates a task; a shim build's platform shim module
         /// defines them instead.
@@ -22864,17 +22864,24 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         };
 
         /// A `ProgramTaskCall`'s body: the task, which arrives in the first
-        /// argument register, and the address of the host's `host_fn`,
+        /// argument register, and the addresses of the host's functions,
         /// passed to the builtin from the callee-saved `task_reg` and
-        /// `host_fn_reg`.
-        fn generateProgramTaskCallBody(self: *Self, call: builtins.builtin_registry.ProgramTaskCall, task_reg: GeneralReg, host_fn_reg: GeneralReg) Allocator.Error!void {
+        /// `host_fn_regs`.
+        fn generateProgramTaskCallBody(
+            self: *Self,
+            call: builtins.builtin_registry.ProgramTaskCall,
+            task_reg: GeneralReg,
+            host_fn_regs: [builtins.builtin_registry.max_program_task_call_host_fns]GeneralReg,
+        ) Allocator.Error!void {
             try self.codegen.emit.movRegReg(.w64, task_reg, EmitType.CC.PARAM_REGS[0]);
-            const host_fn = try self.codegen.symbols.intern(self.allocator, call.host_fn, .shared);
-            try self.codegen.emitLoadDataAddress(host_fn_reg, host_fn);
+            for (call.host_fns, host_fn_regs[0..call.host_fns.len]) |host_fn, reg| {
+                const symbol = try self.codegen.symbols.intern(self.allocator, host_fn.symbol(), .shared);
+                try self.codegen.emitLoadDataAddress(reg, symbol);
+            }
             var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
             defer builder.deinit();
             try builder.addRegArg(task_reg);
-            try builder.addRegArg(host_fn_reg);
+            for (host_fn_regs[0..call.host_fns.len]) |reg| try builder.addRegArg(reg);
             try self.callBuiltin(&builder, call.builtin);
         }
 
@@ -22941,7 +22948,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             // inside generateEntrypointBodyCAbi.
                             try self.generateEntrypointBodyCAbi(entry.proc, entry.arg_layouts, entry.ret_layout, .X20, &incoming_stack_copies);
                         },
-                        .program_task_call => |call| try self.generateProgramTaskCallBody(call, .X20, .X21),
+                        .program_task_call => |call| try self.generateProgramTaskCallBody(call, .X20, .{ .X21, .X19 }),
                     }
 
                     const body_epilogue_offset = self.codegen.currentOffset();
@@ -23032,7 +23039,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             // inside generateEntrypointBodyCAbi.
                             try self.generateEntrypointBodyCAbi(entry.proc, entry.arg_layouts, entry.ret_layout, .RBX, &incoming_stack_copies);
                         },
-                        .program_task_call => |call| try self.generateProgramTaskCallBody(call, .RBX, .R13),
+                        .program_task_call => |call| try self.generateProgramTaskCallBody(call, .RBX, .{ .R13, .R12 }),
                     }
 
                     const body_epilogue_offset = self.codegen.currentOffset();

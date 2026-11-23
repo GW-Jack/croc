@@ -8733,12 +8733,12 @@ fn wasmRocHostRequirements(
     const hosted = try hostedSymbolsFromLir(arena, store);
     // A `Tasks` program's `ProgramTaskCall`s call the host's
     // `roc_task_ready` and `roc_task_abort` (design.md "Host Contract").
-    const program_task_calls = &builtins_registry.program_task_calls;
-    const task_host_fns = if (store.createsTask()) program_task_calls.len else 0;
+    const all_task_host_fns = builtins_registry.task_host_fns;
+    const task_host_fns = if (store.createsTask()) all_task_host_fns.len else 0;
     const requirements = try arena.alloc([]const u8, hosted.len + host_symbols.runtime_symbols.len + task_host_fns);
     @memcpy(requirements[0..hosted.len], hosted);
     @memcpy(requirements[hosted.len..][0..host_symbols.runtime_symbols.len], &host_symbols.runtime_symbols);
-    for (requirements[hosted.len + host_symbols.runtime_symbols.len ..], program_task_calls[0..task_host_fns]) |*requirement, call| requirement.* = call.host_fn;
+    for (requirements[hosted.len + host_symbols.runtime_symbols.len ..], all_task_host_fns[0..task_host_fns]) |*requirement, host_fn| requirement.* = host_fn.symbol();
     return requirements;
 }
 

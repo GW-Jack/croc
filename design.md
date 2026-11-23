@@ -34111,7 +34111,7 @@ that root, never during one. It marks the task cancelled, then:
   or is about to.
 - **If the task is new,** the host resumes it anyway.
 
-A Debug runtime traps on a cancel of a task that has reported a terminal
+A second cancel before that resume changes nothing. A Debug runtime traps on a cancel of a task that has reported a terminal
 status (P8).
 
 The next resume of a cancelled task runs no Roc code. It does three
@@ -34351,9 +34351,10 @@ byte:
 - **Program task calls.** `roc_task_wake(task)` calls the registry builtin
   `roc_builtins_task_wake(task, ready)` with the host's `roc_task_ready`
   as `ready` (`RocTask.wake`), and `roc_task_cancel(task)` calls
-  `roc_builtins_task_cancel(task, abort)` with the host's
-  `roc_task_abort` as `abort` (`RocTask.cancel`), both `callconv(.c)`.
-  One table, `builtin_registry.program_task_calls`, lists them, and every
+  `roc_builtins_task_cancel(task, abort, ready)` with the host's
+  `roc_task_abort` and `roc_task_ready` (`RocTask.cancel`), all
+  `callconv(.c)`. One table, `builtin_registry.program_task_calls`, lists
+  them with the host functions each passes (`TaskHostFn`), and every
   backend defines each the same way, where the program's own symbols live:
   - LLVM, in the program's module, beside the host's calls;
   - the dev backend's object file (`roc build --opt=dev`), beside its
@@ -34372,7 +34373,8 @@ byte:
 
   The CLI's `Tasks` fixture host cancels through `roc_task_cancel` at a
   chosen pause, before and after waking the task, on every backend the CLI
-  runs, and fails the run on a leak.
+  runs, resumes the task it was handed back, expects `CANCELLED`, and fails
+  the run on a leak.
 - **Wasm.** Wasm checks the type of every indirect call, so nothing may
   stand in for a function of another signature:
   - each `slot_drop` helper gets its own adapter of the `fn(slot, record,

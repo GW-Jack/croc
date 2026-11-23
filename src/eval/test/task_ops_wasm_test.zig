@@ -6,7 +6,8 @@
 //!
 //! A task is woken through the module's own `roc_task_wake`, which calls
 //! the host's `roc_task_ready` for a parked task, and cancelled through its
-//! `roc_task_cancel`, which calls the host's `roc_task_abort` (design.md
+//! `roc_task_cancel`, which calls the host's `roc_task_abort` and
+//! `roc_task_ready` for a parked task the host had not finished (design.md
 //! "Backends").
 
 const std = @import("std");
@@ -246,12 +247,15 @@ test "cancelling a woken task releases the hosted result through its slot releas
     try std.testing.expectEqual(Status.pending, try run.resumeTask(task));
 
     // The host writes a heap string and wakes the task, which is then
-    // cancelled instead of resumed: the record's slot release, the module's
-    // adapter, frees the string, and no abort runs.
+    // cancelled: the cancelling resume runs the record's slot release, the
+    // module's adapter, which frees the string. No abort runs, and the wake
+    // was the one ready.
     writeHeapStr(&run, run.host.slot, "a string too long to be small");
     try run.call(shim_symbols.roc_task_wake, task);
     try run.call(shim_symbols.roc_task_cancel, task);
     try std.testing.expectEqual(@as(u32, 0), run.host.aborts);
+    try std.testing.expectEqual(@as(u32, 1), run.host.readies);
+    try std.testing.expectEqual(Status.cancelled, try run.resumeTask(task));
     try run.call(shim_symbols.roc_task_free, task);
     run.session.free();
     try std.testing.expectEqual(@as(i64, 0), run.session.liveAllocations());
@@ -271,6 +275,8 @@ test "cancelling a task the host has not finished aborts the host call on the wa
     try run.call(shim_symbols.roc_task_cancel, task);
     try std.testing.expectEqual(@as(u32, 1), run.host.aborts);
     try std.testing.expectEqual(task, run.host.aborted);
+    try std.testing.expectEqual(@as(u32, 1), run.host.readies);
+    try std.testing.expectEqual(Status.cancelled, try run.resumeTask(task));
     try run.call(shim_symbols.roc_task_free, task);
     run.session.free();
     try std.testing.expectEqual(@as(i64, 0), run.session.liveAllocations());

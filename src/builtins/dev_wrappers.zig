@@ -1478,11 +1478,11 @@ pub fn roc_builtins_task_crash_message(roc_task: *task.RocTask, len: *usize) cal
     return task.host_calls.crashMessage(roc_task, len);
 }
 
-/// `roc_task_cancel`'s body, with the host's `roc_task_abort` as `abort`: a
-/// `Tasks` program defines `roc_task_cancel` as a call to this (design.md
-/// "Backends").
-pub fn roc_builtins_task_cancel(roc_task: *task.RocTask, abort: task.AbortFn) callconv(.c) void {
-    roc_task.cancel(abort);
+/// `roc_task_cancel`'s body, with the host's `roc_task_abort` as `abort` and
+/// its `roc_task_ready` as `ready`: a `Tasks` program defines
+/// `roc_task_cancel` as a call to this (design.md "Backends").
+pub fn roc_builtins_task_cancel(roc_task: *task.RocTask, abort: task.AbortFn, ready: task.ReadyFn) callconv(.c) void {
+    roc_task.cancel(abort, ready);
 }
 
 /// Enter the loaded dev-shim code image that contains the generated callsite.

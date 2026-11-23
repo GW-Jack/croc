@@ -117,6 +117,7 @@ fn bareTask(hosted_slot: [*]u8, result_buffer: [*]u8) RocTask {
         .result_buffer = result_buffer,
         .wake_word = 0,
         .started = false,
+        .cancel_requested = false,
         .status = .pending,
         .root_result = undefined,
         .entries = undefined,
@@ -455,8 +456,8 @@ test "cancelling a woken task releases the hosted result in its slot and its rec
     try std.testing.expect(!text.isSmallStr());
     @as(*align(1) builtins.str.RocStr, @ptrCast(host.slot.?)).* = text;
     task.wake(&readyTask);
-    task.cancel(&abortUnexpected);
-    try std.testing.expectEqual(builtins.task.Status.cancelled, task.status);
+    task.cancel(&abortUnexpected, &readyTask);
+    try std.testing.expectEqual(builtins.task.Status.cancelled, task.resumeTask());
     task.free();
     try f.runtime_env.checkForLeaks();
 }
@@ -474,8 +475,9 @@ test "cancelling a task the host has not finished aborts the host call and relea
     try std.testing.expectEqual(builtins.task.Status.pending, task.resumeTask());
 
     aborted = null;
-    task.cancel(&abortRecord);
+    task.cancel(&abortRecord, &readyTask);
     try std.testing.expectEqual(task, aborted.?);
+    try std.testing.expectEqual(builtins.task.Status.cancelled, task.resumeTask());
     task.free();
     try f.runtime_env.checkForLeaks();
 }

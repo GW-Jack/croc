@@ -5488,22 +5488,32 @@ pub const MonoLlvmCodeGen = struct {
     }
 
     /// Define each `ProgramTaskCall` `name(task)` as a call to its builtin
-    /// with the host's `host_fn` (design.md "Backends"): `roc_task_wake`
-    /// with `roc_task_ready`, `roc_task_cancel` with `roc_task_abort`. In a
+    /// with the host's functions (design.md "Backends"): `roc_task_wake`
+    /// with `roc_task_ready`, `roc_task_cancel` with `roc_task_abort` and
+    /// `roc_task_ready`. In a
     /// `Tasks` program's module, or in the platform shim module of a shim
     /// build, whose shim archive defines the builtins.
     fn defineProgramTaskCalls(self: *MonoLlvmCodeGen) Error!void {
         const builder = self.builder orelse return error.CompilationFailed;
         const ptr_ty = try self.ptrType();
         const fn_ty = builder.fnType(.void, &.{ptr_ty}, .normal) catch return error.OutOfMemory;
-        for (builtins.builtin_registry.program_task_calls) |call| {
-            const target = try self.declareBuiltin(call.builtin, .void, &.{ ptr_ty, ptr_ty });
-            const host_fn = try self.declareHostSymbol(call.host_fn, fn_ty);
+        const registry = builtins.builtin_registry;
+        var host_fns: [registry.task_host_fns.len]LlvmBuilder.Value = undefined;
+        for (registry.task_host_fns, &host_fns) |host_fn, *value| {
+            value.* = (try self.declareHostSymbol(host_fn.symbol(), fn_ty)).toValue(builder);
+        }
+        const param_tys: [1 + registry.max_program_task_call_host_fns]LlvmBuilder.Type = @splat(ptr_ty);
+        for (registry.program_task_calls) |call| {
+            const arg_count = 1 + call.host_fns.len;
+            const target = try self.declareBuiltin(call.builtin, .void, param_tys[0..arg_count]);
             const func = builder.addFunction(fn_ty, builder.strtabString(call.name) catch return error.OutOfMemory, .default) catch return error.OutOfMemory;
             var wip = LlvmBuilder.WipFunction.init(builder, .{ .function = func, .strip = true }) catch return error.OutOfMemory;
             defer wip.deinit();
             wip.cursor = .{ .block = wip.block(0, "entry") catch return error.OutOfMemory };
-            _ = wip.call(.normal, .ccc, .none, target.typeOf(builder), target.toValue(builder), &.{ wip.arg(0), host_fn.toValue(builder) }, "") catch return error.OutOfMemory;
+            var args: [1 + registry.max_program_task_call_host_fns]LlvmBuilder.Value = undefined;
+            args[0] = wip.arg(0);
+            for (call.host_fns, args[1..arg_count]) |host_fn, *arg| arg.* = host_fns[@backingInt(host_fn)];
+            _ = wip.call(.normal, .ccc, .none, target.typeOf(builder), target.toValue(builder), args[0..arg_count], "") catch return error.OutOfMemory;
             _ = wip.retVoid() catch return error.OutOfMemory;
             wip.finish() catch return error.OutOfMemory;
         }

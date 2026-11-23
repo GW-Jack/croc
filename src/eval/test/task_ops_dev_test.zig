@@ -175,8 +175,8 @@ test "cancelling a woken task releases the hosted result in its slot and its rec
     try std.testing.expect(!text.isSmallStr());
     @as(*align(1) builtins.str.RocStr, @ptrCast(PausingHost.seen.slot.?)).* = text;
     task.wake(&lir_test.readyTask);
-    task.cancel(&lir_test.abortUnexpected);
-    try std.testing.expectEqual(builtins.task.Status.cancelled, task.status);
+    task.cancel(&lir_test.abortUnexpected, &lir_test.readyTask);
+    try std.testing.expectEqual(builtins.task.Status.cancelled, task.resumeTask());
     task.free();
     try f.runtime_env.checkForLeaks();
 }
@@ -194,8 +194,9 @@ test "cancelling a task the host has not finished aborts the host call and relea
     try std.testing.expectEqual(builtins.task.Status.pending, task.resumeTask());
 
     lir_test.aborted = null;
-    task.cancel(&lir_test.abortRecord);
+    task.cancel(&lir_test.abortRecord, &lir_test.readyTask);
     try std.testing.expectEqual(task, lir_test.aborted.?);
+    try std.testing.expectEqual(builtins.task.Status.cancelled, task.resumeTask());
     task.free();
     try f.runtime_env.checkForLeaks();
 }

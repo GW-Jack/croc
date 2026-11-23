@@ -19,6 +19,7 @@ const collections = @import("collections");
 const numeric_conversion = base.numeric_conversion;
 const builtins = @import("builtins");
 const program_task_calls = builtins.builtin_registry.program_task_calls;
+const task_host_fn_kinds = builtins.builtin_registry.task_host_fns;
 const layout = @import("layout");
 /// Dec's scaling factor (10^18) as an i64, sourced from the canonical Dec type.
 const dec_one_i64: i64 = @intCast(builtins.dec.RocDec.one_point_zero_i128);
@@ -383,10 +384,10 @@ tail_drivers: std.ArrayList(TailDriver) = .empty,
 /// names as its slot release, by the helper's atomic cache key, registered
 /// with its table slot before any body is generated (design.md "Backends").
 slot_drop_adapters: std.AutoArrayHashMapUnmanaged(u64, SlotDropAdapter) = .empty,
-/// The host function each `ProgramTaskCall` passes (`roc_task_ready`,
-/// `roc_task_abort`), imported when the program creates a task (design.md
-/// "Backends").
-task_host_fns: ?[program_task_calls.len]HostedSymbolTarget = null,
+/// The host functions `ProgramTaskCall`s pass (`roc_task_ready`,
+/// `roc_task_abort`), by `TaskHostFn`, imported when the program creates a
+/// task (design.md "Backends").
+task_host_fns: ?[task_host_fn_kinds.len]HostedSymbolTarget = null,
 /// The program's `ProgramTaskCall`s, defined after the procedure bodies when
 /// it imports their host functions.
 program_task_call_fns: ?[program_task_calls.len]index_types.DefinedFunction = null,
@@ -2059,7 +2060,7 @@ fn finishFinalModule(self: *Self) Allocator.Error![]u8 {
         try hosted.append(self.allocator, self.store.getString(hosted_proc.symbol));
     }
     if (self.task_host_fns != null) {
-        for (program_task_calls) |call| try hosted.append(self.allocator, call.host_fn);
+        for (task_host_fn_kinds) |host_fn| try hosted.append(self.allocator, host_fn.symbol());
     }
     self.module.verifyNoBuiltinImports(hosted.items) catch {
         wasmInvariantFmt("WASM/codegen invariant violated: eval module retains a builtin host import", .{});
@@ -6534,20 +6535,24 @@ fn compileProgramTaskCalls(self: *Self) Allocator.Error!void {
     if (self.program_task_call_fns != null) return;
     var fns: [program_task_calls.len]index_types.DefinedFunction = undefined;
     inline for (program_task_calls, 0..) |call, i| {
-        fns[i] = try self.compileProgramTaskCall(call, host_fns[i]);
+        fns[i] = try self.compileProgramTaskCall(call, &host_fns);
     }
     self.program_task_call_fns = fns;
 }
 
-fn compileProgramTaskCall(self: *Self, comptime call: builtins.builtin_registry.ProgramTaskCall, host_fn: HostedSymbolTarget) Allocator.Error!index_types.DefinedFunction {
+fn compileProgramTaskCall(self: *Self, comptime call: builtins.builtin_registry.ProgramTaskCall, host_fns: *const [task_host_fn_kinds.len]HostedSymbolTarget) Allocator.Error!index_types.DefinedFunction {
     const type_idx = try self.internFuncType(&.{.i32}, &.{});
     const defined = self.module.addDefinedFunction(type_idx) catch return error.OutOfMemory;
     _ = try self.addTrackedDefinedFunctionSymbol(defined, call.name, 0);
-    // A relocatable object names the host function's slot by its symbol.
-    if (!self.function_symbols_by_index.contains(host_fn.func_idx)) {
-        try self.recordFunctionSymbol(host_fn.func_idx, host_fn.symbol);
+    var host_fn_slots: [call.host_fns.len]u32 = undefined;
+    for (call.host_fns, &host_fn_slots) |kind, *slot| {
+        const host_fn = host_fns[@backingInt(kind)];
+        // A relocatable object names the host function's slot by its symbol.
+        if (!self.function_symbols_by_index.contains(host_fn.func_idx)) {
+            try self.recordFunctionSymbol(host_fn.func_idx, host_fn.symbol);
+        }
+        slot.* = self.module.addTableElement(host_fn.func_idx) catch return error.OutOfMemory;
     }
-    const host_fn_slot = self.module.addTableElement(host_fn.func_idx) catch return error.OutOfMemory;
     const saved = self.saveState() catch return error.OutOfMemory;
     errdefer self.abandonState(saved);
     try self.beginFunction(defined.local);
@@ -6559,7 +6564,7 @@ fn compileProgramTaskCall(self: *Self, comptime call: builtins.builtin_registry.
     self.current_proc_id = null;
     const task = (try self.allocAnonymousLocals(.i32, 1))[0];
     try self.emitLocalGet(task);
-    try self.emitFunctionTableIndexConst(host_fn_slot);
+    for (host_fn_slots) |slot| try self.emitFunctionTableIndexConst(slot);
     try self.emitBuiltinCall(BuiltinSignatures.kindOf(call.builtin));
     self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
     try self.encodeLocalsDecl(&self.currentBody().preamble, 1);
@@ -7939,9 +7944,9 @@ pub fn registerHostedSymbolTargets(self: *Self, proc_specs: []const LIR.LirProcS
         });
     }
     if (self.task_host_fns == null and self.store.createsTask()) {
-        var host_fns: [program_task_calls.len]HostedSymbolTarget = undefined;
-        for (program_task_calls, &host_fns) |call, *host_fn| {
-            host_fn.* = try self.resolveSymbolTarget(call.host_fn, &.{.i32}, &.{});
+        var host_fns: [task_host_fn_kinds.len]HostedSymbolTarget = undefined;
+        for (task_host_fn_kinds, &host_fns) |kind, *host_fn| {
+            host_fn.* = try self.resolveSymbolTarget(kind.symbol(), &.{.i32}, &.{});
         }
         self.task_host_fns = host_fns;
     }
