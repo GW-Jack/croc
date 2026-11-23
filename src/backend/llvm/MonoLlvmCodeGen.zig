@@ -4686,7 +4686,7 @@ pub const MonoLlvmCodeGen = struct {
                 try self.emitDynElemLowLevel(assign.target, assign.op, assign.args, self.store.stmtRowOrDefault(assign.extra));
                 try work.append(wa, .{ .node = assign.next });
             } else {
-                try self.emitLowLevel(assign.target, assign.op, assign.args, self.store.stmtRowOrDefault(assign.extra).unique_args, self.store.stmtRowOrDefault(assign.extra).interchangeable, self.store.stmtRowOrDefault(assign.extra).simd_concat_count);
+                try self.emitLowLevel(assign.target, assign.op, assign.args, self.store.stmtRowOrDefault(assign.extra).unique_args, self.store.stmtRowOrDefault(assign.extra).interchangeable, self.store.stmtRowOrDefault(assign.extra).simd_concat_count, self.store.stmtRowOrDefault(assign.extra).group_result);
                 try work.append(wa, .{ .node = assign.next });
             },
             .assign_list => |assign| {
@@ -5450,6 +5450,69 @@ pub const MonoLlvmCodeGen = struct {
         self.defines_task_host_calls = true;
     }
 
+    /// A running-set operation (design.md "Backends"): one call of its
+    /// `roc_builtins_group_*` builtin, with the loop id first, the owner task
+    /// last, and each list as its bytes pointer and length. `group_init`
+    /// also passes the size and alignment of `group_result`, its entries'
+    /// result, and the drop of a result nobody takes.
+    fn emitGroupOp(self: *MonoLlvmCodeGen, target: LocalId, op: lir.LowLevel, args: anytype, group_result: collections.OptionalId(layout.Idx)) Error!void {
+        const ptr_ty = try self.ptrType();
+        const usize_ty = self.ptrSizedIntType();
+        const id = try self.loadLocalScalar(GuardedList.at(args, 0), .u64);
+        const owner = try self.loadPointer(self.slot(GuardedList.at(args, GuardedList.borrowLen(args) - 1)).ptr);
+        if (op == .group_init) {
+            const result_layout = group_result.get() orelse
+                invariant("LLVM codegen invariant violated: group_init names no result layout", .{});
+            const builder = self.builder orelse return error.CompilationFailed;
+            const size_align = self.layouts().layoutSizeAlign(self.layouts().getLayout(result_layout));
+            const limits = self.slot(GuardedList.at(args, 2)).ptr;
+            const values = [_]LlvmBuilder.Value{
+                id,
+                try self.loadLocalScalar(GuardedList.at(args, 1), .u64),
+                try self.loadPointer(limits),
+                try self.loadUsize(try self.offsetPtr(limits, self.rocListLenOffset())),
+                try self.loadLocalScalar(GuardedList.at(args, 3), .u64),
+                (builder.intConst(.i64, size_align.size) catch return error.OutOfMemory).toValue(),
+                (builder.intConst(.i64, size_align.alignment.toByteUnits()) catch return error.OutOfMemory).toValue(),
+                try self.erasedCallbackValue(lir.ContinuationPass.hostDrop(self.layouts(), result_layout)),
+                owner,
+            };
+            return self.callBuiltinVoid(.group_init, &.{ .i64, .i64, ptr_ty, usize_ty, .i64, .i64, .i64, ptr_ty, ptr_ty }, &values);
+        }
+        if (op == .group_push) {
+            const path = self.slot(GuardedList.at(args, 2)).ptr;
+            const values = [_]LlvmBuilder.Value{
+                id,
+                try self.loadPointer(self.slot(GuardedList.at(args, 1)).ptr),
+                try self.loadPointer(path),
+                try self.loadUsize(try self.offsetPtr(path, self.rocListLenOffset())),
+                try self.loadLocalBool(GuardedList.at(args, 3)),
+                try self.loadLocalBool(GuardedList.at(args, 4)),
+                owner,
+            };
+            return self.callBuiltinVoid(.group_push, &.{ .i64, ptr_ty, ptr_ty, usize_ty, .i1, .i1, ptr_ty }, &values);
+        }
+        if (op == .group_spawn) {
+            const start = try self.loadPointer(self.slot(GuardedList.at(args, 1)).ptr);
+            return self.callBuiltinVoid(.group_spawn, &.{ .i64, ptr_ty, ptr_ty }, &.{ id, start, owner });
+        }
+        if (op == .group_next) {
+            const status = try self.callBuiltin(.group_next, .i32, &.{ .i64, ptr_ty }, &.{ id, owner });
+            return self.storeLocalInt(target, status, self.localLayout(target));
+        }
+        if (op == .group_arrival) {
+            const arrived = try self.callBuiltin(.group_arrival, ptr_ty, &.{ .i64, ptr_ty }, &.{ id, owner });
+            return self.storePointer(self.slot(target).ptr, arrived);
+        }
+        const builtin_fn: BuiltinSymbol = if (op == .group_start)
+            .group_start
+        else if (op == .group_cancel)
+            .group_cancel
+        else
+            .group_free;
+        return self.callBuiltinVoid(builtin_fn, &.{ .i64, ptr_ty }, &.{ id, owner });
+    }
+
     /// Define the host's task calls, which a program that creates a task
     /// exports (design.md "Backends"): `roc_task_free` and
     /// `roc_task_crash_message`, each a call to its builtin. Linking the
@@ -5862,7 +5925,7 @@ pub const MonoLlvmCodeGen = struct {
         return .{ .ptr = storage.ptr, .layout_idx = storage.layout_idx };
     }
 
-    fn emitLowLevel(self: *MonoLlvmCodeGen, target: LocalId, op: lir.LowLevel, args: LocalSpan, unique_args: u64, interchangeable: layout.WidthValues(bool), simd_concat_count: ?u5) Error!void {
+    fn emitLowLevel(self: *MonoLlvmCodeGen, target: LocalId, op: lir.LowLevel, args: LocalSpan, unique_args: u64, interchangeable: layout.WidthValues(bool), simd_concat_count: ?u5, group_result: collections.OptionalId(layout.Idx)) Error!void {
         try self.prepareLocalWrite(target);
         const arg_locals = self.store.getLocalSpan(args);
         if (!op.acceptsStrViewArgs()) {
@@ -6160,9 +6223,7 @@ pub const MonoLlvmCodeGen = struct {
             .task_hosted_slot => try self.emitTaskPointerField(target, GuardedList.at(arg_locals, 0), self.taskFieldOffsets().hosted_slot),
             .task_result_buffer => try self.emitTaskPointerField(target, GuardedList.at(arg_locals, 0), self.taskFieldOffsets().result_buffer),
             .task_create => try self.emitTaskCreate(target, arg_locals),
-            // A task-form concurrent loop's running set reaches the LLVM
-            // backend in milestone 4's 10h.
-            .group_init, .group_push, .group_start, .group_next, .group_arrival, .group_spawn, .group_cancel, .group_free => @panic("TODO: running-set operations are not implemented in the LLVM backend"),
+            .group_init, .group_push, .group_start, .group_next, .group_arrival, .group_spawn, .group_cancel, .group_free => try self.emitGroupOp(target, op, arg_locals, group_result),
             .crash => try self.emitCrashBytes("Roc crashed"),
             // Every remaining op is a numeric conversion; the comptime check keeps
             // this switch exhaustive when a non-conversion op is added.

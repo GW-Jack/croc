@@ -4982,6 +4982,13 @@ pub fn build(b: *std.Build) void {
     });
 
     test_suites.register(.{
+        .step_suffix = "task-ops-llvm",
+        .description = "Run task operation LLVM backend Zig tests",
+        .compile = compiler_suites_test,
+        .namespace = "eval.test.task_ops_llvm_test.",
+    });
+
+    test_suites.register(.{
         .step_suffix = "cli-main",
         .description = "Run roc CLI main Zig tests",
         .compile = compiler_suites_test,
