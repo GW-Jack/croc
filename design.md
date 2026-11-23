@@ -34088,8 +34088,10 @@ exit: cancel_group(g); repeat next(g) until Ended, dropping what arrives
 
 **Helper marks.** Every LIR specialization of a Builtin running-set helper
 records which helper it is in `LirProcSpec.running_set_helper`: `run_create`,
-`run_next`, `run_spawn`, `run_cancel` or `run_entry`, and `none` for every
-other procedure. LIR construction sets it from the helper's Builtin
+`run_next`, `run_spawn`, `run_cancel`, `run_entry`, `run_arrived` or
+`run_ended`, and `none` for every other procedure. The sequential `run_next!`
+builds its result through `run_arrived` and `run_ended`, and the task form
+calls them where a result arrives and where the loop ends. LIR construction sets it from the helper's Builtin
 declaration; every copy of a procedure keeps it, and so do LIR images and the
 native cache. The continuation pass finds a loop's operations by this mark
 and the loop id each call passes first, never by a name or by a body's

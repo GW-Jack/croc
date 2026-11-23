@@ -1105,6 +1105,11 @@ pub const RunningSetHelper = enum(u8) {
     run_spawn,
     run_cancel,
     run_entry,
+    /// The sequential `run_next!` builds its result through these two. The
+    /// task form calls them where an entry's result arrives (`run_arrived`)
+    /// and where the loop ends (`run_ended`).
+    run_arrived,
+    run_ended,
 };
 
 /// Where the erased calls a callee left pending are run. A tail call through
