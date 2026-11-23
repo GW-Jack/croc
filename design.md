@@ -34896,6 +34896,27 @@ byte:
   `RocPoll`: 0 is `ROC_READY` and 1 is `ROC_PENDING`. The site's switch
   takes 0 as ready and every other value as pending. `out` is
   `task_hosted_slot(task)`.
+- **Running sets.** Each running-set operation is one `callconv(.c)` call
+  of the builtin of its name (`roc_builtins_group_init`, `_push`, `_start`,
+  `_next`, `_arrival`, `_spawn`, `_cancel`, `_free`). Each takes the loop id
+  first, as a `U64`, and the owner task last. In between:
+  - `group_init` passes the entry count, then `limits` as its bytes pointer
+    and length, then the root limit. It also passes the size and alignment
+    of an entry's result, from the layout its extra fields name, and the
+    drop of a result nobody takes. That drop is the result layout's
+    `host_drop` RC helper, which `hostDrop` selects, made the way the backend
+    makes a capture's `on_drop`, or null when results hold nothing to
+    release.
+  - `group_push` passes the start record, which the set takes, then
+    `limit_path` as its bytes pointer and length, then `shielded` and
+    `background` as C `bool`s.
+  - `group_spawn` passes the start record, which the set takes.
+  - `group_next` returns its status as a `U32`, and `group_arrival` the
+    slot's address, typed by its target's `Ptr` layout.
+  - The others return nothing, and their target is `{}`.
+
+  The lists are borrowed for the call: ARC keeps them alive across it like
+  any other operation's borrowed operand.
 - **The host's calls.** A compiled `Tasks` program gets `roc_task_free`
   and `roc_task_crash_message` from the builtins object linked into it, so every
   backend links the same symbols. The interpreter shim defines them from

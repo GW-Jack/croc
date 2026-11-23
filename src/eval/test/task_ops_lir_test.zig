@@ -1065,15 +1065,24 @@ const Helpers = struct {
 };
 
 /// What a promotion test's loop body does with its arrivals.
-const LoopBody = enum {
+pub const LoopBody = enum {
     /// Sum every arrival, spawning the entry 7 at the first.
     sum_and_spawn,
     /// Return the first arrival: cancel, then drain.
     first,
 };
 
+/// Who releases a promotion test's lists.
+pub const Releases = enum {
+    /// The program does, as ARC would right after run_create!: the
+    /// interpreter tests run LIR from before ARC.
+    explicit,
+    /// ARC, which a compiling backend's test runs after the pass.
+    arc,
+};
+
 /// How a promotion test's loop id reaches its helper calls.
-const IdShape = enum {
+pub const IdShape = enum {
     /// An `i64_literal` the calls pass directly.
     direct,
     /// An `i128_literal`, which the calls pass through a `ref.local` copy:
@@ -1087,12 +1096,12 @@ const IdShape = enum {
 /// The provides root `g()` of a promotion test, in the sequential form:
 ///
 ///     r = run_create!(3, [10, 20, 30], [[], [], []], [F, F, F], background, [], 0)
-///     (Monotype's ARC would release the lists here)
+///     (the lists are released here)
 ///     then `body` over run_next!(3, r)
 ///
 /// Promotes it with the continuation pass and returns the task entry that
 /// takes `g`'s place.
-fn promotionProgram(f: *Fixture, background: [3]bool, body: LoopBody, id_shape: IdShape) TaskOpsTestError!LIR.LirProcSpecId {
+pub fn promotionProgram(f: *Fixture, background: [3]bool, body: LoopBody, releases: Releases, id_shape: IdShape) TaskOpsTestError!LIR.LirProcSpecId {
     const helpers = try Helpers.make(f);
     const list_u64 = try f.layouts.insertList(.u64);
     const list_list_u64 = try f.layouts.insertList(list_u64);
@@ -1158,10 +1167,13 @@ fn promotionProgram(f: *Fixture, background: [3]bool, body: LoopBody, id_shape: 
         },
     };
 
-    var head = try release(f, background_list, list_bool, loop);
-    head = try release(f, shielded, list_bool, head);
-    head = try release(f, paths, list_list_u64, head);
-    head = try release(f, entries, list_u64, head);
+    var head = loop;
+    if (releases == .explicit) {
+        head = try release(f, background_list, list_bool, head);
+        head = try release(f, shielded, list_bool, head);
+        head = try release(f, paths, list_list_u64, head);
+        head = try release(f, entries, list_u64, head);
+    }
     head = try callStmt(f, r, helpers.create, &.{ id, entries, paths, shielded, background_list, limits, root_limit }, head);
     head = try literal(f, root_limit, 0, .u64, head);
     head = try f.store.addCFStmt(.{ .assign_list = .{ .target = limits, .elems = .empty(), .next = head } }, .test_fixture);
@@ -1223,19 +1235,12 @@ fn startEntry(interp: *eval.Interpreter, entry: LIR.LirProcSpecId, root: *u64) T
     return @ptrFromInt(created.value.read(usize));
 }
 
-test "promotion runs a loop whose entries may suspend as child tasks and spawns into it" {
-    var f = try Fixture.init(std.testing.allocator);
-    defer f.deinit();
-    const entry = try promotionProgram(&f, .{ false, true, true }, .sum_and_spawn, .direct);
-
-    var static_strings = try eval.Interpreter.buildStaticStrings(f.allocator, &f.store);
-    defer static_strings.deinit();
-    var interp = try eval.Interpreter.init(f.allocator, &f.store, &f.layouts, static_strings.view(), f.runtime_env.get_ops());
-    defer interp.deinit();
-
-    var root: u64 = 0;
+/// Run the `.sum_and_spawn` promotion program's task, created with its
+/// result going to `root`, through its steps: three entries start, 10
+/// arrives and the body spawns 7, 7 arrives, and the two background entries
+/// are cancelled. The loop returns 17.
+pub fn driveSpawnLoop(task: *RocTask, root: *const u64) TaskOpsTestError!void {
     ReadyChildren.len = 0;
-    const task = try startEntry(&interp, entry, &root);
     const ready = &ReadyChildren.ready;
     const abort = &ReadyChildren.abort;
     const Status = builtins.task.Status;
@@ -1262,7 +1267,44 @@ test "promotion runs a loop whose entries may suspend as child tasks and spawns 
     try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
     try std.testing.expectEqual(Status.cancelled, thirty.resumeFromHost(ready, abort));
     try std.testing.expectEqual(Status.done, task.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(@as(u64, 17), root);
+    try std.testing.expectEqual(@as(u64, 17), root.*);
+}
+
+/// Run the `.first` promotion program's task, with three non-background
+/// entries, through its steps: 20 arrives first, and the body cancels the
+/// other two, which haven't begun, and drains. Each cancelled report readies
+/// the loop, which parks until the last. The loop returns 20.
+pub fn driveCancelLoop(task: *RocTask, root: *const u64) TaskOpsTestError!void {
+    ReadyChildren.len = 0;
+    const ready = &ReadyChildren.ready;
+    const abort = &ReadyChildren.abort;
+    const Status = builtins.task.Status;
+
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(@as(usize, 3), ReadyChildren.len);
+    const children = ReadyChildren.tasks[0..3].*;
+    try std.testing.expectEqual(Status.done, children[1].resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.cancelled, children[0].resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.cancelled, children[2].resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.done, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(@as(u64, 20), root.*);
+}
+
+test "promotion runs a loop whose entries may suspend as child tasks and spawns into it" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const entry = try promotionProgram(&f, .{ false, true, true }, .sum_and_spawn, .explicit, .direct);
+
+    var static_strings = try eval.Interpreter.buildStaticStrings(f.allocator, &f.store);
+    defer static_strings.deinit();
+    var interp = try eval.Interpreter.init(f.allocator, &f.store, &f.layouts, static_strings.view(), f.runtime_env.get_ops());
+    defer interp.deinit();
+
+    var root: u64 = 0;
+    const task = try startEntry(&interp, entry, &root);
+    try driveSpawnLoop(task, &root);
     task.free();
     try f.runtime_env.checkForLeaks();
 }
@@ -1271,7 +1313,7 @@ test "promotion cancels a loop's running set and drains it through run_next!" {
     var f = try Fixture.init(std.testing.allocator);
     defer f.deinit();
     // Its loop id has the shape lowering gives one.
-    const entry = try promotionProgram(&f, .{ false, false, false }, .first, .copied_i128);
+    const entry = try promotionProgram(&f, .{ false, false, false }, .first, .explicit, .copied_i128);
 
     var static_strings = try eval.Interpreter.buildStaticStrings(f.allocator, &f.store);
     defer static_strings.deinit();
@@ -1279,26 +1321,8 @@ test "promotion cancels a loop's running set and drains it through run_next!" {
     defer interp.deinit();
 
     var root: u64 = 0;
-    ReadyChildren.len = 0;
     const task = try startEntry(&interp, entry, &root);
-    const ready = &ReadyChildren.ready;
-    const abort = &ReadyChildren.abort;
-    const Status = builtins.task.Status;
-
-    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(@as(usize, 3), ReadyChildren.len);
-    const children = ReadyChildren.tasks[0..3].*;
-
-    // 20 arrives first. The body cancels the other two, which haven't begun,
-    // and drains: each cancelled report readies the loop, which parks until
-    // the last.
-    try std.testing.expectEqual(Status.done, children[1].resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.cancelled, children[0].resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.cancelled, children[2].resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.done, task.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(@as(u64, 20), root);
+    try driveCancelLoop(task, &root);
     task.free();
     try f.runtime_env.checkForLeaks();
 }
@@ -1306,31 +1330,18 @@ test "promotion cancels a loop's running set and drains it through run_next!" {
 test "promotion promotes a loop on a tail that paths share once" {
     var f = try Fixture.init(std.testing.allocator);
     defer f.deinit();
-    const entry = try promotionProgram(&f, .{ false, false, false }, .first, .shared_tail);
+    const entry = try promotionProgram(&f, .{ false, false, false }, .first, .explicit, .shared_tail);
 
     var static_strings = try eval.Interpreter.buildStaticStrings(f.allocator, &f.store);
     defer static_strings.deinit();
     var interp = try eval.Interpreter.init(f.allocator, &f.store, &f.layouts, static_strings.view(), f.runtime_env.get_ops());
     defer interp.deinit();
 
-    // The loop runs as it does off a shared tail: 20 arrives first, and the
-    // other two entries, which haven't begun, are cancelled and drained.
+    // The loop runs as it does off a shared tail.
     var root: u64 = 0;
     ReadyChildren.len = 0;
     const task = try startEntry(&interp, entry, &root);
-    const ready = &ReadyChildren.ready;
-    const abort = &ReadyChildren.abort;
-    const Status = builtins.task.Status;
-    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(@as(usize, 3), ReadyChildren.len);
-    const children = ReadyChildren.tasks[0..3].*;
-    try std.testing.expectEqual(Status.done, children[1].resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.cancelled, children[0].resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.cancelled, children[2].resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.done, task.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(@as(u64, 20), root);
+    try driveCancelLoop(task, &root);
     task.free();
     try f.runtime_env.checkForLeaks();
 }

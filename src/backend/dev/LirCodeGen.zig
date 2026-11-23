@@ -5045,9 +5045,97 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     try self.callBuiltin(&builder, .task_create);
                     return try self.scalarRetReg();
                 },
-                // A task-form concurrent loop's running set reaches the dev
-                // backend in milestone 4's 10h.
-                .group_init, .group_push, .group_start, .group_next, .group_arrival, .group_spawn, .group_cancel, .group_free => @panic("TODO: running-set operations are not implemented in the dev backend"),
+                // A task-form concurrent loop's running set: each operation
+                // is one call of its `roc_builtins_group_*` builtin, which
+                // names the set by the loop id first and the owner task last
+                // (design.md "Records And The Task").
+                .group_init => {
+                    // (id, entry count, limits, root limit, task); the builtin
+                    // also takes the result slots' size and alignment and the
+                    // drop of a result nobody takes.
+                    expectArgCount(ll.op, args, 5);
+                    const result_layout = ll.group_result.get() orelse
+                        base.invariant("LIR/codegen invariant violated: group_init names no result layout", .{});
+                    const size_align = self.layout_store.layoutSizeAlign(self.layout_store.getLayout(result_layout));
+                    const id_off = try self.ensureOnStack(try self.emitValueLocal(GuardedList.at(args, 0)), 8);
+                    const count_off = try self.ensureOnStack(try self.emitValueLocal(GuardedList.at(args, 1)), 8);
+                    const limits_off = try self.ensureOnStack(try self.emitValueLocal(GuardedList.at(args, 2)), roc_list_size);
+                    const root_off = try self.ensureOnStack(try self.emitValueLocal(GuardedList.at(args, 3)), 8);
+                    const task_off = try self.ensureOnStack(try self.emitValueLocal(GuardedList.at(args, 4)), 8);
+                    const drop_reg = try self.materializeErasedCallableOnDrop(lir.ContinuationPass.hostDrop(self.layout_store, result_layout));
+                    var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+                    defer builder.deinit();
+                    try builder.addMemArg(frame_ptr, id_off);
+                    try builder.addMemArg(frame_ptr, count_off);
+                    try builder.addMemArg(frame_ptr, limits_off + list_bytes_offset);
+                    try builder.addMemArg(frame_ptr, limits_off + list_len_offset);
+                    try builder.addMemArg(frame_ptr, root_off);
+                    try builder.addImmArg(@intCast(size_align.size));
+                    try builder.addImmArg(@intCast(size_align.alignment.toByteUnits()));
+                    try builder.addRegArg(drop_reg);
+                    try builder.addMemArg(frame_ptr, task_off);
+                    try self.callBuiltin(&builder, .group_init);
+                    self.codegen.freeGeneral(drop_reg);
+                    return .{ .immediate_i64 = 0 };
+                },
+                .group_push => {
+                    // (id, start, limit path, shielded, background, task).
+                    expectArgCount(ll.op, args, 6);
+                    const id_off = try self.ensureOnStack(try self.emitValueLocal(GuardedList.at(args, 0)), 8);
+                    const start_off = try self.ensureOnStack(try self.emitValueLocal(GuardedList.at(args, 1)), 8);
+                    const path_off = try self.ensureOnStack(try self.emitValueLocal(GuardedList.at(args, 2)), roc_list_size);
+                    const shielded_reg = try self.ensureInGeneralReg(try self.emitValueLocal(GuardedList.at(args, 3)));
+                    const background_reg = try self.ensureInGeneralReg(try self.emitValueLocal(GuardedList.at(args, 4)));
+                    const task_off = try self.ensureOnStack(try self.emitValueLocal(GuardedList.at(args, 5)), 8);
+                    var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+                    defer builder.deinit();
+                    try builder.addMemArg(frame_ptr, id_off);
+                    try builder.addMemArg(frame_ptr, start_off);
+                    try builder.addMemArg(frame_ptr, path_off + list_bytes_offset);
+                    try builder.addMemArg(frame_ptr, path_off + list_len_offset);
+                    try builder.addRegArg(shielded_reg);
+                    try builder.addRegArg(background_reg);
+                    try builder.addMemArg(frame_ptr, task_off);
+                    try self.callBuiltin(&builder, .group_push);
+                    self.freeGenerals(.{ shielded_reg, background_reg });
+                    return .{ .immediate_i64 = 0 };
+                },
+                .group_spawn => {
+                    // (id, start, task).
+                    expectArgCount(ll.op, args, 3);
+                    const locs = try self.emitValueLocals(3, args);
+                    var offsets: [3]i32 = undefined;
+                    for (locs, &offsets) |loc, *offset| offset.* = try self.ensureOnStack(loc, 8);
+                    var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+                    defer builder.deinit();
+                    for (offsets) |offset| try builder.addMemArg(frame_ptr, offset);
+                    try self.callBuiltin(&builder, .group_spawn);
+                    return .{ .immediate_i64 = 0 };
+                },
+                .group_start, .group_next, .group_arrival, .group_cancel, .group_free => {
+                    // (id, task); next returns its status and arrival the
+                    // arrived entry's slot.
+                    expectArgCount(ll.op, args, 2);
+                    const locs = try self.emitValueLocals(2, args);
+                    var offsets: [2]i32 = undefined;
+                    for (locs, &offsets) |loc, *offset| offset.* = try self.ensureOnStack(loc, 8);
+                    var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+                    defer builder.deinit();
+                    for (offsets) |offset| try builder.addMemArg(frame_ptr, offset);
+                    const builtin_fn: BuiltinFn = if (ll.op == .group_start)
+                        .group_start
+                    else if (ll.op == .group_next)
+                        .group_next
+                    else if (ll.op == .group_arrival)
+                        .group_arrival
+                    else if (ll.op == .group_cancel)
+                        .group_cancel
+                    else
+                        .group_free;
+                    try self.callBuiltin(&builder, builtin_fn);
+                    if (ll.op == .group_next or ll.op == .group_arrival) return try self.scalarRetReg();
+                    return .{ .immediate_i64 = 0 };
+                },
                 .ptr_cast => {
                     // ptr_cast: identity bits (box(T) -> ptr(T) or ptr -> ptr).
                     const loc = try self.emitValueLocal(GuardedList.at(args, 0));
@@ -21350,6 +21438,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                     .ret_layout = self.localLayout(assign.target),
                                     .unique_args = self.store.stmtRowOrDefault(assign.extra).unique_args,
                                     .interchangeable = self.store.stmtRowOrDefault(assign.extra).interchangeable,
+                                    .group_result = self.store.stmtRowOrDefault(assign.extra).group_result,
                                 }) catch |err| {
                                     self.pending_overflow_result_target = null;
                                     return err;

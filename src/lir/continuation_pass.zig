@@ -490,7 +490,11 @@ fn spliceLocals(store: *LirStore, span: *LIR.LocalSpan, before: []const LocalId,
 
 /// The `host_drop` RC helper of `layout_idx`, or `none` when it does
 /// nothing.
-fn hostDrop(layouts: *const layout.Store, layout_idx: layout.Idx) LIR.ErasedCallableOnDrop {
+/// The release of a value of `layout_idx` in memory that the runtime calls
+/// with the shape of an erased capture's `on_drop`, or none when the value
+/// holds nothing to release: a record's capture, a hosted slot's result, and
+/// a running set's unclaimed entry result.
+pub fn hostDrop(layouts: *const layout.Store, layout_idx: layout.Idx) LIR.ErasedCallableOnDrop {
     const key = layout.RcHelper{ .op = .host_drop, .layout_idx = layout_idx };
     if (layouts.rcHelperPlan(key) == .noop) return .none;
     return .{ .rc_helper = key };

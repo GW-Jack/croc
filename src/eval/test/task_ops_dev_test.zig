@@ -8,6 +8,7 @@ const builtins = @import("builtins");
 const backend = @import("backend");
 const lir = @import("lir");
 const roc_target = @import("roc_target");
+const layout = @import("layout");
 const lir_test = @import("task_ops_lir_test.zig");
 
 const LIR = lir.LIR;
@@ -47,8 +48,17 @@ const PausingHost = struct {
         return 1;
     }
 
+    /// `roc_test_unused`, which the promotion programs' `run_entry!` calls
+    /// only on an entry no test uses: it counts as a call nobody expected.
+    fn unused(_: *RocTask, _: [*]u8) callconv(.c) u32 {
+        seen.calls += 1;
+        return 0;
+    }
+
     fn resolve(_: *const anyopaque, name: []const u8) ?usize {
-        return if (std.mem.eql(u8, name, "roc_test_pause")) @intFromPtr(&pause) else null;
+        if (std.mem.eql(u8, name, "roc_test_pause")) return @intFromPtr(&pause);
+        if (std.mem.eql(u8, name, "roc_test_unused")) return @intFromPtr(&unused);
+        return null;
     }
 };
 
@@ -61,7 +71,7 @@ const DevRun = struct {
     /// Compile every procedure, with the task entry as the entrypoint, and
     /// enter `f`'s runtime host: compiled records call builtins that read
     /// the entered ops for the task's whole life.
-    fn init(self: *DevRun, f: *Fixture, entry: LIR.LirProcSpecId) DevTaskTestError!void {
+    fn init(self: *DevRun, f: *Fixture, entry: LIR.LirProcSpecId, entry_args: []const layout.Idx) DevTaskTestError!void {
         PausingHost.seen = .{};
         // Code generation takes LIR after ARC, which the pipeline runs after
         // the continuation pass, with the task entry as a root.
@@ -73,7 +83,7 @@ const DevRun = struct {
         const resolver_context: u8 = 0;
         codegen.setHostedSymbolResolver(.{ .context = &resolver_context, .resolve = PausingHost.resolve });
         try codegen.compileAllProcSpecs(f.store.getProcSpecs());
-        const entrypoint = try codegen.generateEntrypointWrapper("roc_task_entry", entry, &.{ .u64, .opaque_ptr }, .opaque_ptr);
+        const entrypoint = try codegen.generateEntrypointWrapper("roc_task_entry", entry, entry_args, .opaque_ptr);
         try codegen.finishImage();
         self.executable = try ExecutableMemory.initWithEntryOffsetAndUnwindInfo(
             codegen.getGeneratedCode(),
@@ -81,6 +91,15 @@ const DevRun = struct {
             codegen.getUnwindFunctions(),
         );
         self.entered = builtins.in_process_host.enter(f.runtime_env.get_ops(), null);
+    }
+
+    /// Call a promotion program's task entry, which takes only the root
+    /// result's address, and return the task it creates.
+    fn startRoot(self: *DevRun, root: [*]u8) *RocTask {
+        var result_out: usize = @intFromPtr(root);
+        var created: usize = 0;
+        self.executable.callRocABI(@ptrCast(&created), @ptrCast(&result_out));
+        return @ptrFromInt(created);
     }
 
     fn deinit(self: *DevRun) void {
@@ -105,7 +124,7 @@ test "a task paused at a hosted call resumes from its record and returns the roo
     defer f.deinit();
     const entry = try lir_test.pausingProgram(&f, .u64, true);
     var run: DevRun = undefined;
-    try run.init(&f, entry);
+    try run.init(&f, entry, &.{ .u64, .opaque_ptr });
     defer run.deinit();
     var root: u64 = 0;
     const task = run.start(@ptrCast(&root));
@@ -136,7 +155,7 @@ test "a task paused inside a called procedure resumes in its caller's continuati
     defer f.deinit();
     const entry = try lir_test.pausingNestedProgram(&f);
     var run: DevRun = undefined;
-    try run.init(&f, entry);
+    try run.init(&f, entry, &.{ .u64, .opaque_ptr });
     defer run.deinit();
     var root: u64 = 0;
     const task = run.start(@ptrCast(&root));
@@ -162,7 +181,7 @@ test "cancelling a woken task releases the hosted result in its slot and its rec
     defer f.deinit();
     const entry = try lir_test.pausingProgram(&f, .str, false);
     var run: DevRun = undefined;
-    try run.init(&f, entry);
+    try run.init(&f, entry, &.{ .u64, .opaque_ptr });
     defer run.deinit();
     var root: u64 = 0;
     const task = run.start(@ptrCast(&root));
@@ -187,7 +206,7 @@ test "cancelling a task the host has not finished aborts the host call and relea
     defer f.deinit();
     const entry = try lir_test.pausingProgram(&f, .str, false);
     var run: DevRun = undefined;
-    try run.init(&f, entry);
+    try run.init(&f, entry, &.{ .u64, .opaque_ptr });
     defer run.deinit();
     var root: u64 = 0;
     const task = run.start(@ptrCast(&root));
@@ -197,6 +216,38 @@ test "cancelling a task the host has not finished aborts the host call and relea
     task.cancel(&lir_test.abortRecord, &lir_test.readyTask);
     try std.testing.expectEqual(task, lir_test.aborted.?);
     try std.testing.expectEqual(builtins.task.Status.cancelled, task.resumeTask());
+    task.free();
+    try f.runtime_env.checkForLeaks();
+}
+
+test "a promoted loop runs its entries as child tasks and spawns into its set on the dev backend" {
+    if (comptime !backend.host_lir_codegen_available) return error.SkipZigTest;
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const entry = try lir_test.promotionProgram(&f, .{ false, true, true }, .sum_and_spawn, .arc, .direct);
+    var run: DevRun = undefined;
+    try run.init(&f, entry, &.{.opaque_ptr});
+    defer run.deinit();
+    var root: u64 = 0;
+    const task = run.startRoot(@ptrCast(&root));
+    try lir_test.driveSpawnLoop(task, &root);
+    try std.testing.expectEqual(@as(u32, 0), PausingHost.seen.calls);
+    task.free();
+    try f.runtime_env.checkForLeaks();
+}
+
+test "a promoted loop cancels its set and drains it on the dev backend" {
+    if (comptime !backend.host_lir_codegen_available) return error.SkipZigTest;
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const entry = try lir_test.promotionProgram(&f, .{ false, false, false }, .first, .arc, .copied_i128);
+    var run: DevRun = undefined;
+    try run.init(&f, entry, &.{.opaque_ptr});
+    defer run.deinit();
+    var root: u64 = 0;
+    const task = run.startRoot(@ptrCast(&root));
+    try lir_test.driveCancelLoop(task, &root);
+    try std.testing.expectEqual(@as(u32, 0), PausingHost.seen.calls);
     task.free();
     try f.runtime_env.checkForLeaks();
 }
