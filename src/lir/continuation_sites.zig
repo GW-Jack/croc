@@ -8,6 +8,11 @@
 //! them write the join's parameters. Reads and definitions come from the
 //! shared inventories in `body_clone`, and the fixpoint is `arc_liveness`.
 //!
+//! A running set's `group_next` is a site too (a *park site*): it parks the
+//! task while no entry has reported, and its resume runs it again (design.md
+//! "Child Tasks"). Its set is among its live values, even where the code
+//! after it never reads the set, since the resume reads it.
+//!
 //! A tail site is a call to a procedure (never a hosted one) whose result
 //! the procedure returns unchanged: the next statements only copy it into
 //! join parameters with `set_local` and jump, until a `ret` returns a local
@@ -28,12 +33,80 @@ const LocalId = LIR.LocalId;
 
 /// One suspension site and what the continuation pass needs about it.
 pub const Site = struct {
-    /// The `assign_call` statement whose `CallExtra` marks it a site.
+    /// The `assign_call` statement whose `CallExtra` marks it a site, or a
+    /// park site's `group_next`.
     call: CFStmtId,
+    park: bool,
     tail: bool,
     /// The values live after the call, the call's target included when the
     /// code after it reads it, in ascending local order.
     live_after: []const LocalId,
+};
+
+/// A site's statement: a call, or a park site's `group_next`.
+pub const SiteStmt = union(enum) {
+    call: @FieldType(LIR.CFStmt, "assign_call"),
+    park: @FieldType(LIR.CFStmt, "assign_low_level"),
+
+    /// `stmt` as a site's statement, or null when it can't be one. A call
+    /// is a site only when its `CallExtra` says so, which callers check.
+    pub fn of(stmt: LIR.CFStmt) ?SiteStmt {
+        return switch (stmt) {
+            .assign_call => |call| .{ .call = call },
+            .assign_low_level => |op| if (op.op == .group_next) .{ .park = op } else null,
+            .init_uninitialized,
+            .assign_ref,
+            .assign_literal,
+            .assign_call_erased,
+            .assign_packed_erased_fn,
+            .assign_list,
+            .assign_struct,
+            .assign_tag,
+            .store_struct,
+            .store_tag,
+            .set_local,
+            .debug,
+            .expect,
+            .expect_err,
+            .dyn,
+            .runtime_error,
+            .comptime_exhaustiveness_failed,
+            .incref,
+            .decref,
+            .decref_if_initialized,
+            .free,
+            .switch_stmt,
+            .switch_initialized_payload,
+            .str_match,
+            .str_match_set,
+            .join,
+            .jump,
+            .ret,
+            .suspend_save,
+            .suspend_return,
+            .crash,
+            => null,
+        };
+    }
+
+    /// The statement `id`, which a site analysis found.
+    pub fn at(store: *const LirStore, id: CFStmtId) SiteStmt {
+        return of(store.getCFStmtImmediate(id).*) orelse invariant("a suspension site is neither a call nor a running set's next", .{});
+    }
+
+    pub fn target(self: SiteStmt) LocalId {
+        return switch (self) {
+            .call => |call| call.target,
+            .park => |op| op.target,
+        };
+    }
+
+    pub fn next(self: SiteStmt) CFStmtId {
+        return switch (self) {
+            .call => |call| call.next,
+            .park => |op| op.next,
+        };
+    }
 };
 
 /// One procedure's sites, in the order a depth-first walk of its body
@@ -62,9 +135,10 @@ pub fn analyze(allocator: Allocator, store: *const LirStore, proc_id: LIR.LirPro
     var site_nodes = std.ArrayList(u32).empty;
     defer site_nodes.deinit(allocator);
     for (builder.stmts.items, 0..) |stmt_id, node| {
-        const stmt = store.getCFStmtImmediate(stmt_id);
-        if (stmt.* != .assign_call) continue;
-        if (!store.stmtRowOrDefault(stmt.assign_call.extra).suspension_site) continue;
+        switch (SiteStmt.of(store.getCFStmtImmediate(stmt_id).*) orelse continue) {
+            .call => |call| if (!store.stmtRowOrDefault(call.extra).suspension_site) continue,
+            .park => {},
+        }
         try site_nodes.append(allocator, @intCast(node));
     }
     if (site_nodes.items.len == 0) return result;
@@ -78,17 +152,28 @@ pub fn analyze(allocator: Allocator, store: *const LirStore, proc_id: LIR.LirPro
     const sites = try out.alloc(Site, site_nodes.items.len);
     for (site_nodes.items, sites) |node, *site| {
         const call_id = builder.stmts.items[node];
-        const call = store.getCFStmtImmediate(call_id).assign_call;
-        const next_node = builder.node_of.get(call.next) orelse invariant("a suspension site's successor was not walked", .{});
+        const stmt = SiteStmt.at(store, call_id);
+        const next_node = builder.node_of.get(stmt.next()) orelse invariant("a suspension site's successor was not walked", .{});
         const row = &rows[next_node];
-        const live = try out.alloc(LocalId, row.count());
+        // A park site's set, when the code after it doesn't keep it live.
+        const set: ?LocalId = switch (stmt) {
+            .call => null,
+            .park => |op| LirStore.GuardedList.at(store.getLocalSpan(op.args), 0),
+        };
+        const set_live = if (set) |local| if (builder.bit_of.get(local)) |bit| row.isSet(bit) else false else true;
+        const live = try out.alloc(LocalId, row.count() + @intFromBool(!set_live));
         var it = row.iterator();
         var i: usize = 0;
         while (it.next()) |bit| : (i += 1) live[i] = builder.locals.items[bit];
+        if (!set_live) live[i] = set.?;
         std.mem.sort(LocalId, live, {}, localLessThan);
         site.* = .{
             .call = call_id,
-            .tail = try isTailSite(allocator, store, &builder.join_of, call),
+            .park = stmt == .park,
+            .tail = switch (stmt) {
+                .call => |call| try isTailSite(allocator, store, &builder.join_of, call),
+                .park => false,
+            },
             .live_after = live,
         };
     }

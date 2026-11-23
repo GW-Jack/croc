@@ -33696,10 +33696,19 @@ answer is exact. Each procedure records `LirProcSpec.suspends: never | may`,
 and each suspension site records it on its `CallExtra`. Later stages read
 these marks and never rediscover them.
 
+A task-form loop's `group_next` is a suspension site too, a *park site*:
+it parks the task on its running set while no entry has reported (Child
+Tasks). It is a low-level operation, not a call, so it has no `CallExtra`;
+the operation itself is the mark.
+
 The fixpoint's seeds are the body-less procedures marked `may`: a
 `suspending` hosted procedure, marked when LIR construction makes it, and a
-procedure the native cache supplies, whose producer committed its mark. It
-propagates from each seed to the callers that call it directly and commits
+procedure the native cache supplies, whose producer committed its mark. A
+procedure whose body holds a `group_next` is a seed too. A loop has the task
+form only because an entry may suspend, so a program with a `group_next`
+always has a body-less seed as well, and a program without one skips the
+walk; a Debug compiler walks anyway and checks that no `group_next` is
+there. It propagates from each seed to the callers that call it directly and commits
 both marks on every procedure with a body, so a recomputation after rewrites
 replaces stale marks rather than adding to them. Erased calls are never
 sites here; the continuation pass rejects an erased-callable procedure that
@@ -33903,6 +33912,22 @@ result with `ptr_load` from `task_result_buffer(task)` or
 ascending order (the result in its place among them), then the task. It
 reads the result whether or not the continuation takes it, so a result the
 code after the call never reads is released there.
+
+**Park sites.** A park site `s = group_next(set)` gets a continuation and a
+resume entry like any site that is not a tail site, with three differences:
+
+- Its pending test is a switch on `s` whose `group_pending` branch (2) sets
+  the task's pending flag and takes the pending edge; an arrival (0) or the
+  end (1) goes on. `group_next` has already parked the task on the set.
+- Its saved values always include `set`, even where the code after the site
+  never reads it, since the resume entry does.
+- Its result does not arrive anywhere while the task is parked: a report
+  only readies the task. So `R(f, k)` runs `group_next(set)` again for `s`.
+  While that is still `group_pending`, which happens when the report that
+  readied the task was a cancelled entry's and another entry still runs,
+  `R(f, k)` sets the pending flag and saves the same values with itself.
+  Otherwise it calls `C(f, k)` with `s` in the result's place. The
+  continuation therefore never sees `group_pending`.
 
 ### Records And The Task
 

@@ -18,6 +18,7 @@ const core = @import("lir_core");
 const layout = @import("layout");
 const body_clone = @import("body_clone.zig");
 const ContinuationSites = @import("continuation_sites.zig");
+const SiteStmt = ContinuationSites.SiteStmt;
 const SuspensionMarks = @import("suspension_marks.zig");
 const invariant = @import("base").invariant;
 
@@ -33,6 +34,22 @@ const ProcId = LIR.LirProcSpecId;
 /// finished; every other value means it is pending (design.md "Host
 /// Contract").
 const roc_ready: u64 = 0;
+
+/// The status a running set's `group_next` returns while no entry has
+/// reported and some still run: the task is parked on the set (design.md
+/// "Child Tasks"). 0 is an arrival and 1 the end.
+const group_pending: u64 = 2;
+
+/// How a site pauses. A procedure sets the task's pending flag before it
+/// returns, a `suspending` hosted procedure returns a `RocPoll`, and a park
+/// site, a running set's `group_next`, returns `group_pending`. A park
+/// site's resume runs `group_next` on the set again.
+const SiteKind = union(enum) {
+    procedure,
+    hosted,
+    /// The running set.
+    park: LocalId,
+};
 
 /// The program's roots, parallel to `program.Result.root_procs`. The pass
 /// replaces each `provides` root that may suspend with its task entry
@@ -70,7 +87,7 @@ const SiteInfo = struct {
     live_after: []const LocalId,
     /// The call's target in the procedure that contains the site.
     target: LocalId,
-    hosted: bool,
+    kind: SiteKind,
     /// The site's continuation and resume entry, or null for a tail site.
     continuation: ?ProcId,
     resume_entry: ?ProcId,
@@ -122,6 +139,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
         try appendLocal(store, &store.getProcSpecPtr(plan.proc).args, plan.task);
         try appendLocal(store, &store.getProcSpecPtr(plan.proc).frame_locals, plan.task);
         for (plan.sites.sites) |site| {
+            if (site.park) continue;
             const call = store.getCFStmtImmediate(site.call).assign_call;
             if (isHosted(store, call.proc)) continue;
             const args = &store.getCFStmtPtr(site.call).assign_call.args;
@@ -138,13 +156,17 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
     for (plans.items) |plan| {
         const source = store.getProcSpecImmediate(plan.proc).*;
         for (plan.sites.sites, 0..) |site, ordinal| {
-            const call = store.getCFStmtImmediate(site.call).assign_call;
-            const hosted = isHosted(store, call.proc);
-            if (hosted) hosted_procs.set(@backingInt(call.proc));
+            const stmt = SiteStmt.at(store, site.call);
+            const kind: SiteKind = switch (stmt) {
+                .call => |call| if (isHosted(store, call.proc)) .hosted else .procedure,
+                .park => |op| .{ .park = GuardedList.at(store.getLocalSpan(op.args), 0) },
+            };
+            if (kind == .hosted) hosted_procs.set(@backingInt(stmt.call.proc));
+            const target = stmt.target();
             var info = SiteInfo{
                 .live_after = site.live_after,
-                .target = call.target,
-                .hosted = hosted,
+                .target = target,
+                .kind = kind,
                 .continuation = null,
                 .resume_entry = null,
                 .capture_layout = .zst,
@@ -169,9 +191,9 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
                     .abi = .erased_callable,
                 }, store.procLoc(plan.proc));
                 try nameDerived(allocator, store, info.resume_entry.?, plan.proc, "resume", ordinal);
-                info.capture_layout = try captureLayout(allocator, store, layouts, site.live_after, call.target);
+                info.capture_layout = try captureLayout(allocator, store, layouts, site.live_after, target);
                 info.on_drop = hostDrop(layouts, info.capture_layout);
-                if (hosted) info.slot_drop = hostDrop(layouts, store.getLocal(call.target).layout_idx);
+                if (kind == .hosted) info.slot_drop = hostDrop(layouts, store.getLocal(target).layout_idx);
             }
             try infos.put(allocator, site.call, info);
         }
@@ -468,10 +490,19 @@ const Occurrence = struct {
     target: LocalId,
     /// The site's live values, in the order of `SiteInfo.live_after`.
     live: []const LocalId,
-    /// The call, without the task at a hosted site.
-    proc: ProcId,
+    /// The call, without the task at a hosted site; at a park site, no
+    /// procedure and `group_next`'s arguments.
+    proc: ?ProcId,
     args: LIR.LocalSpan,
     extra: LIR.StmtRowId(LIR.CallExtra),
+
+    /// The occurrence of the site `stmt` in its own procedure.
+    fn of(stmt: SiteStmt, task: LocalId, live: []const LocalId) Occurrence {
+        return switch (stmt) {
+            .call => |call| .{ .task = task, .target = call.target, .live = live, .proc = call.proc, .args = call.args, .extra = call.extra },
+            .park => |op| .{ .task = task, .target = op.target, .live = live, .proc = null, .args = op.args, .extra = .none },
+        };
+    }
 };
 
 /// `suspend_save task R(f, k) [saved]; suspend_return`, where the saved
@@ -500,10 +531,20 @@ fn pendingEdge(store: *LirStore, info: SiteInfo, occurrence: Occurrence, origin:
 /// site, with `ready` as the code that runs when nothing paused. A
 /// procedure site keeps its call and tests the pending flag after it; a
 /// hosted site reads the slot's address, calls the host, and branches on
-/// the `RocPoll`.
+/// the `RocPoll`; a park site keeps its `group_next` and branches on the
+/// status.
 fn siteHead(store: *LirStore, layouts: *layout.Store, sink: anytype, info: SiteInfo, occurrence: Occurrence, ready: CFStmtId, origin: LIR.StmtOrigin) Allocator.Error!LIR.CFStmt {
     const edge = try pendingEdge(store, info, occurrence, origin);
-    if (!info.hosted) {
+    if (info.kind == .park) {
+        return .{ .assign_low_level = .{
+            .target = occurrence.target,
+            .op = .group_next,
+            .rc_effect = try store.addRcEffect(LIR.LowLevel.group_next.rcEffect()),
+            .args = occurrence.args,
+            .next = try parkBranch(store, sink, occurrence.task, occurrence.target, edge, ready, origin),
+        } };
+    }
+    if (info.kind == .procedure) {
         const ready_flag = try sink.newLocal(.bool);
         const test_stmt = try store.addCFStmt(.{ .switch_initialized_payload = .{
             .cond = ready_flag,
@@ -515,7 +556,7 @@ fn siteHead(store: *LirStore, layouts: *layout.Store, sink: anytype, info: SiteI
         const read = try store.addLowLevelStmt(ready_flag, .task_ready, &.{occurrence.task}, test_stmt, origin);
         return .{ .assign_call = .{
             .target = occurrence.target,
-            .proc = occurrence.proc,
+            .proc = occurrence.proc.?,
             .args = occurrence.args,
             .extra = occurrence.extra,
             .next = read,
@@ -540,7 +581,7 @@ fn siteHead(store: *LirStore, layouts: *layout.Store, sink: anytype, info: SiteI
     for (0..GuardedList.borrowLen(store.getLocalSpan(occurrence.args))) |i| args.appendAssumeCapacity(GuardedList.at(store.getLocalSpan(occurrence.args), i));
     const call = try store.addCFStmt(.{ .assign_call = .{
         .target = poll,
-        .proc = occurrence.proc,
+        .proc = occurrence.proc.?,
         .args = try store.addLocalSpan(args.items),
         .extra = occurrence.extra,
         .next = branch,
@@ -554,23 +595,30 @@ fn siteHead(store: *LirStore, layouts: *layout.Store, sink: anytype, info: SiteI
     } };
 }
 
+/// A park site's branch on `status`: `group_pending` sets the task's
+/// pending flag and takes `edge`; an arrival or the end goes on to `ready`.
+fn parkBranch(store: *LirStore, sink: anytype, task: LocalId, status: LocalId, edge: CFStmtId, ready: CFStmtId, origin: LIR.StmtOrigin) Allocator.Error!CFStmtId {
+    const unit = try sink.newLocal(.zst);
+    const pending = try store.addLowLevelStmt(unit, .task_set_pending, &.{task}, edge, origin);
+    return store.addCFStmt(.{ .switch_stmt = .{
+        .cond = status,
+        .branches = try store.addCFSwitchBranches(&.{.{ .value = group_pending, .body = pending }}),
+        .default_branch = ready,
+    } }, origin);
+}
+
 /// Give a site of the procedure itself its pending edge, in place.
 fn rewriteSite(store: *LirStore, layouts: *layout.Store, sink: *FrameSink, info: SiteInfo, task: LocalId, site: CFStmtId) Allocator.Error!void {
-    const call = store.getCFStmtImmediate(site).assign_call;
+    const stmt = SiteStmt.at(store, site);
     const origin = store.stmtOrigin(site);
-    const head = try siteHead(store, layouts, sink, info, .{
-        .task = task,
-        .target = call.target,
-        .live = info.live_after,
-        .proc = call.proc,
-        .args = call.args,
-        .extra = call.extra,
-    }, call.next, origin);
+    const head = try siteHead(store, layouts, sink, info, Occurrence.of(stmt, task, info.live_after), stmt.next(), origin);
     try store.replaceCFStmt(site, head, origin);
 }
 
 /// `R(f, k)`: load the saved values and the call's result, then call
-/// `C(f, k)` with them and the task.
+/// `C(f, k)` with them and the task. At a park site the result is the
+/// status of `group_next` run again on the saved set; while it is still
+/// `group_pending`, `R` saves the same values with itself and returns.
 fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Store, info: SiteInfo, origin: LIR.StmtOrigin) Allocator.Error!void {
     const entry = info.resume_entry.?;
     const ret_layout = store.getProcSpecImmediate(entry).ret_layout;
@@ -585,6 +633,10 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
             try self.frame.append(self.allocator, id);
             return id;
         }
+
+        fn newLocal(self: @This(), layout_idx: layout.Idx) Allocator.Error!LocalId {
+            return self.local(layout_idx);
+        }
     };
     const fresh = Fresh{ .store = store, .frame = &frame, .allocator = allocator };
 
@@ -593,13 +645,14 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
     const reuse = try fresh.local(try layouts.insertErasedCallable());
     const result_layout = store.getLocal(info.target).layout_idx;
     const result = try fresh.local(result_layout);
-    const address = try fresh.local(try layouts.insertPtr(result_layout));
+    const address: ?LocalId = if (info.kind == .park) null else try fresh.local(try layouts.insertPtr(result_layout));
     const value = try fresh.local(ret_layout);
 
     var fields = std.ArrayList(LocalId).empty;
     defer fields.deinit(allocator);
     var call_args = try std.ArrayList(LocalId).initCapacity(allocator, info.live_after.len + 1);
     defer call_args.deinit(allocator);
+    var set: ?LocalId = null;
     for (info.live_after) |live| {
         if (live == info.target) {
             call_args.appendAssumeCapacity(result);
@@ -607,8 +660,11 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
             const field = try fresh.local(store.getLocal(live).layout_idx);
             try fields.append(allocator, field);
             call_args.appendAssumeCapacity(field);
+            if (info.kind == .park and live == info.kind.park) set = field;
         }
     }
+    const live_here = try allocator.dupe(LocalId, call_args.items);
+    defer allocator.free(live_here);
     call_args.appendAssumeCapacity(task);
 
     const ret = try store.addCFStmt(.{ .ret = .{ .value = value } }, origin);
@@ -618,8 +674,18 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
         .args = try store.addLocalSpan(call_args.items),
         .next = ret,
     } }, origin);
-    const load = try store.addLowLevelStmt(result, .ptr_load, &.{address}, call, origin);
-    var head = try store.addLowLevelStmt(address, if (info.hosted) .task_hosted_slot else .task_result_buffer, &.{task}, load, origin);
+    var head = switch (info.kind) {
+        .park => blk: {
+            const edge = try pendingEdge(store, info, .{ .task = task, .target = result, .live = live_here, .proc = null, .args = .empty(), .extra = .none }, origin);
+            const branch = try parkBranch(store, fresh, task, result, edge, call, origin);
+            const set_field = set orelse invariant("a park site's set is not among its saved values", .{});
+            break :blk try store.addLowLevelStmt(result, .group_next, &.{set_field}, branch, origin);
+        },
+        .procedure, .hosted => blk: {
+            const load = try store.addLowLevelStmt(result, .ptr_load, &.{address.?}, call, origin);
+            break :blk try store.addLowLevelStmt(address.?, if (info.kind == .hosted) .task_hosted_slot else .task_result_buffer, &.{task}, load, origin);
+        },
+    };
     if (fields.items.len > 0) {
         if (info.capture_layout == .zst) {
             // Every saved value is zero-sized, so there is no capture to read.
@@ -777,7 +843,8 @@ const ContinuationRewriter = struct {
 
     pub fn interceptStmt(self: *ContinuationRewriter, cloner: anytype, old_id: CFStmtId, stmt: LIR.CFStmt, origin: LIR.StmtOrigin) Allocator.Error!body_clone.Intercept {
         switch (stmt) {
-            .assign_call => |call| {
+            .assign_call, .assign_low_level => {
+                const site_stmt = ContinuationSites.SiteStmt.of(stmt) orelse return .none;
                 const info = self.infos.get(old_id) orelse return .none;
                 const continuation = info.continuation orelse return .none;
                 const task = try cloner.mapLocal(self.task);
@@ -799,14 +866,25 @@ const ContinuationRewriter = struct {
                     .next = ret,
                 } }, origin);
 
-                const head = try siteHead(cloner.store, self.layouts, CloneSink(@TypeOf(cloner)){ .cloner = cloner }, info, .{
-                    .task = task,
-                    .target = try cloner.mapLocal(call.target),
-                    .live = live.items,
-                    .proc = call.proc,
-                    .args = try cloner.mapLocalSpan(call.args),
-                    .extra = try cloner.mapCallExtra(call.extra),
-                }, tail, origin);
+                const occurrence: Occurrence = switch (site_stmt) {
+                    .call => |call| .{
+                        .task = task,
+                        .target = try cloner.mapLocal(call.target),
+                        .live = live.items,
+                        .proc = call.proc,
+                        .args = try cloner.mapLocalSpan(call.args),
+                        .extra = try cloner.mapCallExtra(call.extra),
+                    },
+                    .park => |op| .{
+                        .task = task,
+                        .target = try cloner.mapLocal(op.target),
+                        .live = live.items,
+                        .proc = null,
+                        .args = try cloner.mapLocalSpan(op.args),
+                        .extra = .none,
+                    },
+                };
+                const head = try siteHead(cloner.store, self.layouts, CloneSink(@TypeOf(cloner)){ .cloner = cloner }, info, occurrence, tail, origin);
                 return .{ .done = try cloner.store.addCFStmt(head, origin) };
             },
             .jump => |jump| {
@@ -818,7 +896,6 @@ const ContinuationRewriter = struct {
             .assign_literal,
             .assign_call_erased,
             .assign_packed_erased_fn,
-            .assign_low_level,
             .assign_list,
             .assign_struct,
             .assign_tag,
@@ -875,8 +952,7 @@ fn buildContinuation(
     for (site.live_after) |live| args.appendAssumeCapacity(try cloner.mapLocal(live));
     args.appendAssumeCapacity(try cloner.mapLocal(plan.task));
 
-    const call = store.getCFStmtImmediate(site.call).assign_call;
-    var inner = try cloner.cloneStmt(call.next);
+    var inner = try cloner.cloneStmt(SiteStmt.at(store, site.call).next());
 
     // The enclosing joins the copy jumps to, and those their copied bodies
     // jump to in turn.
@@ -951,10 +1027,10 @@ fn verify(allocator: Allocator, store: *const LirStore) Allocator.Error!void {
         var sites = try ContinuationSites.analyze(allocator, store, proc_id);
         defer sites.deinit();
         for (sites.sites) |site| {
-            const call = store.getCFStmtImmediate(site.call).assign_call;
-            try calls.append(allocator, .{ .callee = call.proc, .tail = site.tail });
+            const stmt = SiteStmt.at(store, site.call);
+            if (stmt == .call) try calls.append(allocator, .{ .callee = stmt.call.proc, .tail = site.tail });
             if (site.tail) continue;
-            const save_id = pendingSave(store, call) orelse invariant("continuation pass left a site that is not a tail site without its pending test", .{});
+            const save_id = pendingSave(store, stmt) orelse invariant("continuation pass left a site that is not a tail site without its pending test", .{});
             const save = store.getCFStmtImmediate(save_id).suspend_save;
             const data = store.stmtRow(save.data);
             continuations.set(@backingInt(try verifyResumeEntry(allocator, store, data)));
@@ -963,10 +1039,13 @@ fn verify(allocator: Allocator, store: *const LirStore) Allocator.Error!void {
             // the call's result, the task and a hosted site's slot address.
             var expected = std.ArrayList(LocalId).empty;
             defer expected.deinit(allocator);
-            const call_args = store.getLocalSpan(call.args);
-            const slot: ?LocalId = if (isHosted(store, call.proc)) GuardedList.at(call_args, 1) else null;
+            const slot: ?LocalId = switch (stmt) {
+                .call => |call| if (isHosted(store, call.proc)) GuardedList.at(store.getLocalSpan(call.args), 1) else null,
+                .park => null,
+            };
+            const target = stmt.target();
             for (site.live_after) |live| {
-                if (live == call.target or live == save.task or (slot != null and live == slot.?)) continue;
+                if (live == target or live == save.task or (slot != null and live == slot.?)) continue;
                 try expected.append(allocator, live);
             }
             var saved = std.ArrayList(LocalId).empty;
@@ -983,7 +1062,19 @@ fn verify(allocator: Allocator, store: *const LirStore) Allocator.Error!void {
 
 /// The `suspend_save` that a site's pending test leads to on its cold side,
 /// or null when the site has no pending test.
-fn pendingSave(store: *const LirStore, call: @FieldType(LIR.CFStmt, "assign_call")) ?CFStmtId {
+fn pendingSave(store: *const LirStore, site: SiteStmt) ?CFStmtId {
+    if (site == .park) {
+        const op = site.park;
+        const next = store.getCFStmtImmediate(op.next).*;
+        if (next != .switch_stmt or next.switch_stmt.cond != op.target) return null;
+        const branches = store.getCFSwitchBranches(next.switch_stmt.branches);
+        if (GuardedList.borrowLen(branches) != 1 or GuardedList.at(branches, 0).value != group_pending) return null;
+        const pending = store.getCFStmtImmediate(GuardedList.at(branches, 0).body).*;
+        if (pending != .assign_low_level or pending.assign_low_level.op != .task_set_pending) return null;
+        if (store.getCFStmtImmediate(pending.assign_low_level.next).* != .suspend_save) return null;
+        return pending.assign_low_level.next;
+    }
+    const call = site.call;
     const next = store.getCFStmtImmediate(call.next).*;
     if (isHosted(store, call.proc)) {
         if (next != .switch_stmt) return null;
@@ -1006,7 +1097,9 @@ fn pendingSave(store: *const LirStore, call: @FieldType(LIR.CFStmt, "assign_call
 /// Check that the resume entry `data` names reads its captures as fields in
 /// order and passes them, with at most the call's result among them, then
 /// its task, to a procedure taking exactly those arguments. Returns that
-/// procedure, the site's continuation.
+/// procedure, the site's continuation. A park site's resume entry runs
+/// `group_next` for its result and reaches the call on the switch's default
+/// branch; its pending branch is a park site of its own, checked as one.
 fn verifyResumeEntry(allocator: Allocator, store: *const LirStore, data: LIR.SuspendSaveData) Allocator.Error!ProcId {
     const entry = store.getProcSpecImmediate(data.proc);
     if (entry.abi != .erased_callable) invariant("a pending edge saves a procedure that is not an erased callable", .{});
@@ -1026,7 +1119,7 @@ fn verifyResumeEntry(allocator: Allocator, store: *const LirStore, data: LIR.Sus
                 at = read.next;
             },
             .assign_low_level => |op| {
-                if (op.op == .ptr_load) result = op.target;
+                if (op.op == .ptr_load or op.op == .group_next) result = op.target;
                 at = op.next;
             },
             .assign_struct => |zero_sized| {
@@ -1034,6 +1127,10 @@ fn verifyResumeEntry(allocator: Allocator, store: *const LirStore, data: LIR.Sus
                 at = zero_sized.next;
             },
             .assign_call => |found| break found,
+            .switch_stmt => |branch| {
+                if (result == null or branch.cond != result.?) invariant("a resume entry branches on something other than its park site's status", .{});
+                at = branch.default_branch;
+            },
             .init_uninitialized,
             .assign_literal,
             .assign_call_erased,
@@ -1053,7 +1150,6 @@ fn verifyResumeEntry(allocator: Allocator, store: *const LirStore, data: LIR.Sus
             .decref,
             .decref_if_initialized,
             .free,
-            .switch_stmt,
             .switch_initialized_payload,
             .str_match,
             .str_match_set,

@@ -748,3 +748,191 @@ test "a running set of heap results drops one through the interpreter and releas
     try std.testing.expectEqual(@as(u32, 1), ended.value.read(u32));
     try f.runtime_env.checkForLeaks();
 }
+
+/// The task-form loop the park-site test runs, after the continuation pass:
+/// the provides root `g(cell)` loads its own task from `cell`, opens a
+/// running set of three entries (one returning 5, then two background ones
+/// returning 100 and 200), and sums what arrives:
+///
+///     join L(sum) { s = group_next(set); match s { 0 => sum = sum +
+///     load(group_arrival(set)); jump L, _ => group_free(set); ret sum } }
+///
+/// Only a task-form loop has a `group_next`, and it has that form because
+/// an entry may suspend at a `suspending` hosted call. The program declares
+/// one, `roc_test_unused`, which nothing here calls. Returns the task entry
+/// that takes `g`'s place.
+fn parkingProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
+    _ = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = .empty(),
+        .ret_layout = .u64,
+        .hosted = .some(.{ .symbol = try f.store.insertString("roc_test_unused"), .dispatch_index = 0 }),
+        .suspends = .may,
+    }, .none);
+    const erased = try f.layouts.insertErasedCallable();
+    const list_u64 = try f.layouts.insertList(.u64);
+    const starts = [_]LIR.LirProcSpecId{ try constantStart(f, 5), try constantStart(f, 100), try constantStart(f, 200) };
+    const background = [_]i64{ 0, 1, 1 };
+
+    const cell = try f.local(try f.layouts.insertPtr(.opaque_ptr));
+    const owner = try f.local(.opaque_ptr);
+    const set = try f.local(.opaque_ptr);
+    const count = try f.local(.u64);
+    const no_limit = try f.local(.u64);
+    const limits = try f.local(list_u64);
+    const path = try f.local(list_u64);
+    const no = try f.local(.bool);
+    const yes = try f.local(.bool);
+    const unit = try f.local(.zst);
+    const sum0 = try f.local(.u64);
+    const sum = try f.local(.u64);
+    const status = try f.local(.u32);
+    const slot = try f.local(try f.layouts.insertPtr(.u64));
+    const value = try f.local(.u64);
+    const sum2 = try f.local(.u64);
+    const freed = try f.local(.zst);
+    var start_locals: [3]LocalId = undefined;
+    for (&start_locals) |*start| start.* = try f.local(erased);
+    const join_id: LIR.JoinPointId = @fromBackingInt(@intCast(1));
+
+    // The loop.
+    const back = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } }, .test_fixture);
+    const rebind = try f.store.addCFStmt(.{ .set_local = .{ .target = sum, .value = sum2, .mode = .initialize_join_param, .next = back } }, .test_fixture);
+    const add = try f.op(sum2, .num_int_add_wrap, &.{ sum, value }, rebind);
+    const arrived = try f.op(slot, .group_arrival, &.{set}, try f.op(value, .ptr_load, &.{slot}, add));
+    const ended = try f.op(freed, .group_free, &.{set}, try f.ret(sum));
+    const branch = try f.store.addCFStmt(.{ .switch_stmt = .{
+        .cond = status,
+        .branches = try f.store.addCFSwitchBranches(&.{.{ .value = 0, .body = arrived }}),
+        .default_branch = ended,
+    } }, .test_fixture);
+    const loop_body = try f.op(status, .group_next, &.{set}, branch);
+    const enter = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } }, .test_fixture);
+    const init_sum = try f.store.addCFStmt(.{ .set_local = .{ .target = sum, .value = sum0, .mode = .initialize_join_param, .next = enter } }, .test_fixture);
+    const loop = try f.store.addCFStmt(.{ .join = .{ .id = join_id, .params = try f.store.addLocalSpan(&.{sum}), .body = loop_body, .remainder = init_sum } }, .test_fixture);
+
+    // Opening the set.
+    var head = try literal(f, sum0, 0, .u64, loop);
+    head = try f.op(unit, .group_start, &.{set}, head);
+    var index: usize = start_locals.len;
+    while (index > 0) {
+        index -= 1;
+        head = try f.op(unit, .group_push, &.{ set, start_locals[index], path, no, if (background[index] == 1) yes else no }, head);
+    }
+    head = try f.store.addCFStmt(.{ .assign_low_level = .{
+        .target = set,
+        .op = .group_init,
+        .rc_effect = try f.store.addRcEffect(LowLevel.group_init.rcEffect()),
+        .extra = try f.store.addStmtRow(LIR.LowLevelExtra, .{ .group_result = .some(.u64) }),
+        .args = try f.store.addLocalSpan(&.{ owner, count, limits, no_limit }),
+        .next = head,
+    } }, .test_fixture);
+    head = try f.store.addCFStmt(.{ .assign_list = .{ .target = path, .elems = .empty(), .next = head } }, .test_fixture);
+    head = try f.store.addCFStmt(.{ .assign_list = .{ .target = limits, .elems = .empty(), .next = head } }, .test_fixture);
+    head = try literal(f, yes, 1, .bool, head);
+    head = try literal(f, no, 0, .bool, head);
+    head = try literal(f, no_limit, 0, .u64, head);
+    head = try literal(f, count, 3, .u64, head);
+    index = start_locals.len;
+    while (index > 0) {
+        index -= 1;
+        head = try f.store.addCFStmt(.{ .assign_packed_erased_fn = .{
+            .target = start_locals[index],
+            .data = try f.store.addStmtRow(LIR.PackedErasedFnData, .{
+                .proc = starts[index],
+                .capture = .none,
+                .capture_layout = .none,
+                .on_drop = .none,
+            }),
+            .next = head,
+        } }, .test_fixture);
+    }
+    head = try f.op(owner, .ptr_load, &.{cell}, head);
+    const g = try pointerProc(f, cell, head, .u64);
+
+    try lir.SuspensionMarks.run(f.allocator, &f.store);
+    var roots = [_]LIR.LirProcSpecId{g};
+    try lir.ContinuationPass.run(f.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true} });
+    try indexJoinPoints(f);
+    return roots[0];
+}
+
+/// Give every procedure the table of its join points that the interpreter
+/// jumps through. A compiled program's ARC builds these tables; these tests
+/// run LIR from before ARC, so they build them here: the loop's `g` and the
+/// continuation the pass copies the loop into both need one.
+fn indexJoinPoints(f: *Fixture) TaskOpsTestError!void {
+    var work = std.ArrayList(CFStmtId).empty;
+    defer work.deinit(f.allocator);
+    var joins = std.ArrayList(LIR.JoinPoint).empty;
+    defer joins.deinit(f.allocator);
+    for (0..f.store.procSpecCount()) |index| {
+        const proc_id: LIR.LirProcSpecId = @fromBackingInt(@intCast(index));
+        const body = f.store.getProcSpecImmediate(proc_id).body.get() orelse continue;
+        joins.clearRetainingCapacity();
+        try work.append(f.allocator, body);
+        while (work.pop()) |stmt_id| {
+            const stmt = f.store.getCFStmtImmediate(stmt_id).*;
+            if (stmt == .join) try joins.append(f.allocator, .{ .id = stmt.join.id, .params = stmt.join.params, .body = stmt.join.body });
+            try lir.BodyClone.appendSuccessors(&f.store, &work, stmt_id, f.allocator);
+        }
+        std.mem.sort(LIR.JoinPoint, joins.items, {}, struct {
+            fn lessThan(_: void, lhs: LIR.JoinPoint, rhs: LIR.JoinPoint) bool {
+                return @backingInt(lhs.id) < @backingInt(rhs.id);
+            }
+        }.lessThan);
+        f.store.getProcSpecPtr(proc_id).join_points = try f.store.addJoinPointSpan(joins.items);
+    }
+}
+
+test "a task parks at its running set's next and resumes there until the loop ends" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const entry = try parkingProgram(&f);
+
+    var static_strings = try eval.Interpreter.buildStaticStrings(f.allocator, &f.store);
+    defer static_strings.deinit();
+    var interp = try eval.Interpreter.init(f.allocator, &f.store, &f.layouts, static_strings.view(), f.runtime_env.get_ops());
+    defer interp.deinit();
+
+    var cell: usize = 0;
+    var root: u64 = 0;
+    const Args = extern struct { cell: usize, result_out: usize };
+    var args = Args{ .cell = @intFromPtr(&cell), .result_out = @intFromPtr(&root) };
+    const created = try interp.eval(.{ .proc_id = entry, .arg_layouts = &.{ try f.layouts.insertPtr(.opaque_ptr), .opaque_ptr }, .arg_ptr = @ptrCast(&args) });
+    const task: *RocTask = @ptrFromInt(created.value.read(usize));
+    cell = @intFromPtr(task);
+    const ready = &ReadyChildren.ready;
+    const abort = &ReadyChildren.abort;
+    ReadyChildren.len = 0;
+    const Status = builtins.task.Status;
+
+    // The loop opens the set, which starts all three entries, and parks at
+    // its next: nothing has reported.
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(@as(usize, 3), ReadyChildren.len);
+    const first = ReadyChildren.tasks[0];
+    const second = ReadyChildren.tasks[1];
+    const third = ReadyChildren.tasks[2];
+
+    // The first entry's report readies the task. It resumes at its next and
+    // takes 5; only background entries are left, so the next after that
+    // cancels them and parks again.
+    try std.testing.expectEqual(Status.done, first.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(task, ReadyChildren.tasks[ReadyChildren.len - 1]);
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
+
+    // One cancelled entry's report readies the task, but the other still
+    // runs: the resumed next parks once more.
+    try std.testing.expectEqual(Status.cancelled, second.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(task, ReadyChildren.tasks[ReadyChildren.len - 1]);
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
+
+    // The last report ends the loop, which returns the sum.
+    try std.testing.expectEqual(Status.cancelled, third.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.done, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(@as(u64, 5), root);
+    task.free();
+    try f.runtime_env.checkForLeaks();
+}

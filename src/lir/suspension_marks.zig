@@ -4,9 +4,11 @@
 //! A call is a suspension site when its callee may suspend. A body-less
 //! procedure's mark is given: LIR construction marks a `suspending` hosted
 //! procedure, and a cached body's producer committed its own. A procedure
-//! with a body may suspend when it calls one that may, directly. Erased calls
-//! are never sites here; the continuation pass rejects an erased-callable
-//! procedure that may suspend.
+//! with a body may suspend when it calls one that may, directly, or when it
+//! holds a running set's `group_next`, which parks the task while no entry
+//! has reported (design.md "Child Tasks"). Erased calls are never sites
+//! here; the continuation pass rejects an erased-callable procedure that may
+//! suspend.
 //!
 //! Every procedure with a body and every direct call gets its mark committed,
 //! so running this again after rewrites replaces stale marks.
@@ -27,20 +29,35 @@ const DirectCall = struct {
     stmt: LIR.CFStmtId,
 };
 
+/// Every direct call in every procedure body, and the procedures whose
+/// bodies hold a `group_next`.
+const Walk = struct {
+    calls: std.ArrayList(DirectCall),
+    parks: std.bit_set.DynamicBitSetUnmanaged,
+
+    fn deinit(self: *Walk, allocator: Allocator) void {
+        self.calls.deinit(allocator);
+        self.parks.deinit(allocator);
+    }
+};
+
 /// Commit `suspends` on every procedure with a body and `suspension_site` on
 /// every direct call.
 pub fn run(allocator: Allocator, store: *LirStore) Allocator.Error!void {
     if (!anySeed(store)) {
         // Nothing can suspend: commit `never` without walking. A Debug
-        // compiler walks anyway and checks that no call is a site.
+        // compiler walks anyway and checks that no call is a site. Nor is
+        // there a `group_next`: a loop has the task form only when an entry
+        // may suspend, which needs a suspending procedure.
         if (builtin.mode == .debug) {
-            var calls = try collectDirectCalls(allocator, store);
-            defer calls.deinit(allocator);
-            for (calls.items) |call| {
+            var walk = try walkBodies(allocator, store);
+            defer walk.deinit(allocator);
+            for (walk.calls.items) |call| {
                 if (store.stmtRowOrDefault(store.getCFStmtImmediate(call.stmt).assign_call.extra).suspension_site) {
                     invariant("suspension marks found a site with no suspending procedure", .{});
                 }
             }
+            if (walk.parks.count() != 0) invariant("suspension marks found a running set's next with no suspending procedure", .{});
         }
         for (0..store.procSpecCount()) |index| {
             const proc = store.getProcSpecPtr(@fromBackingInt(@as(u32, @intCast(index))));
@@ -49,9 +66,10 @@ pub fn run(allocator: Allocator, store: *LirStore) Allocator.Error!void {
         return;
     }
 
-    var calls = try collectDirectCalls(allocator, store);
-    defer calls.deinit(allocator);
-    var may = try maySuspend(allocator, store, calls.items);
+    var walk = try walkBodies(allocator, store);
+    defer walk.deinit(allocator);
+    const calls = &walk.calls;
+    var may = try maySuspend(allocator, store, calls.items, &walk.parks);
     defer may.deinit(allocator);
 
     for (0..store.procSpecCount()) |index| {
@@ -66,7 +84,7 @@ pub fn run(allocator: Allocator, store: *LirStore) Allocator.Error!void {
         extra.suspension_site = site;
         updated.extra = try store.addOptionalStmtRow(LIR.CallExtra, extra);
     }
-    if (builtin.mode == .debug) try verify(allocator, store, calls.items);
+    if (builtin.mode == .debug) try verify(allocator, store, calls.items, &walk.parks);
 }
 
 /// Whether any body-less procedure is marked as one that may suspend.
@@ -78,10 +96,13 @@ fn anySeed(store: *const LirStore) bool {
     return false;
 }
 
-/// Every direct call in every procedure body.
-fn collectDirectCalls(allocator: Allocator, store: *const LirStore) Allocator.Error!std.ArrayList(DirectCall) {
+/// Every direct call in every procedure body, and the procedures that hold
+/// a `group_next`.
+fn walkBodies(allocator: Allocator, store: *const LirStore) Allocator.Error!Walk {
     var calls = std.ArrayList(DirectCall).empty;
     errdefer calls.deinit(allocator);
+    var parks = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(allocator, store.procSpecCount());
+    errdefer parks.deinit(allocator);
     var seen = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(allocator, store.cfStmtCount());
     defer seen.deinit(allocator);
     var work = std.ArrayList(LIR.CFStmtId).empty;
@@ -99,15 +120,16 @@ fn collectDirectCalls(allocator: Allocator, store: *const LirStore) Allocator.Er
                 .callee = @backingInt(stmt.assign_call.proc),
                 .stmt = stmt_id,
             });
+            if (stmt == .assign_low_level and stmt.assign_low_level.op == .group_next) parks.set(proc_index);
             try body_clone.appendSuccessors(store, &work, stmt_id, allocator);
         }
     }
-    return calls;
+    return .{ .calls = calls, .parks = parks };
 }
 
-/// The procedures that may suspend: the seeds, and every procedure that
-/// directly calls one that may.
-fn maySuspend(allocator: Allocator, store: *const LirStore, calls: []const DirectCall) Allocator.Error!std.bit_set.DynamicBitSetUnmanaged {
+/// The procedures that may suspend: the seeds, the procedures that hold a
+/// `group_next`, and every procedure that directly calls one that may.
+fn maySuspend(allocator: Allocator, store: *const LirStore, calls: []const DirectCall, parks: *const std.bit_set.DynamicBitSetUnmanaged) Allocator.Error!std.bit_set.DynamicBitSetUnmanaged {
     const proc_count = store.procSpecCount();
     var may = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(allocator, proc_count);
     errdefer may.deinit(allocator);
@@ -115,7 +137,7 @@ fn maySuspend(allocator: Allocator, store: *const LirStore, calls: []const Direc
     defer pending.deinit(allocator);
     for (0..proc_count) |index| {
         const proc = store.getProcSpecImmediate(@fromBackingInt(@as(u32, @intCast(index))));
-        if (proc.body.get() == null and proc.suspends == .may) {
+        if ((proc.body.get() == null and proc.suspends == .may) or parks.isSet(index)) {
             may.set(index);
             try pending.append(allocator, @intCast(index));
         }
@@ -145,9 +167,9 @@ fn maySuspend(allocator: Allocator, store: *const LirStore, calls: []const Direc
 
 /// Debug check that the marks are complete: a call is a site exactly when
 /// its callee may suspend, and a procedure with a body may suspend exactly
-/// when it holds a site.
-fn verify(allocator: Allocator, store: *const LirStore, calls: []const DirectCall) Allocator.Error!void {
-    var has_site = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(allocator, store.procSpecCount());
+/// when it holds a site, a `group_next` being one.
+fn verify(allocator: Allocator, store: *const LirStore, calls: []const DirectCall, parks: *const std.bit_set.DynamicBitSetUnmanaged) Allocator.Error!void {
+    var has_site = try parks.clone(allocator);
     defer has_site.deinit(allocator);
     for (calls) |call| {
         const site = store.stmtRowOrDefault(store.getCFStmtImmediate(call.stmt).assign_call.extra).suspension_site;
@@ -285,4 +307,38 @@ test "a recursive cycle through a suspending call is marked as a whole" {
     try testing.expect(isSite(&store, even_call));
     try testing.expect(isSite(&store, odd_back_call));
     try testing.expect(isSite(&store, odd_seed_call));
+}
+
+/// A procedure whose body is `s = group_next(set); ret s`.
+fn addParking(store: *LirStore, identity: u32) Allocator.Error!LIR.LirProcSpecId {
+    const set = try store.addLocal(.{ .layout_idx = .opaque_ptr });
+    const status = try store.addLocal(.{ .layout_idx = .u32 });
+    const ret = try store.addCFStmt(.{ .ret = .{ .value = status } }, .test_fixture);
+    const next = try store.addLowLevelStmt(status, .group_next, &.{set}, ret, .test_fixture);
+    return store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.forTest(identity),
+        .args = try store.addLocalSpan(&.{set}),
+        .body = .some(next),
+        .ret_layout = .u32,
+    }, .none);
+}
+
+test "a running set's next makes its procedure suspend, and its callers" {
+    const a = testing.allocator;
+    var store = LirStore.init(a);
+    defer store.deinit();
+    // A task-form loop exists only beside a suspending seed.
+    const seed = try addBodyless(&store, 1, .may);
+    const parking = try addParking(&store, 2);
+    const caller = try addRelay(&store, 3, parking);
+    const leaf = try addRelay(&store, 4, null);
+
+    try run(a, &store);
+
+    try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(seed).suspends);
+    try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(parking).suspends);
+    try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(caller.proc).suspends);
+    try testing.expect(isSite(&store, caller.call.?));
+    try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(leaf.proc).suspends);
 }
