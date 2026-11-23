@@ -6246,8 +6246,8 @@ fn addWasmStaticLibRun(
 /// no-op tracy stub (so host_abi.zig can `@import("tracy")` without the real
 /// tracy module, which requires build_options), the vendored float
 /// formatters, and shim I/O.
-/// `task_host_calls` says whether a builtins object root defines the host's
-/// task calls (`builtins_object_options`, read by `static_lib.zig`).
+/// `task_host_calls` says whether a builtins object root defines the task
+/// calls (`builtins_object_options`, read by `static_lib.zig`).
 fn addBuiltinsImports(b: *std.Build, roc_modules: modules.RocModules, module: *std.Build.Module, task_host_calls: bool) void {
     module.addImport("tracy", b.createModule(.{ .root_source_file = b.path("src/builtins/tracy_stub.zig") }));
     const object_options = b.addOptions();
@@ -6274,9 +6274,10 @@ fn addBuiltinsObject(
     optimize: OptimizeMode,
     bundle_compiler_rt: bool,
     wasm_stack_checks: bool,
-    /// Whether the object defines the host's task calls (`roc_task_resume`
-    /// and its siblings). The interpreter shim's does not: the shim defines
-    /// them from the interpreter's own copy of the builtins.
+    /// Whether the object defines the task calls (`roc_task_free`, its
+    /// sibling, and the builtins of the program task calls). The interpreter
+    /// shim's does not: the shim defines them from the interpreter's own copy
+    /// of the builtins.
     task_host_calls: bool,
 ) *Step.Compile {
     std.debug.assert(!wasm_stack_checks or target.result.cpu.arch == .wasm32);

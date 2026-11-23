@@ -48,11 +48,11 @@ pub const TestHost = struct {
     readies: u32 = 0,
     /// The task's `roc_task_wake`: a program's own, or `nativeWake`.
     wake: WakeFn = &nativeWake,
-    /// The runtime's `roc_task_resume` and `roc_task_free`: a program's
-    /// own when it links the builtins privately (LLVM), so one runtime
-    /// handles its tasks (design.md "Backends", One runtime per process),
-    /// or this process's.
-    resume_task: ResumeFn = &builtins.task.host_calls.resumeTask,
+    /// The task's `roc_task_resume` and `roc_task_free`: a program's own
+    /// when it links the builtins privately (LLVM), so one runtime handles
+    /// its tasks (design.md "Backends", One runtime per process), or this
+    /// process's (`nativeResume`).
+    resume_task: ResumeFn = &nativeResume,
     free_task: FreeFn = &builtins.task.host_calls.free,
 
     pub fn init(allocator: std.mem.Allocator, ops: *RocOps, mode: Mode) TestHost {
@@ -215,6 +215,12 @@ pub fn nativeWake(task: *RocTask) callconv(.c) void {
 
 /// `roc_task_cancel`: a program's own, or `nativeCancel`.
 pub const CancelFn = *const fn (*RocTask) callconv(.c) void;
+
+/// Resume with the test host's `roc_task_ready` and `roc_task_abort`, as a
+/// program's `roc_task_resume` does, for a run whose program defines none.
+pub fn nativeResume(task: *RocTask) callconv(.c) u32 {
+    return builtins.dev_wrappers.roc_builtins_task_resume(task, &readyTask, &abortPending);
+}
 
 /// Cancel with the test host's `roc_task_abort` and `roc_task_ready`, as a
 /// program's `roc_task_cancel` does, for a run whose program defines none.

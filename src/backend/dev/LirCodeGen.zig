@@ -22866,7 +22866,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// A `ProgramTaskCall`'s body: the task, which arrives in the first
         /// argument register, and the addresses of the host's functions,
         /// passed to the builtin from the callee-saved `task_reg` and
-        /// `host_fn_regs`.
+        /// `host_fn_regs`. A status the builtin returns stays in the return
+        /// register through the epilogue.
         fn generateProgramTaskCallBody(
             self: *Self,
             call: builtins.builtin_registry.ProgramTaskCall,

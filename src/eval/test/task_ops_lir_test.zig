@@ -119,6 +119,8 @@ fn bareTask(hosted_slot: [*]u8, result_buffer: [*]u8) RocTask {
         .started = false,
         .cancel_requested = false,
         .aborted = false,
+        .ready_fn = null,
+        .abort_fn = null,
         .status = .pending,
         .root_result = undefined,
         .entries = undefined,

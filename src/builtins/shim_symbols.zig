@@ -27,9 +27,12 @@ pub const roc_shim_get_ops = "roc_shim_get_ops";
 pub const roc_entrypoint = "roc_entrypoint";
 /// Dispatches an entrypoint index into the shim, passing an embedded LIR image.
 pub const roc_entrypoint_from_image = "roc_entrypoint_from_image";
-/// Runs a parked or new task until it finishes or pauses again (design.md
-/// "Host Contract").
+/// Runs a parked or new task until it finishes or pauses again; a `Tasks`
+/// program defines it (design.md "Host Contract").
 pub const roc_task_resume = "roc_task_resume";
+/// The registry builtin `task_resume`, which the shims export so a shim
+/// build's platform shim module can define `roc_task_resume` over it.
+pub const roc_builtins_task_resume = "roc_builtins_task_resume";
 /// Tells a task the host wrote its pending hosted result; a `Tasks` program
 /// defines it (design.md "Host Contract").
 pub const roc_task_wake = "roc_task_wake";

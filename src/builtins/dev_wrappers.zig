@@ -1431,11 +1431,12 @@ pub fn roc_builtins_task_push_record(roc_task: *task.RocTask, record: [*]u8, slo
     roc_task.pushRecord(record, slot_drop);
 }
 
-/// `roc_task_resume` under its builtin name, for a backend that links the
-/// builtins privately and defines the host's task calls in the program
-/// (design.md "Backends").
-pub fn roc_builtins_task_resume(roc_task: *task.RocTask) callconv(.c) u32 {
-    return task.host_calls.resumeTask(roc_task);
+/// `roc_task_resume`'s body, with the host's `roc_task_ready` as `ready` and
+/// its `roc_task_abort` as `abort`: a `Tasks` program defines
+/// `roc_task_resume` as a call to this (design.md "Backends"). Returns a
+/// `RocTaskStatus`.
+pub fn roc_builtins_task_resume(roc_task: *task.RocTask, ready: task.ReadyFn, abort: task.AbortFn) callconv(.c) u32 {
+    return @backingInt(roc_task.resumeFromHost(ready, abort));
 }
 
 /// `roc_task_wake`'s body, with the host's `roc_task_ready` as `ready`: a
@@ -1445,7 +1446,9 @@ pub fn roc_builtins_task_wake(roc_task: *task.RocTask, ready: task.ReadyFn) call
     roc_task.wake(ready);
 }
 
-/// `roc_task_free` under its builtin name; see `roc_builtins_task_resume`.
+/// `roc_task_free` under its builtin name, for a backend that links the
+/// builtins privately and defines the host's task calls in the program
+/// (design.md "Backends").
 pub fn roc_builtins_task_free(roc_task: *task.RocTask) callconv(.c) void {
     task.host_calls.free(roc_task);
 }
@@ -1473,7 +1476,7 @@ pub fn roc_builtins_task_host_leave(roc_task: ?*task.RocTask) callconv(.c) void 
 }
 
 /// `roc_task_crash_message` under its builtin name; see
-/// `roc_builtins_task_resume`.
+/// `roc_builtins_task_free`.
 pub fn roc_builtins_task_crash_message(roc_task: *task.RocTask, len: *usize) callconv(.c) [*]const u8 {
     return task.host_calls.crashMessage(roc_task, len);
 }

@@ -85,7 +85,7 @@ const WasmRun = struct {
         const objects = eval.InspectedRun.wasmRuntimeObjects(.default);
         const module = try codegen.generateEntrypointModule(
             &.{.{ .symbol_name = "roc_task_entry", .proc = entry, .arg_layouts = &.{ .u64, .opaque_ptr }, .ret_layout = .opaque_ptr }},
-            &.{ shim_symbols.roc_task_resume, shim_symbols.roc_task_free },
+            &.{shim_symbols.roc_task_free},
             objects.builtins,
             objects.boxy_runtime,
         );

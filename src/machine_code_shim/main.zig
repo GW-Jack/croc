@@ -1028,18 +1028,21 @@ comptime {
     // This archive links no builtins object (the program's builtins load
     // with its image), so the shim is what defines the host's task calls in
     // the binary (design.md "Host Contract"), and the builtins the platform
-    // shim module's `ProgramTaskCall`s (`roc_task_wake`, `roc_task_cancel`)
-    // call. The image's builtin calls
+    // shim module's `ProgramTaskCall`s (`roc_task_resume`, `roc_task_wake`,
+    // `roc_task_cancel`) call. The image's builtin calls
     // resolve to the shim's own wrappers (`resolveShimFunction`), so these
     // share one task runtime with the image's code (design.md "The Task
     // Runtime"). The shim's unit tests link
     // roc_builtins.o in place of the image, and it defines them there.
     if (!builtin.is_test) {
-        @export(&builtins.task.host_calls.resumeTask, .{ .name = shim_symbols.roc_task_resume });
         @export(&builtins.task.host_calls.free, .{ .name = shim_symbols.roc_task_free });
         @export(&builtins.task.host_calls.crashMessage, .{ .name = shim_symbols.roc_task_crash_message });
+        @export(&builtins.dev_wrappers.roc_builtins_task_resume, .{ .name = shim_symbols.roc_builtins_task_resume });
         @export(&builtins.dev_wrappers.roc_builtins_task_wake, .{ .name = shim_symbols.roc_builtins_task_wake });
         @export(&builtins.dev_wrappers.roc_builtins_task_cancel, .{ .name = shim_symbols.roc_builtins_task_cancel });
+    }
+    if (!std.mem.eql(u8, shim_symbols.roc_builtins_task_resume, builtins.builtin_registry.BuiltinFn.task_resume.symbolName())) {
+        @compileError("shim_symbols.roc_builtins_task_resume must name the registry builtin task_resume");
     }
     if (!std.mem.eql(u8, shim_symbols.roc_builtins_task_wake, builtins.builtin_registry.BuiltinFn.task_wake.symbolName())) {
         @compileError("shim_symbols.roc_builtins_task_wake must name the registry builtin task_wake");

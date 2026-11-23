@@ -8745,7 +8745,7 @@ fn wasmRocHostRequirements(
 /// The public definitions of a sealed wasm app object: its entrypoints and
 /// exported static data, and, for a `Tasks` program, the task calls the
 /// host's code calls (design.md "Host Contract"), which the object defines
-/// (the merged builtins' three and the program's `ProgramTaskCall`s).
+/// (the merged builtins' two and the program's `ProgramTaskCall`s).
 fn wasmAppExports(
     ctx: *CliCtx,
     store: *const lir.LirStore,

@@ -6526,7 +6526,8 @@ pub fn compileAllProcSpecs(self: *Self, proc_specs: []const LirProcSpec) Allocat
 
 /// Define each `ProgramTaskCall` `name(task)`, once, when the program
 /// imports the host functions: a call to its builtin with the host
-/// function's table slot (design.md "Backends"). No body calls them, so they
+/// function's table slot, returning the status the builtin leaves on the
+/// stack when it returns one (design.md "Backends"). No body calls them, so they
 /// are made after the bodies. Each symbol is global under its own name, so a
 /// relocatable object keeps it public for the host's link, and a final
 /// module exports it.
@@ -6541,7 +6542,8 @@ fn compileProgramTaskCalls(self: *Self) Allocator.Error!void {
 }
 
 fn compileProgramTaskCall(self: *Self, comptime call: builtins.builtin_registry.ProgramTaskCall, host_fns: *const [task_host_fn_kinds.len]HostedSymbolTarget) Allocator.Error!index_types.DefinedFunction {
-    const type_idx = try self.internFuncType(&.{.i32}, &.{});
+    const results: []const ValType = if (call.returns_status) &.{.i32} else &.{};
+    const type_idx = try self.internFuncType(&.{.i32}, results);
     const defined = self.module.addDefinedFunction(type_idx) catch return error.OutOfMemory;
     _ = try self.addTrackedDefinedFunctionSymbol(defined, call.name, 0);
     var host_fn_slots: [call.host_fns.len]u32 = undefined;

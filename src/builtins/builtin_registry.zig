@@ -539,29 +539,49 @@ pub const ExportSet = enum {
     core,
 };
 
-/// `@export` every wrapper in `set` under its `symbolName`. Called from the
-/// `comptime` block of a payload root.
-pub fn exportWrappers(comptime set: ExportSet) void {
+/// Whether a payload defines the task calls that must come from the copy of
+/// the builtins that runs a program's records (design.md "One runtime per
+/// process"): the host's task calls (`exportTaskHostCalls`) and the builtins
+/// of the `ProgramTaskCall`s.
+pub const TaskCalls = enum {
+    defined,
+    /// The interpreter shim's bundled object, beside which the shim defines
+    /// them from the interpreter's own copy.
+    left_out,
+};
+
+/// `@export` every wrapper in `set` under its `symbolName`, with the task
+/// calls when `task_calls` is `.defined`. Called from the `comptime` block
+/// of a payload root.
+pub fn exportWrappers(comptime set: ExportSet, comptime task_calls: TaskCalls) void {
     @setEvalBranchQuota(100_000);
     inline for (comptime std.enums.values(BuiltinFn)) |f| {
         const included = switch (comptime f.payload()) {
             .full => set == .all_linked,
             .core => true,
         };
-        if (included) @export(BuiltinFn.wrapper(f), .{ .name = f.symbolName() });
+        const task_call = comptime isProgramTaskCallBuiltin(f);
+        if (included and (task_calls == .defined or !task_call)) @export(BuiltinFn.wrapper(f), .{ .name = f.symbolName() });
     }
+    if (task_calls == .defined) exportTaskHostCalls();
 }
 
 /// The host's task calls (design.md "Host Contract", "Backends"):
-/// `roc_task_resume`, `roc_task_free` and `roc_task_crash_message`, in every
-/// payload,
-/// so a compiled `Tasks` program links the same ones on every backend. The
+/// `roc_task_free` and `roc_task_crash_message`, in every payload, so a
+/// compiled `Tasks` program links the same ones on every backend. The
 /// interpreter shim exports the same functions.
-pub fn exportTaskHostCalls() void {
+fn exportTaskHostCalls() void {
     const task = @import("task.zig");
-    @export(&task.host_calls.resumeTask, .{ .name = shim_symbols.roc_task_resume });
     @export(&task.host_calls.free, .{ .name = shim_symbols.roc_task_free });
     @export(&task.host_calls.crashMessage, .{ .name = shim_symbols.roc_task_crash_message });
+}
+
+/// Whether `f` is the builtin a `ProgramTaskCall` calls.
+fn isProgramTaskCallBuiltin(f: BuiltinFn) bool {
+    for (program_task_calls) |call| {
+        if (call.builtin == f) return true;
+    }
+    return false;
 }
 
 /// A host function a `ProgramTaskCall` passes to its builtin. Only the host
@@ -591,13 +611,19 @@ pub const ProgramTaskCall = struct {
     name: [:0]const u8,
     builtin: BuiltinFn,
     host_fns: []const TaskHostFn,
+    /// Whether the builtin returns a `RocTaskStatus` (a C `u32`), which
+    /// `name` returns; otherwise both return nothing.
+    returns_status: bool = false,
 };
 
-/// Every `ProgramTaskCall`: `roc_task_wake` tells the host a woken parked
-/// task is ready through `roc_task_ready`; `roc_task_cancel` abandons a
-/// parked task's operation through `roc_task_abort` and readies it through
-/// `roc_task_ready`.
+/// Every `ProgramTaskCall`: `roc_task_resume` hands the runtime the host's
+/// `roc_task_ready` and `roc_task_abort`, which it stores on the task for
+/// its children (design.md "Child Tasks"); `roc_task_wake` tells the host a
+/// woken parked task is ready through `roc_task_ready`; `roc_task_cancel`
+/// abandons a parked task's operation through `roc_task_abort` and readies
+/// it through `roc_task_ready`.
 pub const program_task_calls = [_]ProgramTaskCall{
+    .{ .name = shim_symbols.roc_task_resume, .builtin = .task_resume, .host_fns = &.{ .ready, .abort }, .returns_status = true },
     .{ .name = shim_symbols.roc_task_wake, .builtin = .task_wake, .host_fns = &.{.ready} },
     .{ .name = shim_symbols.roc_task_cancel, .builtin = .task_cancel, .host_fns = &.{ .abort, .ready } },
 };

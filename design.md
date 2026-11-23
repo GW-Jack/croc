@@ -34488,7 +34488,8 @@ Resumes of a `Tasks` program never overlap (P10), so one pointer is enough;
 of it. Where a link holds two copies of the builtins, the host's task calls
 come from the copy that runs the records. The interpreter shim bundles a
 builtins object beside the interpreter's own copy, so that object leaves
-the task calls out and the shim defines them from the interpreter's copy.
+the task calls and the program task calls' builtins out, and the shim
+defines them from the interpreter's copy.
 In a dev `roc run`, the machine-code shim the host links carries
 builtins, and the shim defines the host's task calls. A run image lowered
 whole resolves its builtin calls to the shim's own, so the image's crash
@@ -34760,10 +34761,11 @@ byte:
   - a shim build (the interpreter's, or the dev backend's run image), in the
     generated platform shim module, which the CLI generates knowing whether
     the program creates a task (`LirStore.createsTask`). The shim archive
-    defines the builtins: the interpreter shim's builtins object exports
-    every core wrapper, and the machine-code shim exports
-    `roc_builtins_task_resume`, `roc_builtins_task_wake` and
-    `roc_builtins_task_cancel` beside the host's calls.
+    defines the builtins. Both shims export `roc_builtins_task_resume`,
+    `roc_builtins_task_wake` and `roc_builtins_task_cancel` beside the
+    host's calls, from the copy of the builtins that runs the records; the
+    interpreter shim's bundled builtins object leaves all five out (One
+    runtime per process).
 
   The CLI's `Tasks` fixture host cancels through `roc_task_cancel` at a
   chosen pause, before and after waking the task, on every backend the CLI

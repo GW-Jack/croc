@@ -53,7 +53,7 @@ const crash_points = [_]CrashPoint{
     .{ .marker = "#after", .message = "crashed after the last pause", .fetches = 2 },
 };
 
-/// The runtime's `roc_task_resume`, as a host links it.
+/// The task's `roc_task_resume`, as a host links it.
 const ResumeFn = task_test_host.ResumeFn;
 
 const E2eError = std.mem.Allocator.Error || eval.LirInterpreter.Error || eval.RuntimeHostEnv.LeakError || error{ TestUnexpectedResult, TestExpectedEqual };
@@ -98,7 +98,7 @@ const Run = struct {
 
     /// The interpreter runs on this process's runtime.
     fn resumeFn(_: Program) ResumeFn {
-        return &builtins.task.host_calls.resumeTask;
+        return &task_test_host.nativeResume;
     }
 
     /// Make the root's task by calling the program's root, the task entry
@@ -307,7 +307,7 @@ const DevRun = struct {
 
     /// A dev image loaded in this process calls this process's builtins.
     fn resumeFn(_: Program) ResumeFn {
-        return &builtins.task.host_calls.resumeTask;
+        return &task_test_host.nativeResume;
     }
 
     /// Make the root's task by calling the compiled task entry
@@ -358,7 +358,7 @@ const WasmProgram = struct {
 
 /// The export the wasm module gives the task entry.
 const wasm_entry = "roc_task_entry";
-const task_calls = [_][]const u8{ builtins.shim_symbols.roc_task_resume, builtins.shim_symbols.roc_task_free };
+const task_calls = [_][]const u8{builtins.shim_symbols.roc_task_free};
 
 /// The size of a wasm32 `Str`, and the tag a seamless slice's allocation
 /// pointer carries.

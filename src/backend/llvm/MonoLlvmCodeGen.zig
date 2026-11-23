@@ -914,7 +914,7 @@ pub const MonoLlvmCodeGen = struct {
     /// wrappers under the provides symbols (dispatching into the prelinked
     /// interpreter), the hosted dispatch table built from the platform's
     /// hosted-section symbols, optionally the embedded LIR image, and a
-    /// `Tasks` program's `roc_task_wake` and `roc_task_cancel`.
+    /// `Tasks` program's `ProgramTaskCall`s.
     pub fn generateInterpreterShimModule(
         self: *MonoLlvmCodeGen,
         module_name: []const u8,
@@ -5451,7 +5451,7 @@ pub const MonoLlvmCodeGen = struct {
     }
 
     /// Define the host's task calls, which a program that creates a task
-    /// exports (design.md "Backends"): `roc_task_resume`, `roc_task_free` and
+    /// exports (design.md "Backends"): `roc_task_free` and
     /// `roc_task_crash_message`, each a call to its builtin. Linking the
     /// builtins keeps only what the program defines, so the program defines
     /// these for the host, and its `ProgramTaskCall`s. Runs after the procs,
@@ -5460,7 +5460,6 @@ pub const MonoLlvmCodeGen = struct {
         const builder = self.builder orelse return error.CompilationFailed;
         const ptr_ty = try self.ptrType();
         const calls = [_]struct { name: []const u8, builtin: BuiltinSymbol, ret: LlvmBuilder.Type, args: usize }{
-            .{ .name = builtins.shim_symbols.roc_task_resume, .builtin = .task_resume, .ret = .i32, .args = 1 },
             .{ .name = builtins.shim_symbols.roc_task_free, .builtin = .task_free, .ret = .void, .args = 1 },
             // (task, *len) -> the message's bytes
             .{ .name = builtins.shim_symbols.roc_task_crash_message, .builtin = .task_crash_message, .ret = ptr_ty, .args = 2 },
@@ -5488,24 +5487,27 @@ pub const MonoLlvmCodeGen = struct {
     }
 
     /// Define each `ProgramTaskCall` `name(task)` as a call to its builtin
-    /// with the host's functions (design.md "Backends"): `roc_task_wake`
-    /// with `roc_task_ready`, `roc_task_cancel` with `roc_task_abort` and
-    /// `roc_task_ready`. In a
+    /// with the host's functions (design.md "Backends"): `roc_task_resume`
+    /// with `roc_task_ready` and `roc_task_abort`, returning the builtin's
+    /// status, `roc_task_wake` with `roc_task_ready`, `roc_task_cancel` with
+    /// `roc_task_abort` and `roc_task_ready`. In a
     /// `Tasks` program's module, or in the platform shim module of a shim
     /// build, whose shim archive defines the builtins.
     fn defineProgramTaskCalls(self: *MonoLlvmCodeGen) Error!void {
         const builder = self.builder orelse return error.CompilationFailed;
         const ptr_ty = try self.ptrType();
-        const fn_ty = builder.fnType(.void, &.{ptr_ty}, .normal) catch return error.OutOfMemory;
+        const host_fn_ty = builder.fnType(.void, &.{ptr_ty}, .normal) catch return error.OutOfMemory;
         const registry = builtins.builtin_registry;
         var host_fns: [registry.task_host_fns.len]LlvmBuilder.Value = undefined;
         for (registry.task_host_fns, &host_fns) |host_fn, *value| {
-            value.* = (try self.declareHostSymbol(host_fn.symbol(), fn_ty)).toValue(builder);
+            value.* = (try self.declareHostSymbol(host_fn.symbol(), host_fn_ty)).toValue(builder);
         }
         const param_tys: [1 + registry.max_program_task_call_host_fns]LlvmBuilder.Type = @splat(ptr_ty);
         for (registry.program_task_calls) |call| {
             const arg_count = 1 + call.host_fns.len;
-            const target = try self.declareBuiltin(call.builtin, .void, param_tys[0..arg_count]);
+            const ret: LlvmBuilder.Type = if (call.returns_status) .i32 else .void;
+            const target = try self.declareBuiltin(call.builtin, ret, param_tys[0..arg_count]);
+            const fn_ty = builder.fnType(ret, &.{ptr_ty}, .normal) catch return error.OutOfMemory;
             const func = builder.addFunction(fn_ty, builder.strtabString(call.name) catch return error.OutOfMemory, .default) catch return error.OutOfMemory;
             var wip = LlvmBuilder.WipFunction.init(builder, .{ .function = func, .strip = true }) catch return error.OutOfMemory;
             defer wip.deinit();
@@ -5513,8 +5515,12 @@ pub const MonoLlvmCodeGen = struct {
             var args: [1 + registry.max_program_task_call_host_fns]LlvmBuilder.Value = undefined;
             args[0] = wip.arg(0);
             for (call.host_fns, args[1..arg_count]) |host_fn, *arg| arg.* = host_fns[@backingInt(host_fn)];
-            _ = wip.call(.normal, .ccc, .none, target.typeOf(builder), target.toValue(builder), args[0..arg_count], "") catch return error.OutOfMemory;
-            _ = wip.retVoid() catch return error.OutOfMemory;
+            const result = wip.call(.normal, .ccc, .none, target.typeOf(builder), target.toValue(builder), args[0..arg_count], "") catch return error.OutOfMemory;
+            if (call.returns_status) {
+                _ = wip.ret(result) catch return error.OutOfMemory;
+            } else {
+                _ = wip.retVoid() catch return error.OutOfMemory;
+            }
             wip.finish() catch return error.OutOfMemory;
         }
     }

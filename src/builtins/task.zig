@@ -143,13 +143,10 @@ pub const BufferLayout = struct {
 };
 
 /// The C-ABI task calls a backend's runtime exports to the host (design.md
-/// "Host Contract"). `roc_task_resume` returns a `RocTaskStatus`, a C enum:
+/// "Host Contract"). The program defines `roc_task_resume`
+/// (`RocTask.resumeFromHost`), which returns a `RocTaskStatus`, a C enum:
 /// `PENDING`, `DONE`, `CANCELLED`, `CRASHED` in `Status` order.
 pub const host_calls = struct {
-    pub fn resumeTask(task: *RocTask) callconv(.c) u32 {
-        return @backingInt(task.resumeTask());
-    }
-
     pub fn free(task: *RocTask) callconv(.c) void {
         task.free();
     }
@@ -252,6 +249,11 @@ pub const RocTask = extern struct {
     /// Whether a cancel's `roc_task_abort` returned, after which the host
     /// must not wake the task (P4). Kept while the monitors are on.
     aborted: bool,
+    /// The host's `roc_task_ready` and `roc_task_abort`, which its resume
+    /// hands the runtime for the task's children (design.md "Child Tasks").
+    /// Null until the host's first resume.
+    ready_fn: ?ReadyFn,
+    abort_fn: ?AbortFn,
     /// Where the outermost record writes the root's result.
     root_result: [*]u8,
     /// The records, innermost last.
@@ -290,6 +292,8 @@ pub const RocTask = extern struct {
             .cancel_requested = false,
             .status = .pending,
             .aborted = false,
+            .ready_fn = null,
+            .abort_fn = null,
             .root_result = root_result,
             .entries = undefined,
             .len = 0,
@@ -374,14 +378,36 @@ pub const RocTask = extern struct {
         self.record_cache[class - 1] = record;
     }
 
-    /// `roc_task_resume`: run records, innermost first, until the list is
-    /// empty, the task pauses again or it crashes.
+    /// `roc_task_resume` (`roc_builtins_task_resume`): keep the host's
+    /// `ready_fn` and `abort_fn` on the task for its children (design.md
+    /// "Child Tasks"), then resume it.
+    pub fn resumeFromHost(self: *RocTask, ready_fn: ReadyFn, abort_fn: AbortFn) Status {
+        if (!self.resumable()) return self.status;
+        self.ready_fn = ready_fn;
+        self.abort_fn = abort_fn;
+        return self.resumeChecked();
+    }
+
+    /// Resume the task with the host functions it has: run records,
+    /// innermost first, until the list is empty, the task pauses again or
+    /// it crashes. A host resumes through `resumeFromHost`.
     pub fn resumeTask(self: *RocTask) Status {
+        if (!self.resumable()) return self.status;
+        return self.resumeChecked();
+    }
+
+    /// Whether the host may resume the task: not after it was freed or
+    /// ended (P8). The check comes before the resume changes the task.
+    fn resumable(self: *RocTask) bool {
         checkNotFreed(self, "resumed");
         if (monitors and self.status != .pending) {
             hostViolation(self.ops, "a task was resumed after it ended (P8)");
-            return self.status;
+            return false;
         }
+        return true;
+    }
+
+    fn resumeChecked(self: *RocTask) Status {
         self.claimResume();
         defer self.releaseResume();
         if (self.started) {
@@ -699,6 +725,8 @@ const test_buffers = BufferLayout{
     .result_buffer_alignment = 8,
 };
 
+const dev_wrappers = @import("dev_wrappers.zig");
+
 test "the pending flag starts clear and is set by setPending" {
     var test_env = utils.TestEnv.init(std.testing.allocator);
     defer test_env.deinit();
@@ -928,9 +956,13 @@ test "the host's C calls resume and free a task and report its status as a C enu
     var root: [1]u8 = .{0};
     const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ inner, null }, .pauses = true, .result = 10 }), &root, test_buffers);
 
-    try std.testing.expectEqual(@as(u32, 0), host_calls.resumeTask(task));
+    try std.testing.expectEqual(@as(?ReadyFn, null), task.ready_fn);
+    try std.testing.expectEqual(@as(u32, 0), dev_wrappers.roc_builtins_task_resume(task, &testReady, &testAbort));
+    // The resume keeps the host's functions for the task's children.
+    try std.testing.expectEqual(@as(?ReadyFn, &testReady), task.ready_fn);
+    try std.testing.expectEqual(@as(?AbortFn, &testAbort), task.abort_fn);
     task.wake(&testReady);
-    try std.testing.expectEqual(@as(u32, 1), host_calls.resumeTask(task));
+    try std.testing.expectEqual(@as(u32, 1), dev_wrappers.roc_builtins_task_resume(task, &testReady, &testAbort));
     try std.testing.expectEqual(@as(u8, 20), root[0]);
     host_calls.free(task);
     try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
@@ -998,7 +1030,7 @@ test "a crash in a resumed record ends its task, releases every record and keeps
 
     try std.testing.expectEqual(Status.pending, task.resumeTask());
     task.wake(&testReady);
-    try std.testing.expectEqual(@as(u32, 3), host_calls.resumeTask(task));
+    try std.testing.expectEqual(@as(u32, 3), dev_wrappers.roc_builtins_task_resume(task, &testReady, &testAbort));
     try std.testing.expectEqual(Status.crashed, task.status);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, TestLog.calls[0..TestLog.call_count]);
     try std.testing.expectEqual(@as(usize, 3), TestLog.drops);
@@ -1052,7 +1084,7 @@ test "a crash several frames deep leaves the resume's caller's values intact" {
     const f1 = f0 * 1.5;
     const f2 = f1 - f0 / 3.0;
 
-    const status = @call(.never_inline, host_calls.resumeTask, .{task});
+    const status = @call(.never_inline, dev_wrappers.roc_builtins_task_resume, .{ task, &testReady, &testAbort });
 
     try std.testing.expectEqual(@as(u32, 3), status);
     try std.testing.expectEqual(seed *% 3, v0);
@@ -1095,7 +1127,6 @@ test "FieldOffsets is where RocTask keeps its first three fields, scaled by the 
 }
 
 test "compiled code's task builtins create a task with the entered ops and push records onto its list" {
-    const dev_wrappers = @import("dev_wrappers.zig");
     const in_process_host = @import("in_process_host.zig");
     var test_env = utils.TestEnv.init(std.testing.allocator);
     defer test_env.deinit();

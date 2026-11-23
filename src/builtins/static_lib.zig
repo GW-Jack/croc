@@ -29,7 +29,6 @@ const builtin_registry = @import("builtin_registry.zig");
 // Export overflow functions that might need compiler-rt symbols.
 comptime {
     builtin_registry.exportOverflowWrappers();
-    if (@import("builtins_object_options").task_host_calls) builtin_registry.exportTaskHostCalls();
 }
 
 // Wrapper namespace for consumers that call builtins via direct function
@@ -39,5 +38,5 @@ pub const dev_wrappers = @import("dev_wrappers.zig");
 // Export every linkable registry wrapper - these are used by
 // `roc build --opt=dev` to call builtin functions via symbol references.
 comptime {
-    builtin_registry.exportWrappers(.all_linked);
+    builtin_registry.exportWrappers(.all_linked, if (@import("builtins_object_options").task_host_calls) .defined else .left_out);
 }

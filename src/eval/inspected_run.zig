@@ -559,7 +559,7 @@ pub fn generateWasmModule(allocator: Allocator, program: Program, cpu_level: roc
 /// Generate a final wasm module, with builtins built for `cpu_level`, that
 /// exports `entrypoints` by their symbol names and the merged builtins'
 /// `runtime_exports` by theirs, as a host drives a program through its own
-/// exports (a task's `roc_task_resume`, for one). `program.main_proc` is
+/// exports (a task's `roc_task_free`, for one). `program.main_proc` is
 /// not used. The caller owns the returned bytes.
 pub fn generateWasmEntrypointModule(
     allocator: Allocator,

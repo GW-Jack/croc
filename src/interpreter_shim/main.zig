@@ -311,17 +311,19 @@ comptime {
     @export(&shimGetOps, .{ .name = shim_symbols.roc_shim_get_ops });
     @export(&shimEntrypoint, .{ .name = shim_symbols.roc_entrypoint });
     @export(&shimEntrypointFromImage, .{ .name = shim_symbols.roc_entrypoint_from_image });
-    // A `Tasks` platform's host drives its tasks with `roc_task_resume`,
-    // `roc_task_free` and `roc_task_crash_message` (design.md "Host
-    // Contract"). They come from the interpreter's copy of the builtins, not
-    // from the builtins object this archive bundles (which leaves them out),
-    // so a resume and the interpreter's crashes share one running task
-    // (design.md "The Task Runtime"). The generated platform shim module
-    // defines `roc_task_wake` and `roc_task_cancel` over the bundled
-    // builtins (`ProgramTaskCall`).
-    @export(&builtins.task.host_calls.resumeTask, .{ .name = shim_symbols.roc_task_resume });
+    // A `Tasks` platform's host drives its tasks with `roc_task_free`,
+    // `roc_task_crash_message` (design.md "Host Contract") and the program
+    // task calls, which the generated platform shim module defines over
+    // their builtins (`ProgramTaskCall`). All of them come from the
+    // interpreter's copy of the builtins, not from the builtins object this
+    // archive bundles (which leaves them out), so a resume and the
+    // interpreter's crashes share one running task (design.md "One runtime
+    // per process").
     @export(&builtins.task.host_calls.free, .{ .name = shim_symbols.roc_task_free });
     @export(&builtins.task.host_calls.crashMessage, .{ .name = shim_symbols.roc_task_crash_message });
+    @export(&builtins.dev_wrappers.roc_builtins_task_resume, .{ .name = shim_symbols.roc_builtins_task_resume });
+    @export(&builtins.dev_wrappers.roc_builtins_task_wake, .{ .name = shim_symbols.roc_builtins_task_wake });
+    @export(&builtins.dev_wrappers.roc_builtins_task_cancel, .{ .name = shim_symbols.roc_builtins_task_cancel });
 }
 
 fn shimGetOps() callconv(.c) *anyopaque {

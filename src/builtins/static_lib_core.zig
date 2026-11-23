@@ -28,7 +28,6 @@ const builtin_registry = @import("builtin_registry.zig");
 
 comptime {
     builtin_registry.exportOverflowWrappers();
-    builtin_registry.exportTaskHostCalls();
 }
 
 /// Wrapper namespace for consumers that call builtins via direct function
@@ -37,5 +36,5 @@ pub const dev_wrappers = @import("dev_wrappers.zig");
 
 // Export only the registry wrappers classified `.core`.
 comptime {
-    builtin_registry.exportWrappers(.core);
+    builtin_registry.exportWrappers(.core, .defined);
 }
