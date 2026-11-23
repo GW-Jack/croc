@@ -1235,61 +1235,87 @@ fn startEntry(interp: *eval.Interpreter, entry: LIR.LirProcSpecId, root: *u64) T
     return @ptrFromInt(created.value.read(usize));
 }
 
-/// Run the `.sum_and_spawn` promotion program's task, created with its
-/// result going to `root`, through its steps: three entries start, 10
-/// arrives and the body spawns 7, 7 arrives, and the two background entries
-/// are cancelled. The loop returns 17.
-pub fn driveSpawnLoop(task: *RocTask, root: *const u64) TaskOpsTestError!void {
-    ReadyChildren.len = 0;
-    const ready = &ReadyChildren.ready;
-    const abort = &ReadyChildren.abort;
+/// How the drive functions below run a backend's tasks: `Run.Task` names a
+/// task, `begin` forgets the tasks readied so far, `resumeTask` resumes one
+/// and returns its status, and `readied` lists every task readied since
+/// `begin`, in order. This one runs native tasks with `resumeFromHost`.
+pub const NativeRun = struct {
+    /// A native task.
+    pub const Task = *RocTask;
+    /// What resuming a native task can fail with.
+    pub const Error = TaskOpsTestError;
+
+    /// Forget the tasks readied so far.
+    pub fn begin(_: *NativeRun) void {
+        ReadyChildren.len = 0;
+    }
+
+    /// Resume `task`, readying tasks into `ReadyChildren`.
+    pub fn resumeTask(_: *NativeRun, task: *RocTask) Error!builtins.task.Status {
+        return task.resumeFromHost(&ReadyChildren.ready, &ReadyChildren.abort);
+    }
+
+    /// Every task readied since `begin`, in order.
+    pub fn readied(_: *NativeRun) []const *RocTask {
+        return ReadyChildren.tasks[0..ReadyChildren.len];
+    }
+};
+
+/// The root result of the `.sum_and_spawn` promotion program's loop.
+pub const spawn_loop_result: u64 = 17;
+
+/// Run the `.sum_and_spawn` promotion program's task through its steps:
+/// three entries start, 10 arrives and the body spawns 7, 7 arrives, and
+/// the two background entries are cancelled. The loop then returns
+/// `spawn_loop_result`.
+pub fn driveSpawnLoop(comptime Run: type, run: *Run, task: Run.Task) Run.Error!void {
     const Status = builtins.task.Status;
+    run.begin();
 
     // The promoted run_create! starts the three entries; the loop parks.
-    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(@as(usize, 3), ReadyChildren.len);
-    const ten = ReadyChildren.tasks[0];
-    const twenty = ReadyChildren.tasks[1];
-    const thirty = ReadyChildren.tasks[2];
+    try std.testing.expectEqual(Status.pending, try run.resumeTask(task));
+    try std.testing.expectEqual(@as(usize, 3), run.readied().len);
+    const first = run.readied()[0..3].*;
 
-    // 10 arrives. The body spawns 7, a fourth child, and the loop parks for it.
-    try std.testing.expectEqual(Status.done, ten.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(task, ReadyChildren.tasks[ReadyChildren.len - 1]);
-    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
-    const seven = ReadyChildren.tasks[ReadyChildren.len - 1];
+    // 10 arrives, readying the loop. The body spawns 7, a fourth child,
+    // and the loop parks for it.
+    try std.testing.expectEqual(Status.done, try run.resumeTask(first[0]));
+    try std.testing.expectEqual(task, run.readied()[run.readied().len - 1]);
+    try std.testing.expectEqual(Status.pending, try run.resumeTask(task));
+    const seven = run.readied()[run.readied().len - 1];
     try std.testing.expect(seven != task);
 
     // 7 arrives; only the background entries are left, so they are
     // cancelled, and the loop ends once both have reported.
-    try std.testing.expectEqual(Status.done, seven.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.cancelled, twenty.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.cancelled, thirty.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.done, task.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(@as(u64, 17), root.*);
+    try std.testing.expectEqual(Status.done, try run.resumeTask(seven));
+    try std.testing.expectEqual(Status.pending, try run.resumeTask(task));
+    try std.testing.expectEqual(Status.cancelled, try run.resumeTask(first[1]));
+    try std.testing.expectEqual(Status.pending, try run.resumeTask(task));
+    try std.testing.expectEqual(Status.cancelled, try run.resumeTask(first[2]));
+    try std.testing.expectEqual(Status.done, try run.resumeTask(task));
 }
+
+/// The root result of the `.first` promotion program's loop.
+pub const cancel_loop_result: u64 = 20;
 
 /// Run the `.first` promotion program's task, with three non-background
 /// entries, through its steps: 20 arrives first, and the body cancels the
 /// other two, which haven't begun, and drains. Each cancelled report readies
-/// the loop, which parks until the last. The loop returns 20.
-pub fn driveCancelLoop(task: *RocTask, root: *const u64) TaskOpsTestError!void {
-    ReadyChildren.len = 0;
-    const ready = &ReadyChildren.ready;
-    const abort = &ReadyChildren.abort;
+/// the loop, which parks until the last. The loop then returns
+/// `cancel_loop_result`.
+pub fn driveCancelLoop(comptime Run: type, run: *Run, task: Run.Task) Run.Error!void {
     const Status = builtins.task.Status;
+    run.begin();
 
-    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(@as(usize, 3), ReadyChildren.len);
-    const children = ReadyChildren.tasks[0..3].*;
-    try std.testing.expectEqual(Status.done, children[1].resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.cancelled, children[0].resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.cancelled, children[2].resumeFromHost(ready, abort));
-    try std.testing.expectEqual(Status.done, task.resumeFromHost(ready, abort));
-    try std.testing.expectEqual(@as(u64, 20), root.*);
+    try std.testing.expectEqual(Status.pending, try run.resumeTask(task));
+    try std.testing.expectEqual(@as(usize, 3), run.readied().len);
+    const children = run.readied()[0..3].*;
+    try std.testing.expectEqual(Status.done, try run.resumeTask(children[1]));
+    try std.testing.expectEqual(Status.pending, try run.resumeTask(task));
+    try std.testing.expectEqual(Status.cancelled, try run.resumeTask(children[0]));
+    try std.testing.expectEqual(Status.pending, try run.resumeTask(task));
+    try std.testing.expectEqual(Status.cancelled, try run.resumeTask(children[2]));
+    try std.testing.expectEqual(Status.done, try run.resumeTask(task));
 }
 
 test "promotion runs a loop whose entries may suspend as child tasks and spawns into it" {
@@ -1304,7 +1330,9 @@ test "promotion runs a loop whose entries may suspend as child tasks and spawns 
 
     var root: u64 = 0;
     const task = try startEntry(&interp, entry, &root);
-    try driveSpawnLoop(task, &root);
+    var native: NativeRun = .{};
+    try driveSpawnLoop(NativeRun, &native, task);
+    try std.testing.expectEqual(spawn_loop_result, root);
     task.free();
     try f.runtime_env.checkForLeaks();
 }
@@ -1322,7 +1350,9 @@ test "promotion cancels a loop's running set and drains it through run_next!" {
 
     var root: u64 = 0;
     const task = try startEntry(&interp, entry, &root);
-    try driveCancelLoop(task, &root);
+    var native: NativeRun = .{};
+    try driveCancelLoop(NativeRun, &native, task);
+    try std.testing.expectEqual(cancel_loop_result, root);
     task.free();
     try f.runtime_env.checkForLeaks();
 }
@@ -1339,9 +1369,10 @@ test "promotion promotes a loop on a tail that paths share once" {
 
     // The loop runs as it does off a shared tail.
     var root: u64 = 0;
-    ReadyChildren.len = 0;
     const task = try startEntry(&interp, entry, &root);
-    try driveCancelLoop(task, &root);
+    var native: NativeRun = .{};
+    try driveCancelLoop(NativeRun, &native, task);
+    try std.testing.expectEqual(cancel_loop_result, root);
     task.free();
     try f.runtime_env.checkForLeaks();
 }

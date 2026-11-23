@@ -15,6 +15,7 @@ const builtins = @import("builtins");
 const backend = @import("backend");
 const eval = @import("eval");
 const lir = @import("lir");
+const layout = @import("layout");
 const lir_test = @import("task_ops_lir_test.zig");
 
 const LIR = lir.LIR;
@@ -43,6 +44,10 @@ const PausingHost = struct {
     /// The task the last `roc_task_ready` was given.
     readied: u32 = 0,
     readies: u32 = 0,
+    /// Every task `roc_task_ready` was given since the queue was last
+    /// emptied, in order.
+    ready_queue: [32]u32 = undefined,
+    ready_len: usize = 0,
 
     fn pause(context: ?*anyopaque, _: *wasm_runner.ModuleInstance, params: [*]const Val, results: [*]Val) error{}!void {
         const self: *PausingHost = @ptrCast(@alignCast(context));
@@ -65,17 +70,35 @@ const PausingHost = struct {
         const self: *PausingHost = @ptrCast(@alignCast(context));
         self.readies += 1;
         self.readied = @bitCast(params[0].I32);
+        self.ready_queue[self.ready_len] = self.readied;
+        self.ready_len += 1;
+    }
+
+    /// `u32 roc_test_unused(RocTask *task, u64 *out)`, which the promotion
+    /// programs' `run_entry!` calls only on an entry no test uses: it
+    /// counts as a call nobody expected.
+    fn unused(context: ?*anyopaque, _: *wasm_runner.ModuleInstance, _: [*]const Val, results: [*]Val) error{}!void {
+        const self: *PausingHost = @ptrCast(@alignCast(context));
+        self.calls += 1;
+        results[0] = .{ .I32 = 0 };
     }
 };
 
 /// `f`'s program compiled by the wasm backend and instantiated, with the
-/// task entry `roc_task_entry(x, result_out)` exported beside the host's
-/// task calls.
+/// task entry `roc_task_entry` exported beside the host's task calls. It
+/// runs tasks for `lir_test`'s drive functions.
 const WasmRun = struct {
     host: PausingHost,
     session: Session,
 
-    fn init(self: *WasmRun, f: *Fixture, entry: LIR.LirProcSpecId) WasmTaskTestError!void {
+    /// A task, by its wasm32 address.
+    pub const Task = u32;
+    /// What running a task in the module can fail with.
+    pub const Error = WasmTaskTestError;
+
+    /// Compile `f` with `entry` exported as the task entry, which takes
+    /// `entry_args`, and instantiate it.
+    fn init(self: *WasmRun, f: *Fixture, entry: LIR.LirProcSpecId, entry_args: []const layout.Idx) WasmTaskTestError!void {
         self.host = .{};
         // Code generation takes LIR after ARC, which the pipeline runs after
         // the continuation pass, with the task entry as a root.
@@ -84,7 +107,7 @@ const WasmRun = struct {
         defer codegen.deinit();
         const objects = eval.InspectedRun.wasmRuntimeObjects(.default);
         const module = try codegen.generateEntrypointModule(
-            &.{.{ .symbol_name = "roc_task_entry", .proc = entry, .arg_layouts = &.{ .u64, .opaque_ptr }, .ret_layout = .opaque_ptr }},
+            &.{.{ .symbol_name = "roc_task_entry", .proc = entry, .arg_layouts = entry_args, .ret_layout = .opaque_ptr }},
             &.{shim_symbols.roc_task_free},
             objects.builtins,
             objects.boxy_runtime,
@@ -108,6 +131,12 @@ const WasmRun = struct {
             .results = &.{},
             .callback = PausingHost.ready,
             .context = &self.host,
+        }, .{
+            .name = "roc_test_unused",
+            .params = &.{ .I32, .I32 },
+            .results = &.{.I32},
+            .callback = PausingHost.unused,
+            .context = &self.host,
         } });
     }
 
@@ -123,7 +152,27 @@ const WasmRun = struct {
         return @bitCast(task[0].I32);
     }
 
-    fn resumeTask(self: *WasmRun, task: u32) WasmTaskTestError!Status {
+    /// Call a promotion program's task entry, which takes only the root
+    /// result's address, and return the task it creates.
+    fn startRoot(self: *WasmRun, root: u32) WasmTaskTestError!u32 {
+        var task: [1]Val = undefined;
+        try self.session.invoke("roc_task_entry", &.{.{ .I32 = @bitCast(root) }}, &task);
+        return @bitCast(task[0].I32);
+    }
+
+    /// Forget the tasks readied so far.
+    pub fn begin(self: *WasmRun) void {
+        self.host.ready_len = 0;
+    }
+
+    /// Every task readied since `begin`, in order.
+    pub fn readied(self: *WasmRun) []const u32 {
+        return self.host.ready_queue[0..self.host.ready_len];
+    }
+
+    /// Resume `task` through the module's `roc_task_resume` and return its
+    /// status.
+    pub fn resumeTask(self: *WasmRun, task: u32) WasmTaskTestError!Status {
         var status: [1]Val = undefined;
         try self.session.invoke(shim_symbols.roc_task_resume, &.{.{ .I32 = @bitCast(task) }}, &status);
         return @fromBackingInt(@intCast(status[0].I32));
@@ -139,7 +188,7 @@ test "a task paused at a hosted call resumes from its record and returns the roo
     defer f.deinit();
     const entry = try lir_test.pausingProgram(&f, .u64, true);
     var run: WasmRun = undefined;
-    try run.init(&f, entry);
+    try run.init(&f, entry, &.{ .u64, .opaque_ptr });
     defer run.deinit();
     const root = run.session.alloc(8, 8);
     const task = try run.start(root);
@@ -173,7 +222,7 @@ test "a task paused inside a called procedure resumes in its caller's continuati
     defer f.deinit();
     const entry = try lir_test.pausingNestedProgram(&f);
     var run: WasmRun = undefined;
-    try run.init(&f, entry);
+    try run.init(&f, entry, &.{ .u64, .opaque_ptr });
     defer run.deinit();
     const root = run.session.alloc(8, 8);
     const task = try run.start(root);
@@ -199,7 +248,7 @@ test "a task whose hosted result has a slot release resumes and releases that re
     // release, and the module carries that release's adapter.
     const entry = try lir_test.pausingProgram(&f, .str, false);
     var run: WasmRun = undefined;
-    try run.init(&f, entry);
+    try run.init(&f, entry, &.{ .u64, .opaque_ptr });
     defer run.deinit();
     const root = run.session.alloc(8, 8);
     const task = try run.start(root);
@@ -240,7 +289,7 @@ test "cancelling a woken task releases the hosted result through its slot releas
     defer f.deinit();
     const entry = try lir_test.pausingProgram(&f, .str, false);
     var run: WasmRun = undefined;
-    try run.init(&f, entry);
+    try run.init(&f, entry, &.{ .u64, .opaque_ptr });
     defer run.deinit();
     const root = run.session.alloc(8, 8);
     const task = try run.start(root);
@@ -266,7 +315,7 @@ test "cancelling a task the host has not finished aborts the host call on the wa
     defer f.deinit();
     const entry = try lir_test.pausingProgram(&f, .str, false);
     var run: WasmRun = undefined;
-    try run.init(&f, entry);
+    try run.init(&f, entry, &.{ .u64, .opaque_ptr });
     defer run.deinit();
     const root = run.session.alloc(8, 8);
     const task = try run.start(root);
@@ -287,7 +336,7 @@ test "a continuation that pauses again resumes from its own record and finishes 
     defer f.deinit();
     const entry = try lir_test.pausingTwiceProgram(&f);
     var run: WasmRun = undefined;
-    try run.init(&f, entry);
+    try run.init(&f, entry, &.{ .u64, .opaque_ptr });
     defer run.deinit();
     const root = run.session.alloc(8, 8);
     const task = try run.start(root);
@@ -306,6 +355,40 @@ test "a continuation that pauses again resumes from its own record and finishes 
     try run.call(shim_symbols.roc_task_wake, task);
     try std.testing.expectEqual(Status.done, try run.resumeTask(task));
     try std.testing.expectEqual(@as(u64, 120), std.mem.readInt(u64, run.session.memory()[root..][0..8], .little));
+    try run.call(shim_symbols.roc_task_free, task);
+    run.session.free();
+    try std.testing.expectEqual(@as(i64, 0), run.session.liveAllocations());
+}
+
+test "a promoted loop runs its entries as child tasks and spawns into its set on the wasm backend" {
+    var f = try Fixture.initFor(std.testing.allocator, .u32);
+    defer f.deinit();
+    const entry = try lir_test.promotionProgram(&f, .{ false, true, true }, .sum_and_spawn, .arc, .direct);
+    var run: WasmRun = undefined;
+    try run.init(&f, entry, &.{.opaque_ptr});
+    defer run.deinit();
+    const root = run.session.alloc(8, 8);
+    const task = try run.startRoot(root);
+    try lir_test.driveSpawnLoop(WasmRun, &run, task);
+    try std.testing.expectEqual(lir_test.spawn_loop_result, std.mem.readInt(u64, run.session.memory()[root..][0..8], .little));
+    try std.testing.expectEqual(@as(u32, 0), run.host.calls);
+    try run.call(shim_symbols.roc_task_free, task);
+    run.session.free();
+    try std.testing.expectEqual(@as(i64, 0), run.session.liveAllocations());
+}
+
+test "a promoted loop cancels its set and drains it on the wasm backend" {
+    var f = try Fixture.initFor(std.testing.allocator, .u32);
+    defer f.deinit();
+    const entry = try lir_test.promotionProgram(&f, .{ false, false, false }, .first, .arc, .copied_i128);
+    var run: WasmRun = undefined;
+    try run.init(&f, entry, &.{.opaque_ptr});
+    defer run.deinit();
+    const root = run.session.alloc(8, 8);
+    const task = try run.startRoot(root);
+    try lir_test.driveCancelLoop(WasmRun, &run, task);
+    try std.testing.expectEqual(lir_test.cancel_loop_result, std.mem.readInt(u64, run.session.memory()[root..][0..8], .little));
+    try std.testing.expectEqual(@as(u32, 0), run.host.calls);
     try run.call(shim_symbols.roc_task_free, task);
     run.session.free();
     try std.testing.expectEqual(@as(i64, 0), run.session.liveAllocations());

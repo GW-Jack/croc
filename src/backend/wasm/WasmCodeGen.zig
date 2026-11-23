@@ -8687,6 +8687,7 @@ fn generateCFStmtNode(self: *Self, work: *std.ArrayList(StmtWork), wa: Allocator
                     .ret_layout = self.procLocalLayoutIdx(assign.target),
                     .unique_args = self.store.stmtRowOrDefault(assign.extra).unique_args,
                     .interchangeable = self.store.stmtRowOrDefault(assign.extra).interchangeable,
+                    .group_result = self.store.stmtRowOrDefault(assign.extra).group_result,
                 }) catch |err| {
                     self.pending_overflow_result_target = null;
                     return err;
@@ -13444,9 +13445,67 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
             for (0..6) |i| try self.emitProcLocal(GuardedList.at(args, i));
             try self.emitBuiltinCall(.task_create);
         },
-        // A task-form concurrent loop's running set reaches the wasm backend
-        // in milestone 4's 10h.
-        .group_init, .group_push, .group_start, .group_next, .group_arrival, .group_spawn, .group_cancel, .group_free => @panic("TODO: running-set operations are not implemented in the wasm backend"),
+        // A task-form loop's running set: each operation is one call of its
+        // builtin, with each list passed as its bytes and length (design.md
+        // "Backends"). An operation with no result leaves the unit i32 0.
+        .group_init => {
+            // (id, entry count, limits, root limit, task); the builtin also
+            // takes the result slots' size and alignment and the drop of a
+            // result nobody takes.
+            self.requireBuiltinCalls("group_init");
+            const result_layout = ll.group_result.get() orelse
+                base.invariant("LIR/codegen invariant violated: group_init names no result layout", .{});
+            const ls = self.getLayoutStore();
+            const size_align = ls.layoutSizeAlign(ls.getLayout(result_layout));
+            const drop_index = try self.erasedCallableOnDropTableIndex(lir.ContinuationPass.hostDrop(ls, result_layout));
+            const limits = try self.loadRocListFields(try self.emitProcLocalToNewLocal(GuardedList.at(args, 2), .i32));
+            try self.emitProcLocal(GuardedList.at(args, 0));
+            try self.emitProcLocal(GuardedList.at(args, 1));
+            try self.emitLocalGets(.{ limits.bytes, limits.len });
+            try self.emitProcLocal(GuardedList.at(args, 3));
+            try self.emitI64Const(@intCast(size_align.size));
+            try self.emitI64Const(@intCast(size_align.alignment.toByteUnits()));
+            try self.emitOptionalFunctionTableIndexConst(drop_index);
+            try self.emitProcLocal(GuardedList.at(args, 4));
+            try self.emitBuiltinCall(.group_init);
+            try self.emitI32Const(0);
+        },
+        .group_push => {
+            // (id, start, limit path, shielded, background, task).
+            self.requireBuiltinCalls("group_push");
+            const path = try self.loadRocListFields(try self.emitProcLocalToNewLocal(GuardedList.at(args, 2), .i32));
+            try self.emitProcLocal(GuardedList.at(args, 0));
+            try self.emitProcLocal(GuardedList.at(args, 1));
+            try self.emitLocalGets(.{ path.bytes, path.len });
+            for (3..6) |i| try self.emitProcLocal(GuardedList.at(args, i));
+            try self.emitBuiltinCall(.group_push);
+            try self.emitI32Const(0);
+        },
+        .group_spawn => {
+            // (id, start, task).
+            self.requireBuiltinCalls("group_spawn");
+            for (0..3) |i| try self.emitProcLocal(GuardedList.at(args, i));
+            try self.emitBuiltinCall(.group_spawn);
+            try self.emitI32Const(0);
+        },
+        .group_start, .group_next, .group_arrival, .group_cancel, .group_free => {
+            // (id, task); next returns its status and arrival the arrived
+            // entry's slot.
+            self.requireBuiltinCalls("a running-set operation");
+            for (0..2) |i| try self.emitProcLocal(GuardedList.at(args, i));
+            const kind: BuiltinKind = if (ll.op == .group_start)
+                .group_start
+            else if (ll.op == .group_next)
+                .group_next
+            else if (ll.op == .group_arrival)
+                .group_arrival
+            else if (ll.op == .group_cancel)
+                .group_cancel
+            else
+                .group_free;
+            try self.emitBuiltinCall(kind);
+            if (ll.op != .group_next and ll.op != .group_arrival) try self.emitI32Const(0);
+        },
         .ptr_cast => {
             // ptr_cast: identity bits—both sides are i32 pointers.
             try self.emitProcLocal(GuardedList.at(args, 0));

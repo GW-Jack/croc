@@ -230,7 +230,9 @@ test "a promoted loop runs its entries as child tasks and spawns into its set on
     defer run.deinit();
     var root: u64 = 0;
     const task = run.startRoot(@ptrCast(&root));
-    try lir_test.driveSpawnLoop(task, &root);
+    var native: lir_test.NativeRun = .{};
+    try lir_test.driveSpawnLoop(lir_test.NativeRun, &native, task);
+    try std.testing.expectEqual(lir_test.spawn_loop_result, root);
     try std.testing.expectEqual(@as(u32, 0), PausingHost.seen.calls);
     task.free();
     try f.runtime_env.checkForLeaks();
@@ -246,7 +248,9 @@ test "a promoted loop cancels its set and drains it on the dev backend" {
     defer run.deinit();
     var root: u64 = 0;
     const task = run.startRoot(@ptrCast(&root));
-    try lir_test.driveCancelLoop(task, &root);
+    var native: lir_test.NativeRun = .{};
+    try lir_test.driveCancelLoop(lir_test.NativeRun, &native, task);
+    try std.testing.expectEqual(lir_test.cancel_loop_result, root);
     try std.testing.expectEqual(@as(u32, 0), PausingHost.seen.calls);
     task.free();
     try f.runtime_env.checkForLeaks();
