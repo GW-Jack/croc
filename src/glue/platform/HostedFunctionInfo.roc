@@ -8,5 +8,8 @@ HostedFunctionInfo := {
     name : Str,
     ret_fields : List(RecordFieldInfo),
     ret_type_id : U64,
+    ## Declared `suspending`: in a `Tasks` platform the host function takes
+    ## the task and a result pointer and returns a `RocPoll`.
+    suspending : Bool,
     type_str : Str,
 }

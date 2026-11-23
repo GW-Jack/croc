@@ -26,7 +26,11 @@ make_glue : List(Types) -> Try(List(File), Str)
 make_glue = |types_list| {
 	input = GlueInput.from_types(types_list)
 	type_table = TypeTable.from_list(input.types)
-	zig_content = generate_zig_file(input.hosted_functions, type_table, input.provides_entries)
+	tasks = match input.concurrency {
+		Tasks => Bool.True
+		NoConcurrency => Bool.False
+	}
+	zig_content = generate_zig_file(input.hosted_functions, type_table, input.provides_entries, tasks)
 
 	Ok([{ name: "roc_platform_abi.zig", content: zig_content }])
 }
@@ -1941,8 +1945,8 @@ expect lowercase_first("") == ""
 # =============================================================================
 
 ## Generate the complete Zig source file
-generate_zig_file : List(HostedFunctionInfo), TypeTable, List(ProvidesEntry) -> Str
-generate_zig_file = |hosted_functions, type_table, provides_list| {
+generate_zig_file : List(HostedFunctionInfo), TypeTable, List(ProvidesEntry), Bool -> Str
+generate_zig_file = |hosted_functions, type_table, provides_list, tasks| {
 	duplicate_names = duplicate_type_names(type_table)
 	preferred_names = preferred_type_names_zig(hosted_functions, provides_list, type_table, duplicate_names)
 
@@ -1975,11 +1979,12 @@ generate_zig_file = |hosted_functions, type_table, provides_list| {
 		.concat("\n")
 		.concat(generate_runtime_symbol_externs)
 		.concat("\n")
-		.concat(generate_hosted_symbol_externs(hosted_functions, type_table, duplicate_names, preferred_names))
+		.concat(if tasks { generate_task_symbol_externs.concat("\n") } else { "" })
+		.concat(generate_hosted_symbol_externs(hosted_functions, type_table, duplicate_names, preferred_names, tasks))
 		.concat("\n")
 		.concat(generate_host_helpers)
 		.concat("\n")
-		.concat(generate_entrypoint_externs(provides_list, type_table, duplicate_names, preferred_names))
+		.concat(generate_entrypoint_externs(provides_list, type_table, duplicate_names, preferred_names, tasks))
 }
 
 ## File header comment
@@ -2512,9 +2517,58 @@ generate_runtime_symbol_externs =
 	\\pub extern fn roc_crashed(bytes: [*]const u8, len: usize) callconv(.c) void;
 	\\
 
+## A `Tasks` platform's task ABI (design.md "Host Contract", "Glue").
+generate_task_symbol_externs : Str
+generate_task_symbol_externs =
+	\\// Tasks
+	\\//
+	\\// The platform declares `concurrency: Tasks`. A provided procedure returns its task, and a
+	\\// suspending hosted function returns `.pending` when it finishes later: the host then
+	\\// writes its result once and calls `roc_task_wake` once.
+	\\
+	\\/// A task. The host only passes it back to the calls below.
+	\\pub const RocTask = opaque {};
+	\\
+	\\/// What a suspending hosted function returns.
+	\\pub const RocPoll = enum(u32) { ready = 0, pending = 1 };
+	\\
+	\\/// What `roc_task_resume` returns.
+	\\pub const RocTaskStatus = enum(u32) { pending = 0, done = 1, cancelled = 2, crashed = 3 };
+	\\
+	\\// The program defines these.
+	\\pub extern fn roc_task_resume(task: *RocTask) callconv(.c) RocTaskStatus;
+	\\pub extern fn roc_task_wake(task: *RocTask) callconv(.c) void;
+	\\pub extern fn roc_task_cancel(task: *RocTask) callconv(.c) void;
+	\\pub extern fn roc_task_free(task: *RocTask) callconv(.c) void;
+	\\pub extern fn roc_task_crash_message(task: *RocTask, len: *usize) callconv(.c) [*]const u8;
+	\\
+	\\// The host defines these.
+	\\pub extern fn roc_task_ready(task: *RocTask) callconv(.c) void;
+	\\pub extern fn roc_task_abort(task: *RocTask) callconv(.c) void;
+	\\
+
+## The Zig type of a pointer to a value of `type_id`: `*anyopaque` when the
+## type has no bytes, as a task's result pointer is.
+result_pointer_zig : TypeTable, List(Str), TypeNamePlan.PreferredNames, U64 -> Str
+result_pointer_zig = |type_table, duplicate_names, preferred_names, type_id|
+	if type_table.is_unit(type_id) {
+		"*anyopaque"
+	} else {
+		"*${type_id_to_zig(type_table, duplicate_names, preferred_names, type_id)}"
+	}
+
+## `params` with `first` before them.
+prepend_params_zig : Str, Str -> Str
+prepend_params_zig = |first, params|
+	if params == "" {
+		first
+	} else {
+		"${first}, ${params}"
+	}
+
 ## Generate direct extern declarations for hosted symbols.
-generate_hosted_symbol_externs : List(HostedFunctionInfo), TypeTable, List(Str), TypeNamePlan.PreferredNames -> Str
-generate_hosted_symbol_externs = |hosted_functions, type_table, duplicate_names, preferred_names| {
+generate_hosted_symbol_externs : List(HostedFunctionInfo), TypeTable, List(Str), TypeNamePlan.PreferredNames, Bool -> Str
+generate_hosted_symbol_externs = |hosted_functions, type_table, duplicate_names, preferred_names, tasks| {
 	if List.is_empty(hosted_functions) {
 		return ""
 	}
@@ -2523,12 +2577,17 @@ generate_hosted_symbol_externs = |hosted_functions, type_table, duplicate_names,
 
 	for func in hosted_functions {
 		params = direct_hosted_param_list(type_table, duplicate_names, preferred_names, func)
-		ret_zig = type_id_to_zig(type_table, duplicate_names, preferred_names, func.ret_type_id)
-		ownership = hosted_ownership_doc_zig(type_table, duplicate_names, preferred_names, func)
+		ownership = hosted_ownership_doc_zig(type_table, duplicate_names, preferred_names, func, tasks and func.suspending)
+		signature = if tasks and func.suspending {
+			out_zig = result_pointer_zig(type_table, duplicate_names, preferred_names, func.ret_type_id)
+			"(${prepend_params_zig("task: *RocTask, out: ${out_zig}", params)}) callconv(.c) RocPoll"
+		} else {
+			"(${params}) callconv(.c) ${type_id_to_zig(type_table, duplicate_names, preferred_names, func.ret_type_id)}"
+		}
 
 		$result = Str.concat(
 			$result,
-			"/// Hosted symbol for ${func.name}\n/// Roc signature: ${func.type_str}\n${ownership}pub extern fn ${func.ffi_symbol}(${params}) callconv(.c) ${ret_zig};\n\n",
+			"/// Hosted symbol for ${func.name}\n/// Roc signature: ${func.type_str}\n${ownership}pub extern fn ${func.ffi_symbol}${signature};\n\n",
 		)
 	}
 
@@ -2541,8 +2600,8 @@ generate_hosted_symbol_externs = |hosted_functions, type_table, duplicate_names,
 ## A host author reads this at the signature, which is where the ownership rule
 ## has to be legible: for a container the release is the generated helper, not
 ## the container's own shallow `decref`.
-hosted_ownership_doc_zig : TypeTable, List(Str), TypeNamePlan.PreferredNames, HostedFunctionInfo -> Str
-hosted_ownership_doc_zig = |type_table, duplicate_names, preferred_names, func| {
+hosted_ownership_doc_zig : TypeTable, List(Str), TypeNamePlan.PreferredNames, HostedFunctionInfo, Bool -> Str
+hosted_ownership_doc_zig = |type_table, duplicate_names, preferred_names, func, suspends| {
 	arg_shape = ArgShape.from_table(type_table)
 	use_args_wrapper = arg_shape.single_arg_is_anonymous_record(func.arg_type_ids)
 
@@ -2572,14 +2631,18 @@ hosted_ownership_doc_zig = |type_table, duplicate_names, preferred_names, func| 
 
 	arg_doc = if $arg_lines == "" {
 		""
+	} else if suspends {
+		"/// Owned arguments. Release each exactly once, even when the call finishes later,\n/// unless it is moved into storage or into the result:\n${$arg_lines}"
 	} else {
 		"/// Owned arguments. Release each exactly once before returning, unless it is\n/// moved into storage or into the result:\n${$arg_lines}"
 	}
 
-	ret_doc = if is_type_refcounted(type_table, func.ret_type_id) {
-		"/// The result is owned by Roc: return exactly one owned reference.\n"
-	} else {
+	ret_doc = if !is_type_refcounted(type_table, func.ret_type_id) {
 		""
+	} else if suspends {
+		"/// The result is owned by Roc: write exactly one owned reference to `out`.\n"
+	} else {
+		"/// The result is owned by Roc: return exactly one owned reference.\n"
 	}
 
 	Str.concat(arg_doc, ret_doc)
@@ -2750,13 +2813,23 @@ generate_make_roc_host =
 # Entrypoint Declarations
 # =============================================================================
 
-generate_provided_decl : ProvidesEntry, TypeTable, List(Str), TypeNamePlan.PreferredNames -> Str
-generate_provided_decl = |entry, type_table, duplicate_names, preferred_names| {
+generate_provided_decl : ProvidesEntry, TypeTable, List(Str), TypeNamePlan.PreferredNames, Bool -> Str
+generate_provided_decl = |entry, type_table, duplicate_names, preferred_names, tasks| {
 	match entry.exported {
 		ProvidedProcedure(func) => {
 			params = direct_param_list(type_table, duplicate_names, preferred_names, func.args)
-			ret_zig = type_id_to_zig(type_table, duplicate_names, preferred_names, func.ret)
-			"/// Entrypoint: ${entry.name}\npub extern fn ${entry.ffi_symbol}(${params}) callconv(.c) ${ret_zig};\n\n"
+			signature = if tasks {
+				out_zig = result_pointer_zig(type_table, duplicate_names, preferred_names, func.ret)
+				with_out = if params == "" {
+					"result_out: ${out_zig}"
+				} else {
+					"${params}, result_out: ${out_zig}"
+				}
+				"(${with_out}) callconv(.c) *RocTask"
+			} else {
+				"(${params}) callconv(.c) ${type_id_to_zig(type_table, duplicate_names, preferred_names, func.ret)}"
+			}
+			"/// Entrypoint: ${entry.name}\npub extern fn ${entry.ffi_symbol}${signature};\n\n"
 		}
 		ProvidedData(type_id) => {
 			value_zig = type_id_to_zig(type_table, duplicate_names, preferred_names, type_id)
@@ -2766,8 +2839,8 @@ generate_provided_decl = |entry, type_table, duplicate_names, preferred_names| {
 }
 
 ## Generate extern declarations for entrypoints from the provides clause.
-generate_entrypoint_externs : List(ProvidesEntry), TypeTable, List(Str), TypeNamePlan.PreferredNames -> Str
-generate_entrypoint_externs = |provides_list, type_table, duplicate_names, preferred_names| {
+generate_entrypoint_externs : List(ProvidesEntry), TypeTable, List(Str), TypeNamePlan.PreferredNames, Bool -> Str
+generate_entrypoint_externs = |provides_list, type_table, duplicate_names, preferred_names, tasks| {
 	if List.is_empty(provides_list) {
 		return ""
 	}
@@ -2775,7 +2848,7 @@ generate_entrypoint_externs = |provides_list, type_table, duplicate_names, prefe
 	var $result = "// Provided Symbols\n//\n// Roc exports these symbols from the app with their natural C ABI signatures.\n\n"
 
 	for entry in provides_list {
-		$result = Str.concat($result, generate_provided_decl(entry, type_table, duplicate_names, preferred_names))
+		$result = Str.concat($result, generate_provided_decl(entry, type_table, duplicate_names, preferred_names, tasks))
 	}
 
 	$result

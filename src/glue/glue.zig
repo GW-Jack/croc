@@ -284,7 +284,7 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
         .schemas = &lowered.runtime_value_schemas,
         .roc_ops = runtime_env.get_ops(),
     };
-    var types_list = constructTypesRocList(&glue_writer, collected_modules.items, provides_entries.items, &type_table, arg_layouts[0]);
+    var types_list = constructTypesRocList(&glue_writer, platformConcurrencyMode(modules), collected_modules.items, provides_entries.items, &type_table, arg_layouts[0]);
 
     const proc = lowered.lir_result.store.getProcSpec(glue_proc);
     const ret_size_align = lowered.lir_result.layouts.layoutSizeAlign(lowered.lir_result.layouts.getLayout(proc.ret_layout));
@@ -1123,6 +1123,8 @@ const CollectedModuleTypeInfo = struct {
         ret_fields: []const CollectedRecordFieldInfo,
         arg_type_ids: []const u64,
         ret_type_id: u64,
+        /// Declared `suspending` (design.md "Host Contract", "Glue").
+        suspending: bool,
     };
 
     fn deinit(self: *CollectedModuleTypeInfo, gpa: std.mem.Allocator) void {
@@ -4295,6 +4297,7 @@ fn writeHostedFunctionInfo(
     writer.writeField(value_base, elem_layout, "HostedFunctionInfo", "name", RocStr, createBigRocStr(hosted.name, writer.roc_ops));
     writer.writeField(value_base, elem_layout, "HostedFunctionInfo", "ret_fields", RocList, buildRocList(writer, hosted.ret_fields, ret_fields_slot.layout_idx, writeRecordFieldInfo));
     writer.writeField(value_base, elem_layout, "HostedFunctionInfo", "ret_type_id", u64, hosted.ret_type_id);
+    writer.writeField(value_base, elem_layout, "HostedFunctionInfo", "suspending", bool, hosted.suspending);
     writer.writeField(value_base, elem_layout, "HostedFunctionInfo", "type_str", RocStr, createBigRocStr(hosted.type_str, writer.roc_ops));
 }
 
@@ -4380,8 +4383,17 @@ fn writeFunctionSignature(
 }
 
 /// Construct the List(Types) Roc value from collected module type info.
+/// The platform header's concurrency mode, from its checked main module.
+fn platformConcurrencyMode(modules: []const BuildEnv.CompiledModuleInfo) base.ConcurrencyMode {
+    for (modules) |mod| {
+        if (mod.is_platform_main) return mod.semantic.env.concurrency_mode;
+    }
+    glueInvariant("glue ran without a platform main module", .{});
+}
+
 fn constructTypesRocList(
     writer: *const GlueRocValueWriter,
+    concurrency: base.ConcurrencyMode,
     collected_modules: []const CollectedModuleTypeInfo,
     provides_entries: []const CollectedProvidesEntry,
     type_table: *const TypeTable,
@@ -4396,6 +4408,12 @@ fn constructTypesRocList(
     const provides_slot = writer.recordField(types_base, allocated.elem_layout, "Types", "provides_entries");
     const types_slot = writer.recordField(types_base, allocated.elem_layout, "Types", "types");
 
+    const concurrency_slot = writer.recordField(types_base, allocated.elem_layout, "Types", "concurrency");
+    writer.writeTagDiscriminant(concurrency_slot.ptr, concurrency_slot.layout_idx, switch (concurrency) {
+        .none => writer.tagIndex("ConcurrencyMode", "NoConcurrency"),
+        .tasks => writer.tagIndex("ConcurrencyMode", "Tasks"),
+        .parallel_tasks => unreachable, // checking rejects ParallelTasks as not implemented (Can.setPlatformConcurrencyMode)
+    });
     writer.writeField(types_base, allocated.elem_layout, "Types", "modules", RocList, buildRocList(writer, collected_modules, modules_slot.layout_idx, writeModuleTypeInfo));
     writer.writeField(types_base, allocated.elem_layout, "Types", "provides_entries", RocList, buildRocList(writer, provides_entries, provides_slot.layout_idx, writeProvidesEntry));
     writer.writeField(types_base, allocated.elem_layout, "Types", "types", RocList, buildRocList(writer, type_table.entries.items, types_slot.layout_idx, writeTypeInfo));
@@ -4913,6 +4931,7 @@ fn collectModuleTypeInfo(
                 .ret_fields = metadata.ret_fields,
                 .arg_type_ids = metadata.arg_type_ids,
                 .ret_type_id = metadata.ret_type_id,
+                .suspending = hosted_proc.suspending,
             });
         } else switch (entry.value) {
             .procedure_binding => {
@@ -5190,6 +5209,7 @@ const GlueProtocolLock = struct {
         bool_,
         unit,
         types,
+        concurrency_mode,
         provides_entry,
         provided_export,
         function_signature,
@@ -5248,8 +5268,10 @@ const GlueProtocolLock = struct {
             .list_record_field => try self.list(idx, .record_field),
             .list_tag_variant => try self.list(idx, .tag_variant),
             .types => try self.record(idx, "Types", &.{
-                .{ .name = "modules", .type = .list_module_info }, .{ .name = "provides_entries", .type = .list_provides_entry }, .{ .name = "types", .type = .list_type_info },
+                .{ .name = "concurrency", .type = .concurrency_mode },         .{ .name = "modules", .type = .list_module_info },
+                .{ .name = "provides_entries", .type = .list_provides_entry }, .{ .name = "types", .type = .list_type_info },
             }),
+            .concurrency_mode => try self.tagUnion(idx, "ConcurrencyMode", &.{ .{ .name = "NoConcurrency", .type = .unit }, .{ .name = "Tasks", .type = .unit } }),
             .provides_entry => try self.record(idx, "ProvidesEntry", &.{ .{ .name = "exported", .type = .provided_export }, .{ .name = "ffi_symbol", .type = .str_ }, .{ .name = "name", .type = .str_ } }),
             .provided_export => try self.tagUnion(idx, "ProvidedExport", &.{ .{ .name = "ProvidedData", .type = .u64_ }, .{ .name = "ProvidedProcedure", .type = .function_signature } }),
             .function_signature => try self.record(idx, "FunctionSignature", &.{ .{ .name = "args", .type = .list_u64 }, .{ .name = "ret", .type = .u64_ } }),
@@ -5263,7 +5285,8 @@ const GlueProtocolLock = struct {
                 .{ .name = "arg_fields", .type = .list_record_field_info }, .{ .name = "arg_type_ids", .type = .list_u64 },
                 .{ .name = "ffi_symbol", .type = .str_ },                   .{ .name = "index", .type = .u64_ },
                 .{ .name = "name", .type = .str_ },                         .{ .name = "ret_fields", .type = .list_record_field_info },
-                .{ .name = "ret_type_id", .type = .u64_ },                  .{ .name = "type_str", .type = .str_ },
+                .{ .name = "ret_type_id", .type = .u64_ },                  .{ .name = "suspending", .type = .bool_ },
+                .{ .name = "type_str", .type = .str_ },
             }),
             .record_field_info => try self.record(idx, "RecordFieldInfo", &.{ .{ .name = "name", .type = .str_ }, .{ .name = "type_str", .type = .str_ } }),
             .type_info => try self.record(idx, "TypeInfo", &.{ .{ .name = "layout", .type = .abi_layout }, .{ .name = "rc", .type = .rc_plan }, .{ .name = "repr", .type = .type_repr }, .{ .name = "shape_id", .type = .u64_ } }),
@@ -5362,7 +5385,9 @@ test "glue platform schema lock rejects field rename addition and type mutation"
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const mutations = [_]struct { path: []const u8, source: []const u8 }{
-        .{ .path = "Types.roc", .source = "import ModuleTypeInfo\nimport TypeInfo\nimport ProvidesEntry\nTypes := { modules : List(ModuleTypeInfo), provides_entries : List(ProvidesEntry), types : List(TypeInfo), added : U64 }" },
+        .{ .path = "Types.roc", .source = "import ConcurrencyMode\nimport ModuleTypeInfo\nimport TypeInfo\nimport ProvidesEntry\nTypes := { concurrency : ConcurrencyMode, modules : List(ModuleTypeInfo), provides_entries : List(ProvidesEntry), types : List(TypeInfo), added : U64 }" },
+        .{ .path = "ConcurrencyMode.roc", .source = "ConcurrencyMode := [NoConcurrency, Tasks, ParallelTasks]" },
+        .{ .path = "HostedFunctionInfo.roc", .source = "import RecordFieldInfo\nHostedFunctionInfo := { arg_fields : List(RecordFieldInfo), arg_type_ids : List(U64), ffi_symbol : Str, index : U64, name : Str, ret_fields : List(RecordFieldInfo), ret_type_id : U64, suspending : U64, type_str : Str }" },
         .{ .path = "ProvidesEntry.roc", .source = "import ProvidedExport\nProvidesEntry := { exported : ProvidedExport, ffi_symbol : Str, name : Str, type_id : U64 }" },
         .{ .path = "ProvidedExport.roc", .source = "import FunctionSignature\nProvidedExport := [ProvidedData(U32), ProvidedProcedure(FunctionSignature)]" },
         .{ .path = "FunctionSignature.roc", .source = "FunctionSignature := { args : List(U64), result : U64 }" },
