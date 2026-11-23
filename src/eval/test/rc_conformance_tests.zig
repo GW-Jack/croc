@@ -1278,7 +1278,7 @@ const exemptions = [_]Exemption{
 
 /// Why the running-set operations are exempt. `group_arrival` needs no entry:
 /// its row is trivial.
-const running_set_reason = "no producer yet: the running-set operations land before the pass that promotes a concurrent loop to them; the child-task group runtime's tests pin what each one takes and releases";
+const running_set_reason = "only running-set promotion and the continuation pass emit it, for a concurrent loop of a platform that declares `concurrency: Tasks`, which this sweep's platform-free sources cannot declare; the child-task group runtime's tests and the task-ops LIR and backend leak checks pin what it takes and releases";
 
 /// Loaded once and kept for the life of the test binary: publishing the
 /// Builtin module for every case would dominate the sweep's runtime.

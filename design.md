@@ -34182,16 +34182,20 @@ other operation's:
 - `next` returns an owned `a`;
 - `cancel_group` releases the entries that haven't started.
 
-**Two forms.** The continuation pass gives each loop a form and records it on
-the loop's `group`; backends read the mark and never decide the form.
+**Two forms.** Monotype lowers every loop to its sequential form, and the
+continuation pass *promotes* some loops to the task form. Backends see only
+the result and never decide a form.
 
-A loop is *task-form* when its `entry_call`, or a function its body spawns,
-may suspend. Otherwise it is *sequential*. A task-form loop's `next` and its
-exit wait are suspension sites, so the procedure holding the loop may
-suspend, which can make other loops task-form. The pass extends
-Suspendability's fixpoint with this rule. The rule is monotone, so the
-least fixpoint is well defined. A `None` build has no `suspending`
-procedure, so all its loops are sequential.
+A loop is *task-form* when the `run_next!` specialization it calls may
+suspend. Otherwise it is *sequential*. `run_next!` calls `run_entry!`, and a
+spawned function joins the entries' list and so goes through the same
+`run_entry!`, so this holds exactly when an entry or a spawned function may
+suspend. SuspensionMarks already decides it, and no new fixpoint is needed:
+the procedure holding the loop calls `run_next!`, so it may already suspend,
+and so may every procedure whose loop's entries call it. Loops whose entries
+share a lambda set share these specializations, so the form belongs to the
+specialization. A `None` build has no `suspending` procedure, so all its
+loops are sequential.
 
 *Sequential form.* No task and no runtime call. The operations are ordinary
 LIR over a list:
@@ -34216,10 +34220,10 @@ can't pause, so concurrency costs such a loop nothing.
 
 *Task form.* The running set is a runtime group, and each entry is a child
 task (Child Tasks). The child's start record is an erased callable whose
-capture is the entry closure. The pass makes one start procedure per item
-type, the same way it makes a root's: the procedure calls `entry_call` on
-its capture as a tail site and writes the result to the child's result
-destination. The operations:
+capture is the entry closure. The pass makes one start procedure per
+`run_entry!` specialization, the same way it makes a root's: the procedure
+calls `run_entry!` on its capture as a tail site and writes the result to
+the child's result destination. The operations:
 - `group` creates the group, with one block for all the entries and their
   result slots. It fixes each entry's place in the task tree in input order,
   and starts every entry whose limits have room;
@@ -34282,6 +34286,38 @@ through copies of its literal local; the LIR checks follow them back to the
 literal. The Boxy strategy lowers every plan loop sequentially; it compiles no
 `Tasks` program, since the CLI rejects a `Tasks` platform under
 `--specialize=no`, so no Boxy loop's entries can suspend.
+
+**Promotion.** The pass promotes before it finds any procedure's sites,
+since a promoted `next` is a park site (Park sites). In each procedure,
+every call of a `run_next!` specialization that may suspend names a
+task-form loop by its loop id. That procedure's calls of the other helpers
+with the same id belong to the loop: Monotype keeps a loop's calls in the
+procedure that holds it, because `Running(a)` never escapes it, and gives
+each loop of each specialization its own id. Promotion finds the loop's
+`run_entry!`, `run_arrived` and `run_ended` as the calls in that
+`run_next!`'s body. It rewrites each call in place, so the loop's code
+around them is unchanged:
+- `r = run_create!(id, entries, limit_paths, shielded, background, limits,
+  root_limit)` becomes `group_init(id, n, limits, root_limit)`, with `n`
+  the entries' length and the result layout `a` in its extra fields. A loop
+  over `i < n` follows that packs entry `i`'s start record and runs
+  `group_push(id, start, limit_paths[i], shielded[i], background[i])`. Then
+  come `group_start(id)` and `r = run_create!(id, [], [], [], [], [], 0)`,
+  the empty sequential set, which the later helper calls receive as before.
+  ARC runs after the pass and counts the lists and the entries the loop
+  reads from them like any other code's;
+- `t = run_next!(id, r)` becomes the park site `s = group_next(id)`. On 0
+  it runs `t = run_arrived(r, ptr_load(group_arrival(id)))`, and on 1
+  `group_free(id)` then `t = run_ended(r)`;
+- `r2 = run_spawn!(id, r, f)` packs `f`'s start record, runs
+  `group_spawn(id, start)`, and binds `r2` to `r`;
+- `r2 = run_cancel!(id, r)` runs `group_cancel(id)` and binds `r2` to `r`.
+
+A loop id that a promoted `next` names, with no `run_create!` in the same
+procedure, breaks the pass's invariant. Unreachable procedures are dropped
+before the pass (ReachableProcs), so a `run_next!` specialization that
+promotion leaves uncalled stays in the program. It stays well formed: it
+may suspend, so the pass gives it a task like any other such procedure.
 
 **The library.** Each of these is ordinary Builtin Roc written with a
 concurrent loop, so it gets both forms:

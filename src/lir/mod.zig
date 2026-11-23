@@ -83,6 +83,8 @@ pub const TailDrive = @import("tail_drive.zig");
 pub const SuspensionMarks = @import("suspension_marks.zig");
 pub const ContinuationSites = @import("continuation_sites.zig");
 pub const ContinuationPass = @import("continuation_pass.zig");
+/// Rewrites a concurrent loop whose entries may suspend to its task form.
+pub const RunningSetPromotion = @import("running_set_promotion.zig");
 /// Function values built in their caller's frame.
 pub const FrameCallables = @import("frame_callables.zig");
 /// Final immutable failure-image guards and explicit completion.
@@ -176,6 +178,7 @@ test "lir tests" {
     std.testing.refAllDecls(ReachableProcs);
     std.testing.refAllDecls(CheckedPipeline);
     std.testing.refAllDecls(SuspensionMarks);
+    std.testing.refAllDecls(RunningSetPromotion);
     std.testing.refAllDecls(ContinuationSites);
     std.testing.refAllDecls(ContinuationPass);
     std.testing.refAllDecls(BoxReuse);

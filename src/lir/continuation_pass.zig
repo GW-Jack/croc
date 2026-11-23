@@ -20,6 +20,7 @@ const body_clone = @import("body_clone.zig");
 const ContinuationSites = @import("continuation_sites.zig");
 const SiteStmt = ContinuationSites.SiteStmt;
 const SuspensionMarks = @import("suspension_marks.zig");
+const RunningSetPromotion = @import("running_set_promotion.zig");
 const invariant = @import("base").invariant;
 
 const LIR = core.LIR;
@@ -102,12 +103,16 @@ const ProcPlan = struct {
     task: LocalId,
 };
 
-/// Give every procedure that may suspend its task argument, make the
-/// continuation and resume entry of each of its sites that is not a tail
-/// site, add the pending edges, and give `suspending` hosted procedures the
-/// host's shape. Each `provides` root that may suspend is started as a task:
+/// Promote task-form concurrent loops, give every procedure that may suspend
+/// its task argument, make the continuation and resume entry of each of its
+/// sites that is not a tail site, add the pending edges, and give
+/// `suspending` hosted procedures the host's shape. Each `provides` root that may suspend is started as a task:
 /// its place in `roots` goes to an entry that creates the task.
 pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots: Roots) Allocator.Error!void {
+    // A promoted loop's `group_next` is a park site, so promotion comes
+    // before any procedure's sites are found.
+    try RunningSetPromotion.run(allocator, store, layouts);
+
     var plans = std.ArrayList(ProcPlan).empty;
     defer {
         for (plans.items) |*plan| plan.sites.deinit();
@@ -269,12 +274,109 @@ fn nameDerived(allocator: Allocator, store: *LirStore, derived: ProcId, source: 
     try store.setProcDebugName(derived, text);
 }
 
-/// Start the root `root` as a task. Its start procedure `S` is an erased
-/// callable whose capture is the root's explicit arguments and whose body
-/// calls the root with them, and with the task when it may suspend, as a
-/// tail site. Its
-/// task entry `E(args..., result_out)` takes the root's place: it packs the
-/// start record and returns the task it creates, whose root result goes to
+/// A start procedure: an erased callable `S(task, capture, reuse)` whose
+/// capture is a struct of explicit arguments and whose body calls one
+/// procedure with them as a tail site (design.md "Records And The Task").
+pub const Start = struct {
+    proc: ProcId,
+    /// The capture's layout, `zst` when every argument is zero-sized.
+    capture_layout: layout.Idx,
+};
+
+/// Make the start procedure of `callee`, whose explicit arguments have
+/// `explicit` layouts. When `pass_task` holds, the call passes the task
+/// after them: `callee` may suspend, so the pass gives it the task, either
+/// already (a root) or after this (an entry's `run_entry!`).
+pub fn buildStart(allocator: Allocator, store: *LirStore, layouts: *layout.Store, callee: ProcId, explicit: []const layout.Idx, pass_task: bool) Allocator.Error!Start {
+    const source = store.getProcSpecImmediate(callee).*;
+    const origin = store.stmtOrigin(source.body.get().?);
+    const capture_fields = try allocator.alloc(layout.StructField, explicit.len);
+    defer allocator.free(capture_fields);
+    for (explicit, capture_fields, 0..) |arg_layout, *field, index| field.* = .{ .index = @intCast(index), .layout = arg_layout };
+    const capture_layout = try layouts.putStructFields(capture_fields);
+    const erased = try layouts.insertErasedCallable();
+
+    const start = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .identity = source.identity.derived("start", &.{}),
+        .args = .empty(),
+        .ret_layout = source.ret_layout,
+        .abi = .erased_callable,
+    }, store.procLoc(callee));
+    try nameDerived(allocator, store, start, callee, "start", null);
+    var frame = std.ArrayList(LocalId).empty;
+    defer frame.deinit(allocator);
+    const task = try freshLocal(store, &frame, allocator, .opaque_ptr);
+    const capture = try freshLocal(store, &frame, allocator, .opaque_ptr);
+    const reuse = try freshLocal(store, &frame, allocator, erased);
+    const value = try freshLocal(store, &frame, allocator, source.ret_layout);
+    const call_args = try allocator.alloc(LocalId, explicit.len + @intFromBool(pass_task));
+    defer allocator.free(call_args);
+    for (explicit, call_args[0..explicit.len]) |arg_layout, *arg| arg.* = try freshLocal(store, &frame, allocator, arg_layout);
+    if (pass_task) call_args[explicit.len] = task;
+
+    const ret = try store.addCFStmt(.{ .ret = .{ .value = value } }, origin);
+    var head = try store.addCFStmt(.{ .assign_call = .{
+        .target = value,
+        .proc = callee,
+        .args = try store.addLocalSpan(call_args),
+        .next = ret,
+    } }, origin);
+    const fields = call_args[0..explicit.len];
+    if (capture_layout == .zst) {
+        // Every argument is zero-sized, so there is no capture to read.
+        var index = fields.len;
+        while (index > 0) {
+            index -= 1;
+            head = try store.addCFStmt(.{ .assign_struct = .{ .target = fields[index], .fields = .empty(), .next = head } }, origin);
+        }
+    } else {
+        const record = try freshLocal(store, &frame, allocator, capture_layout);
+        var index = fields.len;
+        while (index > 0) {
+            index -= 1;
+            head = try store.addCFStmt(.{ .assign_ref = .{ .target = fields[index], .op = LIR.RefOp.field(record, @intCast(index)), .next = head } }, origin);
+        }
+        head = try store.addLowLevelStmt(record, .erased_capture_load, &.{ capture, reuse }, head, origin);
+    }
+    std.mem.sort(LocalId, frame.items, {}, localLessThan);
+    const spec = store.getProcSpecPtr(start);
+    spec.args = try store.addLocalSpan(&.{ task, capture, reuse });
+    spec.frame_locals = try store.addLocalSpan(frame.items);
+    spec.body = .some(head);
+    spec.erased_capture_arg = .some(capture);
+    spec.erased_reuse_arg = .some(reuse);
+    spec.erased_call_args = .some(try store.internErasedCallArgsPlan(layouts, &.{.opaque_ptr}));
+    return .{ .proc = start, .capture_layout = capture_layout };
+}
+
+/// `record = <start, {fields}>` before `next`: a start record whose capture
+/// holds `fields`, the start procedure's explicit arguments. The capture's
+/// local goes in `frame`.
+pub fn packStart(allocator: Allocator, store: *LirStore, layouts: *const layout.Store, frame: *std.ArrayList(LocalId), start: Start, fields: []const LocalId, record: LocalId, next: CFStmtId, origin: LIR.StmtOrigin) Allocator.Error!CFStmtId {
+    const capture: ?LocalId = if (start.capture_layout == .zst) null else try freshLocal(store, frame, allocator, start.capture_layout);
+    const head = try store.addCFStmt(.{ .assign_packed_erased_fn = .{
+        .target = record,
+        .data = try store.addStmtRow(LIR.PackedErasedFnData, .{
+            .proc = start.proc,
+            .capture = .of(capture),
+            .capture_layout = if (capture == null) .none else .some(start.capture_layout),
+            .on_drop = if (capture == null) .none else hostDrop(layouts, start.capture_layout),
+        }),
+        .next = next,
+    } }, origin);
+    const capture_local = capture orelse return head;
+    return try store.addCFStmt(.{ .assign_struct = .{
+        .target = capture_local,
+        .fields = try store.addLocalSpan(fields),
+        .next = head,
+    } }, origin);
+}
+
+/// Start the root `root` as a task. Its start procedure `S` (`buildStart`)
+/// takes the root's explicit arguments as its capture. Its task entry
+/// `E(args..., result_out)` takes the root's place: it packs the start
+/// record and returns the task it creates, whose root result goes to
 /// `result_out` (design.md "Host Contract"). Returns `E`.
 fn startRoot(allocator: Allocator, store: *LirStore, layouts: *layout.Store, root: ProcId, may_suspend: bool, buffers: Buffers) Allocator.Error!ProcId {
     const source = store.getProcSpecImmediate(root).*;
@@ -285,68 +387,9 @@ fn startRoot(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roo
     const explicit = if (may_suspend) root_args[0 .. root_args.len - 1] else root_args;
     const arg_layouts = try allocator.alloc(layout.Idx, explicit.len);
     defer allocator.free(arg_layouts);
-    const capture_fields = try allocator.alloc(layout.StructField, explicit.len);
-    defer allocator.free(capture_fields);
-    for (explicit, arg_layouts, capture_fields, 0..) |arg, *arg_layout, *field, index| {
-        arg_layout.* = store.getLocal(arg).layout_idx;
-        field.* = .{ .index = @intCast(index), .layout = arg_layout.* };
-    }
-    const capture_layout = try layouts.putStructFields(capture_fields);
+    for (explicit, arg_layouts) |arg, *arg_layout| arg_layout.* = store.getLocal(arg).layout_idx;
+    const start = try buildStart(allocator, store, layouts, root, arg_layouts, may_suspend);
     const erased = try layouts.insertErasedCallable();
-
-    const start = try store.addProcSpec(.{
-        .name = store.freshSyntheticSymbol(),
-        .identity = source.identity.derived("start", &.{}),
-        .args = .empty(),
-        .ret_layout = source.ret_layout,
-        .abi = .erased_callable,
-    }, store.procLoc(root));
-    try nameDerived(allocator, store, start, root, "start", null);
-    {
-        var frame = std.ArrayList(LocalId).empty;
-        defer frame.deinit(allocator);
-        const task = try freshLocal(store, &frame, allocator, .opaque_ptr);
-        const capture = try freshLocal(store, &frame, allocator, .opaque_ptr);
-        const reuse = try freshLocal(store, &frame, allocator, erased);
-        const value = try freshLocal(store, &frame, allocator, source.ret_layout);
-        const call_args = try allocator.alloc(LocalId, explicit.len + @intFromBool(may_suspend));
-        defer allocator.free(call_args);
-        for (arg_layouts, call_args[0..explicit.len]) |arg_layout, *arg| arg.* = try freshLocal(store, &frame, allocator, arg_layout);
-        if (may_suspend) call_args[explicit.len] = task;
-
-        const ret = try store.addCFStmt(.{ .ret = .{ .value = value } }, origin);
-        var head = try store.addCFStmt(.{ .assign_call = .{
-            .target = value,
-            .proc = root,
-            .args = try store.addLocalSpan(call_args),
-            .next = ret,
-        } }, origin);
-        const fields = call_args[0..explicit.len];
-        if (capture_layout == .zst) {
-            // Every argument is zero-sized, so there is no capture to read.
-            var index = fields.len;
-            while (index > 0) {
-                index -= 1;
-                head = try store.addCFStmt(.{ .assign_struct = .{ .target = fields[index], .fields = .empty(), .next = head } }, origin);
-            }
-        } else {
-            const record = try freshLocal(store, &frame, allocator, capture_layout);
-            var index = fields.len;
-            while (index > 0) {
-                index -= 1;
-                head = try store.addCFStmt(.{ .assign_ref = .{ .target = fields[index], .op = LIR.RefOp.field(record, @intCast(index)), .next = head } }, origin);
-            }
-            head = try store.addLowLevelStmt(record, .erased_capture_load, &.{ capture, reuse }, head, origin);
-        }
-        std.mem.sort(LocalId, frame.items, {}, localLessThan);
-        const spec = store.getProcSpecPtr(start);
-        spec.args = try store.addLocalSpan(&.{ task, capture, reuse });
-        spec.frame_locals = try store.addLocalSpan(frame.items);
-        spec.body = .some(head);
-        spec.erased_capture_arg = .some(capture);
-        spec.erased_reuse_arg = .some(reuse);
-        spec.erased_call_args = .some(try store.internErasedCallArgsPlan(layouts, &.{.opaque_ptr}));
-    }
 
     const entry = try store.addProcSpec(.{
         .name = store.freshSyntheticSymbol(),
@@ -355,59 +398,42 @@ fn startRoot(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roo
         .ret_layout = .opaque_ptr,
     }, store.procLoc(root));
     try nameDerived(allocator, store, entry, root, "entry", null);
-    {
-        var frame = std.ArrayList(LocalId).empty;
-        defer frame.deinit(allocator);
-        const entry_args = try allocator.alloc(LocalId, explicit.len + 1);
-        defer allocator.free(entry_args);
-        for (arg_layouts, entry_args[0..explicit.len]) |arg_layout, *arg| arg.* = try freshLocal(store, &frame, allocator, arg_layout);
-        const result_out = try freshLocal(store, &frame, allocator, .opaque_ptr);
-        entry_args[explicit.len] = result_out;
-        const record = try freshLocal(store, &frame, allocator, erased);
-        const task = try freshLocal(store, &frame, allocator, .opaque_ptr);
-        const sizes = [_]u64{ buffers.hosted_slot_size, buffers.hosted_slot_alignment, buffers.result_buffer_size, buffers.result_buffer_alignment };
-        var size_locals: [sizes.len]LocalId = undefined;
-        for (&size_locals) |*size_local| size_local.* = try freshLocal(store, &frame, allocator, .u64);
+    var frame = std.ArrayList(LocalId).empty;
+    defer frame.deinit(allocator);
+    const entry_args = try allocator.alloc(LocalId, explicit.len + 1);
+    defer allocator.free(entry_args);
+    for (arg_layouts, entry_args[0..explicit.len]) |arg_layout, *arg| arg.* = try freshLocal(store, &frame, allocator, arg_layout);
+    const result_out = try freshLocal(store, &frame, allocator, .opaque_ptr);
+    entry_args[explicit.len] = result_out;
+    const record = try freshLocal(store, &frame, allocator, erased);
+    const task = try freshLocal(store, &frame, allocator, .opaque_ptr);
+    const sizes = [_]u64{ buffers.hosted_slot_size, buffers.hosted_slot_alignment, buffers.result_buffer_size, buffers.result_buffer_alignment };
+    var size_locals: [sizes.len]LocalId = undefined;
+    for (&size_locals) |*size_local| size_local.* = try freshLocal(store, &frame, allocator, .u64);
 
-        const ret = try store.addCFStmt(.{ .ret = .{ .value = task } }, origin);
-        var head = try store.addLowLevelStmt(task, .task_create, &.{ record, result_out, size_locals[0], size_locals[1], size_locals[2], size_locals[3] }, ret, origin);
-        var index = sizes.len;
-        while (index > 0) {
-            index -= 1;
-            head = try store.addCFStmt(.{ .assign_literal = .{
-                .target = size_locals[index],
-                .value = .{ .i64_literal = .{ .value = @intCast(sizes[index]), .layout_idx = .u64 } },
-                .next = head,
-            } }, origin);
-        }
-        const capture: ?LocalId = if (capture_layout == .zst) null else try freshLocal(store, &frame, allocator, capture_layout);
-        head = try store.addCFStmt(.{ .assign_packed_erased_fn = .{
-            .target = record,
-            .data = try store.addStmtRow(LIR.PackedErasedFnData, .{
-                .proc = start,
-                .capture = .of(capture),
-                .capture_layout = if (capture == null) .none else .some(capture_layout),
-                .on_drop = if (capture == null) .none else hostDrop(layouts, capture_layout),
-            }),
+    const ret = try store.addCFStmt(.{ .ret = .{ .value = task } }, origin);
+    var head = try store.addLowLevelStmt(task, .task_create, &.{ record, result_out, size_locals[0], size_locals[1], size_locals[2], size_locals[3] }, ret, origin);
+    var index = sizes.len;
+    while (index > 0) {
+        index -= 1;
+        head = try store.addCFStmt(.{ .assign_literal = .{
+            .target = size_locals[index],
+            .value = .{ .i64_literal = .{ .value = @intCast(sizes[index]), .layout_idx = .u64 } },
             .next = head,
         } }, origin);
-        if (capture) |capture_local| {
-            head = try store.addCFStmt(.{ .assign_struct = .{
-                .target = capture_local,
-                .fields = try store.addLocalSpan(entry_args[0..explicit.len]),
-                .next = head,
-            } }, origin);
-        }
-        std.mem.sort(LocalId, frame.items, {}, localLessThan);
-        const spec = store.getProcSpecPtr(entry);
-        spec.args = try store.addLocalSpan(entry_args);
-        spec.frame_locals = try store.addLocalSpan(frame.items);
-        spec.body = .some(head);
     }
+    head = try packStart(allocator, store, layouts, &frame, start, entry_args[0..explicit.len], record, head, origin);
+    std.mem.sort(LocalId, frame.items, {}, localLessThan);
+    const spec = store.getProcSpecPtr(entry);
+    spec.args = try store.addLocalSpan(entry_args);
+    spec.frame_locals = try store.addLocalSpan(frame.items);
+    spec.body = .some(head);
     return entry;
 }
 
-fn freshLocal(store: *LirStore, frame: *std.ArrayList(LocalId), allocator: Allocator, layout_idx: layout.Idx) Allocator.Error!LocalId {
+/// A new local of `layout_idx`, recorded in `frame`, the locals a
+/// procedure being built will list.
+pub fn freshLocal(store: *LirStore, frame: *std.ArrayList(LocalId), allocator: Allocator, layout_idx: layout.Idx) Allocator.Error!LocalId {
     const id = try store.addLocal(.{ .layout_idx = layout_idx });
     try frame.append(allocator, id);
     return id;
@@ -415,7 +441,7 @@ fn freshLocal(store: *LirStore, frame: *std.ArrayList(LocalId), allocator: Alloc
 
 /// The locals of `span`, copied out of the store, which grows as the pass
 /// adds to it.
-fn copyLocals(allocator: Allocator, store: *const LirStore, span: LIR.LocalSpan) Allocator.Error![]LocalId {
+pub fn copyLocals(allocator: Allocator, store: *const LirStore, span: LIR.LocalSpan) Allocator.Error![]LocalId {
     const list = store.getLocalSpan(span);
     const out = try allocator.alloc(LocalId, GuardedList.borrowLen(list));
     for (out, 0..) |*item, index| item.* = GuardedList.at(store.getLocalSpan(span), index);
@@ -446,7 +472,8 @@ fn isHosted(store: *const LirStore, proc: ProcId) bool {
     return store.getProcSpecImmediate(proc).hosted.get() != null;
 }
 
-fn appendLocal(store: *LirStore, span: *LIR.LocalSpan, local: LocalId) Allocator.Error!void {
+/// Add `local` at the end of `span`.
+pub fn appendLocal(store: *LirStore, span: *LIR.LocalSpan, local: LocalId) Allocator.Error!void {
     try spliceLocals(store, span, &.{}, &.{local});
 }
 

@@ -508,7 +508,7 @@ pub fn abortUnexpected(_: *RocTask) callconv(.c) void {
 
 /// Tasks the running-set test's `roc_task_ready` was handed, in order.
 const ReadyChildren = struct {
-    var tasks: [8]*RocTask = undefined;
+    var tasks: [32]*RocTask = undefined;
     var len: usize = 0;
 
     fn ready(task: *RocTask) callconv(.c) void {
@@ -763,6 +763,19 @@ test "a running set of heap results drops one through the interpreter and releas
     try f.runtime_env.checkForLeaks();
 }
 
+/// Declare `roc_test_unused : {} => U64`, a `suspending` hosted procedure,
+/// so a procedure that calls it may suspend.
+fn suspendingHosted(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
+    return try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = .empty(),
+        .ret_layout = .u64,
+        .hosted = .some(.{ .symbol = try f.store.insertString("roc_test_unused"), .dispatch_index = 0 }),
+        .suspends = .may,
+    }, .none);
+}
+
 /// The task-form loop the park-site test runs, after the continuation pass:
 /// the provides root `g()` opens a running set of three entries (one
 /// returning 5, then two background ones returning 100 and 200) and sums
@@ -777,14 +790,7 @@ test "a running set of heap results drops one through the interpreter and releas
 /// declares one, `roc_test_unused`, which nothing here calls. Returns the
 /// task entry that takes `g`'s place.
 fn parkingProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
-    _ = try f.store.addProcSpec(.{
-        .name = f.store.freshSyntheticSymbol(),
-        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
-        .args = .empty(),
-        .ret_layout = .u64,
-        .hosted = .some(.{ .symbol = try f.store.insertString("roc_test_unused"), .dispatch_index = 0 }),
-        .suspends = .may,
-    }, .none);
+    _ = try suspendingHosted(f);
     const erased = try f.layouts.insertErasedCallable();
     const list_u64 = try f.layouts.insertList(.u64);
     const starts = [_]LIR.LirProcSpecId{ try constantStart(f, 5), try constantStart(f, 100), try constantStart(f, 200) };
@@ -924,6 +930,341 @@ test "a task parks at its running set's next and resumes there until the loop en
     try std.testing.expectEqual(Status.cancelled, third.resumeFromHost(ready, abort));
     try std.testing.expectEqual(Status.done, task.resumeFromHost(ready, abort));
     try std.testing.expectEqual(@as(u64, 5), root);
+    task.free();
+    try f.runtime_env.checkForLeaks();
+}
+
+/// A procedure of `args` with `body`, made of the fixture's locals so far,
+/// specializing the running-set helper `helper`.
+fn helperProc(f: *Fixture, helper: LIR.RunningSetHelper, args: []const LocalId, body: CFStmtId) TaskOpsTestError!LIR.LirProcSpecId {
+    const proc = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = try f.store.addLocalSpan(args),
+        .frame_locals = try f.store.addLocalSpan(f.locals.items),
+        .body = .some(body),
+        .ret_layout = .u64,
+        .running_set_helper = helper,
+    }, .none);
+    f.locals.clearRetainingCapacity();
+    return proc;
+}
+
+fn callStmt(f: *Fixture, target: LocalId, proc: LIR.LirProcSpecId, args: []const LocalId, next: CFStmtId) TaskOpsTestError!CFStmtId {
+    return try f.store.addCFStmt(.{ .assign_call = .{
+        .target = target,
+        .proc = proc,
+        .args = try f.store.addLocalSpan(args),
+        .next = next,
+    } }, .test_fixture);
+}
+
+fn setLocal(f: *Fixture, target: LocalId, value: LocalId, next: CFStmtId) TaskOpsTestError!CFStmtId {
+    return try f.store.addCFStmt(.{ .set_local = .{ .target = target, .value = value, .mode = .initialize_join_param, .next = next } }, .test_fixture);
+}
+
+fn jump(f: *Fixture, join_id: LIR.JoinPointId) TaskOpsTestError!CFStmtId {
+    return try f.store.addCFStmt(.{ .jump = .{ .target = join_id } }, .test_fixture);
+}
+
+fn release(f: *Fixture, value: LocalId, layout_idx: layout.Idx, next: CFStmtId) TaskOpsTestError!CFStmtId {
+    return try f.store.addCFStmt(.{ .decref = .{
+        .value = value,
+        .rc = try f.store.addRcHelperRef(.{ .concrete = .{ .op = .decref, .layout_idx = layout_idx } }),
+        .next = next,
+    } }, .test_fixture);
+}
+
+/// The running-set helpers of a loop over `U64` entries, in the sequential
+/// form Monotype makes, with a running set and its `run_next!` result both
+/// `U64`: `run_arrived` gives the arrived entry's result (never 0 here) and
+/// `run_ended` gives 0. `run_entry!` returns its entry, but may suspend: on
+/// the entry 999, which no test uses, it calls a `suspending` hosted
+/// procedure.
+const Helpers = struct {
+    create: LIR.LirProcSpecId,
+    next: LIR.LirProcSpecId,
+    spawn: LIR.LirProcSpecId,
+    cancel: LIR.LirProcSpecId,
+
+    fn make(f: *Fixture) TaskOpsTestError!Helpers {
+        const hosted = try suspendingHosted(f);
+        const list_u64 = try f.layouts.insertList(.u64);
+        const list_bool = try f.layouts.insertList(.bool);
+
+        // run_entry!(c) = match c { 999 => roc_test_unused(), _ => c }
+        const entry = blk: {
+            const c = try f.local(.u64);
+            const x = try f.local(.u64);
+            const suspend_path = try callStmt(f, x, hosted, &.{}, try f.ret(x));
+            const body = try f.store.addCFStmt(.{ .switch_stmt = .{
+                .cond = c,
+                .branches = try f.store.addCFSwitchBranches(&.{.{ .value = 999, .body = suspend_path }}),
+                .default_branch = try f.ret(c),
+            } }, .test_fixture);
+            break :blk try helperProc(f, .run_entry, &.{c}, body);
+        };
+        // run_arrived(r, x) = x
+        const arrived = blk: {
+            const r = try f.local(.u64);
+            const x = try f.local(.u64);
+            break :blk try helperProc(f, .run_arrived, &.{ r, x }, try f.ret(x));
+        };
+        // run_ended(r) = 0
+        const ended = blk: {
+            const r = try f.local(.u64);
+            const zero = try f.local(.u64);
+            break :blk try helperProc(f, .run_ended, &.{r}, try literal(f, zero, 0, .u64, try f.ret(zero)));
+        };
+        // run_next!(id, r): x = run_entry!(1); x == 0 => run_ended(r), _ => run_arrived(r, x).
+        // The task form never runs it; it only names the three above.
+        const next = blk: {
+            const id = try f.local(.u64);
+            const r = try f.local(.u64);
+            const c = try f.local(.u64);
+            const x = try f.local(.u64);
+            const t_ended = try f.local(.u64);
+            const t_arrived = try f.local(.u64);
+            const branch = try f.store.addCFStmt(.{ .switch_stmt = .{
+                .cond = x,
+                .branches = try f.store.addCFSwitchBranches(&.{.{ .value = 0, .body = try callStmt(f, t_ended, ended, &.{r}, try f.ret(t_ended)) }}),
+                .default_branch = try callStmt(f, t_arrived, arrived, &.{ r, x }, try f.ret(t_arrived)),
+            } }, .test_fixture);
+            const body = try literal(f, c, 1, .u64, try callStmt(f, x, entry, &.{c}, branch));
+            break :blk try helperProc(f, .run_next, &.{ id, r }, body);
+        };
+        // run_create!(id, entries, limit_paths, shielded, background, limits, root_limit) = 0
+        const create = blk: {
+            const args = [_]LocalId{
+                try f.local(.u64),
+                try f.local(list_u64),
+                try f.local(try f.layouts.insertList(list_u64)),
+                try f.local(list_bool),
+                try f.local(list_bool),
+                try f.local(list_u64),
+                try f.local(.u64),
+            };
+            const zero = try f.local(.u64);
+            break :blk try helperProc(f, .run_create, &args, try literal(f, zero, 0, .u64, try f.ret(zero)));
+        };
+        // run_spawn!(id, r, f) = r
+        const spawn = blk: {
+            const id = try f.local(.u64);
+            const r = try f.local(.u64);
+            const function = try f.local(.u64);
+            break :blk try helperProc(f, .run_spawn, &.{ id, r, function }, try f.ret(r));
+        };
+        // run_cancel!(id, r) = r
+        const cancel = blk: {
+            const id = try f.local(.u64);
+            const r = try f.local(.u64);
+            break :blk try helperProc(f, .run_cancel, &.{ id, r }, try f.ret(r));
+        };
+        return .{ .create = create, .next = next, .spawn = spawn, .cancel = cancel };
+    }
+};
+
+/// What a promotion test's loop body does with its arrivals.
+const LoopBody = enum {
+    /// Sum every arrival, spawning the entry 7 at the first.
+    sum_and_spawn,
+    /// Return the first arrival: cancel, then drain.
+    first,
+};
+
+/// The provides root `g()` of a promotion test, in the sequential form:
+///
+///     r = run_create!(3, [10, 20, 30], [[], [], []], [F, F, F], background, [], 0)
+///     (Monotype's ARC would release the lists here)
+///     then `body` over run_next!(3, r)
+///
+/// Promotes it with the continuation pass and returns the task entry that
+/// takes `g`'s place.
+fn promotionProgram(f: *Fixture, background: [3]bool, body: LoopBody) TaskOpsTestError!LIR.LirProcSpecId {
+    const helpers = try Helpers.make(f);
+    const list_u64 = try f.layouts.insertList(.u64);
+    const list_list_u64 = try f.layouts.insertList(list_u64);
+    const list_bool = try f.layouts.insertList(.bool);
+
+    const id = try f.local(.u64);
+    const r = try f.local(.u64);
+    var values: [3]LocalId = undefined;
+    for (&values) |*value| value.* = try f.local(.u64);
+    const entries = try f.local(list_u64);
+    const no_path = try f.local(list_u64);
+    const paths = try f.local(list_list_u64);
+    const no = try f.local(.bool);
+    const yes = try f.local(.bool);
+    const shielded = try f.local(list_bool);
+    const background_list = try f.local(list_bool);
+    const limits = try f.local(list_u64);
+    const root_limit = try f.local(.u64);
+    const loop_join: LIR.JoinPointId = @fromBackingInt(@intCast(1));
+
+    const loop = switch (body) {
+        .sum_and_spawn => blk: {
+            // join L(sum, spawned) { t = run_next!(3, r); match t { 0 => ret sum,
+            //   _ => sum = sum + t; if !spawned { run_spawn!(3, r, 7); spawned = 1 }; jump L } }
+            const sum = try f.local(.u64);
+            const spawned = try f.local(.u64);
+            const t = try f.local(.u64);
+            const sum2 = try f.local(.u64);
+            const seven = try f.local(.u64);
+            const r2 = try f.local(.u64);
+            const one = try f.local(.u64);
+            const zero = try f.local(.u64);
+            const spawn_path = try literal(f, seven, 7, .u64, try callStmt(f, r2, helpers.spawn, &.{ id, r, seven }, try literal(f, one, 1, .u64, try setLocal(f, spawned, one, try setLocal(f, sum, sum2, try jump(f, loop_join))))));
+            const keep_path = try setLocal(f, sum, sum2, try jump(f, loop_join));
+            const spawn_once = try f.store.addCFStmt(.{ .switch_stmt = .{
+                .cond = spawned,
+                .branches = try f.store.addCFSwitchBranches(&.{.{ .value = 0, .body = spawn_path }}),
+                .default_branch = keep_path,
+            } }, .test_fixture);
+            const arrived = try f.op(sum2, .num_int_add_wrap, &.{ sum, t }, spawn_once);
+            const branch = try f.store.addCFStmt(.{ .switch_stmt = .{
+                .cond = t,
+                .branches = try f.store.addCFSwitchBranches(&.{.{ .value = 0, .body = try f.ret(sum) }}),
+                .default_branch = arrived,
+            } }, .test_fixture);
+            const loop_body = try callStmt(f, t, helpers.next, &.{ id, r }, branch);
+            const enter = try literal(f, zero, 0, .u64, try setLocal(f, sum, zero, try setLocal(f, spawned, zero, try jump(f, loop_join))));
+            break :blk try f.store.addCFStmt(.{ .join = .{ .id = loop_join, .params = try f.store.addLocalSpan(&.{ sum, spawned }), .body = loop_body, .remainder = enter } }, .test_fixture);
+        },
+        .first => blk: {
+            // first = run_next!(3, r); r2 = run_cancel!(3, r);
+            // join D { t = run_next!(3, r2); match t { 0 => ret first, _ => jump D } }
+            const first = try f.local(.u64);
+            const r2 = try f.local(.u64);
+            const t = try f.local(.u64);
+            const drain_body = try callStmt(f, t, helpers.next, &.{ id, r2 }, try f.store.addCFStmt(.{ .switch_stmt = .{
+                .cond = t,
+                .branches = try f.store.addCFSwitchBranches(&.{.{ .value = 0, .body = try f.ret(first) }}),
+                .default_branch = try jump(f, loop_join),
+            } }, .test_fixture));
+            const drain = try f.store.addCFStmt(.{ .join = .{ .id = loop_join, .params = .empty(), .body = drain_body, .remainder = try jump(f, loop_join) } }, .test_fixture);
+            break :blk try callStmt(f, first, helpers.next, &.{ id, r }, try callStmt(f, r2, helpers.cancel, &.{ id, r }, drain));
+        },
+    };
+
+    var head = try release(f, background_list, list_bool, loop);
+    head = try release(f, shielded, list_bool, head);
+    head = try release(f, paths, list_list_u64, head);
+    head = try release(f, entries, list_u64, head);
+    head = try callStmt(f, r, helpers.create, &.{ id, entries, paths, shielded, background_list, limits, root_limit }, head);
+    head = try literal(f, root_limit, 0, .u64, head);
+    head = try f.store.addCFStmt(.{ .assign_list = .{ .target = limits, .elems = .empty(), .next = head } }, .test_fixture);
+    head = try f.store.addCFStmt(.{ .assign_list = .{
+        .target = background_list,
+        .elems = try f.store.addLocalSpan(&.{ if (background[0]) yes else no, if (background[1]) yes else no, if (background[2]) yes else no }),
+        .next = head,
+    } }, .test_fixture);
+    head = try f.store.addCFStmt(.{ .assign_list = .{ .target = shielded, .elems = try f.store.addLocalSpan(&.{ no, no, no }), .next = head } }, .test_fixture);
+    head = try literal(f, yes, 1, .bool, head);
+    head = try literal(f, no, 0, .bool, head);
+    head = try f.store.addCFStmt(.{ .assign_list = .{ .target = paths, .elems = try f.store.addLocalSpan(&.{ no_path, no_path, no_path }), .next = head } }, .test_fixture);
+    head = try f.store.addCFStmt(.{ .assign_list = .{ .target = no_path, .elems = .empty(), .next = head } }, .test_fixture);
+    head = try f.store.addCFStmt(.{ .assign_list = .{ .target = entries, .elems = try f.store.addLocalSpan(&values), .next = head } }, .test_fixture);
+    for (values, [_]i64{ 10, 20, 30 }) |value, number| head = try literal(f, value, number, .u64, head);
+    head = try literal(f, id, test_loop_id, .u64, head);
+    const g = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = .empty(),
+        .frame_locals = try f.store.addLocalSpan(f.locals.items),
+        .body = .some(head),
+        .ret_layout = .u64,
+    }, .none);
+    f.locals.clearRetainingCapacity();
+
+    try lir.SuspensionMarks.run(f.allocator, &f.store);
+    var roots = [_]LIR.LirProcSpecId{g};
+    try lir.ContinuationPass.run(f.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true} });
+    try indexJoinPoints(f);
+    return roots[0];
+}
+
+/// Start the task entry `entry` with its result going to `root`.
+fn startEntry(interp: *eval.Interpreter, entry: LIR.LirProcSpecId, root: *u64) TaskOpsTestError!*RocTask {
+    var result_out = @intFromPtr(root);
+    const created = try interp.eval(.{ .proc_id = entry, .arg_layouts = &.{.opaque_ptr}, .arg_ptr = @ptrCast(&result_out) });
+    return @ptrFromInt(created.value.read(usize));
+}
+
+test "promotion runs a loop whose entries may suspend as child tasks and spawns into it" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const entry = try promotionProgram(&f, .{ false, true, true }, .sum_and_spawn);
+
+    var static_strings = try eval.Interpreter.buildStaticStrings(f.allocator, &f.store);
+    defer static_strings.deinit();
+    var interp = try eval.Interpreter.init(f.allocator, &f.store, &f.layouts, static_strings.view(), f.runtime_env.get_ops());
+    defer interp.deinit();
+
+    var root: u64 = 0;
+    ReadyChildren.len = 0;
+    const task = try startEntry(&interp, entry, &root);
+    const ready = &ReadyChildren.ready;
+    const abort = &ReadyChildren.abort;
+    const Status = builtins.task.Status;
+
+    // The promoted run_create! starts the three entries; the loop parks.
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(@as(usize, 3), ReadyChildren.len);
+    const ten = ReadyChildren.tasks[0];
+    const twenty = ReadyChildren.tasks[1];
+    const thirty = ReadyChildren.tasks[2];
+
+    // 10 arrives. The body spawns 7, a fourth child, and the loop parks for it.
+    try std.testing.expectEqual(Status.done, ten.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(task, ReadyChildren.tasks[ReadyChildren.len - 1]);
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
+    const seven = ReadyChildren.tasks[ReadyChildren.len - 1];
+    try std.testing.expect(seven != task);
+
+    // 7 arrives; only the background entries are left, so they are
+    // cancelled, and the loop ends once both have reported.
+    try std.testing.expectEqual(Status.done, seven.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.cancelled, twenty.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.cancelled, thirty.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.done, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(@as(u64, 17), root);
+    task.free();
+    try f.runtime_env.checkForLeaks();
+}
+
+test "promotion cancels a loop's running set and drains it through run_next!" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const entry = try promotionProgram(&f, .{ false, false, false }, .first);
+
+    var static_strings = try eval.Interpreter.buildStaticStrings(f.allocator, &f.store);
+    defer static_strings.deinit();
+    var interp = try eval.Interpreter.init(f.allocator, &f.store, &f.layouts, static_strings.view(), f.runtime_env.get_ops());
+    defer interp.deinit();
+
+    var root: u64 = 0;
+    ReadyChildren.len = 0;
+    const task = try startEntry(&interp, entry, &root);
+    const ready = &ReadyChildren.ready;
+    const abort = &ReadyChildren.abort;
+    const Status = builtins.task.Status;
+
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(@as(usize, 3), ReadyChildren.len);
+    const children = ReadyChildren.tasks[0..3].*;
+
+    // 20 arrives first. The body cancels the other two, which haven't begun,
+    // and drains: each cancelled report readies the loop, which parks until
+    // the last.
+    try std.testing.expectEqual(Status.done, children[1].resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.cancelled, children[0].resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.cancelled, children[2].resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.done, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(@as(u64, 20), root);
     task.free();
     try f.runtime_env.checkForLeaks();
 }
