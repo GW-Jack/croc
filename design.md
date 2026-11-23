@@ -33947,6 +33947,31 @@ The runtime's `RocTask` (`src/builtins/task.zig`) fixes where these live.
 The interpreter and every compiling backend implement the operations
 against it (Backends).
 
+A task-form concurrent loop (Plans And Concurrent Loops) reaches its running
+set through eight more, which the continuation pass also makes alone. The
+running set is an `opaque_ptr` with no reference count, and each operation
+is one call of the `roc_builtins_group_*` builtin of the same name (Child
+Tasks):
+- `group_init(task, entry_count, limits, root_limit)` is the running set
+  for `entry_count` entries, owned by `task`. It borrows `limits`, a
+  `List(U64)`, and takes `root_limit` as `flatten` encodes it. The
+  operation's extra fields name the layout of an entry's result, which
+  sizes the slots and gives the drop for a result nobody takes;
+- `group_push(g, start, limit_path, shielded, background)` adds one entry.
+  It takes the start record and borrows `limit_path`, a `List(U64)`;
+- `group_start(g)` starts the entries their limits allow;
+- `group_next(g)` is a `U32`: 0 when a result arrived, 1 when the set has
+  ended, 2 when the owner must suspend parked on it;
+- `group_arrival(g)` is the arrived entry's slot, typed by its target's
+  `Ptr` layout. Its `ptr_load` is the owned result, like a hosted result's;
+- `group_spawn(g, start)` adds a spawned entry and takes its start record;
+- `group_cancel(g)` is a loop exit's cancel, and `group_free(g)` frees an
+  ended set.
+
+Each but `group_arrival` may allocate or release: starting entries makes
+child tasks, and ending, cancelling or freeing drops start records and
+results.
+
 Resuming a task clears its pending flag and repeats, until the list is empty
 or the task pauses again: take the innermost record and call it with the
 task, then release it.

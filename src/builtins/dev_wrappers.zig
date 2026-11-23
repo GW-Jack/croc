@@ -1507,6 +1507,7 @@ pub fn roc_builtins_group_init(owner: *task.RocTask, entry_count: u64, limits_by
         @intCast(slot_alignment),
         if (result_drop == null) null else &dropResultThrough,
         if (result_drop) |drop| @ptrCast(@constCast(drop)) else null,
+        null,
     );
 }
 

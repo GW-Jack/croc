@@ -691,6 +691,31 @@ pub const LowLevel = enum(u16) {
     /// goes to `root_result`. Each size and alignment is a `U64`.
     task_create,
 
+    // Running-set operations of a task-form concurrent loop (design.md
+    // "Records And The Task", "Child Tasks"), made only by the continuation
+    // pass. The running set is an `opaque_ptr` with no reference count.
+    /// (task, entry_count, limits, root_limit) -> running set: a set for
+    /// `entry_count` entries owned by `task`, borrowing `limits`
+    /// (`List(U64)`); `root_limit` is 0 for none or 1 + the root limit's
+    /// index. The extra fields name the layout of an entry's result.
+    group_init,
+    /// (set, start, limit_path, shielded, background) -> {}: add the next
+    /// entry, taking its start record and borrowing `limit_path`.
+    group_push,
+    /// (set) -> {}: start the entries their limits allow.
+    group_start,
+    /// (set) -> U32: 0 when a result arrived, 1 when the set has ended, 2
+    /// when the owner suspends parked on it.
+    group_next,
+    /// (set) -> Ptr(T): the slot of the entry that just arrived.
+    group_arrival,
+    /// (set, start) -> {}: add a spawned entry, taking its start record.
+    group_spawn,
+    /// (set) -> {}: a loop exit's cancel.
+    group_cancel,
+    /// (set) -> {}: free a set that has ended.
+    group_free,
+
     /// Index into `builtins.simd.Op`. The SIMD entries are intentionally one
     /// contiguous, order-pinned block so the interpreter and compile-time
     /// evaluator share the semantic oracle's operation vocabulary without a
@@ -1287,6 +1312,17 @@ pub const LowLevel = enum(u16) {
         .task_hosted_slot = byType(.none()),
         .task_result_buffer = byType(.none()),
         .task_create = byType(.consumesArgsRetainingArgs(arg_0, 0)),
+
+        // Starting entries makes child tasks; ending, cancelling and
+        // freeing a set drop start records and results nobody took.
+        .group_init = byType(.{ .may_allocate = true }),
+        .group_push = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_1 }),
+        .group_start = byType(.{ .may_allocate = true, .may_retain_or_release = true }),
+        .group_next = byType(.{ .may_allocate = true, .may_retain_or_release = true }),
+        .group_arrival = byType(.none()),
+        .group_spawn = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_1 }),
+        .group_cancel = byType(.{ .may_retain_or_release = true }),
+        .group_free = byType(.{ .may_retain_or_release = true }),
 
         .str_is_eq = byType(.none()),
         .str_is_eq_static_small = byType(.none()),

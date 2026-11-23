@@ -1267,7 +1267,18 @@ const exemptions = [_]Exemption{
     .{ .op = .list_prefetched, .reason = "no LIR producer: lowering splits List.prefetched into an alias of its list and list_prefetch" },
     .{ .op = .list_reverse, .reason = "no producer: List.rev is written in Roc over list_get_unsafe" },
     .{ .op = .task_create, .reason = "only the continuation pass emits it, for a provides root of a platform that declares `concurrency: Tasks`, which this sweep's platform-free sources cannot declare; the task-ops LIR tests and the tasks end-to-end leak checks pin that it takes its start record" },
+    .{ .op = .group_init, .reason = running_set_reason },
+    .{ .op = .group_push, .reason = running_set_reason },
+    .{ .op = .group_start, .reason = running_set_reason },
+    .{ .op = .group_next, .reason = running_set_reason },
+    .{ .op = .group_spawn, .reason = running_set_reason },
+    .{ .op = .group_cancel, .reason = running_set_reason },
+    .{ .op = .group_free, .reason = running_set_reason },
 };
+
+/// Why the running-set operations are exempt. `group_arrival` needs no entry:
+/// its row is trivial.
+const running_set_reason = "no producer yet: the running-set operations land before the pass that promotes a concurrent loop to them; the child-task group runtime's tests pin what each one takes and releases";
 
 /// Loaded once and kept for the life of the test binary: publishing the
 /// Builtin module for every case would dominate the sweep's runtime.

@@ -2712,6 +2712,7 @@ pub const Interpreter = struct {
                         .callable_proc = null,
                         .unique_args = self.store.stmtRowOrDefault(assign.extra).unique_args,
                         .interchangeable = self.store.stmtRowOrDefault(assign.extra).interchangeable,
+                        .group_result = self.store.stmtRowOrDefault(assign.extra).group_result.get(),
                     });
                     if (observation) |obs| {
                         self.conformanceSnapshotResult(obs, value, ret_layout);
@@ -5234,6 +5235,8 @@ pub const Interpreter = struct {
         /// in-place branch is statically dead, so the op yields 0 without the
         /// runtime uniqueness check. Ignored by every other op.
         interchangeable: layout_mod.WidthValues(bool) = layout_mod.WidthValues(bool).both(true, true),
+        /// For `group_init`: the layout of an entry's result.
+        group_result: ?layout_mod.Idx = null,
         /// The element descriptor of a list operation a `.boxy` generic body
         /// emits (`LowLevelExtra.dyn_elem_desc`). Its list arguments and
         /// results, and element results, are then the values' bytes.
@@ -6674,6 +6677,62 @@ pub const Interpreter = struct {
                     .result_buffer_alignment = @intCast(args[5].read(u64)),
                 });
                 break :blk try self.pointerValue(ll.ret_layout, @intFromPtr(task));
+            },
+
+            // ── Running sets ──
+            .group_init => blk: {
+                const result_layout = ll.group_result orelse
+                    return self.invariantFailedError("LIR/interpreter invariant violated: group_init named no result layout", .{});
+                const size_align = self.layout_store.layoutSizeAlign(self.layout_store.getLayout(result_layout));
+                const drop = try self.groupResultDrop(result_layout);
+                const root_limit = args[3].read(u64);
+                const group = builtins.task.groupInit(
+                    taskOf(self.readPointerInt(args[0])),
+                    @intCast(args[1].read(u64)),
+                    listItems(u64, valueToRocList(args[2])),
+                    if (root_limit == 0) null else @intCast(root_limit - 1),
+                    size_align.size,
+                    size_align.alignment.toByteUnits(),
+                    if (drop == null) null else &interpreterGroupResultDrop,
+                    drop,
+                    if (drop == null) null else &interpreterGroupResultDropRelease,
+                );
+                break :blk try self.pointerValue(ll.ret_layout, @intFromPtr(group));
+            },
+            .group_push => blk: {
+                const start = self.readBoxedDataPointer(args[1]) orelse
+                    return self.invariantFailedError("LIR/interpreter invariant violated: group_push had no start record", .{});
+                builtins.task.groupPush(groupOf(self.readPointerInt(args[0])), start, listItems(u64, valueToRocList(args[2])), args[3].read(u8) != 0, args[4].read(u8) != 0);
+                break :blk Value.zst;
+            },
+            .group_start => blk: {
+                builtins.task.groupStart(groupOf(self.readPointerInt(args[0])));
+                break :blk Value.zst;
+            },
+            .group_next => blk: {
+                const status: u32 = switch (builtins.task.groupNext(groupOf(self.readPointerInt(args[0])))) {
+                    .arrived => 0,
+                    .ended => 1,
+                    .pending => 2,
+                };
+                const val = try self.alloc(ll.ret_layout);
+                val.write(u32, status);
+                break :blk val;
+            },
+            .group_arrival => try self.pointerValue(ll.ret_layout, @intFromPtr(builtins.task.groupArrival(groupOf(self.readPointerInt(args[0]))))),
+            .group_spawn => blk: {
+                const start = self.readBoxedDataPointer(args[1]) orelse
+                    return self.invariantFailedError("LIR/interpreter invariant violated: group_spawn had no start record", .{});
+                builtins.task.spawnIn(groupOf(self.readPointerInt(args[0])), start);
+                break :blk Value.zst;
+            },
+            .group_cancel => blk: {
+                builtins.task.cancelGroup(groupOf(self.readPointerInt(args[0])));
+                break :blk Value.zst;
+            },
+            .group_free => blk: {
+                builtins.task.groupFree(groupOf(self.readPointerInt(args[0])));
+                break :blk Value.zst;
             },
 
             // ── Crash ──
@@ -8300,6 +8359,51 @@ pub const Interpreter = struct {
     }
 
     /// The task a `task_*` operation's pointer operand addresses.
+    fn groupOf(raw: usize) *builtins.task.Group {
+        return @ptrFromInt(raw);
+    }
+
+    /// A borrowed list's items.
+    fn listItems(comptime T: type, list: builtins.list.RocList) []const T {
+        const items = list.elements(T) orelse return &.{};
+        return items[0..list.len()];
+    }
+
+    /// What a running set's result drop needs: this interpreter, the owner
+    /// that keeps it alive, and the result's layout. The group keeps it until
+    /// it closes, after the owner's records may be gone.
+    const GroupResultDrop = struct {
+        interpreter: *LirInterpreter,
+        owner: ?*Retained,
+        layout_idx: layout_mod.Idx,
+    };
+
+    /// The drop context for a set whose results have `layout_idx`, or null
+    /// when its results hold nothing to release.
+    fn groupResultDrop(self: *LirInterpreter, layout_idx: layout_mod.Idx) Error!?*GroupResultDrop {
+        if (self.layout_store.rcHelperPlan(.{ .op = .decref, .layout_idx = layout_idx }) == .noop) return null;
+        const roc_ops = self.roc_env.currentRocOps();
+        const drop: *GroupResultDrop = @ptrCast(@alignCast(roc_ops.alloc(@alignOf(GroupResultDrop), @sizeOf(GroupResultDrop))));
+        drop.* = .{ .interpreter = self, .owner = self.retained_owner, .layout_idx = layout_idx };
+        if (drop.owner) |owner| owner.retain();
+        return drop;
+    }
+
+    fn interpreterGroupResultDrop(slot: [*]u8, context: ?*anyopaque, roc_ops: *RocOps) callconv(.c) void {
+        const drop: *GroupResultDrop = @ptrCast(@alignCast(context.?));
+        if (drop.owner) |owner| owner.enter();
+        defer if (drop.owner) |owner| owner.leave();
+        drop.interpreter.bindCallerRocOps(roc_ops);
+        drop.interpreter.performRcHelperRequired(.{ .op = .decref, .layout_idx = drop.layout_idx }, .{ .ptr = slot }, 1, .atomic);
+    }
+
+    fn interpreterGroupResultDropRelease(context: ?*anyopaque, roc_ops: *RocOps) callconv(.c) void {
+        const drop: *GroupResultDrop = @ptrCast(@alignCast(context.?));
+        const owner = drop.owner;
+        roc_ops.dealloc(@ptrCast(drop), @alignOf(GroupResultDrop));
+        if (owner) |retained| retained.release();
+    }
+
     fn taskOf(raw: usize) *RocTask {
         return @ptrFromInt(raw);
     }
@@ -8606,6 +8710,7 @@ pub const Interpreter = struct {
             .ret_layout = self.store.getLocal(assign.target).layout_idx,
             .unique_args = extra.unique_args,
             .interchangeable = extra.interchangeable,
+            .group_result = extra.group_result.get(),
             .elem_desc = elem_desc,
             .ret_desc = if (target_dynamic) try self.localDesc(frame, assign.target) else null,
         });

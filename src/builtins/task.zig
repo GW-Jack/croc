@@ -738,6 +738,10 @@ fn callHost(f: *const fn (*RocTask) callconv(.c) void, task: *RocTask) void {
 /// (`GroupSpec.result_drop_context`).
 pub const ResultDropFn = *const fn (slot: [*]u8, context: ?*anyopaque, ops: *RocOps) callconv(.c) void;
 
+/// Releases a `ResultDropFn`'s context, once, when its group closes: the
+/// interpreter's context keeps the interpreter alive until then.
+pub const ResultDropReleaseFn = *const fn (context: ?*anyopaque, ops: *RocOps) callconv(.c) void;
+
 /// One entry's marks from a flattened plan (design.md "Plans And Concurrent
 /// Loops").
 pub const EntryMarks = struct {
@@ -766,6 +770,9 @@ pub const GroupSpec = struct {
     /// to release.
     result_drop: ?ResultDropFn,
     result_drop_context: ?*anyopaque,
+    /// Releases `result_drop_context` when the group closes; null when it
+    /// needs no release.
+    result_drop_release: ?ResultDropReleaseFn = null,
 };
 
 /// What `groupNext` found.
@@ -817,6 +824,7 @@ pub const Group = struct {
     slot_alignment: usize,
     result_drop: ?ResultDropFn,
     result_drop_context: ?*anyopaque,
+    result_drop_release: ?ResultDropReleaseFn,
     /// Indexes of reported entries in report order; `reports[taken..len]`
     /// are queued. Each entry reports once, so `capacity` entries fit.
     reports: [*]u32,
@@ -1050,7 +1058,10 @@ pub const Group = struct {
         if (self.paths_capacity > 0) ops.dealloc(@ptrCast(self.paths), @alignOf(u32));
         if (self.limit_count > 0) ops.dealloc(@ptrCast(self.limits), @alignOf(Limit));
         freeBuffer(ops, self.block, self.slot_size * self.block_slots, self.slot_alignment);
+        const release = self.result_drop_release;
+        const context = self.result_drop_context;
         ops.dealloc(@ptrCast(self), @alignOf(Group));
+        if (release) |release_context| release_context(context, ops);
     }
 };
 
@@ -1066,7 +1077,7 @@ fn growArray(ops: *RocOps, items: *anyopaque, old: u32, new: u32, size: usize, a
 /// in input order. Called from the owner's code during its resume.
 pub fn groupCreate(owner: *RocTask, spec: GroupSpec) *Group {
     if (spec.marks.len != spec.starts.len) utils.builtinInvariant(owner.ops, "a group's marks don't match its entries");
-    const group = groupInit(owner, spec.starts.len, spec.limits, spec.root_limit, spec.slot_size, spec.slot_alignment, spec.result_drop, spec.result_drop_context);
+    const group = groupInit(owner, spec.starts.len, spec.limits, spec.root_limit, spec.slot_size, spec.slot_alignment, spec.result_drop, spec.result_drop_context, spec.result_drop_release);
     for (spec.starts, spec.marks) |start_record, marks| groupPush(group, start_record, marks.limit_path, marks.shielded, marks.background);
     groupStart(group);
     return group;
@@ -1085,6 +1096,7 @@ pub fn groupInit(
     slot_alignment: usize,
     result_drop: ?ResultDropFn,
     result_drop_context: ?*anyopaque,
+    result_drop_release: ?ResultDropReleaseFn,
 ) *Group {
     const ops = owner.ops;
     const group: *Group = @ptrCast(@alignCast(ops.alloc(@alignOf(Group), @sizeOf(Group))));
@@ -1109,6 +1121,7 @@ pub fn groupInit(
         .slot_alignment = slot_alignment,
         .result_drop = result_drop,
         .result_drop_context = result_drop_context,
+        .result_drop_release = result_drop_release,
         .reports = undefined,
         .reports_len = 0,
         .reports_taken = 0,

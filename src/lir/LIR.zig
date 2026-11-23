@@ -1314,6 +1314,9 @@ pub const LowLevelExtra = struct {
     /// with different storage representations use this explicit fact rather
     /// than reconstructing the transform function return type.
     map_output_elem: collections.OptionalId(layout.Idx) = .none,
+    /// For `group_init`: the layout of an entry's result, which sizes the
+    /// running set's slots and gives the drop for a result nobody takes.
+    group_result: collections.OptionalId(layout.Idx) = .none,
     /// Set on a list operation a `.boxy` generic body emits: its last
     /// argument is the `opaque_ptr` descriptor of the list's elements, which
     /// supplies the element width, alignment, and reference counting the

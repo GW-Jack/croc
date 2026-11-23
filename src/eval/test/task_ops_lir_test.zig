@@ -505,3 +505,246 @@ pub fn abortRecord(task: *RocTask) callconv(.c) void {
 pub fn abortUnexpected(_: *RocTask) callconv(.c) void {
     std.debug.panic("a woken task's cancel aborted the host call", .{});
 }
+
+/// Tasks the running-set test's `roc_task_ready` was handed, in order.
+const ReadyChildren = struct {
+    var tasks: [8]*RocTask = undefined;
+    var len: usize = 0;
+
+    fn ready(task: *RocTask) callconv(.c) void {
+        tasks[len] = task;
+        len += 1;
+    }
+
+    fn abort(_: *RocTask) callconv(.c) void {}
+};
+
+/// An entry's start procedure, as the continuation pass makes one: an
+/// erased callable of the task that returns `result`.
+fn constantStart(f: *Fixture, result: i64) TaskOpsTestError!LIR.LirProcSpecId {
+    const erased = try f.layouts.insertErasedCallable();
+    const task = try f.store.addLocal(.{ .layout_idx = .opaque_ptr });
+    const capture = try f.store.addLocal(.{ .layout_idx = .opaque_ptr });
+    const reuse = try f.store.addLocal(.{ .layout_idx = erased });
+    const value = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const body = try f.store.addCFStmt(.{ .assign_literal = .{
+        .target = value,
+        .value = .{ .i64_literal = .{ .value = result, .layout_idx = .u64 } },
+        .next = try f.ret(value),
+    } }, .test_fixture);
+    return try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = try f.store.addLocalSpan(&.{ task, capture, reuse }),
+        .frame_locals = try f.store.addLocalSpan(&.{ task, capture, reuse, value }),
+        .body = .some(body),
+        .ret_layout = .u64,
+        .abi = .erased_callable,
+        .erased_capture_arg = .some(capture),
+        .erased_reuse_arg = .some(reuse),
+        .erased_call_args = .some(try f.store.internErasedCallArgsPlan(&f.layouts, &.{.opaque_ptr})),
+    }, .none);
+}
+
+/// A procedure of one `opaque_ptr` argument whose body `build` makes from
+/// that argument.
+fn pointerProc(f: *Fixture, arg: LocalId, body: CFStmtId, ret_layout: layout.Idx) TaskOpsTestError!LIR.LirProcSpecId {
+    const proc = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = try f.store.addLocalSpan(&.{arg}),
+        .frame_locals = try f.store.addLocalSpan(f.locals.items),
+        .body = .some(body),
+        .ret_layout = ret_layout,
+    }, .none);
+    f.locals.clearRetainingCapacity();
+    return proc;
+}
+
+fn literal(f: *Fixture, target: LocalId, value: i64, layout_idx: layout.Idx, next: CFStmtId) TaskOpsTestError!CFStmtId {
+    return try f.store.addCFStmt(.{ .assign_literal = .{
+        .target = target,
+        .value = .{ .i64_literal = .{ .value = value, .layout_idx = layout_idx } },
+        .next = next,
+    } }, .test_fixture);
+}
+
+test "the running-set operations run each entry as a child task and move its result out of its slot" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const erased = try f.layouts.insertErasedCallable();
+    const list_u64 = try f.layouts.insertList(.u64);
+    const ptr_u64 = try f.layouts.insertPtr(.u64);
+    const starts = [_]LIR.LirProcSpecId{ try constantStart(&f, 5), try constantStart(&f, 7) };
+
+    // make(task): g = group_init(task, 2, [], 0); push each entry under no
+    // limit; group_start(g); ret g
+    const make = blk: {
+        const task_arg = try f.local(.opaque_ptr);
+        const set = try f.local(.opaque_ptr);
+        const count = try f.local(.u64);
+        const no_limit = try f.local(.u64);
+        const limits = try f.local(list_u64);
+        const path = try f.local(list_u64);
+        const no = try f.local(.bool);
+        const unit = try f.local(.zst);
+        var start_locals: [2]LocalId = undefined;
+        for (&start_locals) |*start| start.* = try f.local(erased);
+        var head = try f.op(unit, .group_start, &.{set}, try f.ret(set));
+        var index: usize = start_locals.len;
+        while (index > 0) {
+            index -= 1;
+            head = try f.op(unit, .group_push, &.{ set, start_locals[index], path, no, no }, head);
+        }
+        head = try f.store.addCFStmt(.{ .assign_low_level = .{
+            .target = set,
+            .op = .group_init,
+            .rc_effect = try f.store.addRcEffect(LowLevel.group_init.rcEffect()),
+            .extra = try f.store.addStmtRow(LIR.LowLevelExtra, .{ .group_result = .some(.u64) }),
+            .args = try f.store.addLocalSpan(&.{ task_arg, count, limits, no_limit }),
+            .next = head,
+        } }, .test_fixture);
+        head = try f.store.addCFStmt(.{ .assign_list = .{ .target = path, .elems = .empty(), .next = head } }, .test_fixture);
+        head = try f.store.addCFStmt(.{ .assign_list = .{ .target = limits, .elems = .empty(), .next = head } }, .test_fixture);
+        head = try literal(&f, no, 0, .bool, head);
+        head = try literal(&f, no_limit, 0, .u64, head);
+        head = try literal(&f, count, 2, .u64, head);
+        index = start_locals.len;
+        while (index > 0) {
+            index -= 1;
+            head = try f.store.addCFStmt(.{ .assign_packed_erased_fn = .{
+                .target = start_locals[index],
+                .data = try f.store.addStmtRow(LIR.PackedErasedFnData, .{
+                    .proc = starts[index],
+                    .capture = .none,
+                    .capture_layout = .none,
+                    .on_drop = .none,
+                }),
+                .next = head,
+            } }, .test_fixture);
+        }
+        break :blk try pointerProc(&f, task_arg, head, .opaque_ptr);
+    };
+    // take(g): group_next(g) must be 0; ret ptr_load(group_arrival(g))
+    const take = blk: {
+        const set = try f.local(.opaque_ptr);
+        const status = try f.local(.u32);
+        const slot = try f.local(ptr_u64);
+        const value = try f.local(.u64);
+        const load = try f.op(value, .ptr_load, &.{slot}, try f.ret(value));
+        const arrival = try f.op(slot, .group_arrival, &.{set}, load);
+        break :blk try pointerProc(&f, set, try f.op(status, .group_next, &.{set}, arrival), .u64);
+    };
+    // next(g): ret group_next(g)
+    const next = blk: {
+        const set = try f.local(.opaque_ptr);
+        const status = try f.local(.u32);
+        break :blk try pointerProc(&f, set, try f.op(status, .group_next, &.{set}, try f.ret(status)), .u32);
+    };
+    // free(g): group_free(g); ret {}
+    const free = blk: {
+        const set = try f.local(.opaque_ptr);
+        const unit = try f.local(.zst);
+        break :blk try pointerProc(&f, set, try f.op(unit, .group_free, &.{set}, try f.ret(unit)), .zst);
+    };
+
+    var static_strings = try eval.Interpreter.buildStaticStrings(f.allocator, &f.store);
+    defer static_strings.deinit();
+    var interp = try eval.Interpreter.init(f.allocator, &f.store, &f.layouts, static_strings.view(), f.runtime_env.get_ops());
+    defer interp.deinit();
+    const call = struct {
+        fn call(i: *eval.Interpreter, proc: LIR.LirProcSpecId, arg: usize) TaskOpsTestError!eval.Interpreter.EvalResult {
+            var address = arg;
+            return try i.eval(.{ .proc_id = proc, .arg_layouts = &.{.opaque_ptr}, .arg_ptr = @ptrCast(&address) });
+        }
+    }.call;
+
+    var slot: [8]u8 = undefined;
+    var buffer: [8]u8 = undefined;
+    var owner = bareTask(&slot, &buffer);
+    owner.ops = f.runtime_env.get_ops();
+    owner.ready_fn = &ReadyChildren.ready;
+    owner.abort_fn = &ReadyChildren.abort;
+    ReadyChildren.len = 0;
+
+    // Both entries start as children, readied in input order.
+    const set = (try call(&interp, make, @intFromPtr(&owner))).value.read(usize);
+    try std.testing.expectEqual(@as(usize, 2), ReadyChildren.len);
+    try std.testing.expectEqual(@as(u32, 2), (try call(&interp, next, set)).value.read(u32));
+
+    // The host resumes the second child first, so its result arrives first.
+    for ([_]usize{ 1, 0 }) |index| {
+        const child = ReadyChildren.tasks[index];
+        try std.testing.expectEqual(builtins.task.Status.done, child.resumeFromHost(&ReadyChildren.ready, &ReadyChildren.abort));
+    }
+    try std.testing.expectEqual(@as(u64, 7), (try call(&interp, take, set)).value.read(u64));
+    try std.testing.expectEqual(@as(u64, 5), (try call(&interp, take, set)).value.read(u64));
+    try std.testing.expectEqual(@as(u32, 1), (try call(&interp, next, set)).value.read(u32));
+    _ = try call(&interp, free, set);
+    try f.runtime_env.checkForLeaks();
+}
+
+test "a running set of heap results drops one through the interpreter and releases its drop at close" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const list_u64 = try f.layouts.insertList(.u64);
+
+    // make(task): g = group_init(task, 0, [], 0) with Str results; group_start(g); ret g
+    const make = blk: {
+        const task_arg = try f.local(.opaque_ptr);
+        const set = try f.local(.opaque_ptr);
+        const count = try f.local(.u64);
+        const no_limit = try f.local(.u64);
+        const limits = try f.local(list_u64);
+        const unit = try f.local(.zst);
+        var head = try f.op(unit, .group_start, &.{set}, try f.ret(set));
+        head = try f.store.addCFStmt(.{ .assign_low_level = .{
+            .target = set,
+            .op = .group_init,
+            .rc_effect = try f.store.addRcEffect(LowLevel.group_init.rcEffect()),
+            .extra = try f.store.addStmtRow(LIR.LowLevelExtra, .{ .group_result = .some(.str) }),
+            .args = try f.store.addLocalSpan(&.{ task_arg, count, limits, no_limit }),
+            .next = head,
+        } }, .test_fixture);
+        head = try f.store.addCFStmt(.{ .assign_list = .{ .target = limits, .elems = .empty(), .next = head } }, .test_fixture);
+        head = try literal(&f, no_limit, 0, .u64, head);
+        head = try literal(&f, count, 0, .u64, head);
+        break :blk try pointerProc(&f, task_arg, head, .opaque_ptr);
+    };
+    // finish(g): group_next(g); group_free(g); ret the status
+    const finish = blk: {
+        const set = try f.local(.opaque_ptr);
+        const status = try f.local(.u32);
+        const unit = try f.local(.zst);
+        const free = try f.op(unit, .group_free, &.{set}, try f.ret(status));
+        break :blk try pointerProc(&f, set, try f.op(status, .group_next, &.{set}, free), .u32);
+    };
+
+    var static_strings = try eval.Interpreter.buildStaticStrings(f.allocator, &f.store);
+    defer static_strings.deinit();
+    var interp = try eval.Interpreter.init(f.allocator, &f.store, &f.layouts, static_strings.view(), f.runtime_env.get_ops());
+    defer interp.deinit();
+
+    var slot: [8]u8 = undefined;
+    var buffer: [8]u8 = undefined;
+    var owner = bareTask(&slot, &buffer);
+    owner.ops = f.runtime_env.get_ops();
+    owner.ready_fn = &ReadyChildren.ready;
+    owner.abort_fn = &ReadyChildren.abort;
+
+    var address = @intFromPtr(&owner);
+    const made = try interp.eval(.{ .proc_id = make, .arg_layouts = &.{.opaque_ptr}, .arg_ptr = @ptrCast(&address) });
+    const group: *builtins.task.Group = @ptrFromInt(made.value.read(usize));
+
+    // A heap string in a result slot, as an entry nobody takes would leave
+    // it; the set's drop must release it.
+    var result: builtins.str.RocStr = .fromSlice("a string too long to fit in a small string", owner.ops);
+    try std.testing.expect(!result.isSmallStr());
+    const drop = group.result_drop orelse return error.TestUnexpectedResult;
+    drop(@ptrCast(&result), group.result_drop_context, owner.ops);
+
+    address = @intFromPtr(group);
+    const ended = try interp.eval(.{ .proc_id = finish, .arg_layouts = &.{.opaque_ptr}, .arg_ptr = @ptrCast(&address) });
+    try std.testing.expectEqual(@as(u32, 1), ended.value.read(u32));
+    try f.runtime_env.checkForLeaks();
+}
