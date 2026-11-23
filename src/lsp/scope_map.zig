@@ -200,6 +200,7 @@ pub const ScopeMap = struct {
                 .e_nominal_external,
                 .e_hosted_lambda,
                 .e_dbg,
+                .e_spawn,
                 .e_expect_err,
                 .e_expect,
                 .e_return,

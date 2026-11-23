@@ -527,6 +527,11 @@ pub const Tag = enum {
     /// * lhs - node index for expr
     /// * rhs - ignored
     return_expr,
+    /// A spawn expression, which adds an entry to the enclosing concurrent loop.
+    /// Example: `spawn fetch(link)`
+    /// * lhs - node index for the spawned expression
+    /// * rhs - ignored
+    spawn,
     /// DESCRIPTION
     /// Example: EXAMPLE
     /// * lhs - LHS DESCRIPTION

@@ -424,7 +424,30 @@ fn writeDecl(self: *Self, depth: u8) std.mem.Allocator.Error!void {
     }
 }
 
-const BlockKind = enum { body, loop_body, associated };
+/// `for_bang_body` is a loop body inside a `for!` loop of the same function,
+/// where a `spawn` may appear (design.md "Plans And Concurrent Loops").
+const BlockKind = enum {
+    body,
+    loop_body,
+    for_bang_body,
+    associated,
+
+    fn isLoopBody(kind: BlockKind) bool {
+        return switch (kind) {
+            .loop_body, .for_bang_body => true,
+            .body, .associated => false,
+        };
+    }
+
+    /// The kind of a loop body nested in a block of this kind: a `spawn`
+    /// stays valid in a loop nested inside a `for!` body.
+    fn nestedLoopBody(kind: BlockKind) BlockKind {
+        return switch (kind) {
+            .for_bang_body => .for_bang_body,
+            .body, .loop_body, .associated => .loop_body,
+        };
+    }
+};
 
 /// Writes statements on their own lines, ending at the block's indentation
 /// level so the caller can write the closing delimiter.
@@ -432,7 +455,7 @@ fn writeBlockStatements(self: *Self, depth: u8, kind: BlockKind) std.mem.Allocat
     self.indent += 1;
     const count: u8 = switch (kind) {
         .associated => self.choose(3),
-        .body, .loop_body => self.choose(3),
+        .body, .loop_body, .for_bang_body => self.choose(3),
     };
     for (0..count) |index| {
         try self.writeNewline();
@@ -442,7 +465,7 @@ fn writeBlockStatements(self: *Self, depth: u8, kind: BlockKind) std.mem.Allocat
                 1 => try self.writeTypeDecl(depth -| 1),
                 else => try self.writeDecl(depth -| 1),
             },
-            .body, .loop_body => try self.writeBodyStatement(depth -| 1, kind, index == 0),
+            .body, .loop_body, .for_bang_body => try self.writeBodyStatement(depth -| 1, kind, index == 0),
         }
     }
     if (kind != .associated and count == 0) {
@@ -453,7 +476,7 @@ fn writeBlockStatements(self: *Self, depth: u8, kind: BlockKind) std.mem.Allocat
     }
     if (kind != .associated) {
         try self.writeNewline();
-        if (kind == .loop_body and self.choose(4) == 0) {
+        if (kind.isLoopBody() and self.choose(4) == 0) {
             try self.write("break");
         } else {
             try self.writeExpr(depth -| 1);
@@ -466,7 +489,7 @@ fn writeBlockStatements(self: *Self, depth: u8, kind: BlockKind) std.mem.Allocat
 /// The first statement of a block is never a bare expression or a type
 /// annotation, both of which would make the block parse as a record.
 fn writeBodyStatement(self: *Self, depth: u8, kind: BlockKind, first: bool) std.mem.Allocator.Error!void {
-    switch (self.choose(if (first) 8 else 12)) {
+    switch (self.choose(if (first) 8 else 13)) {
         0 => {
             try self.write("var $");
             try self.writeSymbol(self.fresh(.value));
@@ -495,13 +518,13 @@ fn writeBodyStatement(self: *Self, depth: u8, kind: BlockKind, first: bool) std.
             try self.write("crash ");
             try self.writePlainString();
         },
-        6 => try self.writeForStatement(depth),
+        6 => try self.writeForStatement(depth, kind),
         7 => try self.writeDecl(depth),
         8 => {
             try self.write("while ");
             try self.writeExpr(depth);
             try self.write(" {");
-            try self.writeBlockStatements(depth, .loop_body);
+            try self.writeBlockStatements(depth, kind.nestedLoopBody());
             try self.write("}");
         },
         9 => try self.writeTypeAnnoStatement(depth, .body),
@@ -512,18 +535,25 @@ fn writeBodyStatement(self: *Self, depth: u8, kind: BlockKind, first: bool) std.
             try self.writeBlockStatements(depth, kind);
             try self.write("}");
         },
-        11 => if (kind == .loop_body) try self.write("break") else try self.writeExpr(depth),
+        11 => if (kind.isLoopBody()) try self.write("break") else try self.writeExpr(depth),
+        // A `spawn` statement adds a zero-argument function to the `for!`
+        // loop around it; elsewhere this is a plain expression statement.
+        12 => if (kind == .for_bang_body) {
+            try self.write("spawn || ");
+            try self.writeExpr(depth);
+        } else try self.writeExpr(depth),
         else => unreachable,
     }
 }
 
-fn writeForStatement(self: *Self, depth: u8) std.mem.Allocator.Error!void {
-    try self.write(if (self.reader.boolean()) "for " else "for! ");
+fn writeForStatement(self: *Self, depth: u8, kind: BlockKind) std.mem.Allocator.Error!void {
+    const is_for_bang = !self.reader.boolean();
+    try self.write(if (is_for_bang) "for! " else "for ");
     try self.writeDeclPattern(depth -| 2);
     try self.write(" in ");
     try self.writeExpr(depth);
     try self.write(" {");
-    try self.writeBlockStatements(depth, .loop_body);
+    try self.writeBlockStatements(depth, if (is_for_bang) .for_bang_body else kind.nestedLoopBody());
     try self.write("}");
 }
 

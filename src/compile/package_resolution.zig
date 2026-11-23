@@ -2351,6 +2351,7 @@ fn appendPlatformDep(
         .if_without_else,
         .match,
         .dbg,
+        .spawn,
         .crash,
         .record_builder,
         .nominal_record,

@@ -1479,6 +1479,7 @@ fn countMatchExprRoots(test_env: *const TestEnv) usize {
             .e_type_dispatch_call,
             .e_tuple_access,
             .e_dbg,
+            .e_spawn,
             .e_expect_err,
             .e_expect,
             .e_for,

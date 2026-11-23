@@ -261,6 +261,40 @@ test "pipe question suffix precedence distinguishes empty call" {
     try std.testing.expectEqual(.arrow_call, std.meta.activeTag(target_with_arg_pipe));
 }
 
+test "spawn starts an expression only before a same-line operand" {
+    const gpa = std.testing.allocator;
+    // `spawn f`, `spawn || f`, `spawn (f)` and `spawn Foo` are spawns; `spawn(f)` is a call,
+    // and a bare `spawn` is a lookup.
+    const source = "(spawn f, spawn || f, spawn (f), spawn Foo, spawn(f), spawn)";
+
+    var env = try CommonEnv.init(gpa, source);
+    defer env.deinit(gpa);
+
+    const ast = try expr(gpa, &env);
+    defer ast.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), ast.tokenize_diagnostics.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ast.parse_diagnostics.items.len);
+
+    const root = ast.store.getExpr(@fromBackingInt(@intCast(ast.root_node_idx)));
+    try std.testing.expectEqual(.tuple, std.meta.activeTag(root));
+    const items = ast.store.exprSlice(root.tuple.items);
+    try std.testing.expectEqual(@as(usize, 6), items.len);
+
+    const spawned_lookup = ast.store.getExpr(items[0]);
+    try std.testing.expectEqual(.spawn, std.meta.activeTag(spawned_lookup));
+    try std.testing.expectEqual(.ident, std.meta.activeTag(ast.store.getExpr(spawned_lookup.spawn.expr)));
+
+    const spawned_lambda = ast.store.getExpr(items[1]);
+    try std.testing.expectEqual(.spawn, std.meta.activeTag(spawned_lambda));
+    try std.testing.expectEqual(.lambda, std.meta.activeTag(ast.store.getExpr(spawned_lambda.spawn.expr)));
+
+    try std.testing.expectEqual(.spawn, std.meta.activeTag(ast.store.getExpr(items[2])));
+    try std.testing.expectEqual(.spawn, std.meta.activeTag(ast.store.getExpr(items[3])));
+    try std.testing.expectEqual(.apply, std.meta.activeTag(ast.store.getExpr(items[4])));
+    try std.testing.expectEqual(.ident, std.meta.activeTag(ast.store.getExpr(items[5])));
+}
+
 test "whitespace-separated postfix after pipe applies to pipe result" {
     // Repro for https://github.com/roc-lang/roc/issues/10517
     const gpa = std.testing.allocator;

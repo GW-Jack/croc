@@ -10206,6 +10206,7 @@ test "literal conversion ownership includes nested codec evidence" {
                 .runtime_error,
                 .crash,
                 .dbg,
+                .spawn,
                 .expect_err,
                 .expect,
                 .ellipsis,

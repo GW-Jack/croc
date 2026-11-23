@@ -933,6 +933,12 @@ test "NodeStore round trip - Expr" {
         },
     });
     try expressions.append(gpa, AST.Expr{
+        .spawn = .{
+            .expr = rand_idx(random, AST.Expr.Idx),
+            .region = rand_region(random),
+        },
+    });
+    try expressions.append(gpa, AST.Expr{
         .crash = .{
             .expr = rand_idx(random, AST.Expr.Idx),
             .region = rand_region(random),

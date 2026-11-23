@@ -104,6 +104,7 @@ const EffectfulTopLevel = problem_mod.EffectfulTopLevel;
 const EffectfulComptimeExpression = problem_mod.EffectfulComptimeExpression;
 const EffectfulExpect = problem_mod.EffectfulExpect;
 const ConcurrentLoopNotLowered = problem_mod.ConcurrentLoopNotLowered;
+const SpawnOutsidePlanLoop = problem_mod.SpawnOutsidePlanLoop;
 const EffectfulFunctionName = problem_mod.EffectfulFunctionName;
 const RedundantOpenTagUnion = problem_mod.RedundantOpenTagUnion;
 
@@ -1108,6 +1109,9 @@ pub const ReportBuilder = struct {
             },
             .concurrent_loop_not_lowered => |data| {
                 return self.buildConcurrentLoopNotLoweredReport(data);
+            },
+            .spawn_outside_plan_loop => |data| {
+                return self.buildSpawnOutsidePlanLoopReport(data);
             },
             .effectful_function_name => |data| {
                 return self.buildEffectfulFunctionNameReport(data);
@@ -3530,6 +3534,7 @@ pub const ReportBuilder = struct {
                 .e_closure,
                 .e_crash,
                 .e_dbg,
+                .e_spawn,
                 .e_deferred_import_ref,
                 .e_derived_method,
                 .e_dispatch_call,
@@ -5762,6 +5767,12 @@ pub const ReportBuilder = struct {
     fn buildConcurrentLoopNotLoweredReport(self: *Self, data: ConcurrentLoopNotLowered) Allocator.Error!Report {
         return self.buildHighlightedRegionReport("Concurrent Loop Not Supported Yet", "This `for!` loop runs a plan, and this compiler can't compile concurrent loops yet.", .runtime_error, data.region, &.{
             D.bytes("The loop crashes if it runs."),
+        });
+    }
+
+    fn buildSpawnOutsidePlanLoopReport(self: *Self, data: SpawnOutsidePlanLoop) Allocator.Error!Report {
+        return self.buildHighlightedRegionReport("Spawn Outside Plan Loop", "This `spawn` is not inside a `for!` loop over a plan.", .runtime_error, data.region, &.{
+            D.bytes("A `spawn` adds an entry to the innermost `for!` loop around it that runs a plan, a value of type `Concurrently(a)`. The `for!` loops around this one run streams instead, so the `spawn` crashes if it runs."),
         });
     }
 

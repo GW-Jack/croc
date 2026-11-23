@@ -185,6 +185,8 @@ const Class = enum(u8) {
     property,
     enum_member,
     function,
+    /// A contextual keyword: a `spawn` that starts a spawn expression.
+    keyword,
 
     fn semanticType(self: Class) ?SemanticType {
         return switch (self) {
@@ -197,6 +199,7 @@ const Class = enum(u8) {
             .property => .property,
             .enum_member => .enumMember,
             .function => .function,
+            .keyword => .keyword,
         };
     }
 
@@ -314,7 +317,7 @@ const CheckedClassifier = struct {
             .default => 0,
             .namespace, .type, .type_parameter, .variable => 1,
             .parameter, .function, .enum_member => 2,
-            .property, .type_declaration => 3,
+            .property, .type_declaration, .keyword => 3,
             .skip => 4,
         };
     }
@@ -514,6 +517,8 @@ const CheckedClassifier = struct {
             .e_dispatch_call => |call| self.setIdent(call.method_name_region, call.method_name, .function),
             .e_type_method_call => |call| self.setIdent(call.method_name_region, call.method_name, .function),
             .e_type_dispatch_call => |call| self.setIdent(call.method_name_region, call.method_name, .function),
+            // `spawn` is a contextual keyword, tokenized as an identifier.
+            .e_spawn => self.set(self.firstTokenAtOrAfter(region.start.offset), .keyword),
             .e_num,
             .e_frac_f32,
             .e_frac_f64,
@@ -1259,6 +1264,10 @@ const Classifier = struct {
                 try self.push(.{ .expr = f.expr });
             },
             .dbg => |e| try self.push(.{ .expr = e.expr }),
+            .spawn => |e| {
+                self.set(e.region.start, .keyword);
+                try self.push(.{ .expr = e.expr });
+            },
             .crash => |e| try self.push(.{ .expr = e.expr }),
             .@"return" => |e| try self.push(.{ .expr = e.expr }),
             .list => |l| try self.pushExprs(self.ast.store.exprSlice(l.items)),

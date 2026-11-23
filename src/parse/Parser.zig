@@ -358,6 +358,7 @@ const ExprParentKind = enum(u16) {
     expr_match_guard = 0x0f6b,
     expr_match_body = 0xe148,
     expr_dbg = 0x68b5,
+    expr_spawn = 0x5c3e,
     expr_crash = 0x23a1,
     expr_return = 0xf86e,
     expr_for_list = 0xb739,
@@ -973,6 +974,24 @@ fn addMalformedNode(
         // Cast the cached node to the requested type
         return @fromBackingInt(@intCast(@backingInt(self.cached_malformed_node.?)));
     }
+}
+
+/// Whether the `LowerIdent` at the current position starts a `spawn`
+/// expression. `spawn` is contextual: it starts one only when its text is
+/// `spawn` and the next token, on the same line, can start the spawned
+/// expression (an identifier, a lambda, a spaced `(`, `if` or `match`).
+/// Anywhere else, `spawn(f)` included, it stays an identifier.
+fn startsSpawnExpr(self: *Parser) bool {
+    std.debug.assert(self.peek() == .LowerIdent); // rationale: callers check the token before asking
+    const next = self.peekNext();
+    const next_starts_operand = next == .LowerIdent or next == .UpperIdent or next == .OpBar or
+        next == .OpenRound or next == .KwIf or next == .KwMatch;
+    if (!next_starts_operand) return false;
+    if (!std.mem.eql(u8, self.tokenText(self.pos), "spawn")) return false;
+    const source = self.tok_buf.env.source;
+    const spawn_end: usize = @intCast(self.tok_buf.resolve(self.pos).end.offset);
+    const next_start: usize = @intCast(self.tok_buf.resolve(self.pos + 1).start.offset);
+    return std.mem.findScalar(u8, source[spawn_end..next_start], '\n') == null;
 }
 
 fn recoverMalformedTypeDeclLine(self: *Parser, start: TokenIdx) void {
@@ -3420,6 +3439,7 @@ fn isParenthesizedLiteral(self: *Parser, expr: AST.Expr.Idx) bool {
         .@"break",
         .crash,
         .dbg,
+        .spawn,
         .ellipsis,
         .field_access,
         .for_expr,
@@ -3789,6 +3809,13 @@ fn runExprStatementKernel(
                     continue :expr_kernel .suffix;
                 }
             } else if (tok_int < @backingInt(Token.Tag.OpPlus)) {
+                if (tok == .LowerIdent and self.startsSpawnExpr()) {
+                    const start = self.pos;
+                    self.advance();
+                    try open_syntax.pushExpr(open_allocator, .expr_spawn, ExprAfterExprState, .{ .start = start, .min_bp = expr_state.min_bp });
+                    expr_state = .{ .start = self.pos, .min_bp = 0 };
+                    continue :expr_kernel .prefix;
+                }
                 if (tok == .LowerIdent or tok == .NamedUnderscore) {
                     const start = self.pos;
                     self.advance();
@@ -4751,6 +4778,16 @@ fn runExprStatementKernel(
                         const state = open_syntax.popExprPayload(.expr_dbg, ExprAfterExprState);
                         last_expr = null;
                         const expr = try self.store.addExpr(.{ .dbg = .{
+                            .region = .{ .start = state.start, .end = self.pos },
+                            .expr = completed,
+                        } });
+                        expr_finish_state = .{ .start = state.start, .min_bp = state.min_bp, .expr = expr };
+                        continue :expr_kernel .suffix;
+                    },
+                    .expr_spawn => {
+                        const state = open_syntax.popExprPayload(.expr_spawn, ExprAfterExprState);
+                        last_expr = null;
+                        const expr = try self.store.addExpr(.{ .spawn = .{
                             .region = .{ .start = state.start, .end = self.pos },
                             .expr = completed,
                         } });

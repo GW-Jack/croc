@@ -539,6 +539,11 @@ test "NodeStore round trip - Expressions" {
         },
     });
     try expressions.append(gpa, CIR.Expr{
+        .e_spawn = .{
+            .expr = rand_idx(CIR.Expr.Idx),
+        },
+    });
+    try expressions.append(gpa, CIR.Expr{
         .e_expect_err = .{
             .expr = rand_idx(CIR.Expr.Idx),
             .snippet = rand_idx(StringLiteral.Idx),
@@ -1288,6 +1293,12 @@ test "NodeStore round trip - Diagnostics" {
 
     try diagnostics.append(gpa, CIR.Diagnostic{
         .break_outside_loop = .{
+            .region = rand_region(),
+        },
+    });
+
+    try diagnostics.append(gpa, CIR.Diagnostic{
+        .spawn_outside_concurrent_loop = .{
             .region = rand_region(),
         },
     });

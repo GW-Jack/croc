@@ -238,6 +238,9 @@ pub const ExprData = union(enum) {
     runtime_error: struct { evaluated: []const ExprId = &.{} },
     crash: base.StringLiteral.Idx,
     dbg: ExprId,
+    /// `spawn f`, adding the function `f` to the innermost enclosing plan
+    /// loop (design.md "Plans And Concurrent Loops").
+    spawn: ExprId,
     expect_err: struct {
         expr: ExprId,
         snippet: base.StringLiteral.Idx,
@@ -786,6 +789,7 @@ pub const CheckedBodies = struct {
             .e_runtime_error => |runtime_error| .{ .runtime_error = .{ .evaluated = node_store.sliceExpr(runtime_error.evaluated) } },
             .e_crash => |crash| .{ .crash = crash.msg },
             .e_dbg => |dbg| .{ .dbg = dbg.expr },
+            .e_spawn => |spawn| .{ .spawn = spawn.expr },
             .e_expect_err => |expect_err| .{ .expect_err = .{ .expr = expect_err.expr, .snippet = expect_err.snippet } },
             .e_expect => |expect| .{ .expect = expect.body },
             .e_ellipsis => .ellipsis,

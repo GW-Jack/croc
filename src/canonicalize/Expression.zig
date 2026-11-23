@@ -570,6 +570,16 @@ pub const Expr = union(enum) {
     e_dbg: struct {
         expr: Expr.Idx,
     },
+    /// Adds `expr`, a `() => a` function, as an entry to the innermost
+    /// enclosing concurrent loop. Canonicalization makes one only inside a
+    /// `for!` body in the same function. Evaluates to `{}`.
+    ///
+    /// ```roc
+    /// spawn fetch(link)
+    /// ```
+    e_spawn: struct {
+        expr: Expr.Idx,
+    },
     /// The Err arm of a `?` operator used directly inside a top-level `expect`.
     /// Consumes the Err payload and fails the enclosing `expect` at runtime,
     /// reporting the payload value. This expression never returns.
@@ -1587,6 +1597,14 @@ pub const Expr = union(enum) {
             },
             .e_dbg => |e| {
                 const begin = try ir.beginSExprNodeAt(tree, "e-dbg", expr_idx);
+                const attrs = tree.beginNode();
+
+                try ir.store.getExpr(e.expr).pushToSExprTree(ir, tree, e.expr);
+
+                try tree.endNode(begin, attrs);
+            },
+            .e_spawn => |e| {
+                const begin = try ir.beginSExprNodeAt(tree, "e-spawn", expr_idx);
                 const attrs = tree.beginNode();
 
                 try ir.store.getExpr(e.expr).pushToSExprTree(ir, tree, e.expr);

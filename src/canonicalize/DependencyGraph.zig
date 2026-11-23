@@ -1571,6 +1571,7 @@ const DemandAnalyzer = struct {
                 if (deferred.backing) |backing| try walk.push(self.allocator, .{ .visit = backing.expr });
             },
             .e_dbg => |dbg| try walk.push(self.allocator, .{ .visit = dbg.expr }),
+            .e_spawn => |spawn| try walk.push(self.allocator, .{ .visit = spawn.expr }),
             .e_expect_err => |expect_err| try walk.push(self.allocator, .{ .visit = expect_err.expr }),
             .e_expect => |expect| try walk.push(self.allocator, .{ .visit = expect.body }),
             .e_return => |ret| try walk.push(self.allocator, .{ .visit = ret.expr }),
@@ -2341,6 +2342,7 @@ pub fn collectNameReferences(
                 for (cir.store.sliceExpr(run_ll.args)) |arg| try scratch_stack.append(allocator, arg);
             },
             .e_dbg => |dbg| try scratch_stack.append(allocator, dbg.expr),
+            .e_spawn => |spawn| try scratch_stack.append(allocator, spawn.expr),
             .e_expect_err => |expect_err| try scratch_stack.append(allocator, expect_err.expr),
             .e_expect => |expect| try scratch_stack.append(allocator, expect.body),
             // NOTE: `ret.lambda` is a back-reference to the enclosing lambda,

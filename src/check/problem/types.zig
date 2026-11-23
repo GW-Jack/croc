@@ -104,6 +104,7 @@ pub const Problem = union(enum) {
     effectful_comptime_expression: EffectfulComptimeExpression,
     effectful_expect: EffectfulExpect,
     concurrent_loop_not_lowered: ConcurrentLoopNotLowered,
+    spawn_outside_plan_loop: SpawnOutsidePlanLoop,
     effectful_function_name: EffectfulFunctionName,
     annotation_only_value: AnnotationOnlyValue,
     annotation_only_value_use: AnnotationOnlyValueUse,
@@ -354,6 +355,13 @@ pub const EffectfulExpect = struct {
 /// A `for!` loop over a plan (design.md "Plans And Concurrent Loops"). It
 /// checks, but no backend compiles it yet, so the loop crashes if it runs.
 pub const ConcurrentLoopNotLowered = struct {
+    region: base.Region,
+};
+
+/// A `spawn` with no plan loop to add its entry to (design.md "Plans And
+/// Concurrent Loops"): the `for!` loops enclosing it in its function run
+/// streams, not plans. The `spawn` crashes if it runs.
+pub const SpawnOutsidePlanLoop = struct {
     region: base.Region,
 };
 

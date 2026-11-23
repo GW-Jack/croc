@@ -272,7 +272,7 @@ pub fn CirVisitor(comptime Context: type) type {
                 inline .e_nominal, .e_nominal_external => |nom| {
                     self.walkExpr(store, nom.backing_expr);
                 },
-                inline .e_dbg, .e_expect_err => |dbg| {
+                inline .e_dbg, .e_spawn, .e_expect_err => |dbg| {
                     self.walkExpr(store, dbg.expr);
                 },
                 .e_expect => |exp| {

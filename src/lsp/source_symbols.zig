@@ -385,6 +385,7 @@ const Walk = struct {
             .e_tuple_access,
             .e_runtime_error,
             .e_crash,
+            .e_spawn,
             .e_expect_err,
             .e_expect,
             .e_ellipsis,

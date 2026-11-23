@@ -477,6 +477,12 @@ pub const Diagnostic = union(enum) {
     break_outside_loop: struct {
         region: Region,
     },
+    /// A `spawn` that is not directly inside the body of a `for!` loop in the
+    /// same function (it is outside any `for!`, or inside a closure or an
+    /// `expect` within one).
+    spawn_outside_concurrent_loop: struct {
+        region: Region,
+    },
     infinite_loop_never_exits: struct {
         region: Region,
     },
@@ -634,6 +640,7 @@ pub const Diagnostic = union(enum) {
             .type_var_starting_with_dollar => |d| d.region,
             .underscore_in_type_declaration => |d| d.region,
             .break_outside_loop => |d| d.region,
+            .spawn_outside_concurrent_loop => |d| d.region,
             .infinite_loop_never_exits => |d| d.region,
             .trailing_try_suffix => |d| d.region,
             .return_outside_fn => |d| d.region,

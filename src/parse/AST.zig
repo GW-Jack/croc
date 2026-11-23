@@ -2837,6 +2837,11 @@ pub const Expr = union(enum) {
         expr: Expr.Idx,
         region: TokenizedRegion,
     },
+    /// `spawn f`, which adds `f` as an entry to the innermost enclosing concurrent loop.
+    spawn: struct {
+        expr: Expr.Idx,
+        region: TokenizedRegion,
+    },
     crash: struct {
         expr: Expr.Idx,
         region: TokenizedRegion,
@@ -2899,7 +2904,7 @@ pub const Expr = union(enum) {
     /// Extract the region from any Expr variant
     pub fn to_tokenized_region(self: @This()) TokenizedRegion {
         return switch (self) {
-            inline .ident, .int, .frac, .typed_int, .typed_frac, .string, .multiline_string, .typed_string, .typed_multiline_string, .tag, .list, .record, .tuple, .field_access, .method_call, .tuple_access, .arrow_call, .lambda, .record_updater, .bin_op, .unary_op, .suffix_single_question, .apply, .if_then_else, .if_without_else, .match, .dbg, .crash, .block, .record_builder, .nominal_record, .nominal_apply, .ellipsis, .@"break", .@"return", .for_expr, .malformed, .string_part, .single_quote => |v| v.region,
+            inline .ident, .int, .frac, .typed_int, .typed_frac, .string, .multiline_string, .typed_string, .typed_multiline_string, .tag, .list, .record, .tuple, .field_access, .method_call, .tuple_access, .arrow_call, .lambda, .record_updater, .bin_op, .unary_op, .suffix_single_question, .apply, .if_then_else, .if_without_else, .match, .dbg, .spawn, .crash, .block, .record_builder, .nominal_record, .nominal_apply, .ellipsis, .@"break", .@"return", .for_expr, .malformed, .string_part, .single_quote => |v| v.region,
         };
     }
 
@@ -3096,6 +3101,14 @@ pub const Expr = union(enum) {
             },
             .dbg => |a| {
                 const begin = try tree.beginNamedNode("e-dbg");
+                const attrs = tree.beginNode();
+
+                try ast.store.getExpr(a.expr).pushToSExprTree(gpa, env, ast, tree);
+
+                try tree.endNode(begin, attrs);
+            },
+            .spawn => |a| {
+                const begin = try ast.beginSexprNodeAt(env, tree, "e-spawn", a.region);
                 const attrs = tree.beginNode();
 
                 try ast.store.getExpr(a.expr).pushToSExprTree(gpa, env, ast, tree);

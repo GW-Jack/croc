@@ -2139,6 +2139,7 @@ const Formatter = struct {
                 .if_without_else,
                 .match,
                 .dbg,
+                .spawn,
                 .crash,
                 .record_builder,
                 .nominal_record,
@@ -2479,6 +2480,7 @@ const Formatter = struct {
                         .if_without_else,
                         .match,
                         .dbg,
+                        .spawn,
                         .crash,
                         .record_builder,
                         .nominal_record,
@@ -2961,6 +2963,15 @@ const Formatter = struct {
                 },
                 else => return fmt.finishExpr(f),
             },
+            .spawn => |sp| switch (f.phase) {
+                0 => {
+                    // The operand starts on `spawn`'s line, so no comment comes between them.
+                    try fmt.pushAll("spawn ");
+                    f.phase = 1;
+                    return call(exprFrame(sp.expr, .{}));
+                },
+                else => return fmt.finishExpr(f),
+            },
             .crash => |c| switch (f.phase) {
                 0 => {
                     try fmt.pushAll(kw(.KwCrash));
@@ -3164,6 +3175,7 @@ const Formatter = struct {
                             .if_without_else,
                             .match,
                             .dbg,
+                            .spawn,
                             .crash,
                             .record_builder,
                             .nominal_record,
@@ -4981,6 +4993,7 @@ const Formatter = struct {
             .if_then_else,
             .if_without_else,
             .dbg,
+            .spawn,
             .crash,
             .@"return",
             .for_expr,
@@ -5050,6 +5063,7 @@ const Formatter = struct {
                 .if_without_else,
                 .match,
                 .dbg,
+                .spawn,
                 .crash,
                 .record_builder,
                 .nominal_record,
@@ -5351,6 +5365,7 @@ const Formatter = struct {
             .if_without_else => |i| try fmt.ifConditionLayout(sink, child, i.condition, i.then) or try child(fmt, sink, i.then),
             .arrow_call => |a| if (grouped) fmt.exprChild(sink, expr_idx) else try child(fmt, sink, a.left) or try child(fmt, sink, a.right),
             .dbg => |d| child(fmt, sink, d.expr),
+            .spawn => |sp| child(fmt, sink, sp.expr),
             .crash => |c| child(fmt, sink, c.expr),
             .@"return" => |r| child(fmt, sink, r.expr),
             .for_expr => |f| try child(fmt, sink, f.expr) or try child(fmt, sink, f.body),
@@ -6633,10 +6648,29 @@ test "issue 11160: pipe method receivers preserve expression grouping" {
         .{ .input = "t=x|>(|v|v).y()", .expected = "t = x |> (|v| v).y()\n" },
         .{ .input = "t=x|>(if a b else c).y()", .expected = "t = x |> (if (a) b else c).y()\n" },
         .{ .input = "t=x|>(dbg a).y()", .expected = "t = x |> (dbg a).y()\n" },
+        .{ .input = "t=x|>(spawn a).y()", .expected = "t = x |> (spawn a).y()\n" },
         .{ .input = "t=x|>(crash \"failed\").y()", .expected = "t = x |> (crash \"failed\").y()\n" },
         .{ .input = "t=x|>((a+b).y())", .expected = "t = x |> ((a + b).y())\n" },
         .{ .input = "t=x|>(a+b).field.y()", .expected = "t = x |> (a + b).field.y()\n" },
         .{ .input = "t=x|>(a+b).0.y()", .expected = "t = x |> (a + b).0.y()\n" },
+    };
+    for (cases) |case| {
+        const result = try moduleFmtsStable(std.testing.allocator, case.input, false);
+        defer std.testing.allocator.free(result);
+        try std.testing.expectEqualStrings(case.expected, result);
+    }
+}
+
+test "spawn is a contextual word: operand forms format as spawn, other uses as identifiers" {
+    const cases = [_]struct { input: []const u8, expected: []const u8 }{
+        .{ .input = "x=spawn   f", .expected = "x = spawn f\n" },
+        .{ .input = "x=spawn   ||f!()", .expected = "x = spawn || f!()\n" },
+        .{ .input = "x=spawn (f)", .expected = "x = spawn (f)\n" },
+        .{ .input = "x=spawn Foo", .expected = "x = spawn Foo\n" },
+        .{ .input = "x=spawn if a b else c", .expected = "x = spawn if (a) b else c\n" },
+        .{ .input = "x=spawn(f)", .expected = "x = spawn(f)\n" },
+        .{ .input = "spawn=1", .expected = "spawn = 1\n" },
+        .{ .input = "x=spawn", .expected = "x = spawn\n" },
     };
     for (cases) |case| {
         const result = try moduleFmtsStable(std.testing.allocator, case.input, false);
@@ -8436,6 +8470,7 @@ test "nested expressions, patterns, types, and statements format on a small nati
         .{ .head = "x = ", .open = "f(", .core = "a", .close = "?)" },
         .{ .head = "x = ", .open = "\"${", .core = "a", .close = "}\"" },
         .{ .head = "x = ", .open = "dbg ", .core = "a", .close = "" },
+        .{ .head = "x = ", .open = "spawn ", .core = "a", .close = "" },
         .{ .head = "x = ", .open = "T.(", .core = "a", .close = ")" },
         .{ .head = "x = ", .open = "[{ a: f(|b| (", .core = "1", .close = ")) }]" },
         .{ .head = "f = |", .open = "[", .core = "a", .close = "]", .tail = "| a" },

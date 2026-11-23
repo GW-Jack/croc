@@ -426,7 +426,7 @@ fn collectContainingRegionsFromExpr(
                 try collectContainingRegionsFromStatement(allocator, ast, stmt_idx, target_offset, regions);
             }
         },
-        inline .dbg, .crash => |d| {
+        inline .dbg, .spawn, .crash => |d| {
             try collectContainingRegionsFromExpr(allocator, ast, d.expr, target_offset, regions);
         },
         .record_builder => |rb| {

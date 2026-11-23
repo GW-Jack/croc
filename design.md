@@ -34044,8 +34044,22 @@ already resolves, is the direction this will take.
 **`spawn`.** `spawn f`, with `f : () => a`, adds an entry to the innermost
 enclosing concurrent loop. It may appear inside plain `for`, `while`, `if`
 and `match`, but not inside a nested function or closure: the set of
-running entries has no name, so nothing can capture it. Checking reports
-`spawn` anywhere else as an error. Its value is `{}`. A spawned entry:
+running entries has no name, so nothing can capture it. Its value is `{}`.
+
+`spawn` is a contextual word, not a reserved one, so it stays usable as a
+name. In expression position it starts a spawn only when the token after it
+is on the same line and is a lowercase or uppercase name, a lambda's `|`, a
+spaced `(`, `if` or `match`. Anywhere else it is an identifier, so `spawn(f)`
+stays a call and `spawn = ...` a definition.
+
+Canonicalization accepts a `spawn` only inside the body of a `for!` loop in
+the same function, possibly nested in `for`, `while`, `if`, `match` or
+blocks, and reports one outside every `for!` body or inside a closure or
+`expect` within one as an error. Checking then binds each `spawn` to the
+innermost enclosing loop that takes the plan protocol in the same function,
+skipping `for`, `while` and stream `for!` loops, and checks `f` against
+`() => a` for that loop's items `a`. A `spawn` with no such loop is a type
+error. A rejected `spawn` crashes if it runs. A spawned entry:
 - is unshielded and never background;
 - counts against the root limit if the plan has one. A plan whose
   outermost node is not a `Limit`, such as `p.limit(2).shielded()`, spawns

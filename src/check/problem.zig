@@ -114,6 +114,7 @@ pub const EffectfulTopLevel = types.EffectfulTopLevel;
 pub const EffectfulComptimeExpression = types.EffectfulComptimeExpression;
 pub const EffectfulExpect = types.EffectfulExpect;
 pub const ConcurrentLoopNotLowered = types.ConcurrentLoopNotLowered;
+pub const SpawnOutsidePlanLoop = types.SpawnOutsidePlanLoop;
 pub const EffectfulFunctionName = types.EffectfulFunctionName;
 
 // Comptime errors

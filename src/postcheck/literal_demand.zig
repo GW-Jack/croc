@@ -674,6 +674,7 @@ const Builder = struct {
                 .runtime_error,
                 .crash,
                 .dbg,
+                .spawn,
                 .expect_err,
                 .expect,
                 .ellipsis,

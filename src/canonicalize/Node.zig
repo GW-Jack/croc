@@ -125,6 +125,7 @@ pub const Tag = enum {
     expr_if_then_else,
     expr_match,
     expr_dbg,
+    expr_spawn,
     expr_crash,
     expr_expect_err,
     expr_block,
@@ -298,6 +299,7 @@ pub const Tag = enum {
     diag_redundant_exposed,
     diag_if_expr_without_else,
     diag_break_outside_loop,
+    diag_spawn_outside_concurrent_loop,
     diag_infinite_loop_never_exits,
     diag_trailing_try_suffix,
     diag_return_outside_fn,
@@ -404,6 +406,7 @@ pub const Payload = extern union {
     expr_nominal_external: ExprNominalExternal,
     expr_crash: ExprCrash,
     expr_dbg: ExprDbg,
+    expr_spawn: ExprSpawn,
     expr_expect_err: ExprExpectErr,
     expr_anno_only: ExprAnnoOnly,
     expr_derived_method: ExprDerivedMethod,
@@ -933,6 +936,12 @@ pub const Payload = extern union {
 
     /// expr_dbg: debug expression
     pub const ExprDbg = extern struct {
+        expr: u32,
+        _padding: [12]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+
+    /// expr_spawn: spawn expression
+    pub const ExprSpawn = extern struct {
         expr: u32,
         _padding: [12]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
     };

@@ -286,6 +286,7 @@ fn statementOmittedDefaults(
         .e_runtime_error,
         .e_crash,
         .e_dbg,
+        .e_spawn,
         .e_expect_err,
         .e_expect,
         .e_ellipsis,

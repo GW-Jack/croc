@@ -13918,6 +13918,7 @@ fn collectExpectBindingPatterns(
             .e_type_dispatch_call => |call| try appendExprSpanForExpectBindings(env, allocator, &stack, call.args),
             .e_tuple_access => |access| try stack.append(allocator, access.tuple),
             .e_dbg => |dbg| try stack.append(allocator, dbg.expr),
+            .e_spawn => |spawn| try stack.append(allocator, spawn.expr),
             .e_expect_err => |expect_err| try stack.append(allocator, expect_err.expr),
             .e_expect => |expect_expr| try stack.append(allocator, expect_expr.body),
             .e_return => |ret| try stack.append(allocator, ret.expr),

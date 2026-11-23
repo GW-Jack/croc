@@ -114,6 +114,7 @@ const ExprNodeTag = enum {
     if_without_else,
     match,
     dbg,
+    spawn,
     crash,
     bin_op,
     block,
@@ -970,6 +971,7 @@ const expr_shapes = .{
     .if_without_else = .{ .if_without_else, .{ .condition = .lhs, .then = .rhs } },
     .match = .{ .match, .{ .expr = .main_token, .branches = .span } },
     .dbg = .{ .dbg, .{ .expr = .lhs } },
+    .spawn = .{ .spawn, .{ .expr = .lhs } },
     .crash = .{ .crash, .{ .expr = .lhs } },
     .nominal_record = .{ .nominal_record, .{ .mapper = .lhs, .backing = .rhs } },
     .nominal_apply = .{ .nominal_apply, .{ .mapper = .lhs, .args = .rhs_extra_span } },
@@ -989,7 +991,7 @@ pub fn addExpr(store: *NodeStore, expr: AST.Expr) std.mem.Allocator.Error!AST.Ex
         .region = AST.TokenizedRegion.empty(),
     };
     switch (expr) {
-        inline .int, .frac, .typed_int, .typed_frac, .string_part, .string, .multiline_string, .typed_string, .typed_multiline_string, .tuple, .lambda, .apply, .record_updater, .method_call, .tuple_access, .bin_op, .suffix_single_question, .unary_op, .if_without_else, .match, .dbg, .crash, .nominal_record, .nominal_apply, .ellipsis, .@"break", .@"return", .block => |v, variant| node = try store.slotNode(@field(expr_shapes, @tagName(variant)), v),
+        inline .int, .frac, .typed_int, .typed_frac, .string_part, .string, .multiline_string, .typed_string, .typed_multiline_string, .tuple, .lambda, .apply, .record_updater, .method_call, .tuple_access, .bin_op, .suffix_single_question, .unary_op, .if_without_else, .match, .dbg, .spawn, .crash, .nominal_record, .nominal_apply, .ellipsis, .@"break", .@"return", .block => |v, variant| node = try store.slotNode(@field(expr_shapes, @tagName(variant)), v),
         .tag => |e| {
             node.tag = .tag;
             node.region = e.region;
@@ -1804,7 +1806,7 @@ pub fn getExpr(store: *const NodeStore, expr_idx: AST.Expr.Idx) AST.Expr {
     const tag = narrowNodeTag(ExprNodeTag, node.tag) orelse
         base.invariant("Expected a valid expr tag, got {s}", .{@tagName(node.tag)});
     switch (tag) {
-        inline .int, .frac, .typed_int, .typed_frac, .string_part, .string, .multiline_string, .typed_string, .typed_multiline_string, .list, .tuple, .lambda, .apply, .record_update, .method_call, .tuple_access, .bin_op, .suffix_single_question, .unary_op, .if_without_else, .match, .dbg, .crash, .nominal_record, .nominal_apply, .ellipsis, .break_expr, .return_expr, .block, .malformed => |t| return store.slotValue(AST.Expr, expr_shapes, t, node),
+        inline .int, .frac, .typed_int, .typed_frac, .string_part, .string, .multiline_string, .typed_string, .typed_multiline_string, .list, .tuple, .lambda, .apply, .record_update, .method_call, .tuple_access, .bin_op, .suffix_single_question, .unary_op, .if_without_else, .match, .dbg, .spawn, .crash, .nominal_record, .nominal_apply, .ellipsis, .break_expr, .return_expr, .block, .malformed => |t| return store.slotValue(AST.Expr, expr_shapes, t, node),
         .single_quote => {
             return .{ .single_quote = .{
                 .token = node.main_token,
@@ -2570,6 +2572,7 @@ pub fn collectRedundantReturns(store: *const NodeStore) Allocator.Error!std.Dyna
             .suffix_single_question,
             .if_without_else,
             .dbg,
+            .spawn,
             .crash,
             .bin_op,
             .ellipsis,
@@ -2676,6 +2679,7 @@ pub fn collectRedundantReturns(store: *const NodeStore) Allocator.Error!std.Dyna
             .if_without_else,
             .ident,
             .dbg,
+            .spawn,
             .crash,
             .record_builder,
             .nominal_record,

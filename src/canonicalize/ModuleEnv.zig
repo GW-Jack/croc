@@ -3751,6 +3751,24 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
 
             break :blk report;
         },
+        .spawn_outside_concurrent_loop => |data| blk: {
+            const region_info = self.calcRegionInfo(data.region);
+
+            var report = try Report.init(allocator, "Spawn Outside Concurrent Loop", "", .runtime_error);
+            try report.headline.addReflowingText("This ");
+            try report.headline.addAnnotated("spawn", .inline_code);
+            try report.headline.addReflowingText(" is not inside a concurrent loop.");
+
+            try self.addSourceRegionTo(&report.document, region_info, .error_highlight, filename);
+            try report.document.addLineBreak();
+            try report.document.addReflowingText("A ");
+            try report.document.addAnnotated("spawn", .inline_code);
+            try report.document.addReflowingText(" only works directly inside the body of a ");
+            try report.document.addAnnotated("for!", .inline_code);
+            try report.document.addReflowingText(" loop over a plan. It can't be used in a function or closure defined inside the loop, because the loop's running entries can't be captured.");
+
+            break :blk report;
+        },
         .infinite_loop_never_exits => |data| blk: {
             const region_info = self.calcRegionInfo(data.region);
 

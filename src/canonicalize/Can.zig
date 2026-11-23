@@ -434,6 +434,10 @@ scratch_global_value_defs: std.ArrayList(CIR.Def.Idx),
 closure_counter: u32 = 0,
 /// Current loop depth for validating break statements
 loop_depth: u32 = 0,
+/// Number of `for!` loop bodies enclosing the current expression in the
+/// current function. A `spawn` is valid only where it is nonzero. Like
+/// `loop_depth`, it restarts at zero in a lambda body and an `expect` body.
+for_bang_depth: u32 = 0,
 /// The active eager initialization context in `scratch_defining_bound_vars`.
 /// Nested initializers extend it; ordinary scopes preserve it. A lambda
 /// suspends it until its body is finished, without discarding the outer entries.
@@ -576,6 +580,7 @@ pub const state_inventory = state_discipline.inventory(Self, .{
     .scratch_global_value_defs = .keyed,
     .closure_counter = .keyed,
     .loop_depth = .lexical,
+    .for_bang_depth = .lexical,
     .defining_bound_vars = .lexical,
     .defining_assoc_alias = .lexical,
     .current_local_def_ident = .lexical,
@@ -2136,6 +2141,7 @@ fn debugAssertLocalFunctionDeclRecorded(
         .e_runtime_error,
         .e_crash,
         .e_dbg,
+        .e_spawn,
         .e_expect_err,
         .e_expect,
         .e_ellipsis,
@@ -4290,6 +4296,7 @@ const ExpectContext = enum(u8) {
 const SavedExpectState = struct {
     expect_context: ExpectContext,
     loop_depth: u32,
+    for_bang_depth: u32,
     expect_scope_floor: u32,
 };
 
@@ -4302,10 +4309,12 @@ fn enterExpect(self: *Self, context: ExpectContext) SavedExpectState {
     const saved = SavedExpectState{
         .expect_context = self.expect_context,
         .loop_depth = self.loop_depth,
+        .for_bang_depth = self.for_bang_depth,
         .expect_scope_floor = self.expect_scope_floor,
     };
     self.expect_context = context;
     self.loop_depth = 0;
+    self.for_bang_depth = 0;
     self.expect_scope_floor = @intCast(self.scopes.items.len);
     return saved;
 }
@@ -4313,7 +4322,17 @@ fn enterExpect(self: *Self, context: ExpectContext) SavedExpectState {
 fn exitExpect(self: *Self, saved: SavedExpectState) void {
     self.expect_context = saved.expect_context;
     self.loop_depth = saved.loop_depth;
+    self.for_bang_depth = saved.for_bang_depth;
     self.expect_scope_floor = saved.expect_scope_floor;
+}
+
+/// How much a loop of `kind` adds to `for_bang_depth` while its body is
+/// canonicalized: only a `for!` body may hold a `spawn`.
+fn forBangDepthStep(kind: CIR.ForKind) u32 {
+    return switch (kind) {
+        .iter => 0,
+        .stream => 1,
+    };
 }
 
 /// The diagnostic for reassigning `pattern_idx`, a var declared outside the
@@ -9730,6 +9749,7 @@ fn warnTrailingTrySuffix(self: *Self, root: Expr.Idx) std.mem.Allocator.Error!vo
         .e_runtime_error,
         .e_crash,
         .e_dbg,
+        .e_spawn,
         .e_expect_err,
         .e_expect,
         .e_ellipsis,
@@ -10561,6 +10581,7 @@ const DefiniteInitAnalyzer = struct {
             .e_if => |if_| .{ .if_ = .{ .if_ = if_ } },
             .e_match => |match| .{ .match = .{ .match = match } },
             .e_dbg => |dbg| .{ .expr = dbg.expr },
+            .e_spawn => |spawn| .{ .expr = spawn.expr },
             .e_expect_err => |expect_err| .{ .expr = expect_err.expr },
             .e_expect => |expect| .{ .expr = expect.body },
             .e_return => |ret| return pushWithPost(frame, .{ .expr = ret.expr }, .force_false),
@@ -11343,6 +11364,7 @@ fn scanLoopExitFacts(self: *Self, body: Expr.Idx) std.mem.Allocator.Error!LoopEx
                         }
                     },
                     .e_dbg => |dbg| try pending.append(stack_allocator, .{ .expr = .{ .idx = dbg.expr, .loop_depth = expr_frame.loop_depth } }),
+                    .e_spawn => |spawn| try pending.append(stack_allocator, .{ .expr = .{ .idx = spawn.expr, .loop_depth = expr_frame.loop_depth } }),
                     .e_expect => |expect| try pending.append(stack_allocator, .{ .expr = .{ .idx = expect.body, .loop_depth = expr_frame.loop_depth } }),
                     .e_expect_err => |expect_err| {
                         try pending.append(stack_allocator, .{ .expr = .{ .idx = expect_err.expr, .loop_depth = expr_frame.loop_depth } });
@@ -12162,6 +12184,11 @@ fn runExprKernel(
                     const saved_loop_depth = self.loop_depth;
                     self.loop_depth = 0;
 
+                    // A closure can't capture the enclosing loop's running
+                    // entries, so a `spawn` in its body is not in that loop.
+                    const saved_for_bang_depth = self.for_bang_depth;
+                    self.for_bang_depth = 0;
+
                     const saved_defining_bound_vars = self.defining_bound_vars;
                     self.defining_bound_vars = null;
 
@@ -12174,6 +12201,7 @@ fn runExprKernel(
                         .saved_enclosing_lambda = saved_enclosing_lambda,
                         .saved_expect_context = saved_expect_context,
                         .saved_loop_depth = saved_loop_depth,
+                        .saved_for_bang_depth = saved_for_bang_depth,
                         .saved_defining_bound_vars = saved_defining_bound_vars,
                     });
                     try stacks.push(.parse, frame_allocator, .{ .idx = e.body, .target = .scratch });
@@ -12294,6 +12322,13 @@ fn runExprKernel(
                 .dbg => |e| {
                     try stacks.push(.finish_dbg, frame_allocator, .{
                         .region = self.parse_ir.tokenizedRegionToRegion(e.region),
+                    });
+                    try stacks.push(.parse, frame_allocator, .{ .idx = e.expr, .target = .scratch });
+                },
+                .spawn => |e| {
+                    try stacks.push(.finish_spawn, frame_allocator, .{
+                        .region = self.parse_ir.tokenizedRegionToRegion(e.region),
+                        .in_for_bang_body = self.for_bang_depth != 0,
                     });
                     try stacks.push(.parse, frame_allocator, .{ .idx = e.expr, .target = .scratch });
                 },
@@ -13374,6 +13409,8 @@ fn runExprKernel(
 
             self.loop_depth += 1;
             errdefer self.loop_depth -= 1;
+            self.for_bang_depth += forBangDepthStep(state.kind);
+            errdefer self.for_bang_depth -= forBangDepthStep(state.kind);
 
             const body_free_vars_start = self.scratch_free_vars.top();
             try stacks.push(.finish_block_for_stmt, frame_allocator, .{
@@ -13397,6 +13434,7 @@ fn runExprKernel(
             const state = stacks.take(.finish_block_for_stmt);
             defer self.scopeExit(self.env.gpa) catch |err| self.recordScopeExitError(err);
             defer self.loop_depth -= 1;
+            defer self.for_bang_depth -= forBangDepthStep(state.kind);
             defer self.endDefiningBoundVars(state.saved_defining_bound_vars);
             defer self.in_statement_position = state.saved_stmt_pos;
             defer self.scratch_bound_vars.clearFrom(state.bound_vars_top);
@@ -13582,6 +13620,25 @@ fn runExprKernel(
             const diverges = anyChildDiverges(child_slice);
             child_slots.shrinkRetainingCapacity(result_start);
             try storeExprKernelOutput(&last_expr, &child_slots, frame_allocator, current_result_target, CanonicalizedExpr{ .idx = expr_idx, .free_vars = free_vars_span, .diverges = diverges });
+
+            continue :expr_kernel_loop .dispatch;
+        },
+        .finish_spawn => {
+            const state = stacks.take(.finish_spawn);
+            const result_start = child_slots.items.len - 1;
+            const can_inner = child_slots.items[result_start].expr;
+
+            const spawn_expr = if (state.in_for_bang_body)
+                try self.env.addExpr(Expr{ .e_spawn = .{
+                    .expr = can_inner.idx,
+                } }, state.region)
+            else
+                try self.env.pushMalformed(Expr.Idx, Diagnostic{ .spawn_outside_concurrent_loop = .{
+                    .region = state.region,
+                } });
+
+            child_slots.shrinkRetainingCapacity(result_start);
+            try storeExprKernelOutput(&last_expr, &child_slots, frame_allocator, current_result_target, CanonicalizedExpr{ .idx = spawn_expr, .free_vars = can_inner.free_vars, .diverges = can_inner.diverges });
 
             continue :expr_kernel_loop .dispatch;
         },
@@ -14337,6 +14394,7 @@ fn runExprKernel(
             defer self.enclosing_lambda = state.saved_enclosing_lambda;
             defer self.expect_context = state.saved_expect_context;
             defer self.loop_depth = state.saved_loop_depth;
+            defer self.for_bang_depth = state.saved_for_bang_depth;
             defer self.endDefiningBoundVars(state.saved_defining_bound_vars);
             defer self.scratch_captures.clearFrom(state.captures_top);
 
@@ -14554,6 +14612,8 @@ fn runExprKernel(
 
             self.loop_depth += 1;
             errdefer self.loop_depth -= 1;
+            self.for_bang_depth += forBangDepthStep(state.kind);
+            errdefer self.for_bang_depth -= forBangDepthStep(state.kind);
 
             try stacks.push(.finish_for_expr, frame_allocator, .{
                 .region = state.region,
@@ -14572,6 +14632,7 @@ fn runExprKernel(
         .finish_for_expr => {
             const state = stacks.take(.finish_for_expr);
             defer self.loop_depth -= 1;
+            defer self.for_bang_depth -= forBangDepthStep(state.kind);
             defer self.scopeExit(self.env.gpa) catch |err| self.recordScopeExitError(err);
             defer self.endDefiningBoundVars(state.saved_defining_bound_vars);
             defer self.in_statement_position = state.saved_stmt_pos;
@@ -16928,6 +16989,7 @@ const ExprKernelLabel = enum {
     finish_list,
     finish_tuple,
     finish_dbg,
+    finish_spawn,
     finish_crash,
     finish_return,
     finish_tuple_access,
@@ -17175,6 +17237,13 @@ const ExprFinishDbgWork = struct {
     region: Region,
 };
 
+const ExprFinishSpawnWork = struct {
+    region: Region,
+    /// Whether the `spawn` is inside a `for!` body in the same function
+    /// (`for_bang_depth` was nonzero when it began).
+    in_for_bang_body: bool,
+};
+
 const ExprFinishCrashWork = struct {
     region: Region,
 };
@@ -17305,6 +17374,7 @@ const ExprFinishLambdaWork = struct {
     saved_enclosing_lambda: ?Expr.Idx,
     saved_expect_context: ExpectContext,
     saved_loop_depth: u32,
+    saved_for_bang_depth: u32,
     saved_defining_bound_vars: ?DataSpan,
 };
 
@@ -17446,6 +17516,7 @@ fn exprKernelPayload(comptime label: ExprKernelLabel) type {
         .finish_list => ExprFinishListWork,
         .finish_tuple => ExprFinishTupleWork,
         .finish_dbg => ExprFinishDbgWork,
+        .finish_spawn => ExprFinishSpawnWork,
         .finish_crash => ExprFinishCrashWork,
         .finish_return => ExprFinishReturnWork,
         .finish_tuple_access => ExprFinishTupleAccessWork,
@@ -17535,6 +17606,7 @@ const ExprKernelWork = struct {
                 .finish_list,
                 .finish_tuple,
                 .finish_dbg,
+                .finish_spawn,
                 .finish_crash,
                 .finish_return,
                 .finish_tuple_access,

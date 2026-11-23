@@ -446,7 +446,8 @@ pub const Constants = struct {
     /// 208: hosted lambdas and checked hosted procedures carry `suspending`.
     /// 209: common idents include `Builtin.Concurrently`, and for-loop dispatch
     /// plans record the loop protocol.
-    pub const CACHE_VERSION = 209;
+    /// 210: canonical IR has the `spawn` expression and its diagnostic.
+    pub const CACHE_VERSION = 210;
 };
 
 /// Configuration for the Roc cache system.

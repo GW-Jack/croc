@@ -394,6 +394,7 @@ const copied_expr_shapes = [_]CopiedShape{
     .{ .cir = "e_runtime_error", .tag = .malformed, .payload = "malformed" },
     .{ .cir = "e_crash", .tag = .expr_crash, .payload = "expr_crash" },
     .{ .cir = "e_dbg", .tag = .expr_dbg, .payload = "expr_dbg" },
+    .{ .cir = "e_spawn", .tag = .expr_spawn, .payload = "expr_spawn" },
     .{ .cir = "e_expect_err", .tag = .expr_expect_err, .payload = "expr_expect_err" },
     .{ .cir = "e_ellipsis", .tag = .expr_ellipsis, .payload = null },
     .{ .cir = "e_anno_only", .tag = .expr_anno_only, .payload = "expr_anno_only" },
@@ -461,6 +462,7 @@ const copied_diagnostic_shapes = [_]DiagnosticShape{
     .{ .cir = "crash_expects_string", .tag = .diag_crash_expects_string, .payload = null, .names = &.{} },
     .{ .cir = "f64_pattern_literal", .tag = .diag_f64_pattern_literal, .payload = null, .names = &.{} },
     .{ .cir = "break_outside_loop", .tag = .diag_break_outside_loop, .payload = null, .names = &.{} },
+    .{ .cir = "spawn_outside_concurrent_loop", .tag = .diag_spawn_outside_concurrent_loop, .payload = null, .names = &.{} },
     .{ .cir = "infinite_loop_never_exits", .tag = .diag_infinite_loop_never_exits, .payload = null, .names = &.{} },
     .{ .cir = "trailing_try_suffix", .tag = .diag_trailing_try_suffix, .payload = null, .names = &.{} },
     .{ .cir = "redundant_return", .tag = .diag_redundant_return, .payload = null, .names = &.{} },
@@ -617,6 +619,7 @@ const ExprNodeTag = enum {
     expr_zero_argument_tag,
     expr_crash,
     expr_dbg,
+    expr_spawn,
     expr_expect_err,
     expr_unary_minus,
     expr_ellipsis,
@@ -771,6 +774,7 @@ const DiagnosticNodeTag = enum {
     diag_type_var_starting_with_dollar,
     diag_underscore_in_type_declaration,
     diag_break_outside_loop,
+    diag_spawn_outside_concurrent_loop,
     diag_infinite_loop_never_exits,
     diag_trailing_try_suffix,
     diag_return_outside_fn,
@@ -1274,9 +1278,9 @@ pub fn deinit(store: *NodeStore) void {
 /// when adding/removing variants from ModuleEnv unions. Update these when modifying the unions.
 ///
 /// Count of the diagnostic nodes in the ModuleEnv
-pub const MODULEENV_DIAGNOSTIC_NODE_COUNT = 100;
+pub const MODULEENV_DIAGNOSTIC_NODE_COUNT = 101;
 /// Count of the expression nodes in the ModuleEnv
-pub const MODULEENV_EXPR_NODE_COUNT = 59;
+pub const MODULEENV_EXPR_NODE_COUNT = 60;
 /// Count of the statement nodes in the ModuleEnv
 pub const MODULEENV_STATEMENT_NODE_COUNT = 21;
 /// Count of the type annotation nodes in the ModuleEnv
@@ -2155,6 +2159,7 @@ fn exprFromNode(store: *const NodeStore, node_idx: Node.Idx, node: Node) CIR.Exp
         .expr_empty_list,
         .expr_crash,
         .expr_dbg,
+        .expr_spawn,
         .expr_expect_err,
         .expr_unary_minus,
         .expr_ellipsis,
@@ -3790,6 +3795,7 @@ pub fn addExpr(store: *NodeStore, expr: CIR.Expr, region: base.Region) Allocator
         .e_runtime_error,
         .e_crash,
         .e_dbg,
+        .e_spawn,
         .e_expect_err,
         .e_expect,
         .e_ellipsis,
@@ -5502,6 +5508,7 @@ pub fn addDiagnosticUnregistered(store: *NodeStore, reason: CIR.Diagnostic) Allo
         .underscore_in_type_declaration,
         .type_var_starting_with_dollar,
         .break_outside_loop,
+        .spawn_outside_concurrent_loop,
         .infinite_loop_never_exits,
         .trailing_try_suffix,
         .redundant_return,
@@ -5678,6 +5685,7 @@ pub fn getDiagnostic(store: *const NodeStore, diagnostic: CIR.Diagnostic.Idx) CI
         .diag_type_var_starting_with_dollar,
         .diag_underscore_in_type_declaration,
         .diag_break_outside_loop,
+        .diag_spawn_outside_concurrent_loop,
         .diag_infinite_loop_never_exits,
         .diag_trailing_try_suffix,
         .diag_return_outside_fn,

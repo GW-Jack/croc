@@ -552,6 +552,7 @@ pub const ModuleIndex = struct {
                 },
                 .e_tuple_access => |access| try self.mark(.{ .expr = access.tuple }, id),
                 .e_dbg => |dbg| try self.mark(.{ .expr = dbg.expr }, id),
+                .e_spawn => |spawn| try self.mark(.{ .expr = spawn.expr }, id),
                 .e_expect_err => |expect_err| try self.mark(.{ .expr = expect_err.expr }, id),
                 .e_expect => |expect| {
                     self.has_expects = true;
@@ -1235,6 +1236,7 @@ pub fn exprDivergence(kind: ExprKind) ExprDivergence {
         .binop,
         .unary_minus,
         .dbg,
+        .spawn,
         .expect,
         .field_access,
         .structural_eq,
@@ -1326,6 +1328,7 @@ pub fn exprEvaluationHasNoEffect(kind: ExprKind) bool {
         .runtime_error,
         .crash,
         .dbg,
+        .spawn,
         .expect_err,
         .expect,
         .ellipsis,
@@ -1562,7 +1565,7 @@ const DivergenceScan = struct {
             .nominal => |nominal| try self.one(nominal.backing_expr),
             .closure, .lambda, .hosted_lambda => .{ .value = 0 },
             .binop => |binop| try self.anyOf(&.{ binop.lhs, binop.rhs }),
-            .unary_minus, .dbg => |child| try self.one(child),
+            .unary_minus, .dbg, .spawn => |child| try self.one(child),
             .expect => |child| try self.expectBody(child),
             .field_access => |field| try self.one(field.receiver),
             .structural_eq => |eq| try self.anyOf(&.{ eq.lhs, eq.rhs }),
@@ -1730,7 +1733,7 @@ const InspectElision = struct {
             switch (data) {
                 .lambda, .closure, .lookup_local, .lookup_external, .lookup_required => break true,
                 .field_access => {},
-                .numeral, .str_segment, .str, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level => break false,
+                .numeral, .str_segment, .str, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .spawn, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level => break false,
             }
             const access = data.field_access;
             if (bodies.rowCoercion(access.receiver) != null) break false;
@@ -2095,7 +2098,7 @@ const ReassignmentPublisher = struct {
                 try self.pushExpr(binop.lhs);
                 try self.pushExpr(binop.rhs);
             },
-            .unary_minus, .dbg => |child| try self.pushExpr(child),
+            .unary_minus, .dbg, .spawn => |child| try self.pushExpr(child),
             // An expect body can only reassign vars declared inside it
             // (canonicalization rejects the rest), so it carries no state
             // through an enclosing construct.
@@ -2499,7 +2502,7 @@ const DiagnosticScan = struct {
                 try self.pushExpr(binop.lhs);
                 try self.pushExpr(binop.rhs);
             },
-            .unary_minus, .dbg, .expect => |child| try self.pushExpr(child),
+            .unary_minus, .dbg, .spawn, .expect => |child| try self.pushExpr(child),
             .field_access => |field| try self.pushExpr(field.receiver),
             .dispatch_call, .method_eq, .type_dispatch_call => try appendDispatchOperands(bodies, @backingInt(id), self),
             .interpolation => |interpolation| {

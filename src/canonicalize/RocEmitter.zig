@@ -392,6 +392,7 @@ fn fieldAccessPathReceiverNeedsParens(self: *Self, receiver_idx: Expr.Idx) bool 
             .e_method_eq,
             .e_crash,
             .e_dbg,
+            .e_spawn,
             .e_expect,
             .e_return,
             .e_for,
@@ -845,6 +846,10 @@ fn emitExprFrame(
         .e_dbg => |dbg| {
             try frames.append(allocator, .{ .expr = dbg.expr });
             try frames.append(allocator, .{ .write = "dbg " });
+        },
+        .e_spawn => |spawn| {
+            try frames.append(allocator, .{ .expr = spawn.expr });
+            try frames.append(allocator, .{ .write = "spawn " });
         },
         .e_expect_err => try self.write("<expect_err>"),
         .e_expect => |expect| {

@@ -1836,6 +1836,7 @@ fn canDiagnosticIsError(diag: anytype) bool {
         .duplicate_tag,
         .f64_pattern_literal,
         .break_outside_loop,
+        .spawn_outside_concurrent_loop,
         .infinite_loop_never_exits,
         .return_outside_fn,
         .control_flow_in_expect,

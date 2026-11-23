@@ -1105,6 +1105,14 @@ local_procedure_candidates: collections.DenseMapUnmanaged(CIR.Pattern.Idx, Local
 /// Binding patterns of the candidates whose declarations are being checked,
 /// innermost last.
 local_procedure_candidate_stack: std.ArrayListUnmanaged(CIR.Pattern.Idx) = .empty,
+/// The plan loops whose bodies are being checked, innermost last (design.md
+/// "Plans And Concurrent Loops"). A `spawn` adds its entry to the innermost
+/// one at or above `plan_loops_floor`.
+active_plan_loops: std.ArrayListUnmanaged(ActivePlanLoop) = .empty,
+/// How many `active_plan_loops` entries belong to functions enclosing the one
+/// being checked. A lambda body and a definition each start a new floor: a
+/// `spawn` never adds to a loop outside its own function.
+plan_loops_floor: usize = 0,
 /// Where each rigid type variable was introduced: the candidate-stack depth
 /// of the annotation that introduced it, where a rigid-variable lookup from a
 /// deeper candidate names a type variable of an enclosing function, and the
@@ -2055,6 +2063,8 @@ pub const state_inventory = state_discipline.inventory(Self, .{
     .selected_hoisted_roots = .keyed,
     .local_procedure_candidates = .settled,
     .local_procedure_candidate_stack = .frame_stack,
+    .active_plan_loops = .frame_stack,
+    .plan_loops_floor = .lexical,
     .rigid_var_intros = .keyed,
     .generating_annotation = .lexical,
     .polymorphic_annotation_owners = .keyed,
@@ -4230,6 +4240,7 @@ const HoistSelectionTransaction = struct {
             .e_lambda,
             .e_hosted_lambda,
             .e_dbg,
+            .e_spawn,
             .e_expect_err,
             .e_expect,
             .e_for,
@@ -5767,6 +5778,7 @@ fn walkLocalTypeContextItem(
                 .e_runtime_error,
                 .e_crash,
                 .e_dbg,
+                .e_spawn,
                 .e_expect_err,
                 .e_expect,
                 .e_ellipsis,
@@ -7178,6 +7190,7 @@ fn conditionOutcome(
             .e_runtime_error,
             .e_crash,
             .e_dbg,
+            .e_spawn,
             .e_expect_err,
             .e_expect,
             .e_ellipsis,
@@ -8163,6 +8176,7 @@ fn visitExprChildren(self: *const Self, expr: CIR.Expr.Idx, visitor: anytype) Al
         .e_type_dispatch_call => |call| for (self.cir.store.sliceExpr(call.args)) |child| try visitor.expr(child),
         .e_tuple_access => |access| try visitor.expr(access.tuple),
         .e_dbg => |dbg| try visitor.expr(dbg.expr),
+        .e_spawn => |spawn| try visitor.expr(spawn.expr),
         .e_expect_err => |expect_err| try visitor.expr(expect_err.expr),
         .e_expect => |expect| try visitor.expr(expect.body),
         .e_return => |ret| try visitor.expr(ret.expr),
@@ -8380,6 +8394,7 @@ fn firstHoistSelectionTestExpr(checker: *Self) error{ExpectedHoistSelectionTestE
             .e_type_dispatch_call,
             .e_tuple_access,
             .e_dbg,
+            .e_spawn,
             .e_expect_err,
             .e_expect,
             .e_for,
@@ -8768,6 +8783,7 @@ fn exprHoistRoles(self: *Self, expr: CIR.Expr.Idx, want_binding_root: bool) Allo
         .e_tuple_access,
         => .all,
         .e_dbg,
+        .e_spawn,
         .e_expect_err,
         .e_expect,
         .e_for,
@@ -16187,7 +16203,7 @@ fn exprIsErroneous(self: *Self, errors: *ErroneousTypeMemo, expr_idx: CIR.Expr.I
         inline .e_dispatch_call, .e_method_eq, .e_type_dispatch_call => |dispatch| {
             if (self.types.varStaticDispatchRejected(dispatch.constraint_fn_var)) return true;
         },
-        .e_num, .e_frac_f32, .e_frac_f64, .e_dec, .e_dec_small, .e_num_from_numeral, .e_typed_int, .e_typed_frac, .e_typed_num_from_numeral, .e_str_segment, .e_str, .e_bytes_literal, .e_lookup_local, .e_lookup_external, .e_deferred_import_ref, .e_lookup_associated_local, .e_lookup_associated, .e_lookup_associated_resolved, .e_lookup_required, .e_list, .e_empty_list, .e_tuple, .e_match, .e_if, .e_record, .e_empty_record, .e_block, .e_tag, .e_nominal, .e_nominal_external, .e_zero_argument_tag, .e_closure, .e_lambda, .e_binop, .e_unary_minus, .e_field_access, .e_method_call, .e_structural_eq, .e_structural_hash, .e_type_method_call, .e_tuple_access, .e_crash, .e_dbg, .e_expect_err, .e_expect, .e_ellipsis, .e_anno_only, .e_derived_method, .e_return, .e_break, .e_for, .e_hosted_lambda, .e_run_low_level => {},
+        .e_num, .e_frac_f32, .e_frac_f64, .e_dec, .e_dec_small, .e_num_from_numeral, .e_typed_int, .e_typed_frac, .e_typed_num_from_numeral, .e_str_segment, .e_str, .e_bytes_literal, .e_lookup_local, .e_lookup_external, .e_deferred_import_ref, .e_lookup_associated_local, .e_lookup_associated, .e_lookup_associated_resolved, .e_lookup_required, .e_list, .e_empty_list, .e_tuple, .e_match, .e_if, .e_record, .e_empty_record, .e_block, .e_tag, .e_nominal, .e_nominal_external, .e_zero_argument_tag, .e_closure, .e_lambda, .e_binop, .e_unary_minus, .e_field_access, .e_method_call, .e_structural_eq, .e_structural_hash, .e_type_method_call, .e_tuple_access, .e_crash, .e_dbg, .e_spawn, .e_expect_err, .e_expect, .e_ellipsis, .e_anno_only, .e_derived_method, .e_return, .e_break, .e_for, .e_hosted_lambda, .e_run_low_level => {},
     }
     if (self.cir.rowCoercedResultWideVar(ModuleEnv.nodeIdxFrom(expr_idx))) |wide_var| {
         if (try errors.contains(wide_var)) return true;
@@ -17501,7 +17517,7 @@ fn selectedRootBindingRead(self: *const Self, root: hoist_roots.SelectedHoistedR
             const read = oracle.pattern_roots.get(local.pattern_idx) orelse return null;
             return if (oracle.keep_roots[read]) read else null;
         },
-        .e_num, .e_dec, .e_dec_small, .e_typed_int, .e_typed_frac, .e_str, .e_str_segment, .e_empty_list, .e_empty_record, .e_zero_argument_tag, .e_list, .e_tuple, .e_tag, .e_record, .e_nominal, .e_nominal_external, .e_frac_f32, .e_frac_f64, .e_num_from_numeral, .e_typed_num_from_numeral, .e_bytes_literal, .e_lookup_external, .e_deferred_import_ref, .e_lookup_associated_local, .e_lookup_associated, .e_lookup_associated_resolved, .e_lookup_required, .e_match, .e_if, .e_call, .e_closure, .e_lambda, .e_binop, .e_unary_minus, .e_field_access, .e_method_call, .e_dispatch_call, .e_interpolation, .e_structural_eq, .e_structural_hash, .e_method_eq, .e_type_method_call, .e_type_dispatch_call, .e_tuple_access, .e_runtime_error, .e_crash, .e_dbg, .e_expect_err, .e_expect, .e_ellipsis, .e_anno_only, .e_derived_method, .e_return, .e_break, .e_for, .e_hosted_lambda, .e_run_low_level => return null,
+        .e_num, .e_dec, .e_dec_small, .e_typed_int, .e_typed_frac, .e_str, .e_str_segment, .e_empty_list, .e_empty_record, .e_zero_argument_tag, .e_list, .e_tuple, .e_tag, .e_record, .e_nominal, .e_nominal_external, .e_frac_f32, .e_frac_f64, .e_num_from_numeral, .e_typed_num_from_numeral, .e_bytes_literal, .e_lookup_external, .e_deferred_import_ref, .e_lookup_associated_local, .e_lookup_associated, .e_lookup_associated_resolved, .e_lookup_required, .e_match, .e_if, .e_call, .e_closure, .e_lambda, .e_binop, .e_unary_minus, .e_field_access, .e_method_call, .e_dispatch_call, .e_interpolation, .e_structural_eq, .e_structural_hash, .e_method_eq, .e_type_method_call, .e_type_dispatch_call, .e_tuple_access, .e_runtime_error, .e_crash, .e_dbg, .e_spawn, .e_expect_err, .e_expect, .e_ellipsis, .e_anno_only, .e_derived_method, .e_return, .e_break, .e_for, .e_hosted_lambda, .e_run_low_level => return null,
     };
 }
 
@@ -17686,6 +17702,7 @@ fn hoistedRootExprStep(
         .e_crash,
         .e_hosted_lambda,
         .e_dbg,
+        .e_spawn,
         .e_expect_err,
         .e_expect,
         .e_for,
@@ -18192,6 +18209,7 @@ const StoredConstScan = struct {
             .e_type_dispatch_call => |call| try addExprSpan(items, module, call.args),
             .e_tuple_access => |access| try addExpr(items, module, access.tuple),
             .e_dbg,
+            .e_spawn,
             .e_expect_err,
             .e_expect,
             .e_break,
@@ -18317,6 +18335,7 @@ fn hoistedCallableDefForExpr(
         .e_type_dispatch_call,
         .e_tuple_access,
         .e_dbg,
+        .e_spawn,
         .e_expect_err,
         .e_expect,
         .e_for,
@@ -19817,6 +19836,7 @@ fn replaceRejectedOperationWithRuntimeError(
         .e_runtime_error,
         .e_crash,
         .e_dbg,
+        .e_spawn,
         .e_expect_err,
         .e_expect,
         .e_ellipsis,
@@ -21369,6 +21389,7 @@ fn localProcedureTargetPattern(self: *Self, env: *const ModuleEnv, binding: Modu
             .e_runtime_error,
             .e_crash,
             .e_dbg,
+            .e_spawn,
             .e_expect_err,
             .e_expect,
             .e_ellipsis,
@@ -22509,11 +22530,15 @@ const DefActivity = struct {
         /// The enclosing definition's bound, while this definition's body is
         /// bounded by its own annotation.
         bounding_annotation: ?CIR.Annotation.Idx,
+        /// The enclosing definition's floor: a `spawn` in this definition
+        /// never adds to a plan loop of the one whose check it interrupts.
+        plan_loops_floor: usize,
     };
 
     /// Restore the saved state, innermost replacement first.
     fn restore(state: *DefActivity, checker: *Self) void {
         const saved = state.saved orelse return;
+        checker.plan_loops_floor = saved.plan_loops_floor;
         checker.bounding_annotation = saved.bounding_annotation;
         checker.current_expect_effect_slot = saved.current_expect_effect_slot;
         checker.function_effect_dependency_scope_start = saved.function_effect_dependency_scope_start;
@@ -22581,8 +22606,10 @@ fn beginDef(self: *Self, state: *DefActivity, env: *Env) std.mem.Allocator.Error
         .function_effect_dependency_scope_start = self.function_effect_dependency_scope_start,
         .current_expect_effect_slot = self.current_expect_effect_slot,
         .bounding_annotation = self.bounding_annotation,
+        .plan_loops_floor = self.plan_loops_floor,
     };
     errdefer state.restore(self);
+    self.plan_loops_floor = self.active_plan_loops.items.len;
     // A definition forced by a forward reference has its own effect context.
     // Suspending frames by offset preserves outer storage without copying it.
     self.function_effect_dependency_scope_start = self.function_effect_dependency_frame_starts.items.len;
@@ -32774,6 +32801,7 @@ const ExprTaskState = union(enum) {
     type_dispatch_call: OperandsCheck,
     expect_err: SingleChildCheck,
     dbg: SingleChildCheck,
+    spawn: SingleChildCheck,
     expect: ExpectCheck,
     for_: ForLoopCheck,
     return_: SingleChildCheck,
@@ -32947,6 +32975,7 @@ fn exprTaskState(expr: CIR.Expr) ?ExprTaskState {
         .e_type_dispatch_call => .{ .type_dispatch_call = .{} },
         .e_expect_err => .{ .expect_err = .{} },
         .e_dbg => .{ .dbg = .{} },
+        .e_spawn => .{ .spawn = .{} },
         .e_expect => .{ .expect = .{} },
         .e_for => .{ .for_ = .{} },
         .e_return => .{ .return_ = .{} },
@@ -33012,6 +33041,7 @@ fn resumeExprTask(self: *Self, task: *ExprTask, env: *Env, child_does_fx: ?bool)
             .method_eq,
             .type_method_call,
             .type_dispatch_call,
+            .spawn,
             .return_,
             .run_low_level,
             => task.does_fx = does_fx or task.does_fx,
@@ -33045,6 +33075,7 @@ fn resumeExprTask(self: *Self, task: *ExprTask, env: *Env, child_does_fx: ?bool)
         .type_dispatch_call => |*state| self.resumeTypeDispatchCallCheck(task, state),
         .expect_err => |*state| self.resumeExpectErrCheck(task, state, env),
         .dbg => |*state| self.resumeDbgCheck(task, state, env),
+        .spawn => |*state| self.resumeSpawnCheck(task, state, env),
         .expect => |*state| self.resumeExpectCheck(task, state, env, child_does_fx),
         .for_ => |*state| self.resumeForExprCheck(task, state, env, child_does_fx),
         .return_ => |*state| self.resumeReturnCheck(task, state, env),
@@ -33082,10 +33113,11 @@ fn abortExprTask(self: *Self, task: *ExprTask, env: *Env) void {
         .type_dispatch_call,
         .expect_err,
         .dbg,
-        .for_,
+        .spawn,
         .return_,
         .run_low_level,
         => {},
+        .for_ => |*state| self.popActivePlanLoop(state),
     }
     task.frame.deinit(self, env);
 }
@@ -33773,6 +33805,7 @@ fn checkLeafExpr(self: *Self, frame: *ExprCheckFrame, expected: Expected, env: *
         .e_type_dispatch_call,
         .e_expect_err,
         .e_dbg,
+        .e_spawn,
         .e_expect,
         .e_for,
         .e_return,
@@ -34843,7 +34876,8 @@ fn completeStatement(_: *Self, state: *BlockStatementsCheck) void {
 fn abortBlockStatements(self: *Self, state: *BlockStatementsCheck, _: *Env) void {
     const current = if (state.current) |*current| current else return;
     switch (current.kind) {
-        .single, .for_ => {},
+        .single => {},
+        .for_ => |*for_loop| self.popActivePlanLoop(for_loop),
         .decl => |decl| self.releaseDeclStatement(decl),
         .expect => |scope| self.abortExpectBody(scope),
     }
@@ -35500,7 +35534,38 @@ const ForLoopCheck = struct {
     loop_region: Region = undefined,
     valid_pattern: bool = false,
     phase: enum { start, iterable, body } = .start,
+    /// Whether this loop takes the plan protocol and is on
+    /// `active_plan_loops` while its body is checked.
+    plan_loop_pushed: bool = false,
 };
+
+/// A plan loop whose body is being checked: a `spawn` in that body adds an
+/// entry of type `() => item` to it.
+const ActivePlanLoop = struct {
+    loop_node: CIR.Node.Idx,
+    item_var: Var,
+};
+
+/// The item var of the plan loop a `spawn` checked now adds its entry to: the
+/// innermost one in the function being checked, or null when there is none.
+fn spawnPlanLoopItemVar(self: *const Self) ?Var {
+    const loops = self.active_plan_loops.items;
+    std.debug.assert(self.plan_loops_floor <= loops.len); // rationale: a floor is set from the stack's length and loops above it pop before it is restored
+    if (loops.len == self.plan_loops_floor) return null;
+    return loops[loops.len - 1].item_var;
+}
+
+/// Close the plan loop `state` pushed, if it pushed one. The loop must be the
+/// innermost active plan loop.
+fn popActivePlanLoop(self: *Self, state: *ForLoopCheck) void {
+    if (!state.plan_loop_pushed) return;
+    const popped = self.active_plan_loops.pop() orelse
+        base.invariant("type checker invariant violated: closing plan loop {d} but no plan loop is open", .{@backingInt(state.loop_node)});
+    if (popped.loop_node != state.loop_node) {
+        base.invariant("type checker invariant violated: closing plan loop {d} but the innermost plan loop is {d}", .{ @backingInt(state.loop_node), @backingInt(popped.loop_node) });
+    }
+    state.plan_loop_pushed = false;
+}
 
 /// design.md "Discarded Var Update": a statement written as a method call on
 /// a `var` binding, whose value is not `{}` but could be assigned back to that
@@ -35560,7 +35625,10 @@ fn startForLoop(self: *Self, state: *ForLoopCheck, expected: Expected, env: *Env
 fn resumeForLoop(self: *Self, state: *ForLoopCheck, expected: Expected, env: *Env) std.mem.Allocator.Error!?ExprChildRequest {
     switch (state.phase) {
         .start => unreachable, // startForLoop advances the phase past .start before any child is checked
-        .body => return null,
+        .body => {
+            self.popActivePlanLoop(state);
+            return null;
+        },
         .iterable => {},
     }
     const pattern = state.pattern;
@@ -35662,6 +35730,12 @@ fn resumeForLoop(self: *Self, state: *ForLoopCheck, expected: Expected, env: *En
             .stream => .stream,
         },
     );
+
+    // A `spawn` in the body adds its entry to this loop.
+    if (plan_item_var) |plan_item| {
+        try self.active_plan_loops.append(self.gpa, .{ .loop_node = state.loop_node, .item_var = plan_item });
+        state.plan_loop_pushed = true;
+    }
 
     state.phase = .body;
     return .{ .expr = state.body, .expected = expected.forStatement().guardHoistSelection() };
@@ -35781,6 +35855,8 @@ const LambdaCheck = struct {
     effect_dependencies_start: ?usize = null,
     /// `match_tag_patterns`' length when the body's check began.
     match_tag_patterns_start: usize = 0,
+    /// The enclosing function's `plan_loops_floor`, while the body has its own.
+    saved_plan_loops_floor: ?usize = null,
 };
 
 fn resumeLambdaCheck(self: *Self, task: *ExprTask, state: *LambdaCheck, env: *Env, child_does_fx: ?bool) std.mem.Allocator.Error!ExprStep {
@@ -36049,6 +36125,10 @@ fn resumeLambdaCheck(self: *Self, task: *ExprTask, state: *LambdaCheck, env: *En
     state.effect_dependencies_start = effect_dependencies_start;
     state.match_tag_patterns_start = self.match_tag_patterns.items.len;
 
+    // A `spawn` in the body can't add to a plan loop enclosing the lambda.
+    state.saved_plan_loops_floor = self.plan_loops_floor;
+    self.plan_loops_floor = self.active_plan_loops.items.len;
+
     // The body's value is this function's result, so a lambda there is
     // consumed by this function and takes no scheme of its own.
     state.saved_call_position = self.scopeChildCallPosition(false, false, true);
@@ -36064,6 +36144,10 @@ fn resumeLambdaCheck(self: *Self, task: *ExprTask, state: *LambdaCheck, env: *En
 /// Release everything a lambda holds while its body is checked, in the
 /// reverse order it was acquired.
 fn releaseLambdaCheck(self: *Self, state: *LambdaCheck) void {
+    if (state.saved_plan_loops_floor) |saved_floor| {
+        self.plan_loops_floor = saved_floor;
+        state.saved_plan_loops_floor = null;
+    }
     if (state.effect_dependencies_start) |effect_dependencies_start| {
         const popped = self.function_effect_dependency_frame_starts.pop() orelse
             base.invariant("type checker invariant violated: closing the function-effect frame starting at {d} but no function-effect frame is open", .{effect_dependencies_start});
@@ -37192,6 +37276,32 @@ fn resumeDbgCheck(self: *Self, task: *ExprTask, state: *SingleChildCheck, env: *
     return .done;
 }
 
+/// design.md "Plans And Concurrent Loops": `spawn f` adds `f : () => a` to
+/// the innermost plan loop enclosing it in its function, whose items are `a`.
+/// It is effectful and its value is `{}`. With no such loop, or with an
+/// operand of another type, the `spawn` is erroneous and crashes if it runs.
+fn resumeSpawnCheck(self: *Self, task: *ExprTask, state: *SingleChildCheck, env: *Env) std.mem.Allocator.Error!ExprStep {
+    const frame = &task.frame;
+    const operand = frame.expr.e_spawn.expr;
+    if (!state.started) {
+        state.started = true;
+        self.markCurrentHoistObservableEffect();
+        return .{ .child = .{ .expr = operand, .expected = frame.nested_expected.forStatement() } };
+    }
+    task.does_fx = true;
+    if (self.spawnPlanLoopItemVar()) |item_var| {
+        const entry_content = try self.types.mkFuncEffectful(&.{}, item_var);
+        const entry_var = try self.freshFromContent(entry_content, env, frame.expr_region);
+        const result = try self.unifyOwnedRelation(entry_var, ModuleEnv.varFrom(operand), env, .none, .construction);
+        if (result.isProblem()) try self.markErroneousValueExpr(frame.expr_idx);
+    } else {
+        _ = try self.problems.appendProblem(.{ .spawn_outside_plan_loop = .{ .region = frame.expr_region } });
+        try self.markErroneousValueExpr(frame.expr_idx);
+    }
+    try self.unifyWith(frame.expr_var, .{ .structure = .empty_record }, env);
+    return .done;
+}
+
 fn resumeReturnCheck(self: *Self, task: *ExprTask, state: *SingleChildCheck, env: *Env) std.mem.Allocator.Error!ExprStep {
     const frame = &task.frame;
     const ret = frame.expr.e_return;
@@ -38296,6 +38406,7 @@ fn operandIsErroneousValue(self: *Self, operand: CIR.Expr.Idx) Allocator.Error!b
             .e_runtime_error,
             .e_crash,
             .e_dbg,
+            .e_spawn,
             .e_expect_err,
             .e_expect,
             .e_ellipsis,
@@ -38395,6 +38506,7 @@ fn appendEvaluationOperands(self: *Self, expr_idx: CIR.Expr.Idx, pool: *std.Arra
         .e_runtime_error,
         .e_crash,
         .e_dbg,
+        .e_spawn,
         .e_expect_err,
         .e_expect,
         .e_ellipsis,
@@ -39589,7 +39701,7 @@ fn unchangedTryErrorReturn(module: *const ModuleEnv, match: CIR.Expr.Match) ?CIR
     const backing = switch (result) {
         .e_nominal => |nominal| nominal.backing_expr,
         .e_nominal_external => |nominal| nominal.backing_expr,
-        .e_num, .e_frac_f32, .e_frac_f64, .e_dec, .e_dec_small, .e_num_from_numeral, .e_typed_int, .e_typed_frac, .e_typed_num_from_numeral, .e_str_segment, .e_str, .e_bytes_literal, .e_lookup_local, .e_lookup_external, .e_deferred_import_ref, .e_lookup_associated_local, .e_lookup_associated, .e_lookup_associated_resolved, .e_lookup_required, .e_list, .e_empty_list, .e_tuple, .e_match, .e_if, .e_call, .e_record, .e_empty_record, .e_block, .e_tag, .e_zero_argument_tag, .e_closure, .e_lambda, .e_binop, .e_unary_minus, .e_field_access, .e_method_call, .e_dispatch_call, .e_interpolation, .e_structural_eq, .e_structural_hash, .e_method_eq, .e_type_method_call, .e_type_dispatch_call, .e_tuple_access, .e_runtime_error, .e_crash, .e_dbg, .e_expect_err, .e_expect, .e_ellipsis, .e_anno_only, .e_derived_method, .e_return, .e_break, .e_for, .e_hosted_lambda, .e_run_low_level => return null,
+        .e_num, .e_frac_f32, .e_frac_f64, .e_dec, .e_dec_small, .e_num_from_numeral, .e_typed_int, .e_typed_frac, .e_typed_num_from_numeral, .e_str_segment, .e_str, .e_bytes_literal, .e_lookup_local, .e_lookup_external, .e_deferred_import_ref, .e_lookup_associated_local, .e_lookup_associated, .e_lookup_associated_resolved, .e_lookup_required, .e_list, .e_empty_list, .e_tuple, .e_match, .e_if, .e_call, .e_record, .e_empty_record, .e_block, .e_tag, .e_zero_argument_tag, .e_closure, .e_lambda, .e_binop, .e_unary_minus, .e_field_access, .e_method_call, .e_dispatch_call, .e_interpolation, .e_structural_eq, .e_structural_hash, .e_method_eq, .e_type_method_call, .e_type_dispatch_call, .e_tuple_access, .e_runtime_error, .e_crash, .e_dbg, .e_spawn, .e_expect_err, .e_expect, .e_ellipsis, .e_anno_only, .e_derived_method, .e_return, .e_break, .e_for, .e_hosted_lambda, .e_run_low_level => return null,
     };
     const tag = module.store.getExpr(backing);
     if (tag != .e_tag) return null;
@@ -39693,7 +39805,7 @@ fn traceHostedErrorOrigin(self: *Self, condition: CIR.Expr.Idx, called: bool, me
                 defer self.gpa.free(name);
                 break :walk try self.cir.insertIdent(Ident.for_text(name));
             },
-            .e_num, .e_frac_f32, .e_frac_f64, .e_dec, .e_dec_small, .e_num_from_numeral, .e_typed_int, .e_typed_frac, .e_typed_num_from_numeral, .e_str_segment, .e_str, .e_bytes_literal, .e_deferred_import_ref, .e_lookup_associated_local, .e_lookup_associated, .e_lookup_required, .e_list, .e_empty_list, .e_tuple, .e_match, .e_if, .e_record, .e_empty_record, .e_tag, .e_nominal, .e_nominal_external, .e_zero_argument_tag, .e_binop, .e_unary_minus, .e_field_access, .e_method_call, .e_dispatch_call, .e_interpolation, .e_structural_eq, .e_structural_hash, .e_method_eq, .e_type_method_call, .e_type_dispatch_call, .e_tuple_access, .e_runtime_error, .e_crash, .e_dbg, .e_expect_err, .e_expect, .e_ellipsis, .e_anno_only, .e_derived_method, .e_break, .e_for, .e_run_low_level => break :walk null,
+            .e_num, .e_frac_f32, .e_frac_f64, .e_dec, .e_dec_small, .e_num_from_numeral, .e_typed_int, .e_typed_frac, .e_typed_num_from_numeral, .e_str_segment, .e_str, .e_bytes_literal, .e_deferred_import_ref, .e_lookup_associated_local, .e_lookup_associated, .e_lookup_required, .e_list, .e_empty_list, .e_tuple, .e_match, .e_if, .e_record, .e_empty_record, .e_tag, .e_nominal, .e_nominal_external, .e_zero_argument_tag, .e_binop, .e_unary_minus, .e_field_access, .e_method_call, .e_dispatch_call, .e_interpolation, .e_structural_eq, .e_structural_hash, .e_method_eq, .e_type_method_call, .e_type_dispatch_call, .e_tuple_access, .e_runtime_error, .e_crash, .e_dbg, .e_spawn, .e_expect_err, .e_expect, .e_ellipsis, .e_anno_only, .e_derived_method, .e_break, .e_for, .e_run_low_level => break :walk null,
         }
     };
     if (memo) |cache| {
@@ -41297,6 +41409,7 @@ fn rewriteDerivedMethodCallAsStructural(
         .e_runtime_error,
         .e_crash,
         .e_dbg,
+        .e_spawn,
         .e_expect_err,
         .e_expect,
         .e_ellipsis,
@@ -42126,7 +42239,7 @@ fn ownedExprConstructorTag(self: *Self, expr_idx: CIR.Expr.Idx) ?ConstructorTag 
     return switch (self.cir.store.getExpr(expr_idx)) {
         .e_tag => |tag| .{ .name = tag.name, .arity = self.cir.store.sliceExpr(tag.args).len },
         .e_zero_argument_tag => |tag| .{ .name = tag.name, .arity = 0 },
-        .e_num, .e_frac_f32, .e_frac_f64, .e_dec, .e_dec_small, .e_num_from_numeral, .e_typed_int, .e_typed_frac, .e_typed_num_from_numeral, .e_str_segment, .e_str, .e_bytes_literal, .e_lookup_local, .e_lookup_external, .e_deferred_import_ref, .e_lookup_associated_local, .e_lookup_associated, .e_lookup_associated_resolved, .e_lookup_required, .e_list, .e_empty_list, .e_tuple, .e_match, .e_if, .e_call, .e_record, .e_empty_record, .e_block, .e_nominal, .e_nominal_external, .e_closure, .e_lambda, .e_binop, .e_unary_minus, .e_field_access, .e_method_call, .e_dispatch_call, .e_interpolation, .e_structural_eq, .e_structural_hash, .e_method_eq, .e_type_method_call, .e_type_dispatch_call, .e_tuple_access, .e_runtime_error, .e_crash, .e_dbg, .e_expect_err, .e_expect, .e_ellipsis, .e_anno_only, .e_derived_method, .e_return, .e_break, .e_for, .e_hosted_lambda, .e_run_low_level => null,
+        .e_num, .e_frac_f32, .e_frac_f64, .e_dec, .e_dec_small, .e_num_from_numeral, .e_typed_int, .e_typed_frac, .e_typed_num_from_numeral, .e_str_segment, .e_str, .e_bytes_literal, .e_lookup_local, .e_lookup_external, .e_deferred_import_ref, .e_lookup_associated_local, .e_lookup_associated, .e_lookup_associated_resolved, .e_lookup_required, .e_list, .e_empty_list, .e_tuple, .e_match, .e_if, .e_call, .e_record, .e_empty_record, .e_block, .e_nominal, .e_nominal_external, .e_closure, .e_lambda, .e_binop, .e_unary_minus, .e_field_access, .e_method_call, .e_dispatch_call, .e_interpolation, .e_structural_eq, .e_structural_hash, .e_method_eq, .e_type_method_call, .e_type_dispatch_call, .e_tuple_access, .e_runtime_error, .e_crash, .e_dbg, .e_spawn, .e_expect_err, .e_expect, .e_ellipsis, .e_anno_only, .e_derived_method, .e_return, .e_break, .e_for, .e_hosted_lambda, .e_run_low_level => null,
     };
 }
 
@@ -42724,6 +42837,7 @@ fn exprStepRelation(expr_idx: CIR.Expr.Idx, expr: CIR.Expr) problem.RelationOwne
         .e_runtime_error,
         .e_crash,
         .e_dbg,
+        .e_spawn,
         .e_expect_err,
         .e_expect,
         .e_ellipsis,
@@ -42809,6 +42923,7 @@ fn recordRelationOperands(self: *Self, expr_idx: CIR.Expr.Idx, expr: CIR.Expr) A
         .e_runtime_error,
         .e_crash,
         .e_dbg,
+        .e_spawn,
         .e_expect_err,
         .e_expect,
         .e_ellipsis,
@@ -42883,6 +42998,7 @@ fn recordRelationOperands(self: *Self, expr_idx: CIR.Expr.Idx, expr: CIR.Expr) A
         .e_runtime_error,
         .e_crash,
         .e_dbg,
+        .e_spawn,
         .e_expect_err,
         .e_expect,
         .e_ellipsis,
@@ -43172,6 +43288,7 @@ fn settledCauseSources(
         .e_runtime_error,
         .e_crash,
         .e_dbg,
+        .e_spawn,
         .e_expect_err,
         .e_expect,
         .e_ellipsis,
@@ -45069,6 +45186,7 @@ fn defaultMaterializationIsRecursive(
                 .e_runtime_error,
                 .e_crash,
                 .e_dbg,
+                .e_spawn,
                 .e_expect_err,
                 .e_expect,
                 .e_ellipsis,
@@ -45263,6 +45381,7 @@ fn defaultMaterializationIsRecursive(
                 try expr_work.append(self.gpa, eq.rhs);
             },
             .e_dbg => |dbg| try expr_work.append(self.gpa, dbg.expr),
+            .e_spawn => |spawn| try expr_work.append(self.gpa, spawn.expr),
             .e_expect_err => |expect_err| try expr_work.append(self.gpa, expect_err.expr),
             .e_expect => |expect| try expr_work.append(self.gpa, expect.body),
             .e_return => |ret| try expr_work.append(self.gpa, ret.expr),
@@ -50416,6 +50535,7 @@ fn tailTrySuffixStep(self: *const Self, expr_idx: CIR.Expr.Idx, pending: *std.Ar
         .e_runtime_error,
         .e_crash,
         .e_dbg,
+        .e_spawn,
         .e_expect_err,
         .e_expect,
         .e_ellipsis,
@@ -53003,7 +53123,7 @@ fn localValueMethodBinding(self: *Self, method_lookup: StaticDispatchMethodBindi
                 const def_types: *const types_mod.Store = if (def.module == self.cir) self.types else &def.module.types;
                 return def_types.resolveThroughAliases(ModuleEnv.varFrom(def_pattern)).desc.content.unwrapFunc() == null;
             },
-            .e_lookup_associated_local, .e_lookup_associated, .e_lookup_required, .e_deferred_import_ref, .e_num, .e_frac_f32, .e_frac_f64, .e_dec, .e_dec_small, .e_num_from_numeral, .e_typed_int, .e_typed_frac, .e_typed_num_from_numeral, .e_str_segment, .e_str, .e_bytes_literal, .e_list, .e_empty_list, .e_tuple, .e_match, .e_if, .e_record, .e_empty_record, .e_block, .e_tag, .e_nominal, .e_nominal_external, .e_zero_argument_tag, .e_call, .e_binop, .e_unary_minus, .e_field_access, .e_method_call, .e_dispatch_call, .e_interpolation, .e_structural_eq, .e_structural_hash, .e_method_eq, .e_type_method_call, .e_type_dispatch_call, .e_tuple_access, .e_crash, .e_dbg, .e_expect_err, .e_expect, .e_ellipsis, .e_return, .e_break, .e_for, .e_run_low_level => return true,
+            .e_lookup_associated_local, .e_lookup_associated, .e_lookup_required, .e_deferred_import_ref, .e_num, .e_frac_f32, .e_frac_f64, .e_dec, .e_dec_small, .e_num_from_numeral, .e_typed_int, .e_typed_frac, .e_typed_num_from_numeral, .e_str_segment, .e_str, .e_bytes_literal, .e_list, .e_empty_list, .e_tuple, .e_match, .e_if, .e_record, .e_empty_record, .e_block, .e_tag, .e_nominal, .e_nominal_external, .e_zero_argument_tag, .e_call, .e_binop, .e_unary_minus, .e_field_access, .e_method_call, .e_dispatch_call, .e_interpolation, .e_structural_eq, .e_structural_hash, .e_method_eq, .e_type_method_call, .e_type_dispatch_call, .e_tuple_access, .e_crash, .e_dbg, .e_spawn, .e_expect_err, .e_expect, .e_ellipsis, .e_return, .e_break, .e_for, .e_run_low_level => return true,
         }
     }
     return true;
@@ -66997,6 +67117,7 @@ test "every checker frame stack and frame's own storage is checked for balance" 
         .function_effect_dependency_frame_starts,
         .pending_function_effect_dependencies,
         .local_procedure_candidate_stack,
+        .active_plan_loops,
         .type_decl_generation_frames,
     }) |field| {
         const discipline = state_inventory.get(field);
