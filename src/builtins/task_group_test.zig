@@ -12,6 +12,7 @@
 const std = @import("std");
 
 const task_mod = @import("task.zig");
+const dev_wrappers = @import("dev_wrappers.zig");
 const erased_callable = @import("erased_callable.zig");
 const utils = @import("utils.zig");
 
@@ -212,6 +213,10 @@ const Loop = struct {
     crash_on_first: bool = false,
     /// Run this loop in the body when the first result arrives.
     inner_on_first: ?*Loop = null,
+    /// Drive the group through the C ABI a compiled task-form loop calls,
+    /// with `result_drop` as the results' drop, rather than the Zig API.
+    through_abi: bool = false,
+    result_drop: ?erased_callable.OnDropFn = null,
     arrivals: usize = 0,
     exiting: bool = false,
     in_body_pause: bool = false,
@@ -221,11 +226,11 @@ const Loop = struct {
 fn loopCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {
     const loop: *Loop = @as(*align(1) const *Loop, @ptrCast(capture.?)).*;
     const task: *RocTask = @as(*const *RocTask, @ptrCast(@alignCast(args.?))).*;
-    if (loop.group == null) loop.group = task_mod.groupCreate(task, loop.spec);
+    if (loop.group == null) loop.group = if (loop.through_abi) createThroughAbi(task, loop) else task_mod.groupCreate(task, loop.spec);
     const group = loop.group.?;
     loop.in_body_pause = false;
     while (true) {
-        switch (task_mod.groupNext(group)) {
+        switch (if (loop.through_abi) nextThroughAbi(group) else task_mod.groupNext(group)) {
             .arrived => |arrival| {
                 const value = @as(*align(1) const u64, @ptrCast(arrival.slot)).*;
                 if (loop.exiting) continue;
@@ -234,7 +239,9 @@ fn loopCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?
                 loop.arrivals += 1;
                 if (loop.arrivals == 1) {
                     if (loop.crash_on_first) ops.crash("the loop body crashed");
-                    if (loop.spawn_on_first) |step| task_mod.spawnIn(group, startRecord(task.ops, step));
+                    if (loop.spawn_on_first) |step| {
+                        if (loop.through_abi) dev_wrappers.roc_builtins_group_spawn(group, startRecord(task.ops, step)) else task_mod.spawnIn(group, startRecord(task.ops, step));
+                    }
                     if (loop.inner_on_first) |inner| {
                         // The inner loop runs, then this one carries on.
                         task.pushRecord(record(task, &loopCall, std.mem.asBytes(&inner)), null);
@@ -250,12 +257,12 @@ fn loopCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?
                     }
                 }
                 if (loop.break_after) |after| if (loop.arrivals == after) {
-                    task_mod.cancelGroup(group);
+                    if (loop.through_abi) dev_wrappers.roc_builtins_group_cancel(group) else task_mod.cancelGroup(group);
                     loop.exiting = true;
                 };
             },
             .ended => {
-                task_mod.groupFree(group);
+                if (loop.through_abi) dev_wrappers.roc_builtins_group_free(group) else task_mod.groupFree(group);
                 loop.ended = true;
                 if (ret) |out| @as(*align(1) u64, @ptrCast(out)).* = loop.arrivals;
                 return;
@@ -268,6 +275,38 @@ fn loopCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?
         }
     }
 }
+
+/// `group` as a compiled loop makes it: init, one push per entry with its
+/// limit path as a `List(U64)`, then start.
+fn createThroughAbi(task: *RocTask, loop: *const Loop) *Group {
+    const plan = loop.spec;
+    const root_limit: u64 = if (plan.root_limit) |root| @as(u64, root) + 1 else 0;
+    const group = dev_wrappers.roc_builtins_group_init(task, plan.starts.len, @ptrCast(plan.limits.ptr), plan.limits.len, root_limit, plan.slot_size, plan.slot_alignment, loop.result_drop);
+    for (plan.starts, plan.marks) |start_record, marks| {
+        var path: [8]u64 = undefined;
+        for (marks.limit_path, path[0..marks.limit_path.len]) |limit, *wide| wide.* = limit;
+        dev_wrappers.roc_builtins_group_push(group, start_record, @ptrCast(&path), marks.limit_path.len, marks.shielded, marks.background);
+    }
+    dev_wrappers.roc_builtins_group_start(group);
+    return group;
+}
+
+/// `next` as a compiled loop calls it.
+fn nextThroughAbi(group: *Group) task_mod.Next {
+    return switch (dev_wrappers.roc_builtins_group_next(group)) {
+        0 => .{ .arrived = .{ .index = 0, .slot = dev_wrappers.roc_builtins_group_arrival(group) } },
+        1 => .ended,
+        2 => .pending,
+        else => fail("group_next returned an unknown status"),
+    };
+}
+
+/// A result drop with an erased capture's `on_drop` shape: adds the
+/// dropped result to `dropped_sum`.
+fn countDrop(slot: ?[*]u8, _: *RocOps) callconv(.c) void {
+    dropped_sum += @as(*align(1) const u64, @ptrCast(slot.?)).*;
+}
+var dropped_sum: u64 = 0;
 
 const buffers = task_mod.BufferLayout{
     .hosted_slot_size = 8,
@@ -316,6 +355,39 @@ test "a loop runs each entry as a child task and takes each result as it arrives
     // Entry 1 never pauses; 2 pauses once and 0 twice.
     try std.testing.expectEqualSlices(u8, &.{ 11, 12, 10 }, Host.arrivals[0..Host.arrival_count]);
     try std.testing.expectEqual(@as(usize, 3), Host.ended[@backingInt(Status.done)]);
+    task.free();
+    try std.testing.expectEqual(@as(usize, 0), env.getAllocationCount());
+}
+
+test "a loop driven through the group C ABI runs limited, spawned and background entries, and drops a result nobody takes" {
+    var env = utils.TestEnv.init(std.testing.allocator);
+    defer env.deinit();
+    const ops = env.getOps();
+    Host.reset();
+    dropped_sum = 0;
+    const limited: task_mod.EntryMarks = .{ .limit_path = &.{0}, .shielded = false, .background = false };
+    // Shielded and begun, so the loop's end lets it finish, and its result
+    // is dropped.
+    const kept_background: task_mod.EntryMarks = .{ .limit_path = &.{}, .shielded = true, .background = true };
+    const starts = [_][*]u8{
+        startRecord(ops, .{ .id = 0, .pauses = 1, .result = 60 }),
+        startRecord(ops, .{ .id = 1, .pauses = 4, .result = 7 }),
+        startRecord(ops, .{ .id = 2, .pauses = 0, .result = 62 }),
+    };
+    var loop: Loop = .{
+        .spec = spec(&starts, &.{ limited, kept_background, limited }, &.{1}, 0),
+        .spawn_on_first = .{ .id = 3, .pauses = 1, .result = 63 },
+        .through_abi = true,
+        .result_drop = &countDrop,
+    };
+    var root: u64 = 0;
+    const task = rootTask(ops, &loop, &root);
+    try std.testing.expectEqual(Status.done, Host.run(task, null));
+    // Limit 0 runs entry 0, then 2, then the spawned entry, one at a time.
+    try std.testing.expectEqual(@as(usize, 2), Host.max_live);
+    try std.testing.expectEqualSlices(u8, &.{ 60, 62, 63 }, Host.arrivals[0..Host.arrival_count]);
+    try std.testing.expectEqual(@as(u64, 7), dropped_sum);
+    try std.testing.expectEqual(@as(usize, 4), Host.ended[@backingInt(Status.done)]);
     task.free();
     try std.testing.expectEqual(@as(usize, 0), env.getAllocationCount());
 }

@@ -790,6 +790,9 @@ pub const Next = union(enum) {
 /// on several threads.
 pub const Group = struct {
     owner: *RocTask,
+    /// The slot of the entry `groupNext` last reported arrived, for a
+    /// compiled loop to move its result out of.
+    arrival: [*]u8,
     /// The wake word of the owner's wait on this group: `wake_parked` while
     /// the owner is parked on it, and the count of reports queued that
     /// `groupNext` has not taken.
@@ -912,7 +915,9 @@ pub const Group = struct {
 
     /// Append an entry under the limits `limit_path`; it starts when they
     /// have room and nothing before it is waiting for them.
-    fn append(self: *Group, start_record: [*]u8, slot: [*]u8, own_slot: bool, limit_path: []const u32, shielded: bool, background: bool) void {
+    /// Add an entry. `limit_path` holds limit indexes, as `u32` from Zig
+    /// callers or `u64` from a compiled program's `List(U64)`.
+    fn append(self: *Group, start_record: [*]u8, slot: [*]u8, own_slot: bool, limit_path: anytype, shielded: bool, background: bool) void {
         const ops = self.owner.ops;
         if (self.len == self.capacity) {
             const capacity = @max(4, self.capacity * 2);
@@ -925,10 +930,10 @@ pub const Group = struct {
             self.paths = @ptrCast(@alignCast(growArray(ops, @ptrCast(self.paths), self.paths_capacity, capacity, @sizeOf(u32), @alignOf(u32))));
             self.paths_capacity = capacity;
         }
-        for (limit_path) |limit| {
+        for (limit_path, self.paths[self.paths_len..][0..limit_path.len]) |limit, *copy| {
             if (limit >= self.limit_count) utils.builtinInvariant(ops, "an entry's limit path names a limit the plan doesn't have");
+            copy.* = @intCast(limit);
         }
-        @memcpy(self.paths[self.paths_len..][0..limit_path.len], limit_path);
         self.entries[self.len] = .{
             .start = start_record,
             .child = null,
@@ -1060,12 +1065,33 @@ fn growArray(ops: *RocOps, items: *anyopaque, old: u32, new: u32, size: usize, a
 /// Loops", task form). Each entry's place in the task tree is fixed here,
 /// in input order. Called from the owner's code during its resume.
 pub fn groupCreate(owner: *RocTask, spec: GroupSpec) *Group {
+    if (spec.marks.len != spec.starts.len) utils.builtinInvariant(owner.ops, "a group's marks don't match its entries");
+    const group = groupInit(owner, spec.starts.len, spec.limits, spec.root_limit, spec.slot_size, spec.slot_alignment, spec.result_drop, spec.result_drop_context);
+    for (spec.starts, spec.marks) |start_record, marks| groupPush(group, start_record, marks.limit_path, marks.shielded, marks.background);
+    groupStart(group);
+    return group;
+}
+
+/// The first of `group`'s three steps, for a compiled program that adds
+/// its entries one at a time: a group for `entry_count` entries, with no
+/// entry yet. `groupPush` adds each, in input order, and `groupStart`
+/// starts every entry its limits allow.
+pub fn groupInit(
+    owner: *RocTask,
+    entry_count: usize,
+    limits: []const u64,
+    root_limit: ?u32,
+    slot_size: usize,
+    slot_alignment: usize,
+    result_drop: ?ResultDropFn,
+    result_drop_context: ?*anyopaque,
+) *Group {
     const ops = owner.ops;
-    if (spec.marks.len != spec.starts.len) utils.builtinInvariant(ops, "a group's marks don't match its entries");
     const group: *Group = @ptrCast(@alignCast(ops.alloc(@alignOf(Group), @sizeOf(Group))));
-    const stride = std.mem.alignForward(usize, spec.slot_size, spec.slot_alignment);
+    const stride = std.mem.alignForward(usize, slot_size, slot_alignment);
     group.* = .{
         .owner = owner,
+        .arrival = undefined,
         .word = 0,
         .outer = owner.open_groups,
         .entries = undefined,
@@ -1075,14 +1101,14 @@ pub fn groupCreate(owner: *RocTask, spec: GroupSpec) *Group {
         .paths_len = 0,
         .paths_capacity = 0,
         .limits = undefined,
-        .limit_count = @intCast(spec.limits.len),
-        .root_limit = spec.root_limit,
-        .block = allocBuffer(ops, stride * spec.starts.len, spec.slot_alignment),
-        .block_slots = spec.starts.len,
+        .limit_count = @intCast(limits.len),
+        .root_limit = root_limit,
+        .block = allocBuffer(ops, stride * entry_count, slot_alignment),
+        .block_slots = entry_count,
         .slot_size = stride,
-        .slot_alignment = spec.slot_alignment,
-        .result_drop = spec.result_drop,
-        .result_drop_context = spec.result_drop_context,
+        .slot_alignment = slot_alignment,
+        .result_drop = result_drop,
+        .result_drop_context = result_drop_context,
         .reports = undefined,
         .reports_len = 0,
         .reports_taken = 0,
@@ -1092,20 +1118,35 @@ pub fn groupCreate(owner: *RocTask, spec: GroupSpec) *Group {
         .foreground_left = 0,
         .ending = false,
     };
-    if (spec.limits.len > 0) {
-        group.limits = @ptrCast(@alignCast(ops.alloc(@alignOf(Group.Limit), spec.limits.len * @sizeOf(Group.Limit))));
-        for (spec.limits, group.limits[0..spec.limits.len]) |allowed, *limit| {
+    if (limits.len > 0) {
+        group.limits = @ptrCast(@alignCast(ops.alloc(@alignOf(Group.Limit), limits.len * @sizeOf(Group.Limit))));
+        for (limits, group.limits[0..limits.len]) |allowed, *limit| {
             if (allowed == 0) utils.builtinInvariant(ops, "a limit allows no running entries");
             limit.* = .{ .allowed = allowed, .running = 0 };
         }
     }
-    if (spec.root_limit) |root| if (root >= spec.limits.len) utils.builtinInvariant(ops, "a group's root limit names a limit the plan doesn't have");
+    if (root_limit) |root| if (root >= limits.len) utils.builtinInvariant(ops, "a group's root limit names a limit the plan doesn't have");
     owner.open_groups = group;
-    for (spec.starts, spec.marks, 0..) |start_record, marks, index| {
-        group.append(start_record, group.block + index * stride, false, marks.limit_path, marks.shielded, marks.background);
-    }
-    group.startEligible();
     return group;
+}
+
+/// The slot of the entry whose arrival `groupNext` last reported.
+pub fn groupArrival(group: *const Group) [*]u8 {
+    return group.arrival;
+}
+
+/// Add the next entry to a group `groupInit` made: the group takes
+/// `start_record`, and the entry's result goes to its slot in the group's
+/// block.
+pub fn groupPush(group: *Group, start_record: [*]u8, limit_path: anytype, shielded: bool, background: bool) void {
+    if (group.len >= group.block_slots) utils.builtinInvariant(group.owner.ops, "a group got more entries than it was made for");
+    group.append(start_record, group.block + group.len * group.slot_size, false, limit_path, shielded, background);
+}
+
+/// Start every entry its limits allow, once `groupPush` has added them all.
+pub fn groupStart(group: *Group) void {
+    if (group.len != group.block_slots) utils.builtinInvariant(group.owner.ops, "a group started before all its entries were added");
+    group.startEligible();
 }
 
 /// `next`: take one report (design.md "Plans And Concurrent Loops"). A
@@ -1124,6 +1165,7 @@ pub fn groupNext(group: *Group) Next {
                     continue;
                 }
                 entry.state = .taken;
+                group.arrival = entry.slot;
                 return .{ .arrived = .{ .index = index, .slot = entry.slot } };
             },
             .cancelled => entry.state = .taken,

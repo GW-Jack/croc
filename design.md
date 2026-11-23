@@ -34644,7 +34644,8 @@ takes the report as a crash, or at a root, which returns
 `ROC_TASK_CRASHED`.
 
 **The runtime's operations.** `src/builtins/task.zig` implements the
-loop operations as `groupCreate`, `groupNext`, `spawnIn`, `cancelGroup` and
+loop operations as `groupCreate` (or its three steps `groupInit`,
+`groupPush` and `groupStart`), `groupNext`, `spawnIn`, `cancelGroup` and
 `groupFree`, which the task form's builtins call:
 - a group keeps its entries in input order, each with its start record
   until it starts, its result slot, its limit path, its marks and its
@@ -34662,6 +34663,25 @@ loop operations as `groupCreate`, `groupNext`, `spawnIn`, `cancelGroup` and
 - a result nobody takes, a background entry's after the loop ends or any
   entry's while its owner finishes, is released with the drop function and
   context `group` was given.
+
+A compiled loop reaches them through eight builtins, `roc_builtins_group_*`:
+- `group` is three calls. `group_init` sizes the group for the plan's
+  entries and takes its `limits` (borrowed) and `root_limit` as `flatten`
+  encodes it: 0 for none, otherwise 1 + the root limit's index.
+  `group_push` adds one entry, taking its start record and borrowing its
+  `limit_path`, with its two marks as flags. `group_start` starts the
+  entries the limits allow. The loop over entries is the program's own
+  code, so ARC moves each start record into its push like any other
+  consumed value, and the runtime never takes a list whose items it
+  would have to retain or release;
+- `group_next` returns 0 when a result arrived, 1 when the group has
+  ended, or 2 for pending. After a 0, `group_arrival` gives the arrived
+  entry's slot, and the loop moves the result out of it;
+- `group_spawn`, `group_cancel` and `group_free` are `spawn_in`,
+  `cancel_group` and freeing a group that has ended;
+- the result drop has the shape of an erased capture's `on_drop`, which
+  every backend already makes for a layout, and the runtime calls it
+  through its context.
 
 A task that runs no more of its code is *finishing*: it was cancelled, it
 crashed, or an entry's crash reached it. Its first finishing resume releases
