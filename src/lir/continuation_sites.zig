@@ -10,8 +10,9 @@
 //!
 //! A running set's `group_next` is a site too (a *park site*): it parks the
 //! task while no entry has reported, and its resume runs it again (design.md
-//! "Child Tasks"). Its set is among its live values, even where the code
-//! after it never reads the set, since the resume reads it.
+//! "Child Tasks"). Its loop id, which names the set, is among its live
+//! values even where the code after it never reads the id, since the resume
+//! reads it.
 //!
 //! A tail site is a call to a procedure (never a hosted one) whose result
 //! the procedure returns unchanged: the next statements only copy it into
@@ -155,17 +156,17 @@ pub fn analyze(allocator: Allocator, store: *const LirStore, proc_id: LIR.LirPro
         const stmt = SiteStmt.at(store, call_id);
         const next_node = builder.node_of.get(stmt.next()) orelse invariant("a suspension site's successor was not walked", .{});
         const row = &rows[next_node];
-        // A park site's set, when the code after it doesn't keep it live.
-        const set: ?LocalId = switch (stmt) {
+        // A park site's loop id, when the code after it doesn't keep it live.
+        const loop_id: ?LocalId = switch (stmt) {
             .call => null,
             .park => |op| LirStore.GuardedList.at(store.getLocalSpan(op.args), 0),
         };
-        const set_live = if (set) |local| if (builder.bit_of.get(local)) |bit| row.isSet(bit) else false else true;
-        const live = try out.alloc(LocalId, row.count() + @intFromBool(!set_live));
+        const id_live = if (loop_id) |local| if (builder.bit_of.get(local)) |bit| row.isSet(bit) else false else true;
+        const live = try out.alloc(LocalId, row.count() + @intFromBool(!id_live));
         var it = row.iterator();
         var i: usize = 0;
         while (it.next()) |bit| : (i += 1) live[i] = builder.locals.items[bit];
-        if (!set_live) live[i] = set.?;
+        if (!id_live) live[i] = loop_id.?;
         std.mem.sort(LocalId, live, {}, localLessThan);
         site.* = .{
             .call = call_id,

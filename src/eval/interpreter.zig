@@ -6686,8 +6686,9 @@ pub const Interpreter = struct {
                 const size_align = self.layout_store.layoutSizeAlign(self.layout_store.getLayout(result_layout));
                 const drop = try self.groupResultDrop(result_layout);
                 const root_limit = args[3].read(u64);
-                const group = builtins.task.groupInit(
-                    taskOf(self.readPointerInt(args[0])),
+                _ = builtins.task.groupInit(
+                    taskOf(self.readPointerInt(args[4])),
+                    args[0].read(u64),
                     @intCast(args[1].read(u64)),
                     listItems(u64, valueToRocList(args[2])),
                     if (root_limit == 0) null else @intCast(root_limit - 1),
@@ -6697,20 +6698,20 @@ pub const Interpreter = struct {
                     drop,
                     if (drop == null) null else &interpreterGroupResultDropRelease,
                 );
-                break :blk try self.pointerValue(ll.ret_layout, @intFromPtr(group));
+                break :blk Value.zst;
             },
             .group_push => blk: {
                 const start = self.readBoxedDataPointer(args[1]) orelse
                     return self.invariantFailedError("LIR/interpreter invariant violated: group_push had no start record", .{});
-                builtins.task.groupPush(groupOf(self.readPointerInt(args[0])), start, listItems(u64, valueToRocList(args[2])), args[3].read(u8) != 0, args[4].read(u8) != 0);
+                builtins.task.groupPush(self.openGroup(args[0], args[5]), start, listItems(u64, valueToRocList(args[2])), args[3].read(u8) != 0, args[4].read(u8) != 0);
                 break :blk Value.zst;
             },
             .group_start => blk: {
-                builtins.task.groupStart(groupOf(self.readPointerInt(args[0])));
+                builtins.task.groupStart(self.openGroup(args[0], args[1]));
                 break :blk Value.zst;
             },
             .group_next => blk: {
-                const status: u32 = switch (builtins.task.groupNext(groupOf(self.readPointerInt(args[0])))) {
+                const status: u32 = switch (builtins.task.groupNext(self.openGroup(args[0], args[1]))) {
                     .arrived => 0,
                     .ended => 1,
                     .pending => 2,
@@ -6719,19 +6720,19 @@ pub const Interpreter = struct {
                 val.write(u32, status);
                 break :blk val;
             },
-            .group_arrival => try self.pointerValue(ll.ret_layout, @intFromPtr(builtins.task.groupArrival(groupOf(self.readPointerInt(args[0]))))),
+            .group_arrival => try self.pointerValue(ll.ret_layout, @intFromPtr(builtins.task.groupArrival(self.openGroup(args[0], args[1])))),
             .group_spawn => blk: {
                 const start = self.readBoxedDataPointer(args[1]) orelse
                     return self.invariantFailedError("LIR/interpreter invariant violated: group_spawn had no start record", .{});
-                builtins.task.spawnIn(groupOf(self.readPointerInt(args[0])), start);
+                builtins.task.spawnIn(self.openGroup(args[0], args[2]), start);
                 break :blk Value.zst;
             },
             .group_cancel => blk: {
-                builtins.task.cancelGroup(groupOf(self.readPointerInt(args[0])));
+                builtins.task.cancelGroup(self.openGroup(args[0], args[1]));
                 break :blk Value.zst;
             },
             .group_free => blk: {
-                builtins.task.groupFree(groupOf(self.readPointerInt(args[0])));
+                builtins.task.groupFree(self.openGroup(args[0], args[1]));
                 break :blk Value.zst;
             },
 
@@ -8359,8 +8360,9 @@ pub const Interpreter = struct {
     }
 
     /// The task a `task_*` operation's pointer operand addresses.
-    fn groupOf(raw: usize) *builtins.task.Group {
-        return @ptrFromInt(raw);
+    /// The running set a group operation names by its loop id and owner.
+    fn openGroup(self: *const LirInterpreter, loop_id: Value, owner: Value) *builtins.task.Group {
+        return builtins.task.openGroup(taskOf(self.readPointerInt(owner)), loop_id.read(u64));
     }
 
     /// A borrowed list's items.

@@ -693,27 +693,30 @@ pub const LowLevel = enum(u16) {
 
     // Running-set operations of a task-form concurrent loop (design.md
     // "Records And The Task", "Child Tasks"), made only by the continuation
-    // pass. The running set is an `opaque_ptr` with no reference count.
-    /// (task, entry_count, limits, root_limit) -> running set: a set for
-    /// `entry_count` entries owned by `task`, borrowing `limits`
-    /// (`List(U64)`); `root_limit` is 0 for none or 1 + the root limit's
-    /// index. The extra fields name the layout of an entry's result.
+    // pass. Each names its running set by the loop's id, a `U64`, and the
+    // owner task, last: the owner's innermost open set. The pass appends the
+    // task to each, as it does at a call; before that, the task is absent.
+    /// (id, entry_count, limits, root_limit, task) -> {}: open loop `id`'s
+    /// set for `entry_count` entries, borrowing `limits` (`List(U64)`);
+    /// `root_limit` is 0 for none or 1 + the root limit's index. The extra
+    /// fields name the layout of an entry's result.
     group_init,
-    /// (set, start, limit_path, shielded, background) -> {}: add the next
-    /// entry, taking its start record and borrowing `limit_path`.
+    /// (id, start, limit_path, shielded, background, task) -> {}: add the
+    /// next entry, taking its start record and borrowing `limit_path`.
     group_push,
-    /// (set) -> {}: start the entries their limits allow.
+    /// (id, task) -> {}: start the entries their limits allow.
     group_start,
-    /// (set) -> U32: 0 when a result arrived, 1 when the set has ended, 2
-    /// when the owner suspends parked on it.
+    /// (id, task) -> U32: 0 when a result arrived, 1 when the set has ended,
+    /// 2 when the owner suspends parked on it.
     group_next,
-    /// (set) -> Ptr(T): the slot of the entry that just arrived.
+    /// (id, task) -> Ptr(T): the slot of the entry that just arrived.
     group_arrival,
-    /// (set, start) -> {}: add a spawned entry, taking its start record.
+    /// (id, start, task) -> {}: add a spawned entry, taking its start
+    /// record.
     group_spawn,
-    /// (set) -> {}: a loop exit's cancel.
+    /// (id, task) -> {}: a loop exit's cancel.
     group_cancel,
-    /// (set) -> {}: free a set that has ended.
+    /// (id, task) -> {}: free a set that has ended.
     group_free,
 
     /// Index into `builtins.simd.Op`. The SIMD entries are intentionally one
@@ -979,6 +982,13 @@ pub const LowLevel = enum(u16) {
     /// sees them.
     pub fn typeOnlyOperands(self: LowLevel) u32 {
         return op_info[@backingInt(self)].type_only_operands;
+    }
+
+    /// Whether this is a running-set operation, which names its set by a
+    /// loop id and the owner task (design.md "Records And The Task").
+    pub fn namesRunningSet(self: LowLevel) bool {
+        return self == .group_init or self == .group_push or self == .group_start or self == .group_next or
+            self == .group_arrival or self == .group_spawn or self == .group_cancel or self == .group_free;
     }
 
     /// Return the explicit RC metadata for this primitive. The masks identify

@@ -1489,17 +1489,22 @@ pub fn roc_builtins_task_cancel(roc_task: *task.RocTask, abort: task.AbortFn, re
 }
 
 /// `group`'s first step for a task-form concurrent loop (design.md "Plans
-/// And Concurrent Loops", "Child Tasks"): a running set owned by `owner`
-/// for `entry_count` entries. `limits` is the flattened plan's `limits`,
-/// borrowed; `root_limit` is its `root_limit`, 0 for none or 1 + the root
-/// limit's index. `result_drop` releases an entry result nobody takes, the
-/// way an erased capture's `on_drop` does, or is null when results hold
-/// nothing to release. `roc_builtins_group_push` then adds each entry and
-/// `roc_builtins_group_start` starts them.
-pub fn roc_builtins_group_init(owner: *task.RocTask, entry_count: u64, limits_bytes: ?[*]const u8, limits_len: usize, root_limit: u64, slot_size: u64, slot_alignment: u64, result_drop: ?erased_callable.OnDropFn) callconv(.c) *task.Group {
+/// And Concurrent Loops", "Child Tasks"): open the running set of loop
+/// `loop_id`, owned by `owner`, for `entry_count` entries. `limits` is the
+/// flattened plan's `limits`, borrowed; `root_limit` is its `root_limit`, 0
+/// for none or 1 + the root limit's index. `result_drop` releases an entry
+/// result nobody takes, the way an erased capture's `on_drop` does, or is
+/// null when results hold nothing to release. `roc_builtins_group_push`
+/// then adds each entry and `roc_builtins_group_start` starts them.
+///
+/// Every `roc_builtins_group_*` call names its set by the loop's id and the
+/// owner, last, as the continuation pass appends a task: the owner's
+/// innermost open set (`task.openGroup`).
+pub fn roc_builtins_group_init(loop_id: u64, entry_count: u64, limits_bytes: ?[*]const u8, limits_len: usize, root_limit: u64, slot_size: u64, slot_alignment: u64, result_drop: ?erased_callable.OnDropFn, owner: *task.RocTask) callconv(.c) void {
     const limits: []const u64 = if (limits_len == 0) &.{} else @as([*]const u64, @ptrCast(@alignCast(limits_bytes.?)))[0..limits_len];
-    return task.groupInit(
+    _ = task.groupInit(
         owner,
+        loop_id,
         @intCast(entry_count),
         limits,
         if (root_limit == 0) null else @intCast(root_limit - 1),
@@ -1518,26 +1523,25 @@ fn dropResultThrough(slot: [*]u8, context: ?*anyopaque, ops: *RocOps) callconv(.
     drop(slot, ops);
 }
 
-/// Add the next entry, in input order: the group takes `start`, the
-/// entry's start record. `limit_path` is the entry's marks' `limit_path`,
-/// borrowed.
-pub fn roc_builtins_group_push(group: *task.Group, start: [*]u8, limit_path_bytes: ?[*]const u8, limit_path_len: usize, shielded: bool, background: bool) callconv(.c) void {
+/// Add the next entry, in input order: the set takes `start`, the entry's
+/// start record. `limit_path` is the entry's marks' `limit_path`, borrowed.
+pub fn roc_builtins_group_push(loop_id: u64, start: [*]u8, limit_path_bytes: ?[*]const u8, limit_path_len: usize, shielded: bool, background: bool, owner: *task.RocTask) callconv(.c) void {
     const limit_path: []const u64 = if (limit_path_len == 0) &.{} else @as([*]const u64, @ptrCast(@alignCast(limit_path_bytes.?)))[0..limit_path_len];
-    task.groupPush(group, start, limit_path, shielded, background);
+    task.groupPush(task.openGroup(owner, loop_id), start, limit_path, shielded, background);
 }
 
 /// Start every entry its limits allow, after the last push.
-pub fn roc_builtins_group_start(group: *task.Group) callconv(.c) void {
-    task.groupStart(group);
+pub fn roc_builtins_group_start(loop_id: u64, owner: *task.RocTask) callconv(.c) void {
+    task.groupStart(task.openGroup(owner, loop_id));
 }
 
 /// `next`: 0 when an entry's result arrived, and
 /// `roc_builtins_group_arrival` then gives its slot for the caller to move
-/// the result out of; 1 when the group has ended; 2 when nothing has
-/// arrived, so the owner suspends, parked on the group, and calls this
-/// again when resumed.
-pub fn roc_builtins_group_next(group: *task.Group) callconv(.c) u32 {
-    return switch (task.groupNext(group)) {
+/// the result out of; 1 when the set has ended; 2 when nothing has
+/// arrived, so the owner suspends, parked on the set, and calls this again
+/// when resumed.
+pub fn roc_builtins_group_next(loop_id: u64, owner: *task.RocTask) callconv(.c) u32 {
+    return switch (task.groupNext(task.openGroup(owner, loop_id))) {
         .arrived => 0,
         .ended => 1,
         .pending => 2,
@@ -1546,25 +1550,25 @@ pub fn roc_builtins_group_next(group: *task.Group) callconv(.c) u32 {
 
 /// The slot of the entry whose arrival `roc_builtins_group_next` last
 /// reported.
-pub fn roc_builtins_group_arrival(group: *task.Group) callconv(.c) [*]u8 {
-    return task.groupArrival(group);
+pub fn roc_builtins_group_arrival(loop_id: u64, owner: *task.RocTask) callconv(.c) [*]u8 {
+    return task.groupArrival(task.openGroup(owner, loop_id));
 }
 
-/// `spawn_in`: add an entry under the root limit, if there is one; the
-/// group takes `start`.
-pub fn roc_builtins_group_spawn(group: *task.Group, start: [*]u8) callconv(.c) void {
-    task.spawnIn(group, start);
+/// `spawn_in`: add an entry under the root limit, if there is one; the set
+/// takes `start`.
+pub fn roc_builtins_group_spawn(loop_id: u64, start: [*]u8, owner: *task.RocTask) callconv(.c) void {
+    task.spawnIn(task.openGroup(owner, loop_id), start);
 }
 
 /// `cancel_group`, a loop's exit: drop the entries that haven't started and
 /// cancel the running ones the shields allow.
-pub fn roc_builtins_group_cancel(group: *task.Group) callconv(.c) void {
-    task.cancelGroup(group);
+pub fn roc_builtins_group_cancel(loop_id: u64, owner: *task.RocTask) callconv(.c) void {
+    task.cancelGroup(task.openGroup(owner, loop_id));
 }
 
-/// Free a group once `roc_builtins_group_next` reported it ended.
-pub fn roc_builtins_group_free(group: *task.Group) callconv(.c) void {
-    task.groupFree(group);
+/// Free a set once `roc_builtins_group_next` reported it ended.
+pub fn roc_builtins_group_free(loop_id: u64, owner: *task.RocTask) callconv(.c) void {
+    task.groupFree(task.openGroup(owner, loop_id));
 }
 
 /// Enter the loaded dev-shim code image that contains the generated callsite.

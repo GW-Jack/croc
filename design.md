@@ -33913,16 +33913,18 @@ ascending order (the result in its place among them), then the task. It
 reads the result whether or not the continuation takes it, so a result the
 code after the call never reads is released there.
 
-**Park sites.** A park site `s = group_next(set)` gets a continuation and a
-resume entry like any site that is not a tail site, with three differences:
+**Park sites.** A park site `s = group_next(id, task)` gets a continuation
+and a resume entry like any site that is not a tail site, with three
+differences:
 
 - Its pending test is a switch on `s` whose `group_pending` branch (2) sets
   the task's pending flag and takes the pending edge; an arrival (0) or the
   end (1) goes on. `group_next` has already parked the task on the set.
-- Its saved values always include `set`, even where the code after the site
-  never reads it, since the resume entry does.
+- Its saved values always include the loop id `id`, even where the code
+  after the site never reads it, since the resume entry does.
 - Its result does not arrive anywhere while the task is parked: a report
-  only readies the task. So `R(f, k)` runs `group_next(set)` again for `s`.
+  only readies the task. So `R(f, k)` runs `group_next(id, task)` again for
+  `s`.
   While that is still `group_pending`, which happens when the report that
   readied the task was a cancelled entry's and another entry still runs,
   `R(f, k)` sets the pending flag and saves the same values with itself.
@@ -33973,25 +33975,34 @@ The interpreter and every compiling backend implement the operations
 against it (Backends).
 
 A task-form concurrent loop (Plans And Concurrent Loops) reaches its running
-set through eight more, which the continuation pass also makes alone. The
-running set is an `opaque_ptr` with no reference count, and each operation
-is one call of the `roc_builtins_group_*` builtin of the same name (Child
-Tasks):
-- `group_init(task, entry_count, limits, root_limit)` is the running set
-  for `entry_count` entries, owned by `task`. It borrows `limits`, a
+set through eight more. Each is one call of the `roc_builtins_group_*`
+builtin of the same name (Child Tasks). No value holds a running set: each
+operation names its set by the loop's id, a `U64` literal that Monotype
+gives each compiled loop, and the task that owns it. Concurrent loops nest
+lexically, and a set closes before the loop that encloses it goes on, so
+the set an operation means is always its task's innermost open one. The
+runtime takes that one, and a build with monitors checks that its loop id
+is the one named. Like a call, an operation names its task last, and the
+continuation pass, which gives each task-form procedure its task, appends
+it. Before the pass an operation's first operand is the loop id and it has
+no task:
+- `group_init(id, entry_count, limits, root_limit, task)` opens the running
+  set for `entry_count` entries, owned by `task`. It borrows `limits`, a
   `List(U64)`, and takes `root_limit` as `flatten` encodes it. The
   operation's extra fields name the layout of an entry's result, which
   sizes the slots and gives the drop for a result nobody takes;
-- `group_push(g, start, limit_path, shielded, background)` adds one entry.
-  It takes the start record and borrows `limit_path`, a `List(U64)`;
-- `group_start(g)` starts the entries their limits allow;
-- `group_next(g)` is a `U32`: 0 when a result arrived, 1 when the set has
-  ended, 2 when the owner must suspend parked on it;
-- `group_arrival(g)` is the arrived entry's slot, typed by its target's
-  `Ptr` layout. Its `ptr_load` is the owned result, like a hosted result's;
-- `group_spawn(g, start)` adds a spawned entry and takes its start record;
-- `group_cancel(g)` is a loop exit's cancel, and `group_free(g)` frees an
-  ended set.
+- `group_push(id, start, limit_path, shielded, background, task)` adds one
+  entry. It takes the start record and borrows `limit_path`, a `List(U64)`;
+- `group_start(id, task)` starts the entries their limits allow;
+- `group_next(id, task)` is a `U32`: 0 when a result arrived, 1 when the set
+  has ended, 2 when the owner must suspend parked on it;
+- `group_arrival(id, task)` is the arrived entry's slot, typed by its
+  target's `Ptr` layout. Its `ptr_load` is the owned result, like a hosted
+  result's;
+- `group_spawn(id, start, task)` adds a spawned entry and takes its start
+  record;
+- `group_cancel(id, task)` is a loop exit's cancel, and `group_free(id,
+  task)` frees an ended set.
 
 Each but `group_arrival` may allocate or release: starting entries makes
 child tasks, and ending, cancelling or freeing drops start records and
@@ -34731,7 +34742,10 @@ A compiled loop reaches them through eight builtins, `roc_builtins_group_*`:
   `cancel_group` and freeing a group that has ended;
 - the result drop has the shape of an erased capture's `on_drop`, which
   every backend already makes for a layout, and the runtime calls it
-  through its context.
+  through its context;
+- each takes the loop's id first and the owner task last, and acts on the
+  owner's innermost open group, whose id a build with monitors checks
+  (`openGroup`). No group pointer crosses the C ABI.
 
 A task that runs no more of its code is *finishing*: it was cancelled, it
 crashed, or an entry's crash reached it. Its first finishing resume releases

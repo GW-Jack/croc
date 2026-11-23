@@ -230,7 +230,7 @@ fn loopCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?
     const group = loop.group.?;
     loop.in_body_pause = false;
     while (true) {
-        switch (if (loop.through_abi) nextThroughAbi(group) else task_mod.groupNext(group)) {
+        switch (if (loop.through_abi) nextThroughAbi(task) else task_mod.groupNext(group)) {
             .arrived => |arrival| {
                 const value = @as(*align(1) const u64, @ptrCast(arrival.slot)).*;
                 if (loop.exiting) continue;
@@ -240,7 +240,7 @@ fn loopCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?
                 if (loop.arrivals == 1) {
                     if (loop.crash_on_first) ops.crash("the loop body crashed");
                     if (loop.spawn_on_first) |step| {
-                        if (loop.through_abi) dev_wrappers.roc_builtins_group_spawn(group, startRecord(task.ops, step)) else task_mod.spawnIn(group, startRecord(task.ops, step));
+                        if (loop.through_abi) dev_wrappers.roc_builtins_group_spawn(abi_loop_id, startRecord(task.ops, step), task) else task_mod.spawnIn(group, startRecord(task.ops, step));
                     }
                     if (loop.inner_on_first) |inner| {
                         // The inner loop runs, then this one carries on.
@@ -257,12 +257,12 @@ fn loopCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?
                     }
                 }
                 if (loop.break_after) |after| if (loop.arrivals == after) {
-                    if (loop.through_abi) dev_wrappers.roc_builtins_group_cancel(group) else task_mod.cancelGroup(group);
+                    if (loop.through_abi) dev_wrappers.roc_builtins_group_cancel(abi_loop_id, task) else task_mod.cancelGroup(group);
                     loop.exiting = true;
                 };
             },
             .ended => {
-                if (loop.through_abi) dev_wrappers.roc_builtins_group_free(group) else task_mod.groupFree(group);
+                if (loop.through_abi) dev_wrappers.roc_builtins_group_free(abi_loop_id, task) else task_mod.groupFree(group);
                 loop.ended = true;
                 if (ret) |out| @as(*align(1) u64, @ptrCast(out)).* = loop.arrivals;
                 return;
@@ -276,25 +276,29 @@ fn loopCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?
     }
 }
 
+/// The loop id the C ABI test's loop names its set by.
+const abi_loop_id: u64 = 7;
+
 /// `group` as a compiled loop makes it: init, one push per entry with its
-/// limit path as a `List(U64)`, then start.
+/// limit path as a `List(U64)`, then start, each naming the set by its loop
+/// id and owner.
 fn createThroughAbi(task: *RocTask, loop: *const Loop) *Group {
     const plan = loop.spec;
     const root_limit: u64 = if (plan.root_limit) |root| @as(u64, root) + 1 else 0;
-    const group = dev_wrappers.roc_builtins_group_init(task, plan.starts.len, @ptrCast(plan.limits.ptr), plan.limits.len, root_limit, plan.slot_size, plan.slot_alignment, loop.result_drop);
+    dev_wrappers.roc_builtins_group_init(abi_loop_id, plan.starts.len, @ptrCast(plan.limits.ptr), plan.limits.len, root_limit, plan.slot_size, plan.slot_alignment, loop.result_drop, task);
     for (plan.starts, plan.marks) |start_record, marks| {
         var path: [8]u64 = undefined;
         for (marks.limit_path, path[0..marks.limit_path.len]) |limit, *wide| wide.* = limit;
-        dev_wrappers.roc_builtins_group_push(group, start_record, @ptrCast(&path), marks.limit_path.len, marks.shielded, marks.background);
+        dev_wrappers.roc_builtins_group_push(abi_loop_id, start_record, @ptrCast(&path), marks.limit_path.len, marks.shielded, marks.background, task);
     }
-    dev_wrappers.roc_builtins_group_start(group);
-    return group;
+    dev_wrappers.roc_builtins_group_start(abi_loop_id, task);
+    return task_mod.openGroup(task, abi_loop_id);
 }
 
 /// `next` as a compiled loop calls it.
-fn nextThroughAbi(group: *Group) task_mod.Next {
-    return switch (dev_wrappers.roc_builtins_group_next(group)) {
-        0 => .{ .arrived = .{ .index = 0, .slot = dev_wrappers.roc_builtins_group_arrival(group) } },
+fn nextThroughAbi(task: *RocTask) task_mod.Next {
+    return switch (dev_wrappers.roc_builtins_group_next(abi_loop_id, task)) {
+        0 => .{ .arrived = .{ .index = 0, .slot = dev_wrappers.roc_builtins_group_arrival(abi_loop_id, task) } },
         1 => .ended,
         2 => .pending,
         else => fail("group_next returned an unknown status"),

@@ -546,9 +546,8 @@ fn constantStart(f: *Fixture, result: i64) TaskOpsTestError!LIR.LirProcSpecId {
     }, .none);
 }
 
-/// A procedure of one `opaque_ptr` argument whose body `build` makes from
-/// that argument.
-fn pointerProc(f: *Fixture, arg: LocalId, body: CFStmtId, ret_layout: layout.Idx) TaskOpsTestError!LIR.LirProcSpecId {
+/// A procedure of the one argument `arg`, with `body`.
+fn unaryProc(f: *Fixture, arg: LocalId, body: CFStmtId, ret_layout: layout.Idx) TaskOpsTestError!LIR.LirProcSpecId {
     const proc = try f.store.addProcSpec(.{
         .name = f.store.freshSyntheticSymbol(),
         .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
@@ -569,6 +568,56 @@ fn literal(f: *Fixture, target: LocalId, value: i64, layout_idx: layout.Idx, nex
     } }, .test_fixture);
 }
 
+/// The loop id the running-set tests' loops name their sets by.
+const test_loop_id: i64 = 3;
+
+/// `group_init(id, count, [], 0, task)` for a set of `count` entries with
+/// results of `result`, before `next`; `id`, `limits` and `no_limit` are
+/// the caller's locals, which this defines.
+fn groupInit(f: *Fixture, id: LocalId, count: i64, result: layout.Idx, task: ?LocalId, next: CFStmtId) TaskOpsTestError!CFStmtId {
+    const count_local = try f.local(.u64);
+    const no_limit = try f.local(.u64);
+    const limits = try f.local(try f.layouts.insertList(.u64));
+    const unit = try f.local(.zst);
+    var args = std.ArrayList(LocalId).empty;
+    defer args.deinit(f.allocator);
+    try args.appendSlice(f.allocator, &.{ id, count_local, limits, no_limit });
+    if (task) |owner| try args.append(f.allocator, owner);
+    var head = try f.store.addCFStmt(.{ .assign_low_level = .{
+        .target = unit,
+        .op = .group_init,
+        .rc_effect = try f.store.addRcEffect(LowLevel.group_init.rcEffect()),
+        .extra = try f.store.addStmtRow(LIR.LowLevelExtra, .{ .group_result = .some(result) }),
+        .args = try f.store.addLocalSpan(args.items),
+        .next = next,
+    } }, .test_fixture);
+    head = try f.store.addCFStmt(.{ .assign_list = .{ .target = limits, .elems = .empty(), .next = head } }, .test_fixture);
+    head = try literal(f, no_limit, 0, .u64, head);
+    head = try literal(f, count_local, count, .u64, head);
+    return try literal(f, id, test_loop_id, .u64, head);
+}
+
+/// Pack each of `starts` into `start_locals`, an erased callable with no
+/// capture, before `next`.
+fn packStarts(f: *Fixture, starts: []const LIR.LirProcSpecId, start_locals: []const LocalId, next: CFStmtId) TaskOpsTestError!CFStmtId {
+    var head = next;
+    var index = starts.len;
+    while (index > 0) {
+        index -= 1;
+        head = try f.store.addCFStmt(.{ .assign_packed_erased_fn = .{
+            .target = start_locals[index],
+            .data = try f.store.addStmtRow(LIR.PackedErasedFnData, .{
+                .proc = starts[index],
+                .capture = .none,
+                .capture_layout = .none,
+                .on_drop = .none,
+            }),
+            .next = head,
+        } }, .test_fixture);
+    }
+    return head;
+}
+
 test "the running-set operations run each entry as a child task and move its result out of its slot" {
     var f = try Fixture.init(std.testing.allocator);
     defer f.deinit();
@@ -577,87 +626,60 @@ test "the running-set operations run each entry as a child task and move its res
     const ptr_u64 = try f.layouts.insertPtr(.u64);
     const starts = [_]LIR.LirProcSpecId{ try constantStart(&f, 5), try constantStart(&f, 7) };
 
-    // make(task): g = group_init(task, 2, [], 0); push each entry under no
-    // limit; group_start(g); ret g
+    // make(task): group_init(3, 2, [], 0, task); push each entry under no
+    // limit; group_start(3, task)
     const make = blk: {
-        const task_arg = try f.local(.opaque_ptr);
-        const set = try f.local(.opaque_ptr);
-        const count = try f.local(.u64);
-        const no_limit = try f.local(.u64);
-        const limits = try f.local(list_u64);
+        const task = try f.local(.opaque_ptr);
+        const id = try f.local(.u64);
         const path = try f.local(list_u64);
         const no = try f.local(.bool);
         const unit = try f.local(.zst);
         var start_locals: [2]LocalId = undefined;
         for (&start_locals) |*start| start.* = try f.local(erased);
-        var head = try f.op(unit, .group_start, &.{set}, try f.ret(set));
+        var head = try f.op(unit, .group_start, &.{ id, task }, try f.ret(unit));
         var index: usize = start_locals.len;
         while (index > 0) {
             index -= 1;
-            head = try f.op(unit, .group_push, &.{ set, start_locals[index], path, no, no }, head);
+            head = try f.op(unit, .group_push, &.{ id, start_locals[index], path, no, no, task }, head);
         }
-        head = try f.store.addCFStmt(.{ .assign_low_level = .{
-            .target = set,
-            .op = .group_init,
-            .rc_effect = try f.store.addRcEffect(LowLevel.group_init.rcEffect()),
-            .extra = try f.store.addStmtRow(LIR.LowLevelExtra, .{ .group_result = .some(.u64) }),
-            .args = try f.store.addLocalSpan(&.{ task_arg, count, limits, no_limit }),
-            .next = head,
-        } }, .test_fixture);
         head = try f.store.addCFStmt(.{ .assign_list = .{ .target = path, .elems = .empty(), .next = head } }, .test_fixture);
-        head = try f.store.addCFStmt(.{ .assign_list = .{ .target = limits, .elems = .empty(), .next = head } }, .test_fixture);
         head = try literal(&f, no, 0, .bool, head);
-        head = try literal(&f, no_limit, 0, .u64, head);
-        head = try literal(&f, count, 2, .u64, head);
-        index = start_locals.len;
-        while (index > 0) {
-            index -= 1;
-            head = try f.store.addCFStmt(.{ .assign_packed_erased_fn = .{
-                .target = start_locals[index],
-                .data = try f.store.addStmtRow(LIR.PackedErasedFnData, .{
-                    .proc = starts[index],
-                    .capture = .none,
-                    .capture_layout = .none,
-                    .on_drop = .none,
-                }),
-                .next = head,
-            } }, .test_fixture);
-        }
-        break :blk try pointerProc(&f, task_arg, head, .opaque_ptr);
+        head = try groupInit(&f, id, 2, .u64, task, head);
+        break :blk try unaryProc(&f, task, try packStarts(&f, &starts, &start_locals, head), .zst);
     };
-    // take(g): group_next(g) must be 0; ret ptr_load(group_arrival(g))
+    // take(task): group_next(3, task) must be 0; ret ptr_load(group_arrival(3, task))
     const take = blk: {
-        const set = try f.local(.opaque_ptr);
+        const task = try f.local(.opaque_ptr);
+        const id = try f.local(.u64);
         const status = try f.local(.u32);
         const slot = try f.local(ptr_u64);
         const value = try f.local(.u64);
         const load = try f.op(value, .ptr_load, &.{slot}, try f.ret(value));
-        const arrival = try f.op(slot, .group_arrival, &.{set}, load);
-        break :blk try pointerProc(&f, set, try f.op(status, .group_next, &.{set}, arrival), .u64);
+        const arrival = try f.op(slot, .group_arrival, &.{ id, task }, load);
+        const body = try literal(&f, id, test_loop_id, .u64, try f.op(status, .group_next, &.{ id, task }, arrival));
+        break :blk try unaryProc(&f, task, body, .u64);
     };
-    // next(g): ret group_next(g)
+    // next(task): ret group_next(3, task)
     const next = blk: {
-        const set = try f.local(.opaque_ptr);
+        const task = try f.local(.opaque_ptr);
+        const id = try f.local(.u64);
         const status = try f.local(.u32);
-        break :blk try pointerProc(&f, set, try f.op(status, .group_next, &.{set}, try f.ret(status)), .u32);
+        const body = try literal(&f, id, test_loop_id, .u64, try f.op(status, .group_next, &.{ id, task }, try f.ret(status)));
+        break :blk try unaryProc(&f, task, body, .u32);
     };
-    // free(g): group_free(g); ret {}
+    // free(task): group_free(3, task); ret {}
     const free = blk: {
-        const set = try f.local(.opaque_ptr);
+        const task = try f.local(.opaque_ptr);
+        const id = try f.local(.u64);
         const unit = try f.local(.zst);
-        break :blk try pointerProc(&f, set, try f.op(unit, .group_free, &.{set}, try f.ret(unit)), .zst);
+        const body = try literal(&f, id, test_loop_id, .u64, try f.op(unit, .group_free, &.{ id, task }, try f.ret(unit)));
+        break :blk try unaryProc(&f, task, body, .zst);
     };
 
     var static_strings = try eval.Interpreter.buildStaticStrings(f.allocator, &f.store);
     defer static_strings.deinit();
     var interp = try eval.Interpreter.init(f.allocator, &f.store, &f.layouts, static_strings.view(), f.runtime_env.get_ops());
     defer interp.deinit();
-    const call = struct {
-        fn call(i: *eval.Interpreter, proc: LIR.LirProcSpecId, arg: usize) TaskOpsTestError!eval.Interpreter.EvalResult {
-            var address = arg;
-            return try i.eval(.{ .proc_id = proc, .arg_layouts = &.{.opaque_ptr}, .arg_ptr = @ptrCast(&address) });
-        }
-    }.call;
 
     var slot: [8]u8 = undefined;
     var buffer: [8]u8 = undefined;
@@ -666,58 +688,51 @@ test "the running-set operations run each entry as a child task and move its res
     owner.ready_fn = &ReadyChildren.ready;
     owner.abort_fn = &ReadyChildren.abort;
     ReadyChildren.len = 0;
+    var address = @intFromPtr(&owner);
+    const call = struct {
+        fn call(i: *eval.Interpreter, proc: LIR.LirProcSpecId, task: *usize) TaskOpsTestError!eval.Interpreter.EvalResult {
+            return try i.eval(.{ .proc_id = proc, .arg_layouts = &.{.opaque_ptr}, .arg_ptr = @ptrCast(task) });
+        }
+    }.call;
 
     // Both entries start as children, readied in input order.
-    const set = (try call(&interp, make, @intFromPtr(&owner))).value.read(usize);
+    _ = try call(&interp, make, &address);
     try std.testing.expectEqual(@as(usize, 2), ReadyChildren.len);
-    try std.testing.expectEqual(@as(u32, 2), (try call(&interp, next, set)).value.read(u32));
+    try std.testing.expectEqual(@as(u32, 2), (try call(&interp, next, &address)).value.read(u32));
 
     // The host resumes the second child first, so its result arrives first.
     for ([_]usize{ 1, 0 }) |index| {
         const child = ReadyChildren.tasks[index];
         try std.testing.expectEqual(builtins.task.Status.done, child.resumeFromHost(&ReadyChildren.ready, &ReadyChildren.abort));
     }
-    try std.testing.expectEqual(@as(u64, 7), (try call(&interp, take, set)).value.read(u64));
-    try std.testing.expectEqual(@as(u64, 5), (try call(&interp, take, set)).value.read(u64));
-    try std.testing.expectEqual(@as(u32, 1), (try call(&interp, next, set)).value.read(u32));
-    _ = try call(&interp, free, set);
+    try std.testing.expectEqual(@as(u64, 7), (try call(&interp, take, &address)).value.read(u64));
+    try std.testing.expectEqual(@as(u64, 5), (try call(&interp, take, &address)).value.read(u64));
+    try std.testing.expectEqual(@as(u32, 1), (try call(&interp, next, &address)).value.read(u32));
+    _ = try call(&interp, free, &address);
     try f.runtime_env.checkForLeaks();
 }
 
 test "a running set of heap results drops one through the interpreter and releases its drop at close" {
     var f = try Fixture.init(std.testing.allocator);
     defer f.deinit();
-    const list_u64 = try f.layouts.insertList(.u64);
 
-    // make(task): g = group_init(task, 0, [], 0) with Str results; group_start(g); ret g
+    // make(task): group_init(3, 0, [], 0, task) with Str results; group_start(3, task)
     const make = blk: {
-        const task_arg = try f.local(.opaque_ptr);
-        const set = try f.local(.opaque_ptr);
-        const count = try f.local(.u64);
-        const no_limit = try f.local(.u64);
-        const limits = try f.local(list_u64);
+        const task = try f.local(.opaque_ptr);
+        const id = try f.local(.u64);
         const unit = try f.local(.zst);
-        var head = try f.op(unit, .group_start, &.{set}, try f.ret(set));
-        head = try f.store.addCFStmt(.{ .assign_low_level = .{
-            .target = set,
-            .op = .group_init,
-            .rc_effect = try f.store.addRcEffect(LowLevel.group_init.rcEffect()),
-            .extra = try f.store.addStmtRow(LIR.LowLevelExtra, .{ .group_result = .some(.str) }),
-            .args = try f.store.addLocalSpan(&.{ task_arg, count, limits, no_limit }),
-            .next = head,
-        } }, .test_fixture);
-        head = try f.store.addCFStmt(.{ .assign_list = .{ .target = limits, .elems = .empty(), .next = head } }, .test_fixture);
-        head = try literal(&f, no_limit, 0, .u64, head);
-        head = try literal(&f, count, 0, .u64, head);
-        break :blk try pointerProc(&f, task_arg, head, .opaque_ptr);
+        const head = try groupInit(&f, id, 0, .str, task, try f.op(unit, .group_start, &.{ id, task }, try f.ret(unit)));
+        break :blk try unaryProc(&f, task, head, .zst);
     };
-    // finish(g): group_next(g); group_free(g); ret the status
+    // finish(task): s = group_next(3, task); group_free(3, task); ret s
     const finish = blk: {
-        const set = try f.local(.opaque_ptr);
+        const task = try f.local(.opaque_ptr);
+        const id = try f.local(.u64);
         const status = try f.local(.u32);
         const unit = try f.local(.zst);
-        const free = try f.op(unit, .group_free, &.{set}, try f.ret(status));
-        break :blk try pointerProc(&f, set, try f.op(status, .group_next, &.{set}, free), .u32);
+        const free = try f.op(unit, .group_free, &.{ id, task }, try f.ret(status));
+        const body = try literal(&f, id, test_loop_id, .u64, try f.op(status, .group_next, &.{ id, task }, free));
+        break :blk try unaryProc(&f, task, body, .u32);
     };
 
     var static_strings = try eval.Interpreter.buildStaticStrings(f.allocator, &f.store);
@@ -733,8 +748,8 @@ test "a running set of heap results drops one through the interpreter and releas
     owner.abort_fn = &ReadyChildren.abort;
 
     var address = @intFromPtr(&owner);
-    const made = try interp.eval(.{ .proc_id = make, .arg_layouts = &.{.opaque_ptr}, .arg_ptr = @ptrCast(&address) });
-    const group: *builtins.task.Group = @ptrFromInt(made.value.read(usize));
+    _ = try interp.eval(.{ .proc_id = make, .arg_layouts = &.{.opaque_ptr}, .arg_ptr = @ptrCast(&address) });
+    const group = builtins.task.openGroup(&owner, test_loop_id);
 
     // A heap string in a result slot, as an entry nobody takes would leave
     // it; the set's drop must release it.
@@ -743,24 +758,24 @@ test "a running set of heap results drops one through the interpreter and releas
     const drop = group.result_drop orelse return error.TestUnexpectedResult;
     drop(@ptrCast(&result), group.result_drop_context, owner.ops);
 
-    address = @intFromPtr(group);
     const ended = try interp.eval(.{ .proc_id = finish, .arg_layouts = &.{.opaque_ptr}, .arg_ptr = @ptrCast(&address) });
     try std.testing.expectEqual(@as(u32, 1), ended.value.read(u32));
     try f.runtime_env.checkForLeaks();
 }
 
 /// The task-form loop the park-site test runs, after the continuation pass:
-/// the provides root `g(cell)` loads its own task from `cell`, opens a
-/// running set of three entries (one returning 5, then two background ones
-/// returning 100 and 200), and sums what arrives:
+/// the provides root `g()` opens a running set of three entries (one
+/// returning 5, then two background ones returning 100 and 200) and sums
+/// what arrives:
 ///
-///     join L(sum) { s = group_next(set); match s { 0 => sum = sum +
-///     load(group_arrival(set)); jump L, _ => group_free(set); ret sum } }
+///     join L(sum) { s = group_next(3); match s { 0 => sum = sum +
+///     load(group_arrival(3)); jump L, _ => group_free(3); ret sum } }
 ///
-/// Only a task-form loop has a `group_next`, and it has that form because
-/// an entry may suspend at a `suspending` hosted call. The program declares
-/// one, `roc_test_unused`, which nothing here calls. Returns the task entry
-/// that takes `g`'s place.
+/// Its operations have no task until the pass gives `g` one and passes it
+/// to each. Only a task-form loop has a `group_next`, and it has that form
+/// because an entry may suspend at a `suspending` hosted call. The program
+/// declares one, `roc_test_unused`, which nothing here calls. Returns the
+/// task entry that takes `g`'s place.
 fn parkingProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
     _ = try f.store.addProcSpec(.{
         .name = f.store.freshSyntheticSymbol(),
@@ -773,14 +788,9 @@ fn parkingProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
     const erased = try f.layouts.insertErasedCallable();
     const list_u64 = try f.layouts.insertList(.u64);
     const starts = [_]LIR.LirProcSpecId{ try constantStart(f, 5), try constantStart(f, 100), try constantStart(f, 200) };
-    const background = [_]i64{ 0, 1, 1 };
+    const background = [_]bool{ false, true, true };
 
-    const cell = try f.local(try f.layouts.insertPtr(.opaque_ptr));
-    const owner = try f.local(.opaque_ptr);
-    const set = try f.local(.opaque_ptr);
-    const count = try f.local(.u64);
-    const no_limit = try f.local(.u64);
-    const limits = try f.local(list_u64);
+    const id = try f.local(.u64);
     const path = try f.local(list_u64);
     const no = try f.local(.bool);
     const yes = try f.local(.bool);
@@ -800,56 +810,40 @@ fn parkingProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
     const back = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } }, .test_fixture);
     const rebind = try f.store.addCFStmt(.{ .set_local = .{ .target = sum, .value = sum2, .mode = .initialize_join_param, .next = back } }, .test_fixture);
     const add = try f.op(sum2, .num_int_add_wrap, &.{ sum, value }, rebind);
-    const arrived = try f.op(slot, .group_arrival, &.{set}, try f.op(value, .ptr_load, &.{slot}, add));
-    const ended = try f.op(freed, .group_free, &.{set}, try f.ret(sum));
+    const arrived = try f.op(slot, .group_arrival, &.{id}, try f.op(value, .ptr_load, &.{slot}, add));
+    const ended = try f.op(freed, .group_free, &.{id}, try f.ret(sum));
     const branch = try f.store.addCFStmt(.{ .switch_stmt = .{
         .cond = status,
         .branches = try f.store.addCFSwitchBranches(&.{.{ .value = 0, .body = arrived }}),
         .default_branch = ended,
     } }, .test_fixture);
-    const loop_body = try f.op(status, .group_next, &.{set}, branch);
+    const loop_body = try f.op(status, .group_next, &.{id}, branch);
     const enter = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } }, .test_fixture);
     const init_sum = try f.store.addCFStmt(.{ .set_local = .{ .target = sum, .value = sum0, .mode = .initialize_join_param, .next = enter } }, .test_fixture);
     const loop = try f.store.addCFStmt(.{ .join = .{ .id = join_id, .params = try f.store.addLocalSpan(&.{sum}), .body = loop_body, .remainder = init_sum } }, .test_fixture);
 
     // Opening the set.
     var head = try literal(f, sum0, 0, .u64, loop);
-    head = try f.op(unit, .group_start, &.{set}, head);
+    head = try f.op(unit, .group_start, &.{id}, head);
     var index: usize = start_locals.len;
     while (index > 0) {
         index -= 1;
-        head = try f.op(unit, .group_push, &.{ set, start_locals[index], path, no, if (background[index] == 1) yes else no }, head);
+        head = try f.op(unit, .group_push, &.{ id, start_locals[index], path, no, if (background[index]) yes else no }, head);
     }
-    head = try f.store.addCFStmt(.{ .assign_low_level = .{
-        .target = set,
-        .op = .group_init,
-        .rc_effect = try f.store.addRcEffect(LowLevel.group_init.rcEffect()),
-        .extra = try f.store.addStmtRow(LIR.LowLevelExtra, .{ .group_result = .some(.u64) }),
-        .args = try f.store.addLocalSpan(&.{ owner, count, limits, no_limit }),
-        .next = head,
-    } }, .test_fixture);
     head = try f.store.addCFStmt(.{ .assign_list = .{ .target = path, .elems = .empty(), .next = head } }, .test_fixture);
-    head = try f.store.addCFStmt(.{ .assign_list = .{ .target = limits, .elems = .empty(), .next = head } }, .test_fixture);
     head = try literal(f, yes, 1, .bool, head);
     head = try literal(f, no, 0, .bool, head);
-    head = try literal(f, no_limit, 0, .u64, head);
-    head = try literal(f, count, 3, .u64, head);
-    index = start_locals.len;
-    while (index > 0) {
-        index -= 1;
-        head = try f.store.addCFStmt(.{ .assign_packed_erased_fn = .{
-            .target = start_locals[index],
-            .data = try f.store.addStmtRow(LIR.PackedErasedFnData, .{
-                .proc = starts[index],
-                .capture = .none,
-                .capture_layout = .none,
-                .on_drop = .none,
-            }),
-            .next = head,
-        } }, .test_fixture);
-    }
-    head = try f.op(owner, .ptr_load, &.{cell}, head);
-    const g = try pointerProc(f, cell, head, .u64);
+    head = try groupInit(f, id, 3, .u64, null, head);
+    head = try packStarts(f, &starts, &start_locals, head);
+    const g = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = .empty(),
+        .frame_locals = try f.store.addLocalSpan(f.locals.items),
+        .body = .some(head),
+        .ret_layout = .u64,
+    }, .none);
+    f.locals.clearRetainingCapacity();
 
     try lir.SuspensionMarks.run(f.allocator, &f.store);
     var roots = [_]LIR.LirProcSpecId{g};
@@ -896,13 +890,10 @@ test "a task parks at its running set's next and resumes there until the loop en
     var interp = try eval.Interpreter.init(f.allocator, &f.store, &f.layouts, static_strings.view(), f.runtime_env.get_ops());
     defer interp.deinit();
 
-    var cell: usize = 0;
     var root: u64 = 0;
-    const Args = extern struct { cell: usize, result_out: usize };
-    var args = Args{ .cell = @intFromPtr(&cell), .result_out = @intFromPtr(&root) };
-    const created = try interp.eval(.{ .proc_id = entry, .arg_layouts = &.{ try f.layouts.insertPtr(.opaque_ptr), .opaque_ptr }, .arg_ptr = @ptrCast(&args) });
+    var result_out = @intFromPtr(&root);
+    const created = try interp.eval(.{ .proc_id = entry, .arg_layouts = &.{.opaque_ptr}, .arg_ptr = @ptrCast(&result_out) });
     const task: *RocTask = @ptrFromInt(created.value.read(usize));
-    cell = @intFromPtr(task);
     const ready = &ReadyChildren.ready;
     const abort = &ReadyChildren.abort;
     ReadyChildren.len = 0;

@@ -47,7 +47,7 @@ const group_pending: u64 = 2;
 const SiteKind = union(enum) {
     procedure,
     hosted,
-    /// The running set.
+    /// The loop id that names the running set.
     park: LocalId,
 };
 
@@ -138,6 +138,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
         plan.task = try store.addLocal(.{ .layout_idx = .opaque_ptr });
         try appendLocal(store, &store.getProcSpecPtr(plan.proc).args, plan.task);
         try appendLocal(store, &store.getProcSpecPtr(plan.proc).frame_locals, plan.task);
+        try passTaskToRunningSets(allocator, store, plan.proc, plan.task);
         for (plan.sites.sites) |site| {
             if (site.park) continue;
             const call = store.getCFStmtImmediate(site.call).assign_call;
@@ -421,6 +422,26 @@ fn copyLocals(allocator: Allocator, store: *const LirStore, span: LIR.LocalSpan)
     return out;
 }
 
+/// Pass `task` to every running-set operation in `proc`'s body, last, as a
+/// site passes it to a procedure: the operations name their set by the loop
+/// id and the owner (design.md "Park sites").
+fn passTaskToRunningSets(allocator: Allocator, store: *LirStore, proc: ProcId, task: LocalId) Allocator.Error!void {
+    var work = std.ArrayList(CFStmtId).empty;
+    defer work.deinit(allocator);
+    var seen = try std.DynamicBitSetUnmanaged.initEmpty(allocator, store.cfStmtCount());
+    defer seen.deinit(allocator);
+    try work.append(allocator, store.getProcSpecImmediate(proc).body.get().?);
+    while (work.pop()) |stmt_id| {
+        if (seen.isSet(@backingInt(stmt_id))) continue;
+        seen.set(@backingInt(stmt_id));
+        const stmt = store.getCFStmtImmediate(stmt_id).*;
+        if (stmt == .assign_low_level and stmt.assign_low_level.op.namesRunningSet()) {
+            try appendLocal(store, &store.getCFStmtPtr(stmt_id).assign_low_level.args, task);
+        }
+        try body_clone.appendSuccessors(store, &work, stmt_id, allocator);
+    }
+}
+
 fn isHosted(store: *const LirStore, proc: ProcId) bool {
     return store.getProcSpecImmediate(proc).hosted.get() != null;
 }
@@ -652,7 +673,7 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
     defer fields.deinit(allocator);
     var call_args = try std.ArrayList(LocalId).initCapacity(allocator, info.live_after.len + 1);
     defer call_args.deinit(allocator);
-    var set: ?LocalId = null;
+    var loop_id: ?LocalId = null;
     for (info.live_after) |live| {
         if (live == info.target) {
             call_args.appendAssumeCapacity(result);
@@ -660,7 +681,7 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
             const field = try fresh.local(store.getLocal(live).layout_idx);
             try fields.append(allocator, field);
             call_args.appendAssumeCapacity(field);
-            if (info.kind == .park and live == info.kind.park) set = field;
+            if (info.kind == .park and live == info.kind.park) loop_id = field;
         }
     }
     const live_here = try allocator.dupe(LocalId, call_args.items);
@@ -678,8 +699,8 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
         .park => blk: {
             const edge = try pendingEdge(store, info, .{ .task = task, .target = result, .live = live_here, .proc = null, .args = .empty(), .extra = .none }, origin);
             const branch = try parkBranch(store, fresh, task, result, edge, call, origin);
-            const set_field = set orelse invariant("a park site's set is not among its saved values", .{});
-            break :blk try store.addLowLevelStmt(result, .group_next, &.{set_field}, branch, origin);
+            const id_field = loop_id orelse invariant("a park site's loop id is not among its saved values", .{});
+            break :blk try store.addLowLevelStmt(result, .group_next, &.{ id_field, task }, branch, origin);
         },
         .procedure, .hosted => blk: {
             const load = try store.addLowLevelStmt(result, .ptr_load, &.{address.?}, call, origin);

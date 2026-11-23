@@ -754,6 +754,8 @@ pub const EntryMarks = struct {
 
 /// What a task-form loop's `group` operation hands the runtime.
 pub const GroupSpec = struct {
+    /// The compiled loop's id (`openGroup`).
+    loop_id: u64 = 0,
     /// Each entry's start record, in input order. The group takes them.
     starts: []const [*]u8,
     /// Parallel to `starts`.
@@ -797,6 +799,9 @@ pub const Next = union(enum) {
 /// on several threads.
 pub const Group = struct {
     owner: *RocTask,
+    /// The compiled loop's id, which each of its operations names
+    /// (`openGroup`).
+    loop_id: u64,
     /// The slot of the entry `groupNext` last reported arrived, for a
     /// compiled loop to move its result out of.
     arrival: [*]u8,
@@ -1077,7 +1082,7 @@ fn growArray(ops: *RocOps, items: *anyopaque, old: u32, new: u32, size: usize, a
 /// in input order. Called from the owner's code during its resume.
 pub fn groupCreate(owner: *RocTask, spec: GroupSpec) *Group {
     if (spec.marks.len != spec.starts.len) utils.builtinInvariant(owner.ops, "a group's marks don't match its entries");
-    const group = groupInit(owner, spec.starts.len, spec.limits, spec.root_limit, spec.slot_size, spec.slot_alignment, spec.result_drop, spec.result_drop_context, spec.result_drop_release);
+    const group = groupInit(owner, spec.loop_id, spec.starts.len, spec.limits, spec.root_limit, spec.slot_size, spec.slot_alignment, spec.result_drop, spec.result_drop_context, spec.result_drop_release);
     for (spec.starts, spec.marks) |start_record, marks| groupPush(group, start_record, marks.limit_path, marks.shielded, marks.background);
     groupStart(group);
     return group;
@@ -1089,6 +1094,7 @@ pub fn groupCreate(owner: *RocTask, spec: GroupSpec) *Group {
 /// starts every entry its limits allow.
 pub fn groupInit(
     owner: *RocTask,
+    loop_id: u64,
     entry_count: usize,
     limits: []const u64,
     root_limit: ?u32,
@@ -1103,6 +1109,7 @@ pub fn groupInit(
     const stride = std.mem.alignForward(usize, slot_size, slot_alignment);
     group.* = .{
         .owner = owner,
+        .loop_id = loop_id,
         .arrival = undefined,
         .word = 0,
         .outer = owner.open_groups,
@@ -1140,6 +1147,18 @@ pub fn groupInit(
     }
     if (root_limit) |root| if (root >= limits.len) utils.builtinInvariant(ops, "a group's root limit names a limit the plan doesn't have");
     owner.open_groups = group;
+    return group;
+}
+
+/// The running set a compiled loop's operation names: the owner's innermost
+/// open group. Loops nest lexically within a task's code, and a loop closes
+/// before the code around it goes on, so the loop whose operation runs is
+/// always the innermost one open; a recursive call that opens the same loop
+/// again opens a new innermost group. In a runtime with monitors, the
+/// group's loop id must be `loop_id`.
+pub fn openGroup(owner: *RocTask, loop_id: u64) *Group {
+    const group = owner.open_groups orelse utils.builtinInvariant(owner.ops, "a concurrent loop's operation ran with no loop open");
+    if (monitors and group.loop_id != loop_id) utils.builtinInvariant(owner.ops, "a concurrent loop's operation named a loop other than the innermost open one");
     return group;
 }
 
