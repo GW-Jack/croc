@@ -43,6 +43,7 @@ pub const BuiltinIndices = struct {
     hasher_type: Statement.Idx,
     iter_type: Statement.Idx,
     stream_type: Statement.Idx,
+    concurrently_type: Statement.Idx,
     list_type: Statement.Idx,
     box_type: Statement.Idx,
     encoding_type: Statement.Idx,
@@ -101,6 +102,7 @@ pub const BuiltinIndices = struct {
     hasher_ident: Ident.Idx,
     iter_ident: Ident.Idx,
     stream_ident: Ident.Idx,
+    concurrently_ident: Ident.Idx,
     list_ident: Ident.Idx,
     box_ident: Ident.Idx,
     encoding_ident: Ident.Idx,
@@ -250,6 +252,7 @@ pub const builtin_type_specs = [_]BuiltinTypeSpec{
     .{ .display_name = "Hasher", .qualified_name = "Builtin.Hasher", .type_field = "hasher_type", .ident_field = "hasher_ident", .lookup = .{ .top_level = "Hasher" } },
     .{ .display_name = "Iter", .qualified_name = "Builtin.Iter", .type_field = "iter_type", .ident_field = "iter_ident", .lookup = .{ .top_level = "Iter" } },
     .{ .display_name = "Stream", .qualified_name = "Builtin.Stream", .type_field = "stream_type", .ident_field = "stream_ident", .lookup = .{ .top_level = "Stream" } },
+    .{ .display_name = "Concurrently", .qualified_name = "Builtin.Concurrently", .type_field = "concurrently_type", .ident_field = "concurrently_ident", .lookup = .{ .top_level = "Concurrently" } },
     .{ .display_name = "List", .qualified_name = "Builtin.List", .type_field = "list_type", .ident_field = "list_ident", .lookup = .{ .top_level = "List" } },
     .{ .display_name = "Box", .qualified_name = "Builtin.Box", .type_field = "box_type", .ident_field = "box_ident", .lookup = .{ .top_level = "Box" } },
     .{ .display_name = "Encoding", .qualified_name = "Builtin.Encoding", .type_field = "encoding_type", .ident_field = "encoding_ident", .lookup = .{ .top_level = "Encoding" } },
@@ -340,7 +343,7 @@ fn hashInt(hash: u64, value: u64) u64 {
 
 /// Hash of the builtin type registry used to reject stale generated builtin index metadata.
 pub const BUILTIN_TYPE_REGISTRY_HASH: u64 = blk: {
-    @setEvalBranchQuota(10_000);
+    @setEvalBranchQuota(20_000);
     var hash = hashBytes(hash_offset, "roc-builtin-type-registry-v1");
     for (builtin_type_specs) |spec| {
         hash = hashBytes(hash, spec.display_name);

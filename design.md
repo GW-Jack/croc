@@ -34023,10 +34023,11 @@ The combinators mean:
   background entries are left, they are cancelled and the loop ends;
 - `concat`: one plan's entries, then the other's.
 
-A pure Builtin function flattens a plan into its entries in input order.
-Each entry carries the limits it is under (outermost first) and its shield
-and background marks. The flattened plan also gives the *root limit*, the
-plan's outermost node if that node is a `Limit`.
+`Concurrently.flatten`, a pure Builtin method the loop lowering calls,
+flattens a plan into its entries in input order. Limits are numbered in
+preorder. Each entry carries the limits it is under (outermost first) and
+its shield and background marks. The flattened plan also gives the *root
+limit*, the plan's outermost node if that node is a `Limit`.
 
 **The protocol.** `for!` over a source whose checked type is
 `Concurrently(a)` takes the plan protocol. Any other source takes `.stream`

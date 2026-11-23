@@ -590,7 +590,7 @@ fn tidyFile(
 /// type must either be private (declared below the exposed block, at the module's
 /// top level) or nested under one of these.
 const allowed_builtin_types = [_][]const u8{
-    "Str", "Hasher", "Iter", "Stream", "List", "Bool", "Box", "Try", "Dict", "Set", "Num", "Encoding", "Crypto",
+    "Str", "Hasher", "Iter", "Stream", "Concurrently", "List", "Bool", "Box", "Try", "Dict", "Set", "Num", "Encoding", "Crypto",
 };
 
 fn isAllowedBuiltinType(name: []const u8) bool {

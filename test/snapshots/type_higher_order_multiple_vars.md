@@ -249,10 +249,10 @@ main! = |_| {}
 				(e-lambda
 					(args
 						(p-assign (ident "x")))
-					(e-call (constraint-fn-var 244)
+					(e-call (constraint-fn-var 255)
 						(e-lookup-local
 							(p-assign (ident "f")))
-						(e-call (constraint-fn-var 243)
+						(e-call (constraint-fn-var 254)
 							(e-lookup-local
 								(p-assign (ident "g")))
 							(e-lookup-local

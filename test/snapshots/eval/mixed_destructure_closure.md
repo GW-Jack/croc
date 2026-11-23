@@ -61,7 +61,7 @@ EndOfFile,
 ~~~
 # CANONICALIZE
 ~~~clojure
-(e-call (constraint-fn-var 297)
+(e-call (constraint-fn-var 308)
 	(e-lambda
 		(args
 			(p-record-destructure
@@ -85,13 +85,13 @@ EndOfFile,
 									(record-destruct (label "e") (ident "e")
 										(required
 											(p-assign (ident "e")))))))))))
-		(e-dispatch-call (method "plus") (constraint-fn-var 263)
+		(e-dispatch-call (method "plus") (constraint-fn-var 274)
 			(receiver
-				(e-dispatch-call (method "plus") (constraint-fn-var 261)
+				(e-dispatch-call (method "plus") (constraint-fn-var 272)
 					(receiver
-						(e-dispatch-call (method "plus") (constraint-fn-var 259)
+						(e-dispatch-call (method "plus") (constraint-fn-var 270)
 							(receiver
-								(e-dispatch-call (method "plus") (constraint-fn-var 257)
+								(e-dispatch-call (method "plus") (constraint-fn-var 268)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "a"))))

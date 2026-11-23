@@ -3881,6 +3881,63 @@ Builtin :: [].{
 		}
 	}
 
+	## A plan: work to run concurrently, which a `for!` loop runs. Building, storing
+	## or returning a plan runs nothing. A loop `for! x in plan { … }` starts the
+	## plan's entries as child tasks and runs its body once per result, in the
+	## order the entries finish. Leaving the loop early cancels the entries still
+	## running, and an entry's crash crashes the loop's task.
+	Concurrently(item) :: [
+		Each(List(() => item)),
+		Cat(Concurrently(item), Concurrently(item)),
+		Limit(U64, Concurrently(item)),
+		Shielded(Concurrently(item)),
+		Background(Concurrently(item)),
+	].{
+
+		## At most `max_running` of the plan's entries run at once; the next starts
+		## as soon as one finishes. Crashes if `max_running` is 0.
+		limit : Concurrently(item), U64 -> Concurrently(item)
+		limit = |plan, max_running|
+			if max_running == 0 {
+				crash "Concurrently.limit: the limit must be at least 1"
+			} else {
+				Limit(max_running, plan)
+			}
+
+		## Leaving the loop early waits for this plan's entries that have begun,
+		## instead of cancelling them. Entries that haven't begun never start.
+		shielded : Concurrently(item) -> Concurrently(item)
+		shielded = |plan| Shielded(plan)
+
+		## These entries don't keep the loop going: once every other entry has
+		## finished, they're cancelled and the loop ends.
+		background : Concurrently(item) -> Concurrently(item)
+		background = |plan| Background(plan)
+
+		## The first plan's entries, then the second's.
+		concat : Concurrently(item), Concurrently(item) -> Concurrently(item)
+		concat = |first, second| Cat(first, second)
+
+		## The compiler calls this to run a `for!` loop over the plan. `entries`
+		## are the plan's functions in input order, and `marks` is parallel to
+		## them. Limit `i` allows `limits[i]` running entries, and an entry's
+		## `limit_path` lists the limits it's under, outermost first. `root_limit`
+		## is 1 when the plan's outermost node is a limit and 0 otherwise: a
+		## spawned entry goes under that limit only.
+		## ```roc
+		## expect List.concurrently([|| 1, || 2]).limit(3).flatten().limits == [3]
+		## ```
+		flatten : Concurrently(item) -> { entries : List(() => item), marks : List({ limit_path : List(U64), shielded : Bool, background : Bool }), limits : List(U64), root_limit : U64 }
+		flatten = |plan| {
+			flat = concurrently_flatten_into(plan, [], Bool.False, Bool.False, { entries: [], marks: [], limits: [] })
+			root_limit = match plan {
+				Limit(_, _) => 1
+				_ => 0
+			}
+			{ entries: flat.entries, marks: flat.marks, limits: flat.limits, root_limit }
+		}
+	}
+
 	## A type has a default sort order when its module provides
 	## `order_relative_to : item, item -> [Before, Same, After]`.
 	## These tags say which argument comes first; they deliberately do not tie
@@ -3910,6 +3967,11 @@ Builtin :: [].{
 		## ```
 		is_empty : List(_item) -> Bool
 		is_empty = |list| List.len(list) == 0
+
+		## A plan whose entries are these functions, in this order. Building it runs
+		## none of them: a `for!` loop over it does.
+		concurrently : List(() => item) -> Concurrently(item)
+		concurrently = |functions| Concurrently.Each(functions)
 
 		## Iterate over the list from first to last.
 		iter : List(item) -> Iter(item)
@@ -27647,6 +27709,32 @@ iter_from_step = |len_if_known, step| {
 	len_if_known,
 	step,
 }
+
+# `Concurrently.flatten`'s walk. `acc` holds what the walk has produced so far,
+# and each node appends its entries, their marks and its limits in input order.
+concurrently_flatten_into : Concurrently(item), List(U64), Bool, Bool, { entries : List(() => item), marks : List({ limit_path : List(U64), shielded : Bool, background : Bool }), limits : List(U64) } -> { entries : List(() => item), marks : List({ limit_path : List(U64), shielded : Bool, background : Bool }), limits : List(U64) }
+concurrently_flatten_into = |plan, limit_path, shielded, background, acc|
+	match plan {
+		Each(functions) => {
+			mark = { limit_path, shielded, background }
+			{
+				entries: List.concat(acc.entries, functions),
+				marks: List.concat(acc.marks, List.repeat(mark, List.len(functions))),
+				limits: acc.limits,
+			}
+		}
+		Cat(first, second) => {
+			after_first = concurrently_flatten_into(first, limit_path, shielded, background, acc)
+			concurrently_flatten_into(second, limit_path, shielded, background, after_first)
+		}
+		Limit(max_running, inner) => {
+			index = List.len(acc.limits)
+			with_limit = { entries: acc.entries, marks: acc.marks, limits: List.append(acc.limits, max_running) }
+			concurrently_flatten_into(inner, List.append(limit_path, index), shielded, background, with_limit)
+		}
+		Shielded(inner) => concurrently_flatten_into(inner, limit_path, Bool.True, background, acc)
+		Background(inner) => concurrently_flatten_into(inner, limit_path, shielded, Bool.True, acc)
+	}
 
 # The `Stream` counterpart of `iter_from_step`: every `Stream` source and
 # adapter builds its value through this one registered constructor, so Monotype

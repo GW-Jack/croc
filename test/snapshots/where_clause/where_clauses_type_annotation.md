@@ -54,7 +54,7 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-assign (ident "a")))
-			(e-dispatch-call (method "to_b") (constraint-fn-var 232)
+			(e-dispatch-call (method "to_b") (constraint-fn-var 243)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "a"))))

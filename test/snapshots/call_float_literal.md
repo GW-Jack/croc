@@ -49,7 +49,7 @@ NO CHANGE
 ~~~
 # CANONICALIZE
 ~~~clojure
-(e-call (constraint-fn-var 219)
+(e-call (constraint-fn-var 230)
 	(e-runtime-error (tag "erroneous_value_expr")))
 ~~~
 # TYPES
