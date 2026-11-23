@@ -103,6 +103,7 @@ const PolymorphicValueAnnotation = problem_mod.PolymorphicValueAnnotation;
 const EffectfulTopLevel = problem_mod.EffectfulTopLevel;
 const EffectfulComptimeExpression = problem_mod.EffectfulComptimeExpression;
 const EffectfulExpect = problem_mod.EffectfulExpect;
+const ConcurrentLoopNotLowered = problem_mod.ConcurrentLoopNotLowered;
 const EffectfulFunctionName = problem_mod.EffectfulFunctionName;
 const RedundantOpenTagUnion = problem_mod.RedundantOpenTagUnion;
 
@@ -1104,6 +1105,9 @@ pub const ReportBuilder = struct {
             },
             .effectful_expect => |data| {
                 return self.buildEffectfulExpectReport(data);
+            },
+            .concurrent_loop_not_lowered => |data| {
+                return self.buildConcurrentLoopNotLoweredReport(data);
             },
             .effectful_function_name => |data| {
                 return self.buildEffectfulFunctionNameReport(data);
@@ -2751,6 +2755,26 @@ pub const ReportBuilder = struct {
 
     /// Whether this failed dispatch is the `iter` call of a plain `for` loop
     /// whose operand is a `Stream`, which only `for!` can consume.
+    /// The kind of the `for` or `for!` loop whose `.iter()` or `.stream()`
+    /// failed because its source is a `Concurrently` plan, if that is why it
+    /// failed. A `for!` reaches here only when its source became a plan after
+    /// the loop was checked (design.md "Plans And Concurrent Loops").
+    fn forLoopOverPlan(self: *Self, data: DispatcherDoesNotImplMethod) ?CIR.ForKind {
+        const types_store = &self.module_env.types;
+        const failed_fn = types_store.resolveVar(data.fn_var).var_;
+        for (self.module_env.for_loop_dispatch_plans.items()) |plan| {
+            if (types_store.resolveVar(@fromBackingInt(@intCast(plan.iter_fn_var))).var_ != failed_fn) continue;
+            const nominal = types_store.resolveVar(data.dispatcher_var).desc.content.unwrapNominalType() orelse return null;
+            if (!nominal.ident.ident_idx.eql(self.module_env.idents.builtin_concurrently)) return null;
+            return switch (plan.protocol) {
+                .iter => .iter,
+                .stream => .stream,
+                .plan => unreachable, // a plan loop's dispatch is rejected, so it reports no missing method
+            };
+        }
+        return null;
+    }
+
     fn isPlainForLoopOverStream(self: *Self, data: DispatcherDoesNotImplMethod) bool {
         const types_store = &self.module_env.types;
         const failed_fn = types_store.resolveVar(data.fn_var).var_;
@@ -3019,6 +3043,29 @@ pub const ReportBuilder = struct {
                             D.ident(data.method_name).withAnnotation(.inline_code),
                             D.bytes("associated with it in the type's declaration."),
                         }, self, &report);
+                    }
+                } else if (self.forLoopOverPlan(data)) |loop_kind| {
+                    switch (loop_kind) {
+                        .iter => try D.renderSlice(&.{
+                            D.bytes("Hint:").withAnnotation(.emphasized),
+                            D.bytes("A"),
+                            D.bytes("Concurrently").withAnnotation(.inline_code),
+                            D.bytes("plan runs with"),
+                            D.bytes("for!").withAnnotation(.inline_code),
+                            D.bytes(", not").withNoPrecedingSpace(),
+                            D.bytes("for").withAnnotation(.inline_code),
+                            D.bytes(".").withNoPrecedingSpace(),
+                        }, self, &report),
+                        .stream => try D.renderSlice(&.{
+                            D.bytes("Hint:").withAnnotation(.emphasized),
+                            D.bytes("This"),
+                            D.bytes("for!").withAnnotation(.inline_code),
+                            D.bytes("loop only learned its source is a"),
+                            D.bytes("Concurrently").withAnnotation(.inline_code),
+                            D.bytes("plan after the loop was checked, so it was checked as a loop over a stream. Annotate the source as"),
+                            D.bytes("Concurrently(_)").withAnnotation(.inline_code),
+                            D.bytes("so the loop runs it as a plan."),
+                        }, self, &report),
                     }
                 } else if (self.isPlainForLoopOverStream(data)) {
                     try D.renderSlice(&.{
@@ -5709,6 +5756,12 @@ pub const ReportBuilder = struct {
     fn buildEffectfulExpectReport(self: *Self, data: EffectfulExpect) Allocator.Error!Report {
         return self.buildHighlightedRegionReport("Effectful Expect", "This expect performs an effect while evaluating its condition.", .runtime_error, data.region, &.{
             D.bytes("Keep expect conditions pure, and test effectful behavior from a function body instead."),
+        });
+    }
+
+    fn buildConcurrentLoopNotLoweredReport(self: *Self, data: ConcurrentLoopNotLowered) Allocator.Error!Report {
+        return self.buildHighlightedRegionReport("Concurrent Loop Not Supported Yet", "This `for!` loop runs a plan, and this compiler can't compile concurrent loops yet.", .runtime_error, data.region, &.{
+            D.bytes("The loop crashes if it runs."),
         });
     }
 

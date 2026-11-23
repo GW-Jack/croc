@@ -14018,6 +14018,7 @@ fn freshBuiltinTypeInstance(self: *Self, builtin_type: Var, env: *Env, new_regio
 
 const BuiltinNominalDecl = union(enum) {
     list,
+    concurrently,
     box,
     dict,
     set,
@@ -14075,6 +14076,7 @@ fn builtinNumStmtFromIndices(indices: CIR.BuiltinIndices, num_kind: CIR.NumKind)
 fn builtinNominalIdent(self: *const Self, decl: BuiltinNominalDecl) Ident.Idx {
     return switch (decl) {
         .list => self.cir.idents.builtin_list,
+        .concurrently => self.cir.idents.builtin_concurrently,
         .box => self.cir.idents.builtin_box,
         .dict => self.cir.idents.builtin_dict,
         .set => self.cir.idents.builtin_set,
@@ -14089,6 +14091,7 @@ fn builtinNominalIdent(self: *const Self, decl: BuiltinNominalDecl) Ident.Idx {
 fn builtinNominalLabel(decl: BuiltinNominalDecl) []const u8 {
     return switch (decl) {
         .list => "List",
+        .concurrently => "Concurrently",
         .box => "Box",
         .dict => "Dict",
         .set => "Set",
@@ -14140,6 +14143,7 @@ fn sourceDeclForBuiltinNominal(self: *const Self, decl: BuiltinNominalDecl) u32 
         const indices = self.builtin_ctx.builtin_indices.?;
         const stmt_idx = switch (decl) {
             .list => indices.list_type,
+            .concurrently => indices.concurrently_type,
             .box => indices.box_type,
             .dict => indices.dict_type,
             .set => indices.set_type,
@@ -14437,6 +14441,7 @@ fn builtinNominalDeclForSourceDecl(source_env: *const ModuleEnv, source_decl: ?u
 fn builtinNominalDeclForIdentInEnv(source_env: *const ModuleEnv, type_ident: Ident.Idx) ?BuiltinNominalDecl {
     const common = source_env.idents;
     if (type_ident.eql(common.list) or type_ident.eql(common.builtin_list)) return .list;
+    if (type_ident.eql(common.builtin_concurrently)) return .concurrently;
     if (type_ident.eql(common.box) or type_ident.eql(common.builtin_box)) return .box;
     if (type_ident.eql(common.dict) or type_ident.eql(common.builtin_dict)) return .dict;
     if (type_ident.eql(common.set) or type_ident.eql(common.builtin_set)) return .set;
@@ -14469,6 +14474,7 @@ fn builtinNominalDeclForBuiltinSourceDecl(self: *const Self, source_decl: ?u32) 
 
     const indices = self.builtin_ctx.builtin_indices orelse return null;
     if (raw_decl == @backingInt(indices.list_type)) return .list;
+    if (raw_decl == @backingInt(indices.concurrently_type)) return .concurrently;
     if (raw_decl == @backingInt(indices.box_type)) return .box;
     if (raw_decl == @backingInt(indices.dict_type)) return .dict;
     if (raw_decl == @backingInt(indices.set_type)) return .set;
@@ -14495,7 +14501,7 @@ fn builtinNominalDeclForBuiltinSourceDecl(self: *const Self, source_decl: ?u32) 
 fn builtinNumKindFromBuiltinSourceDecl(self: *const Self, source_decl: ?u32) ?CIR.NumKind {
     return switch (self.builtinNominalDeclForBuiltinSourceDecl(source_decl) orelse return null) {
         .num => |num_kind| num_kind,
-        .list, .box, .dict, .set, .try_type, .fields, .field, .numeral => null,
+        .list, .concurrently, .box, .dict, .set, .try_type, .fields, .field, .numeral => null,
     };
 }
 
@@ -17147,7 +17153,7 @@ fn storedNominalBacking(self: *const Self, nominal: types_mod.NominalType) Store
         if (nominal.ident.ident_idx.eql(self.cir.idents.builtin_encoding_parse_tag_union_spec)) return .intrinsic_callable;
         if (self.builtinNominalDeclForBuiltinSourceDecl(nominal.sourceDeclOptional())) |builtin_decl| switch (builtin_decl) {
             .list, .box, .dict, .set, .fields, .field, .num => return .args_only,
-            .try_type, .numeral => {},
+            .try_type, .numeral, .concurrently => {},
         };
     }
     const template = self.nominalDeclBackingTemplate(nominal) orelse return .invalid;
@@ -21840,7 +21846,7 @@ fn checkHostBoundaryType(self: *Self, var_: Var, region: Region) std.mem.Allocat
             return switch (ctx.check.builtinNominalDeclForBuiltinSourceDecl(nominal.sourceDeclOptional()) orelse return .other) {
                 .box => .box,
                 .list => .list,
-                .dict, .set, .try_type, .fields, .field, .numeral, .num => .other,
+                .dict, .set, .try_type, .fields, .field, .numeral, .num, .concurrently => .other,
             };
         }
 
@@ -35580,7 +35586,18 @@ fn resumeForLoop(self: *Self, state: *ForLoopCheck, expected: Expected, env: *En
         try self.retireCallLikeExprWithErroneousOperands(expr.expr_idx, expr.expr_var, &.{iterable})
     else
         try self.callLikeOperandsContainErroneousValue(&.{iterable});
-    if (!iterable_is_erroneous) {
+    // design.md "Plans And Concurrent Loops": a `for!` whose source's checked
+    // type is `Concurrently(a)` takes the plan protocol, decided here from the
+    // type as checked so far, and its items are the plan's `a`. No backend
+    // compiles a plan loop yet, so it is reported, and its dispatch is
+    // rejected as an erroneous iterable's is: the loop crashes if it runs.
+    const plan_item_var: ?Var = if (state.kind == .stream and !iterable_is_erroneous) self.concurrentlyItemVar(iterable_var) else null;
+    if (plan_item_var) |plan_item| {
+        _ = try self.unify(plan_item, item_var, env);
+        _ = try self.problems.appendProblem(.{ .concurrent_loop_not_lowered = .{ .region = loop_region } });
+    }
+    const dispatch_rejected = iterable_is_erroneous or plan_item_var != null;
+    if (!dispatch_rejected) {
         try self.late_rejectable_for_loops.append(self.gpa, .{
             .owner = if (state.loop_expr) |expr|
                 .{ .expr = expr.expr_idx }
@@ -35594,7 +35611,7 @@ fn resumeForLoop(self: *Self, state: *ForLoopCheck, expected: Expected, env: *En
         .iter => "iter",
         .stream => "stream",
     }));
-    const iter_fn_var = if (iterable_is_erroneous)
+    const iter_fn_var = if (dispatch_rejected)
         try self.mkRejectedSyntheticReceiverDispatchFn(iterable_var, &.{}, iterator_var, env, iterable_region)
     else
         try self.mkSyntheticReceiverDispatchConstraint(
@@ -35612,7 +35629,7 @@ fn resumeForLoop(self: *Self, state: *ForLoopCheck, expected: Expected, env: *En
         .iter => "next",
         .stream => "next!",
     }));
-    const next_fn_var = if (iterable_is_erroneous)
+    const next_fn_var = if (dispatch_rejected)
         try self.mkRejectedSyntheticReceiverDispatchFn(iterator_var, &.{}, step_var, env, loop_region)
     else
         try self.mkSyntheticReceiverDispatchConstraint(
@@ -35624,7 +35641,7 @@ fn resumeForLoop(self: *Self, state: *ForLoopCheck, expected: Expected, env: *En
             loop_region,
         );
 
-    if (!iterable_is_erroneous) {
+    if (!dispatch_rejected) {
         try self.recordLoopDispatch(iter_fn_var, iterable);
         try self.recordLoopDispatch(next_fn_var, iterable);
     }
@@ -35640,6 +35657,10 @@ fn resumeForLoop(self: *Self, state: *ForLoopCheck, expected: Expected, env: *En
         iter_method,
         next_method,
         step.topology,
+        if (plan_item_var != null) .plan else switch (state.kind) {
+            .iter => .iter,
+            .stream => .stream,
+        },
     );
 
     state.phase = .body;
@@ -57131,6 +57152,13 @@ fn drainStructuralDerive(
 fn typeSupportsStructuralDerive(self: *Self, derivation: EqHashDerivation, flat_type: types_mod.FlatType) std.mem.Allocator.Error!bool {
     self.var_set.clearRetainingCapacity();
     return try self.typeSupportsStructuralDeriveInternal(flat_type, derivation, &self.var_set);
+}
+
+/// The item type `a` when `var_` is `Concurrently(a)`, whose `for!` loop
+/// takes the plan protocol (design.md "Plans And Concurrent Loops").
+fn concurrentlyItemVar(self: *Self, var_: Var) ?Var {
+    const nominal = self.types.resolveVar(var_).desc.content.unwrapNominalType() orelse return null;
+    return self.nominalBuiltinPayloadVar(nominal, .concurrently);
 }
 
 /// Whether `nominal_type` is the builtin declaration `decl`.

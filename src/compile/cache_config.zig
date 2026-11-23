@@ -444,7 +444,9 @@ pub const Constants = struct {
     /// 206: absent optional ids and indices are stored as zero.
     /// 207: module environments record the platform's concurrency mode.
     /// 208: hosted lambdas and checked hosted procedures carry `suspending`.
-    pub const CACHE_VERSION = 208;
+    /// 209: common idents include `Builtin.Concurrently`, and for-loop dispatch
+    /// plans record the loop protocol.
+    pub const CACHE_VERSION = 209;
 };
 
 /// Configuration for the Roc cache system.

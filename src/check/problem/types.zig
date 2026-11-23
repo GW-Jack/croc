@@ -103,6 +103,7 @@ pub const Problem = union(enum) {
     effectful_top_level: EffectfulTopLevel,
     effectful_comptime_expression: EffectfulComptimeExpression,
     effectful_expect: EffectfulExpect,
+    concurrent_loop_not_lowered: ConcurrentLoopNotLowered,
     effectful_function_name: EffectfulFunctionName,
     annotation_only_value: AnnotationOnlyValue,
     annotation_only_value_use: AnnotationOnlyValueUse,
@@ -347,6 +348,12 @@ pub const EffectfulComptimeExpression = struct {
 
 /// An expect expression performs effects while evaluating its condition.
 pub const EffectfulExpect = struct {
+    region: base.Region,
+};
+
+/// A `for!` loop over a plan (design.md "Plans And Concurrent Loops"). It
+/// checks, but no backend compiles it yet, so the loop crashes if it runs.
+pub const ConcurrentLoopNotLowered = struct {
     region: base.Region,
 };
 

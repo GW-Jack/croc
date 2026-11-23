@@ -156,6 +156,7 @@ pub const CommonIdents = extern struct {
     // Fully-qualified type identifiers for type checking and layout generation
     builtin_iter: Ident.Idx,
     builtin_stream: Ident.Idx,
+    builtin_concurrently: Ident.Idx,
     builtin_range: Ident.Idx,
     builtin_try: Ident.Idx,
     builtin_numeral: Ident.Idx,
@@ -316,6 +317,7 @@ pub const CommonIdents = extern struct {
             .dec = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("dec_type").display_name)),
             .builtin_iter = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("iter_type").qualified_name)),
             .builtin_stream = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("stream_type").qualified_name)),
+            .builtin_concurrently = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("concurrently_type").qualified_name)),
             .builtin_range = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("range_type").qualified_name)),
             .builtin_try = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("try_type").qualified_name)),
             .builtin_numeral = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("numeral_type").qualified_name)),
@@ -490,6 +492,15 @@ pub const IteratorStepTopology = extern struct {
     skip_payload_var: u32,
 };
 
+/// The protocol a checked `for` loop runs, chosen by checking (design.md
+/// "Plans And Concurrent Loops"): `iter` for `for`, and for `for!` either
+/// `stream` or, when its source's checked type is `Concurrently(a)`, `plan`.
+pub const ForLoopProtocol = enum(u32) {
+    iter,
+    stream,
+    plan,
+};
+
 /// Checked dispatch and topology metadata for one source `for` loop.
 /// Later stages consume these exact identities instead of inferring the
 /// iterator protocol from names or row shapes.
@@ -506,6 +517,9 @@ pub const ForLoopDispatchPlan = extern struct {
     /// The method that pulls each step: `next` for `for`, `next!` for `for!`.
     next_method_ident: u32,
     step_topology: IteratorStepTopology,
+    /// A `plan` loop's dispatch functions are rejected until a backend
+    /// compiles plan loops.
+    protocol: ForLoopProtocol,
 
     pub const SafeList = collections.SafeList(@This());
 };
@@ -4531,6 +4545,7 @@ pub fn recordForLoopDispatchPlan(
     iter_method: Ident.Idx,
     next_method: Ident.Idx,
     step_topology: IteratorStepTopology,
+    protocol: ForLoopProtocol,
 ) std.mem.Allocator.Error!void {
     const raw_node: u32 = @backingInt(node_idx);
     const raw_pattern: u32 = @backingInt(pattern_idx);
@@ -4548,6 +4563,7 @@ pub fn recordForLoopDispatchPlan(
             .iter_method_ident = @bitCast(iter_method),
             .next_method_ident = @bitCast(next_method),
             .step_topology = step_topology,
+            .protocol = protocol,
         };
         return;
     }
@@ -4562,6 +4578,7 @@ pub fn recordForLoopDispatchPlan(
         .iter_method_ident = @bitCast(iter_method),
         .next_method_ident = @bitCast(next_method),
         .step_topology = step_topology,
+        .protocol = protocol,
     });
 }
 
