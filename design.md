@@ -34334,7 +34334,9 @@ an obligation of this contract.)
 
 Child tasks (Child Tasks) need no new call. The runtime readies a child
 through `roc_task_ready`, and the host resumes it like a root, under the
-same obligations (P1, P2, P7, P10). A child's operation is aborted through
+same obligations (P1, P2, P7, P10). That call comes from inside a resume,
+the owner's when it starts entries or a sibling's when a report makes room,
+so `roc_task_ready` only queues the task. A child's operation is aborted through
 `roc_task_abort` as a root's is. When a resume returns a terminal status for
 a child, the runtime has already freed it. The host must forget the
 pointer, and only a root's status ends the program. Cancelling, freeing or
@@ -34344,9 +34346,9 @@ resuming a child after its terminal status breaks P8.
 
 **The wake word.** The pending flag is what compiled code tests, and
 resuming clears it. Whether a paused task may run again is held separately,
-in an atomic word of the task's one wait source: its hosted operation. A
-child-task running set will be a second kind of wait source with a word of
-its own, and a task waits on exactly one at a time. The word holds a
+in an atomic word of the task's wait source: its hosted operation, or a
+group it waits on (Child Tasks), whose word is its own. A task waits on
+exactly one at a time, and it records which. The word holds a
 *parked* bit and a *count* of completions that are published but not yet
 consumed. A hosted completion may come from any thread, so the word is
 atomic even in `Tasks` builds. It is the only field of a task that two
@@ -34640,6 +34642,38 @@ The owner's crash then cancels all of its entries, shielded ones included,
 and propagates up the same way. Propagation stops at a `supervise!`, which
 takes the report as a crash, or at a root, which returns
 `ROC_TASK_CRASHED`.
+
+**The runtime's operations.** `src/builtins/task.zig` implements the
+loop operations as `groupCreate`, `groupNext`, `spawnIn`, `cancelGroup` and
+`groupFree`, which the task form's builtins call:
+- a group keeps its entries in input order, each with its start record
+  until it starts, its result slot, its limit path, its marks and its
+  state. The entries `group` makes have their slots in one block. A spawned
+  entry's slot is an allocation of its own, since running children hold
+  their slots' addresses;
+- entries start in input order as their limits have room, at `group` and
+  whenever a report frees room;
+- `next` returns *pending* with the owner's wait set to the group. The code
+  suspends there, and its resume entry calls `next` again. The resume parks
+  on the group's word, or runs on if a report came first;
+- a report increments the group's word and clears its parked bit in one
+  compare-and-swap with release ordering, and readies the owner only if the
+  bit was set;
+- a result nobody takes, a background entry's after the loop ends or any
+  entry's while its owner finishes, is released with the drop function and
+  context `group` was given.
+
+A task that runs no more of its code is *finishing*: it was cancelled, it
+crashed, or an entry's crash reached it. Its first finishing resume releases
+its records and cancels the running entries of each open group, shielded
+ones included, and drops the entries that haven't started. Each later one
+takes their reports, innermost group first, closing a group once its last
+child has reported and parking on the first that still has one running. It
+ends `crashed` with the first crash's message, or `cancelled`.
+
+`treeOrder` compares two tasks of one tree, for a test host that resumes the
+ready task first in the tree (Sequential equivalence). It is a Zig function
+of the runtime, not a host call.
 
 **Monitors.** The runtime monitors (Conformance) also check its own rules in
 safe builds:

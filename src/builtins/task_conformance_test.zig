@@ -26,6 +26,13 @@ const RocOps = utils.RocOps;
 const RocTask = task_mod.RocTask;
 const Status = task_mod.Status;
 
+/// Stop the test from a record or a host callback, which can't return an
+/// error.
+fn fail(comptime message: []const u8) noreturn {
+    std.debug.print("{s}\n", .{message});
+    @trap();
+}
+
 const buffers = task_mod.BufferLayout{
     .hosted_slot_size = 8,
     .hosted_slot_alignment = 8,
@@ -354,6 +361,78 @@ fn driveConforming(task: *RocTask) void {
         task.wake(&ready);
         status = task.resumeTask();
     }
+}
+
+/// The task the harness's last `roc_task_ready` named.
+var last_readied: ?*RocTask = null;
+
+fn readyChild(task: *RocTask) callconv(.c) void {
+    last_readied = task;
+}
+
+/// A loop over one entry: open the group and wait for the entry, then take
+/// its result and close the group.
+fn loopOverOne(_: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {
+    const group_out: **task_mod.Group = @as(*align(1) const **task_mod.Group, @ptrCast(capture.?)).*;
+    const task: *RocTask = @as(*const *RocTask, @ptrCast(@alignCast(args.?))).*;
+    const entry = record(task.ops, .{ .next = null, .result = 7 });
+    group_out.* = task_mod.groupCreate(task, .{
+        .starts = &.{entry},
+        .marks = &.{.{ .limit_path = &.{}, .shielded = false, .background = false }},
+        .limits = &.{},
+        .root_limit = null,
+        .slot_size = 8,
+        .slot_alignment = 8,
+        .result_drop = null,
+        .result_drop_context = null,
+    });
+    if (task_mod.groupNext(group_out.*) != .pending) fail("the entry arrived before it ran");
+    const size = erased_callable.payloadSize(@sizeOf(**task_mod.Group));
+    const built = erased_callable.allocate(&finishLoop, &stepDrop, @sizeOf(**task_mod.Group), task.ops);
+    @as(*align(1) **task_mod.Group, @ptrCast(erased_callable.capturePtr(built))).* = group_out;
+    const moved = task.allocRecord(size);
+    @memcpy(moved[0..size], built[0..size]);
+    utils.freeDataPtrC(built, erased_callable.payload_alignment, erased_callable.allocation_has_refcounted_children, task.ops);
+    task.pushRecord(moved, null);
+    task.setPending();
+    ret.?[0] = 0;
+}
+
+fn finishLoop(_: *RocOps, ret: ?[*]u8, _: ?[*]const u8, capture: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {
+    const group: *task_mod.Group = @as(*align(1) const **task_mod.Group, @ptrCast(capture.?)).*.*;
+    const arrival = task_mod.groupNext(group).arrived;
+    ret.?[0] = arrival.slot[0];
+    if (task_mod.groupNext(group) != .ended) fail("the loop did not end after its one entry");
+    task_mod.groupFree(group);
+}
+
+test "a host that frees or cancels a child task, which only the runtime does, is caught (P8)" {
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    reset();
+    last_readied = null;
+    var group: *task_mod.Group = undefined;
+    const start = erased_callable.allocate(&loopOverOne, &stepDrop, @sizeOf(**task_mod.Group), &harness.ops);
+    @as(*align(1) **task_mod.Group, @ptrCast(erased_callable.capturePtr(start))).* = &group;
+    var root: [8]u8 = undefined;
+    const task = RocTask.create(&harness.ops, start, &root, buffers);
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(&readyChild, &abort));
+    const child = last_readied.?;
+    last_readied = null;
+
+    try expectCaught(caughtCrash(*RocTask, &freeTask, child), "P8");
+    try expectCaught(caughtCrash(*RocTask, &cancelTask, child), "P8");
+
+    // The child is as it was: it runs, reports, and readies its owner.
+    try std.testing.expectEqual(Status.done, child.resumeFromHost(&readyChild, &abort));
+    try std.testing.expectEqual(task, last_readied.?);
+    try std.testing.expectEqual(Status.done, task.resumeFromHost(&readyChild, &abort));
+    try std.testing.expectEqual(@as(u8, 7), root[0]);
+    // The runtime freed the child before its resume returned.
+    try expectCaught(caughtCrash(*RocTask, &resumeTask, child), "P8");
+    task.free();
+    try std.testing.expectEqual(@as(usize, 0), harness.live());
 }
 
 test "conforming hosts run with the monitors on and no crash" {

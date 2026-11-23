@@ -277,6 +277,28 @@ pub const RocTask = extern struct {
     /// Released records the task allocated, by class, for its next
     /// suspensions (design.md "The Task Runtime", "Record cache").
     record_cache: [record_classes]?[*]u8,
+    /// A child's group, whose owner is its parent, and its entry there
+    /// (design.md "Child Tasks"); null for a root.
+    group: ?*Group,
+    entry_index: u32,
+    /// The task's place among its parent's children, fixed when its entry
+    /// was made, so the tree order is creation order.
+    tree_index: u32,
+    /// The places this task has handed its groups' entries so far.
+    child_counter: u32,
+    /// The group whose wake word the task is parked on, or null while it
+    /// waits on its hosted operation (its own `wake_word`).
+    wait: ?*Group,
+    /// The innermost group the task's code has open; each holds the next
+    /// one out (`Group.outer`).
+    open_groups: ?*Group,
+    /// Whether the task runs no more of its code: its records are released,
+    /// and it ends once its children have reported (design.md "Child
+    /// Tasks").
+    finishing: bool,
+    /// Whether the task ends `crashed`, with `crash_message`: its own crash,
+    /// or one of its entries'.
+    crashing: bool,
 
     /// A task whose list holds `start`, the root's start record, and whose
     /// outermost record writes to `root_result`. The host's first resume
@@ -309,6 +331,14 @@ pub const RocTask = extern struct {
             .crash_message_len = 0,
             .running_from_task = false,
             .record_cache = @splat(null),
+            .group = null,
+            .entry_index = 0,
+            .tree_index = 0,
+            .child_counter = 0,
+            .wait = null,
+            .open_groups = null,
+            .finishing = false,
+            .crashing = false,
         };
         task.push(.{ .record = start, .slot_drop = null, .from_task = false });
         forgetFreed(task);
@@ -410,25 +440,37 @@ pub const RocTask = extern struct {
     fn resumeChecked(self: *RocTask) Status {
         self.claimResume();
         defer self.releaseResume();
+        var completed = false;
         if (self.started) {
-            // Readied: the host's one completion is counted and the parked
-            // bit is clear. Consuming it with acquire ordering makes the
-            // hosted slot the host wrote visible. A cancel readies the task
-            // with no completion unless one raced it.
+            // Readied: the parked bit of the word the task waited on is
+            // clear. For its hosted operation the host's one completion is
+            // counted, unless a cancel or a crash readied it; a group has
+            // at least one report waiting.
             if (monitors) {
-                const seen = @atomicLoad(u32, &self.wake_word, .monotonic);
-                const readied = if (self.cancel_requested) seen & wake_parked == 0 else seen == 1;
+                const seen = @atomicLoad(u32, self.waitWord(), .monotonic);
+                const readied = if (self.finishing or self.cancel_requested or self.crashing)
+                    seen & wake_parked == 0
+                else if (self.wait != null)
+                    seen & wake_parked == 0 and seen != 0
+                else
+                    seen == 1;
                 if (!readied) {
                     self.releaseResume();
                     hostViolation(self.ops, "a task was resumed without a roc_task_ready (P1)");
                 }
             }
-            const word = @atomicRmw(u32, &self.wake_word, .Xchg, 0, .acquire);
-            if (self.cancel_requested) return self.finishCancel(word & ~wake_parked != 0);
+            if (self.wait == null) {
+                // Consuming the completion with acquire ordering makes the
+                // hosted slot the host wrote visible.
+                const word = @atomicRmw(u32, &self.wake_word, .Xchg, 0, .acquire);
+                completed = word & ~wake_parked != 0;
+            }
+            // A group's reports stay queued for `groupNext`.
+            self.wait = null;
         } else {
             self.started = true;
-            if (self.cancel_requested) return self.finishCancel(false);
         }
+        if (self.finishing or self.cancel_requested or self.crashing) return self.finish(completed);
         self.pending = 0;
         const exits = crash_exit.available();
         while (self.len > 0) {
@@ -448,37 +490,46 @@ pub const RocTask = extern struct {
             self.releaseRecord(entry.record, entry.from_task);
             if (self.pending != 0) {
                 if (self.park()) return .pending;
-                // The completion came before the park: run on, from the
-                // hosted site's resume entry.
+                // The completion or the report came before the park: run
+                // on, from the suspension site's resume entry.
                 self.pending = 0;
             }
         }
-        self.status = .done;
-        return .done;
+        if (self.open_groups != null) utils.builtinInvariant(self.ops, "a task's code finished with a concurrent loop still open");
+        return self.end(.done);
+    }
+
+    /// The wake word of the task's wait source: its hosted operation's, or
+    /// the group's it waits on.
+    fn waitWord(self: *RocTask) *u32 {
+        return if (self.wait) |group| &group.word else &self.wake_word;
     }
 
     /// Back from a crash exit: the records saved at call sites are
     /// consistent, so release them all; what the running frames owned is
-    /// leaked.
+    /// leaked. The task's children are cancelled, and it ends `crashed`
+    /// once they have reported.
     fn crashed(self: *RocTask) Status {
         self.releaseRecord(self.running_record, self.running_from_task);
-        while (self.len > 0) {
-            self.len -= 1;
-            self.releaseRecord(self.entries[self.len].record, self.entries[self.len].from_task);
-        }
-        self.status = .crashed;
-        return .crashed;
+        self.crashing = true;
+        return self.finish(false);
     }
 
-    /// Park the task on its hosted operation: set the parked bit, but only
-    /// while no completion is counted. False when the host already woke the
-    /// task (a host that finished on another thread before the hosted
-    /// function returned); the resume then consumes that completion and
-    /// carries on, so it is never lost and no `roc_task_ready` is due.
+    /// Park the task on its wait source: set the parked bit of its wake
+    /// word, but only while the word is zero. False when the source already
+    /// has something for the task: a host that finished on another thread
+    /// before the hosted function returned, or a report its group queued
+    /// since `groupNext` looked. The resume then carries on, so nothing is
+    /// lost and no `roc_task_ready` is due.
     fn park(self: *RocTask) bool {
-        const seen = @cmpxchgStrong(u32, &self.wake_word, 0, wake_parked, .acq_rel, .acquire) orelse return true;
+        const word = self.waitWord();
+        const seen = @cmpxchgStrong(u32, word, 0, wake_parked, .acq_rel, .acquire) orelse return true;
+        if (self.wait != null) {
+            self.wait = null;
+            return false;
+        }
         if (seen != 1) hostViolation(self.ops, "a task was woken more than once for one operation (P3)");
-        @atomicStore(u32, &self.wake_word, 0, .monotonic);
+        @atomicStore(u32, word, 0, .monotonic);
         return false;
     }
 
@@ -488,10 +539,10 @@ pub const RocTask = extern struct {
     /// consumes it; if the task was parked, it is ready to resume, so tell
     /// the host once through `ready_fn`, the host's `roc_task_ready`.
     ///
-    /// The task has one wait source, so a completion is never counted
-    /// twice: the swap's result is 0 (running, not yet parked) or
-    /// `wake_parked`. A milestone 4 running set has a word of its own,
-    /// whose count may exceed one.
+    /// The hosted operation is one wait source, so a completion is never
+    /// counted twice: the swap's result is 0 (running, not yet parked) or
+    /// `wake_parked`. A group's wake word is another source, whose count
+    /// may exceed one (`Group.word`).
     pub fn wake(self: *RocTask, ready_fn: ReadyFn) void {
         checkNotFreed(self, "woken");
         if (monitors and @atomicLoad(bool, &self.aborted, .monotonic)) hostViolation(self.ops, "a task was woken after its operation was aborted (P4)");
@@ -501,26 +552,41 @@ pub const RocTask = extern struct {
     }
 
     /// `roc_task_cancel`, between resumes: request that the task's next
-    /// resume finish it (design.md "The Task Runtime", "Cancellation"). A
-    /// task parked with no completion counted is unparked here, its
-    /// operation abandoned with `abort` and the task readied with
-    /// `ready_fn`. One whose completion is counted was readied by its wake,
-    /// or is about to be, and a new task is resumed by the host anyway.
-    ///
-    /// Unparking is a compare-and-swap from parked to zero, so exactly one
-    /// of this and a racing wake clears the parked bit, and that one readies
-    /// the task. A wake that lands between the swap and `abort` counts its
-    /// completion without readying; the cancelling resume releases it.
+    /// resume finish it (design.md "The Task Runtime", "Cancellation").
+    /// Only a root's host cancels it; the runtime cancels children.
     pub fn cancel(self: *RocTask, abort: AbortFn, ready_fn: ReadyFn) void {
         checkNotFreed(self, "cancelled");
         if (monitors and self.status != .pending) return hostViolation(self.ops, "a task was cancelled after it ended (P8)");
+        if (monitors and self.group != null) return hostViolation(self.ops, "the host cancelled a child task, which only the runtime cancels (P8)");
+        self.requestCancel(abort, ready_fn);
+    }
+
+    /// Request that the task's next resume finish it. A task parked with
+    /// nothing for it is unparked here: its hosted operation abandoned with
+    /// `abort`, if it waits on one, and the task readied with `ready_fn`. One
+    /// that has something was readied by its source, or is about to be, and
+    /// a new task is resumed anyway.
+    ///
+    /// Unparking is a compare-and-swap from parked to zero, so exactly one
+    /// of this and a racing wake or report clears the parked bit, and that
+    /// one readies the task. A wake that lands between the swap and `abort`
+    /// counts its completion without readying; the finishing resume
+    /// releases it.
+    fn requestCancel(self: *RocTask, abort: AbortFn, ready_fn: ReadyFn) void {
         self.cancel_requested = true;
-        if (!self.started) return;
-        if (@cmpxchgStrong(u32, &self.wake_word, wake_parked, 0, .acq_rel, .monotonic) == null) {
-            abort(self);
+        if (self.started) self.unpark(abort, ready_fn);
+    }
+
+    /// Ready a parked task that will run no more of its code, abandoning
+    /// its hosted operation first if it waits on one. Nothing happens to a
+    /// task that isn't parked.
+    fn unpark(self: *RocTask, abort: AbortFn, ready_fn: ReadyFn) void {
+        if (@cmpxchgStrong(u32, self.waitWord(), wake_parked, 0, .acq_rel, .monotonic) != null) return;
+        if (self.wait == null) {
+            callHost(abort, self);
             if (monitors) @atomicStore(bool, &self.aborted, true, .monotonic);
-            ready_fn(self);
         }
+        callHost(ready_fn, self);
     }
 
     /// Claim the process's one running resume for this task, while the
@@ -532,33 +598,80 @@ pub const RocTask = extern struct {
         hostViolation(self.ops, "two resumes ran at the same time (P10)");
     }
 
-    /// Give up the claim, if this task holds it. Safe to call twice.
+    /// Give up the claim, if this task holds it. Safe to call twice, and
+    /// after the task is freed, since it only compares the pointer.
     fn releaseResume(self: *RocTask) void {
         if (!monitors) return;
         _ = @cmpxchgStrong(?*RocTask, &resuming, self, null, .release, .monotonic);
     }
 
-    /// A resume of a cancelled task: no Roc code runs. Release the hosted
-    /// result if a completion was counted (`completed`), with the release
-    /// the innermost record names for it, then every record.
-    fn finishCancel(self: *RocTask, completed: bool) Status {
-        if (completed) {
-            const innermost = self.entries[self.len - 1];
-            if (innermost.slot_drop) |slot_drop| slot_drop(self.hosted_slot, innermost.record, self.ops);
+    /// A resume of a task that runs no more of its code: cancelled, or
+    /// crashing (its own crash or an entry's). The first such resume
+    /// releases the hosted result if a completion was counted
+    /// (`completed`), with the release the innermost record names for it,
+    /// then every record, and cancels the task's children, shielded ones
+    /// included. The task ends once they have all reported.
+    fn finish(self: *RocTask, completed: bool) Status {
+        if (!self.finishing) {
+            self.finishing = true;
+            if (completed) {
+                const innermost = self.entries[self.len - 1];
+                if (innermost.slot_drop) |slot_drop| slot_drop(self.hosted_slot, innermost.record, self.ops);
+            }
+            while (self.len > 0) {
+                self.len -= 1;
+                self.releaseRecord(self.entries[self.len].record, self.entries[self.len].from_task);
+            }
+            self.pending = 0;
+            var group = self.open_groups;
+            while (group) |open| : (group = open.outer) open.cancelEntries(.all);
         }
-        while (self.len > 0) {
-            self.len -= 1;
-            self.releaseRecord(self.entries[self.len].record, self.entries[self.len].from_task);
+        // Take each group's reports, innermost first, and close it once its
+        // last child has reported; park on the first that still has one
+        // running.
+        while (self.open_groups) |group| {
+            group.dropReports();
+            if (group.live > 0) {
+                self.wait = group;
+                if (self.park()) return .pending;
+                continue;
+            }
+            group.close();
         }
-        self.pending = 0;
-        self.status = .cancelled;
-        return .cancelled;
+        return self.end(if (self.crashing) .crashed else .cancelled);
+    }
+
+    /// One of the task's entries crashed with `message` (design.md "Child
+    /// Tasks", "Crashes"): the task runs no more of its code, and crashes
+    /// with the same message once its other children have reported. The
+    /// first crash's message is the one it keeps.
+    fn takeCrash(self: *RocTask, message: []const u8) void {
+        if (self.crashing) return;
+        const copy: [*]u8 = @ptrCast(self.ops.alloc(1, @max(message.len, 1)));
+        @memcpy(copy[0..message.len], message);
+        self.crash_message = copy;
+        self.crash_message_len = message.len;
+        self.crashing = true;
+    }
+
+    /// The task reached its terminal `status`. A child reports to its group
+    /// and is freed before its resume returns (design.md "Child Tasks").
+    fn end(self: *RocTask, status: Status) Status {
+        self.status = status;
+        if (self.group) |group| group.report(self);
+        return status;
     }
 
     /// `roc_task_free`, after the task is done or cancelled.
     pub fn free(self: *RocTask) void {
         checkNotFreed(self, "freed");
         if (monitors and self.status == .pending) return hostViolation(self.ops, "a task was freed before it ended (P8)");
+        if (monitors and self.group != null) return hostViolation(self.ops, "the host freed a child task, which the runtime frees (P8)");
+        self.release();
+    }
+
+    /// Free the task's memory.
+    fn release(self: *RocTask) void {
         const ops = self.ops;
         for (&self.record_cache) |*list| {
             while (list.*) |record| {
@@ -572,6 +685,17 @@ pub const RocTask = extern struct {
         freeBuffer(ops, self.result_buffer, self.result_buffer_size, self.result_buffer_alignment);
         ops.dealloc(@ptrCast(self), @alignOf(RocTask));
         noteFreed(self, ops);
+    }
+
+    /// The buffer sizes the program gave this task, which its children get
+    /// too.
+    fn bufferLayout(self: *const RocTask) BufferLayout {
+        return .{
+            .hosted_slot_size = self.hosted_slot_size,
+            .hosted_slot_alignment = self.hosted_slot_alignment,
+            .result_buffer_size = self.result_buffer_size,
+            .result_buffer_alignment = self.result_buffer_alignment,
+        };
     }
 
     fn call(self: *RocTask, record: [*]u8, ret: [*]u8) void {
@@ -598,6 +722,482 @@ pub const RocTask = extern struct {
         self.capacity = capacity;
     }
 };
+
+/// Call one of the host's task functions from inside a resume, with no
+/// running task, so a crash in the host reaches its `roc_crashed` rather
+/// than the task's crash exit, as a hosted call does (`hostEnter`).
+fn callHost(f: *const fn (*RocTask) callconv(.c) void, task: *RocTask) void {
+    const was_running = hostEnter();
+    f(task);
+    hostLeave(was_running);
+}
+
+/// Releases a result left in an entry's slot that no `groupNext` hands out:
+/// a background entry's after the loop ended, or any entry's after its
+/// owner was cancelled or crashed. `context` is the group's
+/// (`GroupSpec.result_drop_context`).
+pub const ResultDropFn = *const fn (slot: [*]u8, context: ?*anyopaque, ops: *RocOps) callconv(.c) void;
+
+/// One entry's marks from a flattened plan (design.md "Plans And Concurrent
+/// Loops").
+pub const EntryMarks = struct {
+    /// Indexes into `GroupSpec.limits` of the limits the entry is under,
+    /// outermost first.
+    limit_path: []const u32,
+    shielded: bool,
+    background: bool,
+};
+
+/// What a task-form loop's `group` operation hands the runtime.
+pub const GroupSpec = struct {
+    /// Each entry's start record, in input order. The group takes them.
+    starts: []const [*]u8,
+    /// Parallel to `starts`.
+    marks: []const EntryMarks,
+    /// How many running entries each limit allows; none allows zero.
+    limits: []const u64,
+    /// The limit a spawned entry goes under: the plan's outermost node when
+    /// that node is a `Limit`.
+    root_limit: ?u32,
+    /// The size and alignment of one entry's result.
+    slot_size: usize,
+    slot_alignment: usize,
+    /// Releases a result nobody takes; null when the result holds nothing
+    /// to release.
+    result_drop: ?ResultDropFn,
+    result_drop_context: ?*anyopaque,
+};
+
+/// What `groupNext` found.
+pub const Next = union(enum) {
+    /// The entry at `index` finished; its result is in `slot`, and the
+    /// caller moves it out.
+    arrived: struct { index: u32, slot: [*]u8 },
+    /// Every entry has finished, been cancelled or been dropped.
+    ended,
+    /// Nothing has arrived: the owner suspends here, parked on the group's
+    /// wake word, and calls `groupNext` again from its resume entry.
+    pending,
+};
+
+/// The running set of a task-form concurrent loop: its entries, each run
+/// as a child task of the loop's task, the owner (design.md "Plans And
+/// Concurrent Loops", "Child Tasks").
+///
+/// Everything but `word` is touched only inside resumes and the host's
+/// `roc_task_cancel`, which a `Tasks` host never overlaps (P10). The word
+/// follows the wake-word protocol, so the same steps hold when resumes run
+/// on several threads.
+pub const Group = struct {
+    owner: *RocTask,
+    /// The wake word of the owner's wait on this group: `wake_parked` while
+    /// the owner is parked on it, and the count of reports queued that
+    /// `groupNext` has not taken.
+    word: u32,
+    /// The group the owner opened before this one, still open.
+    outer: ?*Group,
+    entries: [*]GroupEntry,
+    len: u32,
+    capacity: u32,
+    /// The entries' limit paths, back to back (`GroupEntry.path_start`).
+    paths: [*]u32,
+    paths_len: u32,
+    paths_capacity: u32,
+    limits: [*]Limit,
+    limit_count: u32,
+    root_limit: ?u32,
+    /// The slots of the `block_slots` entries `groupCreate` made, in one
+    /// block; a spawned entry's slot is its own allocation.
+    block: [*]u8,
+    block_slots: usize,
+    slot_size: usize,
+    slot_alignment: usize,
+    result_drop: ?ResultDropFn,
+    result_drop_context: ?*anyopaque,
+    /// Indexes of reported entries in report order; `reports[taken..len]`
+    /// are queued. Each entry reports once, so `capacity` entries fit.
+    reports: [*]u32,
+    reports_len: u32,
+    reports_taken: u32,
+    /// The first entry that may not have started yet.
+    first_unstarted: u32,
+    /// Entries whose child is running.
+    live: u32,
+    /// Entries that haven't started and weren't dropped.
+    unstarted: u32,
+    /// Entries that aren't background and are unstarted or running: the
+    /// ones that keep the loop going.
+    foreground_left: u32,
+    /// Whether only background entries were left and `groupNext` cancelled
+    /// them: what arrives after is dropped, and the loop ends.
+    ending: bool,
+
+    const Limit = struct { allowed: u64, running: u64 };
+
+    const State = enum(u8) { unstarted, running, reported, taken, dropped };
+
+    const GroupEntry = struct {
+        /// The start record, while the entry hasn't started.
+        start: [*]u8,
+        /// The running child.
+        child: ?*RocTask,
+        slot: [*]u8,
+        path_start: u32,
+        path_len: u32,
+        tree_index: u32,
+        shielded: bool,
+        background: bool,
+        /// Whether `slot` is the entry's own allocation (a spawned entry).
+        own_slot: bool,
+        state: State,
+        /// How the child ended, once it reported.
+        outcome: Status,
+    };
+
+    /// Which running entries a cancel reaches: a loop exit spares the
+    /// shielded ones that have begun; a cancelled or crashing owner
+    /// cancels all of them.
+    const Reach = enum { exit, all };
+
+    fn path(self: *const Group, entry: *const GroupEntry) []const u32 {
+        return self.paths[entry.path_start..][0..entry.path_len];
+    }
+
+    fn hasRoom(self: *const Group, entry: *const GroupEntry) bool {
+        for (self.path(entry)) |limit| {
+            if (self.limits[limit].running >= self.limits[limit].allowed) return false;
+        }
+        return true;
+    }
+
+    /// Start every unstarted entry whose limits have room, in input order.
+    fn startEligible(self: *Group) void {
+        var index = self.first_unstarted;
+        var first: ?u32 = null;
+        while (index < self.len) : (index += 1) {
+            const entry = &self.entries[index];
+            if (entry.state != .unstarted) continue;
+            if (self.hasRoom(entry)) {
+                self.start(index);
+            } else if (first == null) {
+                first = index;
+            }
+        }
+        self.first_unstarted = first orelse self.len;
+    }
+
+    /// Start the entry at `index` as a child task: it writes its result to
+    /// its slot, and the host learns it is ready through the owner's
+    /// `roc_task_ready`.
+    fn start(self: *Group, index: u32) void {
+        const owner = self.owner;
+        const ready_fn = owner.ready_fn orelse utils.builtinInvariant(owner.ops, "a task started children without the host's roc_task_ready; its resume came from no host");
+        const entry = &self.entries[index];
+        for (self.path(entry)) |limit| {
+            self.limits[limit].running += 1;
+            if (monitors and self.limits[limit].running > self.limits[limit].allowed) utils.builtinInvariant(owner.ops, "a limit has more running entries than it allows");
+        }
+        const child = RocTask.create(owner.ops, entry.start, entry.slot, owner.bufferLayout());
+        child.ready_fn = owner.ready_fn;
+        child.abort_fn = owner.abort_fn;
+        child.group = self;
+        child.entry_index = index;
+        child.tree_index = entry.tree_index;
+        entry.child = child;
+        entry.state = .running;
+        self.unstarted -= 1;
+        self.live += 1;
+        callHost(ready_fn, child);
+    }
+
+    /// Append an entry under the limits `limit_path`; it starts when they
+    /// have room and nothing before it is waiting for them.
+    fn append(self: *Group, start_record: [*]u8, slot: [*]u8, own_slot: bool, limit_path: []const u32, shielded: bool, background: bool) void {
+        const ops = self.owner.ops;
+        if (self.len == self.capacity) {
+            const capacity = @max(4, self.capacity * 2);
+            self.entries = @ptrCast(@alignCast(growArray(ops, @ptrCast(self.entries), self.capacity, capacity, @sizeOf(GroupEntry), @alignOf(GroupEntry))));
+            self.reports = @ptrCast(@alignCast(growArray(ops, @ptrCast(self.reports), self.capacity, capacity, @sizeOf(u32), @alignOf(u32))));
+            self.capacity = capacity;
+        }
+        if (self.paths_len + limit_path.len > self.paths_capacity) {
+            const capacity: u32 = @intCast(@max(8, self.paths_capacity * 2, self.paths_len + limit_path.len));
+            self.paths = @ptrCast(@alignCast(growArray(ops, @ptrCast(self.paths), self.paths_capacity, capacity, @sizeOf(u32), @alignOf(u32))));
+            self.paths_capacity = capacity;
+        }
+        for (limit_path) |limit| {
+            if (limit >= self.limit_count) utils.builtinInvariant(ops, "an entry's limit path names a limit the plan doesn't have");
+        }
+        @memcpy(self.paths[self.paths_len..][0..limit_path.len], limit_path);
+        self.entries[self.len] = .{
+            .start = start_record,
+            .child = null,
+            .slot = slot,
+            .path_start = self.paths_len,
+            .path_len = @intCast(limit_path.len),
+            .tree_index = self.owner.child_counter,
+            .shielded = shielded,
+            .background = background,
+            .own_slot = own_slot,
+            .state = .unstarted,
+            .outcome = .pending,
+        };
+        self.owner.child_counter += 1;
+        self.paths_len += @intCast(limit_path.len);
+        self.len += 1;
+        self.unstarted += 1;
+        if (!background) self.foreground_left += 1;
+    }
+
+    /// A child finished, from inside its own resume: record its report,
+    /// free it, start what its limits now have room for, and queue the
+    /// report for the owner, readying the owner if it is parked on this
+    /// group. A crash also makes the owner crash wherever it waits
+    /// (design.md "Child Tasks", "Crashes").
+    fn report(self: *Group, child: *RocTask) void {
+        const owner = self.owner;
+        const index = child.entry_index;
+        const entry = &self.entries[index];
+        entry.state = .reported;
+        entry.outcome = child.status;
+        entry.child = null;
+        self.live -= 1;
+        if (!entry.background) self.foreground_left -= 1;
+        for (self.path(entry)) |limit| self.limits[limit].running -= 1;
+        if (child.status == .crashed) owner.takeCrash(child.crash_message[0..child.crash_message_len]);
+        child.release();
+        self.reports[self.reports_len] = index;
+        self.reports_len += 1;
+        if (!owner.finishing and !owner.crashing) self.startEligible();
+        // Count the report and clear the parked bit in one step, so
+        // exactly one report readies a parked owner.
+        var seen = @atomicLoad(u32, &self.word, .monotonic);
+        while (@cmpxchgWeak(u32, &self.word, seen, (seen & ~wake_parked) + 1, .release, .monotonic)) |actual| seen = actual;
+        if (seen & wake_parked != 0) {
+            callHost(owner.ready_fn.?, owner);
+        } else if (owner.crashing) {
+            // Parked elsewhere: on its hosted operation, or on another of
+            // its groups.
+            owner.unpark(owner.abort_fn.?, owner.ready_fn.?);
+        }
+    }
+
+    /// Take the next queued report, counting it off the wake word.
+    fn takeReport(self: *Group) ?u32 {
+        if (self.reports_taken == self.reports_len) return null;
+        const index = self.reports[self.reports_taken];
+        self.reports_taken += 1;
+        _ = @atomicRmw(u32, &self.word, .Sub, 1, .acquire);
+        return index;
+    }
+
+    /// Take every queued report and release the results in them.
+    fn dropReports(self: *Group) void {
+        while (self.takeReport()) |index| self.dropResult(index);
+    }
+
+    /// Release the result of a reported entry, if it finished with one.
+    fn dropResult(self: *Group, index: u32) void {
+        const entry = &self.entries[index];
+        entry.state = .taken;
+        if (entry.outcome != .done) return;
+        if (self.result_drop) |drop| drop(entry.slot, self.result_drop_context, self.owner.ops);
+    }
+
+    /// Drop the entries that haven't started, and cancel the running ones
+    /// `reach` covers.
+    fn cancelEntries(self: *Group, reach: Reach) void {
+        const owner = self.owner;
+        for (self.entries[0..self.len]) |*entry| {
+            switch (entry.state) {
+                .unstarted => {
+                    erased_callable.decref(entry.start, owner.ops);
+                    entry.state = .dropped;
+                    self.unstarted -= 1;
+                    if (!entry.background) self.foreground_left -= 1;
+                },
+                .running => {
+                    const child = entry.child.?;
+                    if (reach == .exit and entry.shielded and child.started) continue;
+                    if (!child.cancel_requested) child.requestCancel(owner.abort_fn.?, owner.ready_fn.?);
+                },
+                .reported, .taken, .dropped => {},
+            }
+        }
+        self.first_unstarted = self.len;
+    }
+
+    /// Free the group once nothing in it runs or waits, and take it off its
+    /// owner's open groups. It must be the innermost.
+    fn close(self: *Group) void {
+        const owner = self.owner;
+        const ops = owner.ops;
+        if (owner.open_groups != self) utils.builtinInvariant(ops, "a concurrent loop was closed while a loop inside it was open");
+        if (self.live != 0 or self.unstarted != 0 or self.reports_taken != self.reports_len) utils.builtinInvariant(ops, "a concurrent loop was closed with entries running or reports queued");
+        owner.open_groups = self.outer;
+        for (self.entries[0..self.len]) |*entry| {
+            if (entry.own_slot) freeBuffer(ops, entry.slot, self.slot_size, self.slot_alignment);
+        }
+        if (self.capacity > 0) {
+            ops.dealloc(@ptrCast(self.entries), @alignOf(GroupEntry));
+            ops.dealloc(@ptrCast(self.reports), @alignOf(u32));
+        }
+        if (self.paths_capacity > 0) ops.dealloc(@ptrCast(self.paths), @alignOf(u32));
+        if (self.limit_count > 0) ops.dealloc(@ptrCast(self.limits), @alignOf(Limit));
+        freeBuffer(ops, self.block, self.slot_size * self.block_slots, self.slot_alignment);
+        ops.dealloc(@ptrCast(self), @alignOf(Group));
+    }
+};
+
+/// Grow an array of `old` items of `size` bytes to `new` items.
+fn growArray(ops: *RocOps, items: *anyopaque, old: u32, new: u32, size: usize, alignment: usize) *anyopaque {
+    if (old == 0) return ops.alloc(alignment, new * size);
+    return ops.realloc(items, new * size, alignment);
+}
+
+/// `group`: open a running set for the task's code, the owner, and start
+/// every entry whose limits have room (design.md "Plans And Concurrent
+/// Loops", task form). Each entry's place in the task tree is fixed here,
+/// in input order. Called from the owner's code during its resume.
+pub fn groupCreate(owner: *RocTask, spec: GroupSpec) *Group {
+    const ops = owner.ops;
+    if (spec.marks.len != spec.starts.len) utils.builtinInvariant(ops, "a group's marks don't match its entries");
+    const group: *Group = @ptrCast(@alignCast(ops.alloc(@alignOf(Group), @sizeOf(Group))));
+    const stride = std.mem.alignForward(usize, spec.slot_size, spec.slot_alignment);
+    group.* = .{
+        .owner = owner,
+        .word = 0,
+        .outer = owner.open_groups,
+        .entries = undefined,
+        .len = 0,
+        .capacity = 0,
+        .paths = undefined,
+        .paths_len = 0,
+        .paths_capacity = 0,
+        .limits = undefined,
+        .limit_count = @intCast(spec.limits.len),
+        .root_limit = spec.root_limit,
+        .block = allocBuffer(ops, stride * spec.starts.len, spec.slot_alignment),
+        .block_slots = spec.starts.len,
+        .slot_size = stride,
+        .slot_alignment = spec.slot_alignment,
+        .result_drop = spec.result_drop,
+        .result_drop_context = spec.result_drop_context,
+        .reports = undefined,
+        .reports_len = 0,
+        .reports_taken = 0,
+        .first_unstarted = 0,
+        .live = 0,
+        .unstarted = 0,
+        .foreground_left = 0,
+        .ending = false,
+    };
+    if (spec.limits.len > 0) {
+        group.limits = @ptrCast(@alignCast(ops.alloc(@alignOf(Group.Limit), spec.limits.len * @sizeOf(Group.Limit))));
+        for (spec.limits, group.limits[0..spec.limits.len]) |allowed, *limit| {
+            if (allowed == 0) utils.builtinInvariant(ops, "a limit allows no running entries");
+            limit.* = .{ .allowed = allowed, .running = 0 };
+        }
+    }
+    if (spec.root_limit) |root| if (root >= spec.limits.len) utils.builtinInvariant(ops, "a group's root limit names a limit the plan doesn't have");
+    owner.open_groups = group;
+    for (spec.starts, spec.marks, 0..) |start_record, marks, index| {
+        group.append(start_record, group.block + index * stride, false, marks.limit_path, marks.shielded, marks.background);
+    }
+    group.startEligible();
+    return group;
+}
+
+/// `next`: take one report (design.md "Plans And Concurrent Loops"). A
+/// result is in its slot for the caller to move out; a cancelled entry's
+/// report is skipped. With nothing queued and only background entries left,
+/// cancel them as an exit would and drop what they report. With nothing
+/// queued and entries still to come, the owner parks on the group.
+pub fn groupNext(group: *Group) Next {
+    const owner = group.owner;
+    while (group.takeReport()) |index| {
+        const entry = &group.entries[index];
+        switch (entry.outcome) {
+            .done => {
+                if (group.ending) {
+                    group.dropResult(index);
+                    continue;
+                }
+                entry.state = .taken;
+                return .{ .arrived = .{ .index = index, .slot = entry.slot } };
+            },
+            .cancelled => entry.state = .taken,
+            // The owner crashes before it runs code again, so its code never
+            // sees a crash report.
+            .crashed, .pending => utils.builtinInvariant(owner.ops, "a loop's next took a crash report or one from a running entry"),
+        }
+    }
+    if (group.live == 0 and group.unstarted == 0) return .ended;
+    if (group.foreground_left == 0 and !group.ending) {
+        group.ending = true;
+        group.cancelEntries(.exit);
+        if (group.live == 0) return .ended;
+    }
+    owner.wait = group;
+    return .pending;
+}
+
+/// `spawn_in`: add an entry under the root limit, if the plan has one, and
+/// start it when that limit has room. It is never background or shielded.
+pub fn spawnIn(group: *Group, start_record: [*]u8) void {
+    const ops = group.owner.ops;
+    const root_path: []const u32 = if (group.root_limit) |*root| root[0..1] else &.{};
+    group.append(start_record, allocBuffer(ops, group.slot_size, group.slot_alignment), true, root_path, false, false);
+    group.startEligible();
+}
+
+/// `cancel_group`, a loop exit: drop the entries that haven't started, and
+/// cancel the running ones unless they are shielded and have begun. The
+/// exit then calls `groupNext` until it reports `ended`.
+pub fn cancelGroup(group: *Group) void {
+    group.cancelEntries(.exit);
+}
+
+/// Free a group after `groupNext` reported `ended`.
+pub fn groupFree(group: *Group) void {
+    group.close();
+}
+
+/// Where `a` comes in the task tree against `b`, which shares its root: an
+/// ancestor before its descendants, and siblings in the order their entries
+/// were made. For a test host that resumes the ready task first in the tree
+/// (design.md "Sequential equivalence"); not part of the host ABI.
+pub fn treeOrder(a: *const RocTask, b: *const RocTask) std.math.Order {
+    var x = a;
+    var y = b;
+    var depth_x = treeDepth(x);
+    var depth_y = treeDepth(y);
+    while (depth_x > depth_y) : (depth_x -= 1) {
+        if (parentOf(x) == y) return .gt;
+        x = parentOf(x);
+    }
+    while (depth_y > depth_x) : (depth_y -= 1) {
+        if (parentOf(y) == x) return .lt;
+        y = parentOf(y);
+    }
+    if (x == y) return .eq;
+    while (parentOf(x) != parentOf(y)) {
+        x = parentOf(x);
+        y = parentOf(y);
+    }
+    return std.math.order(x.tree_index, y.tree_index);
+}
+
+fn parentOf(task: *const RocTask) *const RocTask {
+    return task.group.?.owner;
+}
+
+fn treeDepth(task: *const RocTask) u32 {
+    var depth: u32 = 0;
+    var current = task;
+    while (current.group) |group| : (current = group.owner) depth += 1;
+    return depth;
+}
 
 /// A buffer no result is ever written to has no allocation.
 var empty_buffer: [1]u8 align(16) = .{0};
