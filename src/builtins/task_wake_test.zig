@@ -214,7 +214,9 @@ fn runRound(ops: *RocOps) std.Thread.SpawnError!u32 {
     var parks: u32 = 0;
     for (&slots) |*slot| resumeSlot(slot, &parks);
     var remaining: usize = 0;
-    for (slots) |slot| remaining += @intFromBool(!slot.done);
+    // By pointer: the workers already write other fields of these slots, so
+    // copying a whole slot would race with them.
+    for (&slots) |*slot| remaining += @intFromBool(!slot.done);
     while (remaining > 0) {
         for (&slots) |*slot| {
             if (slot.done or !slot.readied.load(.acquire)) continue;
