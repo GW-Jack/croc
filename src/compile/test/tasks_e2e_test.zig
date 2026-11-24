@@ -366,6 +366,9 @@ const task_calls = [_][]const u8{builtins.shim_symbols.roc_task_free};
 const wasm_str_size = builtins.str.RocStr.word_count * 4;
 const wasm_slice_tag = 1;
 
+/// A hosted operation of a wasm run that the host has not finished.
+const WasmPending = struct { task: u32, out: u32, url: [wasm_str_size]u8 };
+
 /// The test host for the wasm-compiled program: `TestHost`'s behaviour over
 /// the module's linear memory, where its strings live. Its hosted functions
 /// are the module's `env` imports, with wasm32's C ABI: a `Str` argument is
@@ -376,13 +379,19 @@ const WasmRun = struct {
     session: wasm_runner.Session,
     mode: task_test_host.Mode,
     trace: std.ArrayList([]u8) = .empty,
-    /// The paused operation: the task, its result slot, and its URL.
-    pending: ?struct { task: u32, out: u32, url: [wasm_str_size]u8 } = null,
+    /// The operations not finished yet, oldest first: each one's task, its
+    /// result slot, and its URL.
+    pending: std.ArrayList(WasmPending) = .empty,
     pauses: u32 = 0,
     /// How many paused operations a cancel abandoned.
     aborts: u32 = 0,
     /// How many times a wake told the host a parked task is ready.
     readies: u32 = 0,
+    /// As `TestHost`'s fields of these names, for `driveQueue`.
+    queue_readies: bool = false,
+    trace_steps: bool = false,
+    ready_tasks: std.ArrayList(u32) = .empty,
+    numbers: task_test_host.TaskNumbers(u32) = .{},
     /// The first error a hosted call hit, which it cannot return.
     failure: ?E2eError = null,
 
@@ -401,6 +410,9 @@ const WasmRun = struct {
     fn deinit(self: *WasmRun) void {
         for (self.trace.items) |entry| std.testing.allocator.free(entry);
         self.trace.deinit(std.testing.allocator);
+        self.pending.deinit(std.testing.allocator);
+        self.ready_tasks.deinit(std.testing.allocator);
+        self.numbers.deinit(std.testing.allocator);
         self.session.deinit();
     }
 
@@ -416,10 +428,17 @@ const WasmRun = struct {
         std.mem.writeInt(u32, self.mem()[addr..][0..4], value, .little);
     }
 
-    /// A heap `Str` holding `text`, allocated as Roc allocates one: its
-    /// refcount of one in the word before its bytes.
+    /// A `Str` holding `text`, as Roc makes one: in place when it is small,
+    /// and otherwise allocated, with its refcount of one in the word before
+    /// its bytes.
     fn newStr(self: *WasmRun, text: []const u8, at: u32) void {
-        std.debug.assert(text.len > wasm_str_size - 1);
+        if (text.len < wasm_str_size) {
+            const str = self.mem()[at..][0..wasm_str_size];
+            @memset(str, 0);
+            @memcpy(str[0..text.len], text);
+            str[wasm_str_size - 1] = @as(u8, @intCast(text.len)) | builtins.str.RocStr.small_str_flag;
+            return;
+        }
         const len: u32 = @intCast(text.len);
         const data = self.session.alloc(4, 4 + len);
         self.writeWord(data, 1);
@@ -485,8 +504,8 @@ const WasmRun = struct {
             },
             .pause => {
                 // A task waits on at most one hosted operation at a time.
-                if (self.pending != null) return error.TestUnexpectedResult;
-                self.pending = .{ .task = task, .out = out, .url = self.mem()[url_addr..][0..wasm_str_size].* };
+                for (self.pending.items) |pending| if (pending.task == task) return error.TestUnexpectedResult;
+                try self.pending.append(std.testing.allocator, .{ .task = task, .out = out, .url = self.mem()[url_addr..][0..wasm_str_size].* });
                 self.pauses += 1;
                 poll.* = .{ .I32 = 1 };
             },
@@ -503,26 +522,44 @@ const WasmRun = struct {
         self.decrefStr(text);
     }
 
-    /// `void roc_task_abort(RocTask *task)`: abandon the paused operation.
+    /// `void roc_task_abort(RocTask *task)`: abandon its paused operation.
     fn abort(context: ?*anyopaque, _: *wasm_runner.ModuleInstance, params: [*]const wasm_runner.Val, _: [*]wasm_runner.Val) error{}!void {
         const self: *WasmRun = @ptrCast(@alignCast(context));
-        const pending = self.pending orelse {
-            if (self.failure == null) self.failure = error.TestUnexpectedResult;
-            return;
+        self.abandon(@bitCast(params[0].I32)) catch |err| {
+            if (self.failure == null) self.failure = err;
         };
-        if (pending.task != @as(u32, @bitCast(params[0].I32))) {
-            if (self.failure == null) self.failure = error.TestUnexpectedResult;
-            return;
-        }
-        self.pending = null;
-        self.aborts += 1;
-        self.decrefStrValue(pending.url);
     }
 
-    /// `void roc_task_ready(RocTask *task)`: a woken task was parked.
-    fn ready(context: ?*anyopaque, _: *wasm_runner.ModuleInstance, _: [*]const wasm_runner.Val, _: [*]wasm_runner.Val) error{}!void {
+    fn abandon(self: *WasmRun, task: u32) E2eError!void {
+        const index = for (self.pending.items, 0..) |pending, i| {
+            if (pending.task == task) break i;
+        } else return error.TestUnexpectedResult;
+        const pending = self.pending.orderedRemove(index);
+        self.aborts += 1;
+        self.decrefStrValue(pending.url);
+        if (self.trace_steps) try self.noteStep("task {d} aborted", .{try self.numbers.of(std.testing.allocator, task)});
+    }
+
+    /// `void roc_task_ready(RocTask *task)`: a woken task was parked, or a
+    /// task is new.
+    fn ready(context: ?*anyopaque, _: *wasm_runner.ModuleInstance, params: [*]const wasm_runner.Val, _: [*]wasm_runner.Val) error{}!void {
         const self: *WasmRun = @ptrCast(@alignCast(context));
         self.readies += 1;
+        if (!self.queue_readies) return;
+        self.queueReady(@bitCast(params[0].I32)) catch |err| {
+            if (self.failure == null) self.failure = err;
+        };
+    }
+
+    fn queueReady(self: *WasmRun, task: u32) E2eError!void {
+        _ = try self.numbers.of(std.testing.allocator, task);
+        try self.ready_tasks.append(std.testing.allocator, task);
+    }
+
+    fn noteStep(self: *WasmRun, comptime format: []const u8, args: anytype) E2eError!void {
+        const entry = try std.fmt.allocPrint(std.testing.allocator, format, args);
+        errdefer std.testing.allocator.free(entry);
+        try self.trace.append(std.testing.allocator, entry);
     }
 
     fn call(self: *WasmRun, name: []const u8, task: u32, returns: []wasm_runner.Val) E2eError!void {
@@ -536,10 +573,10 @@ const WasmRun = struct {
         return @fromBackingInt(@intCast(status[0].I32));
     }
 
-    /// Finish the paused operation: write its result and wake its task.
+    /// Finish the oldest paused operation: write its result and wake its
+    /// task.
     fn finish(self: *WasmRun) E2eError!void {
-        const pending = self.pending.?;
-        self.pending = null;
+        const pending = self.pending.orderedRemove(0);
         // The URL goes back into memory the host owns while it answers.
         const url_addr = self.session.alloc(4, wasm_str_size);
         self.mem()[url_addr..][0..wasm_str_size].* = pending.url;
@@ -557,6 +594,35 @@ const WasmRun = struct {
             status = try self.resumeTask(task);
         }
         return status;
+    }
+
+    /// Run the tree of `root` under a queue, as `TestHost.driveQueue` does.
+    fn driveQueue(self: *WasmRun, root: u32, cancel_after: ?u32) (E2eError || error{Stuck})!builtins.task.Status {
+        self.queue_readies = true;
+        self.trace_steps = true;
+        defer {
+            self.queue_readies = false;
+            self.trace_steps = false;
+        }
+        if (cancel_after == 0) try self.call(builtins.shim_symbols.roc_task_cancel, root, &.{});
+        var resumes: u32 = 0;
+        var next = root;
+        while (true) {
+            const number = try self.numbers.of(std.testing.allocator, next);
+            const status = try self.resumeTask(next);
+            resumes += 1;
+            try self.noteStep("task {d} resumed: {s}", .{ number, @tagName(status) });
+            if (status != .pending) {
+                if (next == root) return status;
+                self.numbers.forget(next);
+            }
+            if (cancel_after == resumes) try self.call(builtins.shim_symbols.roc_task_cancel, root, &.{});
+            while (self.ready_tasks.items.len == 0) {
+                if (self.pending.items.len == 0) return error.Stuck;
+                try self.finish();
+            }
+            next = self.ready_tasks.orderedRemove(0);
+        }
     }
 
     /// Run the task until its `pause`th pause, then cancel it there with
@@ -590,7 +656,7 @@ const WasmRun = struct {
         const store = &program.lowered.lir_result.store;
         const entry = store.getProcSpec(program.lowered.lir_result.root_procs.items[0]);
         const url_addr = self.session.alloc(4, wasm_str_size);
-        self.newStr(url, url_addr);
+        self.newStr(root_url, url_addr);
         var task: [1]wasm_runner.Val = undefined;
         self.session.invoke(wasm_entry, &.{ .{ .I32 = @bitCast(url_addr) }, .{ .I32 = @bitCast(result) } }, &task) catch return error.TestUnexpectedResult;
         if (self.failure) |err| return err;
@@ -1205,4 +1271,194 @@ test "concurrent loops run on child tasks as a None build runs them, on the dev 
 test "concurrent loops run on child tasks as a None build runs them, on LLVM" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     try checkSequentialEquivalence(compareLlvm);
+}
+
+// The queue schedule: every backend runs the same program through the same
+// steps. The host answers in place or pauses every fetch, resumes tasks in
+// the order it was given them, and may cancel the root after any resume. A
+// run's trace records each hosted call, resume and abort, so a backend that
+// parks, reports, cancels or frees a task at another point differs from the
+// interpreter there.
+
+/// One run under the queue: the case, whether fetches pause, and after how
+/// many resumes the root is cancelled, if it is.
+const QueueRun = struct {
+    name: []const u8,
+    mode: task_test_host.Mode,
+    cancel_after: ?u32,
+    outcome: CaseOutcome,
+};
+
+/// The interpreter's queue runs, which `recordQueueRuns` fills and the other
+/// backends' runs compare with. Tests run one at a time.
+var queue_runs: std.ArrayList(QueueRun) = .empty;
+
+fn freeQueueRuns() void {
+    for (queue_runs.items) |run| run.outcome.deinit();
+    queue_runs.deinit(std.testing.allocator);
+    queue_runs = .empty;
+}
+
+/// Make the interpreter's runs: each case in each mode to its end, and then
+/// cancelled after each number of resumes up to that end.
+fn recordQueueRuns(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    recordQueue(lowered) catch |err| {
+        std.log.err("a queue run on the interpreter failed: {s}", .{@errorName(err)});
+        return error.TestUnexpectedResult;
+    };
+}
+
+fn recordQueue(lowered: *const lir.CheckedPipeline.LoweredProgram) E2eError!void {
+    for (plan_loop_cases) |name| {
+        for ([_]task_test_host.Mode{ .ready, .pause }) |mode| {
+            const resumes = try recordQueueRun(lowered, name, mode, null);
+            var cancel_after: u32 = 0;
+            while (cancel_after < resumes) : (cancel_after += 1) {
+                _ = try recordQueueRun(lowered, name, mode, cancel_after);
+            }
+        }
+    }
+}
+
+/// Record one run, and return how many resumes it made.
+fn recordQueueRun(lowered: *const lir.CheckedPipeline.LoweredProgram, name: []const u8, mode: task_test_host.Mode, cancel_after: ?u32) E2eError!u32 {
+    errdefer std.log.err("queue run {s}, {s}, cancelled after {?d}", .{ name, @tagName(mode), cancel_after });
+    const outcome = try queueCase(Run, lowered, name, mode, cancel_after);
+    errdefer outcome.deinit();
+    try queue_runs.append(std.testing.allocator, .{ .name = name, .mode = mode, .cancel_after = cancel_after, .outcome = outcome });
+    var resumes: u32 = 0;
+    for (outcome.trace) |entry| resumes += @intFromBool(std.mem.find(u8, entry, " resumed: ") != null);
+    return resumes;
+}
+
+fn queueCase(comptime R: type, program: R.Program, name: []const u8, mode: task_test_host.Mode, cancel_after: ?u32) E2eError!CaseOutcome {
+    root_url = name;
+    defer root_url = url;
+    var run: R = undefined;
+    try run.init(program, mode);
+    defer run.deinit();
+    var result: RocStr = RocStr.empty();
+    const task = try run.startRoot(program, &result);
+    const cancel: ?task_test_host.CancelAfter = if (cancel_after) |resumes| .{ .resumes = resumes, .cancel = R.cancelFn(program) } else null;
+    const status = run.host.driveQueue(task, cancel) catch |err| switch (err) {
+        error.Stuck => return error.TestUnexpectedResult,
+        else => |other| return other,
+    };
+    run.host.freeTask(task);
+    if (task_test_host.c_abi_failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 0), run.host.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), run.host.ready_tasks.items.len);
+    // Only a cancel keeps a root from its result, whose storage nothing may
+    // read then (P8).
+    const done = status == .done;
+    try std.testing.expect(done or (status == .cancelled and cancel_after != null));
+    const outcome = try CaseOutcome.init(if (done) result.asSlice() else "", run.host.trace.items);
+    errdefer outcome.deinit();
+    if (done) result.decref(run.runtime.get_ops());
+    try run.runtime.checkForLeaks();
+    return outcome;
+}
+
+fn queueCaseWasm(program: *const WasmProgram, name: []const u8, mode: task_test_host.Mode, cancel_after: ?u32) E2eError!CaseOutcome {
+    root_url = name;
+    defer root_url = url;
+    var run: WasmRun = undefined;
+    try run.init(program, mode);
+    defer run.deinit();
+    const result = run.resultStorage();
+    const task = try run.startRoot(program, result);
+    const status = run.driveQueue(task, cancel_after) catch |err| switch (err) {
+        error.Stuck => return error.TestUnexpectedResult,
+        else => |other| return other,
+    };
+    try run.call(builtins.shim_symbols.roc_task_free, task, &.{});
+    // The trace ends with the root's status, so both sides agree on it.
+    const done = status == .done;
+    const text = if (done) wasm_runner.readWasmStr(run.mem(), result) catch return error.TestUnexpectedResult else "";
+    const outcome = try CaseOutcome.init(text, run.trace.items);
+    errdefer outcome.deinit();
+    if (done) run.decrefStr(result);
+    run.session.free();
+    try std.testing.expectEqual(@as(i64, 0), run.session.liveAllocations());
+    return outcome;
+}
+
+fn expectQueueOutcome(want: QueueRun, got: CaseOutcome) E2eError!void {
+    try std.testing.expectEqualStrings(want.outcome.result, got.result);
+    for (want.outcome.trace, 0..) |entry, i| {
+        if (i < got.trace.len) try std.testing.expectEqualStrings(entry, got.trace[i]);
+    }
+    try std.testing.expectEqual(want.outcome.trace.len, got.trace.len);
+}
+
+fn compareQueueRuns(comptime R: type, program: R.Program) E2eError!void {
+    for (queue_runs.items) |want| {
+        errdefer std.log.err("queue run {s}, {s}, cancelled after {?d}, differs from the interpreter's", .{ want.name, @tagName(want.mode), want.cancel_after });
+        const got = try queueCase(R, program, want.name, want.mode, want.cancel_after);
+        defer got.deinit();
+        try expectQueueOutcome(want, got);
+    }
+}
+
+fn compareQueueDev(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    var program: DevProgram = undefined;
+    program.init(lowered) catch |err| {
+        std.log.err("compiling the plan loops with the dev backend failed: {s}", .{@errorName(err)});
+        return error.TestUnexpectedResult;
+    };
+    defer program.deinit();
+    compareQueueRuns(DevRun, &program) catch return error.TestUnexpectedResult;
+}
+
+fn compareQueueLlvm(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    var program: LlvmProgram = undefined;
+    program.init(lowered) catch |err| {
+        std.log.err("compiling the plan loops with LLVM failed: {s}", .{@errorName(err)});
+        return error.TestUnexpectedResult;
+    };
+    defer program.deinit();
+    compareQueueRuns(LlvmRun, &program) catch return error.TestUnexpectedResult;
+}
+
+fn compareQueueWasm(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    var program: WasmProgram = undefined;
+    program.init(lowered) catch |err| {
+        std.log.err("compiling the plan loops with the wasm backend failed: {s}", .{@errorName(err)});
+        return error.TestUnexpectedResult;
+    };
+    defer program.deinit();
+    for (queue_runs.items) |want| {
+        compareQueueRunWasm(&program, want) catch |err| {
+            std.log.err("queue run {s}, {s}, cancelled after {?d}, on wasm differs from the interpreter's: {s}", .{ want.name, @tagName(want.mode), want.cancel_after, @errorName(err) });
+            return error.TestUnexpectedResult;
+        };
+    }
+}
+
+fn compareQueueRunWasm(program: *const WasmProgram, want: QueueRun) E2eError!void {
+    const got = try queueCaseWasm(program, want.name, want.mode, want.cancel_after);
+    defer got.deinit();
+    try expectQueueOutcome(want, got);
+}
+
+fn checkQueueRuns(options: harness.LirLoweringOptions, inspect: harness.LoweredInspectFn) E2eError!void {
+    defer freeQueueRuns();
+    harness.runAppPathLoweredInspection(plan_loop_tasks_path, plan_loop_options, recordQueueRuns) catch return error.TestUnexpectedResult;
+    harness.runAppPathLoweredInspection(plan_loop_tasks_path, options, inspect) catch return error.TestUnexpectedResult;
+}
+
+test "concurrent loops take the interpreter's steps under a queue, cancelled after any resume, on the dev backend" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
+    try checkQueueRuns(plan_loop_options, compareQueueDev);
+}
+
+test "concurrent loops take the interpreter's steps under a queue, cancelled after any resume, on LLVM" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    try checkQueueRuns(plan_loop_options, compareQueueLlvm);
+}
+
+test "concurrent loops take the interpreter's steps under a queue, cancelled after any resume, on the wasm backend" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    try checkQueueRuns(.{ .specialization_strategy = .lss, .target_usize = .u32 }, compareQueueWasm);
 }

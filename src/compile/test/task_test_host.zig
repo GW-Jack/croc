@@ -33,24 +33,64 @@ const Pending = struct {
     url: RocStr,
 };
 
-/// The host: its mode, its trace, and the operation a paused task waits on.
+/// Numbers for the tasks of one tree, in the order the host first heard of
+/// them, so traces of runs whose tasks have other addresses compare. A task
+/// keeps its number until it ends.
+pub fn TaskNumbers(comptime Task: type) type {
+    return struct {
+        const Self = @This();
+
+        live: std.ArrayList(struct { task: Task, number: u32 }) = .empty,
+        next: u32 = 0,
+
+        /// Release the numbers.
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.live.deinit(allocator);
+        }
+
+        /// `task`'s number, which a task the host has not heard of gets now.
+        pub fn of(self: *Self, allocator: std.mem.Allocator, task: Task) std.mem.Allocator.Error!u32 {
+            for (self.live.items) |entry| if (entry.task == task) return entry.number;
+            try self.live.append(allocator, .{ .task = task, .number = self.next });
+            self.next += 1;
+            return self.next - 1;
+        }
+
+        /// `task` ended, so a new task may have its address.
+        pub fn forget(self: *Self, task: Task) void {
+            for (self.live.items, 0..) |entry, i| {
+                if (entry.task != task) continue;
+                _ = self.live.swapRemove(i);
+                return;
+            }
+        }
+    };
+}
+
+/// The host: its mode, its trace, and the operations paused tasks wait on.
 pub const TestHost = struct {
     allocator: std.mem.Allocator,
     ops: *RocOps,
     mode: Mode,
     trace: std.ArrayList([]u8) = .empty,
-    pending: ?Pending = null,
+    /// The operations not finished yet, oldest first: several when the root's
+    /// concurrent loops have children.
+    pending: std.ArrayList(Pending) = .empty,
     /// How many suspending calls paused.
     pauses: u32 = 0,
     /// How many paused operations a cancel abandoned.
     aborts: u32 = 0,
     /// How many times a wake told the host a parked task is ready.
     readies: u32 = 0,
-    /// Whether `readyTask` queues a task for `driveTree`.
+    /// Whether `readyTask` queues a task, for `driveTree` and `driveQueue`.
     queue_readies: bool = false,
     /// The tasks `roc_task_ready` gave, not yet resumed: several when the
     /// root's concurrent loops have children.
     ready_tasks: std.ArrayList(*RocTask) = .empty,
+    /// Whether the trace also records resumes and aborts, for `driveQueue`.
+    trace_steps: bool = false,
+    /// The numbers `driveQueue`'s trace names tasks by.
+    numbers: TaskNumbers(*RocTask) = .{},
     /// The task's `roc_task_wake`: a program's own, or `nativeWake`.
     wake: WakeFn = &nativeWake,
     /// The task's `roc_task_resume` and `roc_task_free`: a program's own
@@ -65,7 +105,9 @@ pub const TestHost = struct {
     }
 
     pub fn deinit(self: *TestHost) void {
-        if (self.pending) |pending| pending.url.decref(self.ops);
+        for (self.pending.items) |pending| pending.url.decref(self.ops);
+        self.pending.deinit(self.allocator);
+        self.numbers.deinit(self.allocator);
         for (self.trace.items) |entry| self.allocator.free(entry);
         self.trace.deinit(self.allocator);
         self.ready_tasks.deinit(self.allocator);
@@ -98,9 +140,10 @@ pub const TestHost = struct {
                 return poll_ready;
             },
             .pause => {
+                const paused = task orelse return error.RuntimeError;
                 // A task waits on at most one hosted operation at a time.
-                if (self.pending != null) return error.RuntimeError;
-                self.pending = .{ .task = task orelse return error.RuntimeError, .out = out, .url = url };
+                for (self.pending.items) |pending| if (pending.task == paused) return error.RuntimeError;
+                try self.pending.append(self.allocator, .{ .task = paused, .out = out, .url = url });
                 self.pauses += 1;
                 return poll_pending;
             },
@@ -141,10 +184,9 @@ pub const TestHost = struct {
         };
     }
 
-    /// Finish the paused operation: write its result and wake its task.
+    /// Finish the oldest paused operation: write its result and wake its task.
     pub fn finish(self: *TestHost) std.mem.Allocator.Error!void {
-        const pending = self.pending.?;
-        self.pending = null;
+        const pending = self.pending.orderedRemove(0);
         pending.out.* = try self.answer(pending.url);
         pending.url.decref(self.ops);
         active_host = self;
@@ -193,6 +235,74 @@ pub const TestHost = struct {
             if (next == root) status = next_status;
         }
         return status;
+    }
+
+    /// Run the tree of `root` under a queue: resume the tasks `roc_task_ready`
+    /// gave in the order it gave them, and finish the oldest paused operation
+    /// when none is left, until the root ends. `cancel` asks to cancel the
+    /// root after that many resumes, unless it ended first. The trace records
+    /// every resume and abort, so two backends' runs can be compared step by
+    /// step.
+    pub fn driveQueue(self: *TestHost, root: *RocTask, cancel: ?CancelAfter) (eval.Interpreter.Error || error{Stuck})!Status {
+        self.queue_readies = true;
+        self.trace_steps = true;
+        defer {
+            self.queue_readies = false;
+            self.trace_steps = false;
+        }
+        if (cancel) |request| if (request.resumes == 0) self.cancelTask(root, request.cancel);
+        var resumes: u32 = 0;
+        var next = root;
+        while (true) {
+            const number = try self.numbers.of(self.allocator, next);
+            const status = self.resumeTask(next);
+            resumes += 1;
+            try self.noteStep("task {d} resumed: {s}", .{ number, @tagName(status) });
+            if (status != .pending) {
+                if (next == root) return status;
+                // The runtime frees a child that ends.
+                self.numbers.forget(next);
+            }
+            if (cancel) |request| if (request.resumes == resumes) self.cancelTask(root, request.cancel);
+            while (self.ready_tasks.items.len == 0) {
+                if (self.pending.items.len == 0) return error.Stuck;
+                try self.finish();
+            }
+            next = self.ready_tasks.orderedRemove(0);
+        }
+    }
+
+    /// `task` can be resumed, once its turn comes.
+    fn queueReady(self: *TestHost, task: *RocTask) std.mem.Allocator.Error!void {
+        // Numbered here, so a child's number is its place in this order.
+        _ = try self.numbers.of(self.allocator, task);
+        try self.ready_tasks.append(self.allocator, task);
+    }
+
+    /// Abandon the operation `task` waits on.
+    fn abandon(self: *TestHost, task: *RocTask) std.mem.Allocator.Error!void {
+        const index = for (self.pending.items, 0..) |pending, i| {
+            if (pending.task == task) break i;
+        } else unreachable; // the runtime aborts only a task parked on an operation
+        const pending = self.pending.orderedRemove(index);
+        self.aborts += 1;
+        pending.url.decref(self.ops);
+        if (self.trace_steps) try self.noteStep("task {d} aborted", .{try self.numbers.of(self.allocator, task)});
+    }
+
+    /// Ask to cancel `task` with `cancel`.
+    fn cancelTask(self: *TestHost, task: *RocTask, cancel: CancelFn) void {
+        const previous = active_host;
+        active_host = self;
+        defer active_host = previous;
+        cancel(task);
+    }
+
+    /// Add a line about the tasks themselves to the trace.
+    fn noteStep(self: *TestHost, comptime format: []const u8, args: anytype) std.mem.Allocator.Error!void {
+        const entry = try std.fmt.allocPrint(self.allocator, format, args);
+        errdefer self.allocator.free(entry);
+        try self.trace.append(self.allocator, entry);
     }
 
     /// The ready task first in the tree, of the ones whose beginning is asked
@@ -261,6 +371,10 @@ pub fn nativeWake(task: *RocTask) callconv(.c) void {
 /// `roc_task_cancel`: a program's own, or `nativeCancel`.
 pub const CancelFn = *const fn (*RocTask) callconv(.c) void;
 
+/// When `driveQueue` asks to cancel its root: after `resumes` resumes, of any
+/// task.
+pub const CancelAfter = struct { resumes: u32, cancel: CancelFn };
+
 /// Resume with the test host's `roc_task_ready` and `roc_task_abort`, as a
 /// program's `roc_task_resume` does, for a run whose program defines none.
 pub fn nativeResume(task: *RocTask) callconv(.c) u32 {
@@ -313,24 +427,23 @@ fn cAbiLog(text: RocStr) callconv(.c) void {
 
 /// `void roc_task_ready(RocTask *task)`: the task was parked or is new, so
 /// the host may resume it. A single task's driver resumes it next, and
-/// `driveTree` resumes it once it is first in the tree.
+/// `driveTree` resumes it once it is first in the tree, and `driveQueue` in
+/// turn.
 fn readyTask(task: *RocTask) callconv(.c) void {
     const host = active_host.?;
     host.readies += 1;
     if (!host.queue_readies) return;
-    host.ready_tasks.append(host.allocator, task) catch {
-        if (c_abi_failure == null) c_abi_failure = error.OutOfMemory;
+    host.queueReady(task) catch |err| {
+        if (c_abi_failure == null) c_abi_failure = err;
     };
 }
 
 /// `void roc_task_abort(RocTask *task)`.
 fn abortPending(task: *RocTask) callconv(.c) void {
     const host = active_host.?;
-    const pending = host.pending.?;
-    std.debug.assert(pending.task == task);
-    host.pending = null;
-    host.aborts += 1;
-    pending.url.decref(host.ops);
+    host.abandon(task) catch |err| {
+        if (c_abi_failure == null) c_abi_failure = err;
+    };
 }
 
 fn readArg(comptime T: type, call: eval.Interpreter.HostedCall, index: usize) T {

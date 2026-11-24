@@ -35251,6 +35251,14 @@ and the continuations and resume entries. A Python model of the design
 (`design/language/concurrency-prototype` on the proposal branch) runs the
 same programs as an executable specification.
 
+Programs whose concurrent loops run child tasks also run under a queue: the
+host resumes tasks in the order it was given them, finishes the oldest paused
+operation when none is left, and may cancel the root after any resume. Each
+compiled backend must record the interpreter's trace of hosted calls, resumes,
+their statuses, and aborts, at every cancellation point, and leave no live
+allocations. wasm has only this check: the tree order that sequential
+equivalence needs follows pointers of the test's own process.
+
 ## Debug Invariants
 
 Every stage boundary has debug-only verification. In release builds, invariant
