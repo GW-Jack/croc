@@ -1172,21 +1172,26 @@ fn buildContinuation(
 /// exactly the values live after its site other than the result, that each
 /// resume entry calls its continuation with its captures in order, and that
 /// every call to a continuation is a tail site. It also checks that no
-/// procedure declares one join identity twice, which a continuation's
-/// copies of its enclosing joins could.
+/// procedure declares one join identity in two statements, which a
+/// continuation's copies of its enclosing joins could. Paths that share a
+/// tail, such as a loop's `break` and its normal end, reach one declaration.
 fn verify(allocator: Allocator, store: *const LirStore) Allocator.Error!void {
     var continuations = try std.DynamicBitSetUnmanaged.initEmpty(allocator, store.procSpecCount());
     defer continuations.deinit(allocator);
     {
         var declared = collections.DenseMapUnmanaged(LIR.JoinPointId, void).empty;
         defer declared.deinit(allocator);
+        var visited = collections.DenseMapUnmanaged(CFStmtId, void).empty;
+        defer visited.deinit(allocator);
         var work = std.ArrayList(CFStmtId).empty;
         defer work.deinit(allocator);
         for (0..store.procSpecCount()) |index| {
             const body = store.getProcSpecImmediate(@fromBackingInt(@intCast(index))).body.get() orelse continue;
             declared.clearRetainingCapacity();
+            visited.clearRetainingCapacity();
             try work.append(allocator, body);
             while (work.pop()) |stmt_id| {
+                if ((try visited.getOrPut(allocator, stmt_id)).found_existing) continue;
                 const stmt = store.getCFStmtImmediate(stmt_id).*;
                 if (stmt == .join) {
                     const slot = try declared.getOrPut(allocator, stmt.join.id);
@@ -1563,6 +1568,36 @@ fn expectPendingEdge(f: *Fixture, edge: CFStmtId, task: LocalId, resume_entry: P
     try testing.expectEqualSlices(LocalId, saved, saved_locals);
     try testing.expect(f.at(save.next) == .suspend_return);
     return data;
+}
+
+test "paths that share a tail after a site share its copy, which declares its joins once" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const x = try f.local();
+    const t = try f.local();
+    const join_id: LIR.JoinPointId = @fromBackingInt(@intCast(1));
+    // t = seed(); switch x { 0 => tail, _ => tail }
+    // tail = join J() = { ret t } in { jump J }
+    const ret = try f.stmt(.{ .ret = .{ .value = t } });
+    const jump = try f.stmt(.{ .jump = .{ .target = join_id } });
+    const tail = try f.stmt(.{ .join = .{ .id = join_id, .params = .empty(), .body = ret, .remainder = jump } });
+    const branch = try f.stmt(.{ .switch_stmt = .{
+        .cond = x,
+        .branches = try f.store.addCFSwitchBranches(&.{.{ .value = 0, .body = tail }}),
+        .default_branch = tail,
+        .continuation = tail,
+    } });
+    _ = try f.addProc(&.{x}, &.{ x, t }, try f.callSeed(t, branch));
+    const count = f.store.procSpecCount();
+
+    try run(testing.allocator, &f.store, &f.layouts, .none);
+
+    const c: ProcId = @fromBackingInt(@intCast(count));
+    const c_branch = f.at(f.spec(c).body.get().?).switch_stmt;
+    const c_arm = GuardedList.at(f.store.getCFSwitchBranches(c_branch.branches), 0);
+    try testing.expectEqual(c_branch.default_branch, c_arm.body);
+    const c_join = f.at(c_branch.default_branch).join;
+    try testing.expectEqual(c_join.id, f.at(c_join.remainder).jump.target);
 }
 
 test "a procedure site tests the pending flag and saves its resume entry on the cold side" {
