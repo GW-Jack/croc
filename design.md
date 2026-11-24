@@ -34450,8 +34450,9 @@ the owner's when it starts entries or a sibling's when a report makes room,
 so `roc_task_ready` only queues the task. A child's operation is aborted through
 `roc_task_abort` as a root's is. When a resume returns a terminal status for
 a child, the runtime has already freed it. The host must forget the
-pointer, and only a root's status ends the program. Cancelling, freeing or
-resuming a child after its terminal status breaks P8.
+pointer, and only a root's status ends the program. The host never cancels
+or frees a child, which only the runtime does, and resuming or waking one
+after its terminal status is using a freed task. Each breaks P8.
 
 ### The Task Runtime
 
@@ -34664,8 +34665,11 @@ Some obligations have no runtime check:
 The *conformance harness* (`src/builtins/task_conformance_test.zig`)
 drives tasks with one adversarial host per checked obligation. Each host
 must be caught by name and then finish its task with nothing leaked.
-Conforming hosts must run with no crash: a single-threaded host, a host
-that finishes before its hosted function returns, and hosts that cancel.
+The obligations on a child (P1, P3, P4, P8, and P10 for a resume inside
+`roc_task_ready`) have hosts of their own. Conforming hosts must run with no
+crash: a single-threaded host, a host that finishes before its hosted
+function returns, hosts that cancel, and a host whose child parks on an
+operation while its owner waits for it.
 The threaded wake test drives a host that finishes operations on worker
 threads under ThreadSanitizer. The interpreter shim is built in the
 compiler's mode, so the CLI cases of the native reference platform, whose

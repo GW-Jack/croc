@@ -370,12 +370,23 @@ fn readyChild(task: *RocTask) callconv(.c) void {
     last_readied = task;
 }
 
+/// What a loop's start record captures: where it keeps its group, and
+/// whether its entry pauses once on a hosted operation.
+const Loop = struct {
+    group_out: **task_mod.Group,
+    entry_pauses: bool,
+};
+
 /// A loop over one entry: open the group and wait for the entry, then take
 /// its result and close the group.
 fn loopOverOne(_: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {
-    const group_out: **task_mod.Group = @as(*align(1) const **task_mod.Group, @ptrCast(capture.?)).*;
+    const loop = @as(*align(1) const Loop, @ptrCast(capture.?)).*;
+    const group_out = loop.group_out;
     const task: *RocTask = @as(*const *RocTask, @ptrCast(@alignCast(args.?))).*;
-    const entry = record(task.ops, .{ .next = null, .result = 7 });
+    const entry = if (loop.entry_pauses)
+        erased_callable.allocate(&pauseOnce, &stepDrop, 0, task.ops)
+    else
+        record(task.ops, .{ .next = null, .result = 7 });
     group_out.* = task_mod.groupCreate(task, .{
         .starts = &.{entry},
         .marks = &.{.{ .limit_path = &.{}, .shielded = false, .background = false }},
@@ -387,15 +398,39 @@ fn loopOverOne(_: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: 
         .result_drop_context = null,
     });
     if (task_mod.groupNext(group_out.*) != .pending) fail("the entry arrived before it ran");
-    const size = erased_callable.payloadSize(@sizeOf(**task_mod.Group));
     const built = erased_callable.allocate(&finishLoop, &stepDrop, @sizeOf(**task_mod.Group), task.ops);
     @as(*align(1) **task_mod.Group, @ptrCast(erased_callable.capturePtr(built))).* = group_out;
-    const moved = task.allocRecord(size);
-    @memcpy(moved[0..size], built[0..size]);
-    utils.freeDataPtrC(built, erased_callable.payload_alignment, erased_callable.allocation_has_refcounted_children, task.ops);
-    task.pushRecord(moved, null);
+    task.pushRecord(moveIntoTask(task, built), null);
     task.setPending();
     ret.?[0] = 0;
+}
+
+/// An entry that pauses on a hosted operation and then returns 7.
+fn pauseOnce(_: *RocOps, ret: ?[*]u8, args: ?[*]const u8, _: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {
+    const task: *RocTask = @as(*const *RocTask, @ptrCast(@alignCast(args.?))).*;
+    task.pushRecord(moveIntoTask(task, record(task.ops, .{ .next = null, .result = 7 })), null);
+    task.setPending();
+    ret.?[0] = 0;
+}
+
+/// A root that runs `loopOverOne`.
+fn loopTask(ops: *RocOps, group: **task_mod.Group, root: *[8]u8, entry_pauses: bool) *RocTask {
+    const start = erased_callable.allocate(&loopOverOne, &stepDrop, @sizeOf(Loop), ops);
+    @as(*align(1) Loop, @ptrCast(erased_callable.capturePtr(start))).* = .{ .group_out = group, .entry_pauses = entry_pauses };
+    return RocTask.create(ops, start, root, buffers);
+}
+
+/// A root parked on its loop, and that loop's one entry, readied but not
+/// resumed.
+const ParkedLoop = struct { root: *RocTask, child: *RocTask };
+
+fn parkedLoop(ops: *RocOps, group: **task_mod.Group, root: *[8]u8, entry_pauses: bool) error{TestUnexpectedResult}!ParkedLoop {
+    last_readied = null;
+    const task = loopTask(ops, group, root, entry_pauses);
+    try std.testing.expect(task.resumeFromHost(&readyChild, &abort) == .pending);
+    const child = last_readied orelse return error.TestUnexpectedResult;
+    last_readied = null;
+    return .{ .root = task, .child = child };
 }
 
 fn finishLoop(_: *RocOps, ret: ?[*]u8, _: ?[*]const u8, capture: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {
@@ -406,33 +441,130 @@ fn finishLoop(_: *RocOps, ret: ?[*]u8, _: ?[*]const u8, capture: ?[*]u8, _: ?[*]
     task_mod.groupFree(group);
 }
 
+fn wakeChild(task: *RocTask) void {
+    task.wake(&readyChild);
+}
+
+/// A host whose `roc_task_ready` resumes the task at once, inside the
+/// resume that readied it.
+fn resumeInsideReady(task: *RocTask) callconv(.c) void {
+    hook_message = caughtCrash(*RocTask, &resumeTask, task);
+    last_readied = task;
+}
+
 test "a host that frees or cancels a child task, which only the runtime does, is caught (P8)" {
-    var harness: Harness = undefined;
-    try harness.init();
-    defer harness.deinit();
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    reset();
+    var group: *task_mod.Group = undefined;
+    var root: [8]u8 = undefined;
+    const loop = try parkedLoop(&h.ops, &group, &root, false);
+
+    try expectCaught(caughtCrash(*RocTask, &freeTask, loop.child), "P8");
+    try expectCaught(caughtCrash(*RocTask, &cancelTask, loop.child), "P8");
+
+    // The child is as it was: it runs, reports, and readies its owner.
+    try std.testing.expectEqual(Status.done, loop.child.resumeFromHost(&readyChild, &abort));
+    try std.testing.expectEqual(loop.root, last_readied.?);
+    try std.testing.expectEqual(Status.done, loop.root.resumeFromHost(&readyChild, &abort));
+    try std.testing.expectEqual(@as(u8, 7), root[0]);
+    // The runtime freed the child before its resume returned.
+    try expectCaught(caughtCrash(*RocTask, &resumeTask, loop.child), "P8");
+    try expectCaught(caughtCrash(*RocTask, &wakeTask, loop.child), "P8");
+    try expectCaught(caughtCrash(*RocTask, &cancelTask, loop.child), "P8");
+    try expectCaught(caughtCrash(*RocTask, &freeTask, loop.child), "P8");
+    loop.root.free();
+    try std.testing.expectEqual(@as(usize, 0), h.live());
+}
+
+test "a host that resumes a child twice for one ready, or its owner before a report, is caught (P1)" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    reset();
+    var group: *task_mod.Group = undefined;
+    var root: [8]u8 = undefined;
+    const loop = try parkedLoop(&h.ops, &group, &root, true);
+
+    try expectCaught(caughtCrash(*RocTask, &resumeTask, loop.root), "P1");
+    try std.testing.expectEqual(Status.pending, loop.child.resumeFromHost(&readyChild, &abort));
+    try expectCaught(caughtCrash(*RocTask, &resumeTask, loop.child), "P1");
+
+    // Both are as they were.
+    loop.child.wake(&readyChild);
+    try std.testing.expectEqual(loop.child, last_readied.?);
+    try std.testing.expectEqual(Status.done, loop.child.resumeFromHost(&readyChild, &abort));
+    try std.testing.expectEqual(loop.root, last_readied.?);
+    try std.testing.expectEqual(Status.done, loop.root.resumeFromHost(&readyChild, &abort));
+    try std.testing.expectEqual(@as(u8, 7), root[0]);
+    loop.root.free();
+    try std.testing.expectEqual(@as(usize, 0), h.live());
+}
+
+test "a host that resumes a child inside roc_task_ready is caught (P10)" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
     reset();
     last_readied = null;
     var group: *task_mod.Group = undefined;
-    const start = erased_callable.allocate(&loopOverOne, &stepDrop, @sizeOf(**task_mod.Group), &harness.ops);
-    @as(*align(1) **task_mod.Group, @ptrCast(erased_callable.capturePtr(start))).* = &group;
     var root: [8]u8 = undefined;
-    const task = RocTask.create(&harness.ops, start, &root, buffers);
-    try std.testing.expectEqual(Status.pending, task.resumeFromHost(&readyChild, &abort));
+    const task = loopTask(&h.ops, &group, &root, false);
+
+    // The owner's resume starts the entry, which readies it.
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(&resumeInsideReady, &abort));
+    try expectCaught(hook_message, "P10");
+
     const child = last_readied.?;
-    last_readied = null;
-
-    try expectCaught(caughtCrash(*RocTask, &freeTask, child), "P8");
-    try expectCaught(caughtCrash(*RocTask, &cancelTask, child), "P8");
-
-    // The child is as it was: it runs, reports, and readies its owner.
     try std.testing.expectEqual(Status.done, child.resumeFromHost(&readyChild, &abort));
-    try std.testing.expectEqual(task, last_readied.?);
     try std.testing.expectEqual(Status.done, task.resumeFromHost(&readyChild, &abort));
     try std.testing.expectEqual(@as(u8, 7), root[0]);
-    // The runtime freed the child before its resume returned.
-    try expectCaught(caughtCrash(*RocTask, &resumeTask, child), "P8");
     task.free();
-    try std.testing.expectEqual(@as(usize, 0), harness.live());
+    try std.testing.expectEqual(@as(usize, 0), h.live());
+}
+
+test "a host that wakes a child twice for one operation is caught (P3)" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    reset();
+    var group: *task_mod.Group = undefined;
+    var root: [8]u8 = undefined;
+    const loop = try parkedLoop(&h.ops, &group, &root, true);
+
+    try std.testing.expectEqual(Status.pending, loop.child.resumeFromHost(&readyChild, &abort));
+    loop.child.wake(&readyChild);
+    try expectCaught(caughtCrash(*RocTask, &wakeChild, loop.child), "P3");
+    try std.testing.expectEqual(Status.done, loop.child.resumeFromHost(&readyChild, &abort));
+    try std.testing.expectEqual(Status.done, loop.root.resumeFromHost(&readyChild, &abort));
+    try std.testing.expectEqual(@as(u8, 7), root[0]);
+    loop.root.free();
+    try std.testing.expectEqual(@as(usize, 0), h.live());
+}
+
+test "a host that wakes a child after the runtime aborted its operation is caught (P4)" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    reset();
+    var group: *task_mod.Group = undefined;
+    var root: [8]u8 = undefined;
+    const loop = try parkedLoop(&h.ops, &group, &root, true);
+
+    try std.testing.expectEqual(Status.pending, loop.child.resumeFromHost(&readyChild, &abort));
+    // Cancelling the root readies it. Its next resume cancels the child.
+    loop.root.cancel(&abort, &readyChild);
+    try std.testing.expectEqual(@as(u32, 0), aborts);
+    try std.testing.expectEqual(Status.pending, loop.root.resumeFromHost(&readyChild, &abort));
+    try std.testing.expectEqual(@as(u32, 1), aborts);
+    try std.testing.expectEqual(loop.child, last_readied.?);
+    try expectCaught(caughtCrash(*RocTask, &wakeChild, loop.child), "P4");
+
+    try std.testing.expectEqual(Status.cancelled, loop.child.resumeFromHost(&readyChild, &abort));
+    try std.testing.expectEqual(Status.cancelled, loop.root.resumeFromHost(&readyChild, &abort));
+    loop.root.free();
+    try std.testing.expectEqual(@as(usize, 0), h.live());
 }
 
 test "conforming hosts run with the monitors on and no crash" {
@@ -477,6 +609,19 @@ test "conforming hosts run with the monitors on and no crash" {
     fresh.free();
     try std.testing.expectEqual(@as(u32, 1), aborts);
     try std.testing.expectEqual(@as(u32, 2), readies);
+
+    // A child parks on its own operation while its owner waits for it.
+    reset();
+    var group: *task_mod.Group = undefined;
+    const loop = try parkedLoop(&h.ops, &group, &root, true);
+    try std.testing.expectEqual(Status.pending, loop.child.resumeFromHost(&readyChild, &abort));
+    loop.child.wake(&readyChild);
+    try std.testing.expectEqual(loop.child, last_readied.?);
+    try std.testing.expectEqual(Status.done, loop.child.resumeFromHost(&readyChild, &abort));
+    try std.testing.expectEqual(loop.root, last_readied.?);
+    try std.testing.expectEqual(Status.done, loop.root.resumeFromHost(&readyChild, &abort));
+    try std.testing.expectEqual(@as(u8, 7), root[0]);
+    loop.root.free();
 
     try std.testing.expectEqual(@as(usize, 0), h.live());
 }
