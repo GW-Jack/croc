@@ -4,8 +4,9 @@
 //! Monotype lowers every concurrent loop to calls of the Builtin running-set
 //! helpers, its sequential form. A loop whose `run_next!` specialization may
 //! suspend is task-form: this rewrites each of its helper calls in place to
-//! running-set operations, which name the set by the loop's id. The
-//! continuation pass runs this before it finds any sites, since a promoted
+//! running-set operations, which name the set by the loop's id. In a `Tasks`
+//! build it also replaces the body of each `run_supervised!` specialization
+//! with its restart loop ("Supervision."). The continuation pass runs this before it finds any sites, since a promoted
 //! `group_next` is a park site, and afterwards gives every operation its
 //! task.
 
@@ -15,7 +16,8 @@ const core = @import("lir_core");
 const layout = @import("layout");
 const body_clone = @import("body_clone.zig");
 const ContinuationPass = @import("continuation_pass.zig");
-const invariant = @import("base").invariant;
+const base = @import("base");
+const invariant = base.invariant;
 
 const LIR = core.LIR;
 const LirStore = core.LirStore;
@@ -40,8 +42,9 @@ const Loop = struct {
     start: Start,
 };
 
-/// Promote every task-form loop in the program (design.md "Promotion").
-pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store) Allocator.Error!void {
+/// Promote every task-form loop in the program (design.md "Promotion"), and
+/// in a `Tasks` build every `run_supervised!` specialization ("Supervision.").
+pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, mode: base.ConcurrencyMode) Allocator.Error!void {
     var loops = collections.DenseMapUnmanaged(ProcId, Loop).empty;
     defer loops.deinit(allocator);
     var starts = collections.DenseMapUnmanaged(ProcId, Start).empty;
@@ -54,6 +57,14 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store) Alloc
         const proc = store.getProcSpecImmediate(proc_id);
         if (proc.running_set_helper != .run_next or proc.suspends == .never) continue;
         try loops.put(allocator, proc_id, try describe(allocator, store, layouts, &starts, proc_id));
+    }
+    if (mode == .tasks) {
+        for (0..proc_count) |index| {
+            const proc_id: ProcId = @fromBackingInt(@intCast(index));
+            const proc = store.getProcSpecImmediate(proc_id);
+            if (proc.running_set_helper != .run_supervised or proc.body.get() == null) continue;
+            try promoteSupervised(allocator, store, layouts, &starts, proc_id);
+        }
     }
     if (loops.count() == 0) return;
     for (0..proc_count) |index| try promoteIn(allocator, store, layouts, &loops, @fromBackingInt(@intCast(index)));
@@ -75,7 +86,7 @@ fn describe(allocator: Allocator, store: *LirStore, layouts: *layout.Store, star
             .run_entry => &entry,
             .run_arrived => &arrived,
             .run_ended => &ended,
-            .none, .run_create, .run_next, .run_spawn, .run_cancel => continue,
+            .none, .run_create, .run_next, .run_spawn, .run_cancel, .run_supervised => continue,
         };
         if (slot.*) |seen| {
             if (seen != callee) invariant("a run_next! specialization calls two specializations of one running-set helper", .{});
@@ -83,21 +94,38 @@ fn describe(allocator: Allocator, store: *LirStore, layouts: *layout.Store, star
         slot.* = callee;
     }
     const entry_proc = entry orelse invariant("a task-form run_next! specialization calls no run_entry!", .{});
-    const entry_spec = store.getProcSpecImmediate(entry_proc).*;
-    if (GuardedList.borrowLen(store.getLocalSpan(entry_spec.args)) != 1) invariant("run_entry! does not take exactly its entry before the continuation pass", .{});
-    const item = store.getLocal(GuardedList.at(store.getLocalSpan(entry_spec.args), 0)).layout_idx;
-    const start = starts.get(entry_proc) orelse blk: {
-        const made = try ContinuationPass.buildStart(allocator, store, layouts, entry_proc, &.{item}, true);
-        try starts.put(allocator, entry_proc, made);
-        break :blk made;
-    };
+    const child = try describeEntry(allocator, store, layouts, starts, entry_proc);
     return .{
         .arrived = arrived orelse invariant("a task-form run_next! specialization calls no run_arrived", .{}),
         .ended = ended orelse invariant("a task-form run_next! specialization calls no run_ended", .{}),
-        .item = item,
-        .result = entry_spec.ret_layout,
-        .start = start,
+        .item = child.item,
+        .result = child.result,
+        .start = child.start,
     };
+}
+
+/// What promotion uses of one `run_entry!` specialization.
+const Entry = struct {
+    /// The layout of an entry, its argument.
+    item: layout.Idx,
+    /// The layout of an entry's result.
+    result: layout.Idx,
+    start: Start,
+};
+
+/// The entry's layouts, and the one start procedure of `entry`. A task-form
+/// loop's entry may suspend and so takes the task; a supervised one takes it
+/// only then.
+fn describeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Store, starts: *collections.DenseMapUnmanaged(ProcId, Start), entry: ProcId) Allocator.Error!Entry {
+    const spec = store.getProcSpecImmediate(entry).*;
+    if (GuardedList.borrowLen(store.getLocalSpan(spec.args)) != 1) invariant("run_entry! does not take exactly its entry before the continuation pass", .{});
+    const item = store.getLocal(GuardedList.at(store.getLocalSpan(spec.args), 0)).layout_idx;
+    const start = starts.get(entry) orelse blk: {
+        const made = try ContinuationPass.buildStart(allocator, store, layouts, entry, &.{item}, spec.suspends != .never);
+        try starts.put(allocator, entry, made);
+        break :blk made;
+    };
+    return .{ .item = item, .result = spec.ret_layout, .start = start };
 }
 
 /// Every statement of `proc`'s body, once. Paths that share a tail, such as a
@@ -224,6 +252,7 @@ const Promoter = struct {
 
         // Before them: open the set, then enter the pushes at 0.
         const zero = try self.local(.u64);
+        const unsupervised = try self.local(.bool);
         var head = try self.jumpWith(push, i, zero, origin);
         head = try self.literal(zero, 0, .u64, head, origin);
         head = try self.store.addCFStmt(.{ .join = .{
@@ -237,9 +266,10 @@ const Promoter = struct {
             .op = .group_init,
             .rc_effect = try self.store.addRcEffect(LIR.LowLevel.group_init.rcEffect()),
             .extra = try self.store.addStmtRow(LIR.LowLevelExtra, .{ .group_result = .some(loop.result) }),
-            .args = try self.store.addLocalSpan(&.{ id, n, limits, root_limit }),
+            .args = try self.store.addLocalSpan(&.{ id, n, limits, root_limit, unsupervised }),
             .next = head,
         } }, origin);
+        head = try self.literal(unsupervised, 0, .bool, head, origin);
         head = try self.op(n, .list_len, &.{entries}, head, origin);
         self.replace(site, head);
     }
@@ -312,6 +342,129 @@ const Promoter = struct {
     }
 };
 
+/// Replace the body of one `run_supervised!(max_restarts, f)` specialization,
+/// `run_entry!(f)`, with its restart loop (design.md "Supervision."):
+///
+///     join restart(left = max_restarts) {
+///         group_init(id, 1, [], 0, True); group_push(id, start of f, [], False, False);
+///         group_start(id); s = group_next(id)
+///         match s {
+///             0 => v = ptr_load(group_arrival(id)); group_free(id); ret v
+///             _ => m = ptr_load(group_arrival(id)); group_free(id);
+///                  match left { 0 => crash m, _ => jump restart(left - 1) }
+///         }
+///     }
+fn promoteSupervised(allocator: Allocator, store: *LirStore, layouts: *layout.Store, starts: *collections.DenseMapUnmanaged(ProcId, Start), proc_id: ProcId) Allocator.Error!void {
+    var entry: ?ProcId = null;
+    var stmts = try bodyStmts(allocator, store, proc_id);
+    defer stmts.deinit(allocator);
+    for (stmts.items) |stmt_id| {
+        const stmt = store.getCFStmtImmediate(stmt_id).*;
+        if (stmt != .assign_call) continue;
+        const callee = stmt.assign_call.proc;
+        if (store.getProcSpecImmediate(callee).running_set_helper != .run_entry) continue;
+        if (entry != null) invariant("a run_supervised! specialization calls run_entry! twice", .{});
+        entry = callee;
+    }
+    const child = try describeEntry(allocator, store, layouts, starts, entry orelse invariant("a run_supervised! specialization calls no run_entry!", .{}));
+    const args = try ContinuationPass.copyLocals(allocator, store, store.getProcSpecImmediate(proc_id).args);
+    defer allocator.free(args);
+    if (args.len != 2) invariant("run_supervised! does not take a restart limit and its function", .{});
+    const max_restarts = args[0];
+    const function = args[1];
+    if (store.getLocal(function).layout_idx != child.item) invariant("run_supervised!'s function is not its run_entry!'s entry", .{});
+    if (store.getProcSpecImmediate(proc_id).ret_layout != child.result) invariant("run_supervised! does not return its run_entry!'s result", .{});
+
+    const origin = store.stmtOrigin(store.getProcSpecImmediate(proc_id).body.get().?);
+    var b = Promoter{
+        .allocator = allocator,
+        .store = store,
+        .layouts = layouts,
+        .joins = body_clone.JoinParamIndex.init(allocator),
+    };
+    defer b.frame.deinit(allocator);
+    defer b.joins.deinit();
+    try b.frame.appendSlice(allocator, args);
+    const restart = b.joins.freshJoinPoint();
+    const left = try b.local(.u64);
+    const id = try b.local(.u64);
+    const status = try b.local(.u32);
+
+    // It returned.
+    const slot = try b.local(try layouts.insertPtr(child.result));
+    const value = try b.local(child.result);
+    var arrived = try store.addCFStmt(.{ .ret = .{ .value = value } }, origin);
+    arrived = try b.op(try b.local(.zst), .group_free, &.{id}, arrived, origin);
+    arrived = try b.op(value, .ptr_load, &.{slot}, arrived, origin);
+    arrived = try b.op(slot, .group_arrival, &.{id}, arrived, origin);
+
+    // It crashed.
+    const message_ptr = try b.local(try layouts.insertPtr(.str));
+    const message = try b.local(.str);
+    const next_left = try b.local(.u64);
+    const one = try b.local(.u64);
+    const give_up = try store.addCFStmt(.{ .crash = .{ .msg = .{ .local = message } } }, origin);
+    var again = try b.jumpWith(restart, left, next_left, origin);
+    again = try b.op(next_left, .num_int_sub_wrap, &.{ left, one }, again, origin);
+    again = try b.literal(one, 1, .u64, again, origin);
+    var crashed = try store.addCFStmt(.{ .switch_stmt = .{
+        .cond = left,
+        .branches = try store.addCFSwitchBranches(&.{.{ .value = 0, .body = give_up }}),
+        .default_branch = again,
+    } }, origin);
+    crashed = try b.op(try b.local(.zst), .group_free, &.{id}, crashed, origin);
+    crashed = try b.op(message, .ptr_load, &.{message_ptr}, crashed, origin);
+    crashed = try b.op(message_ptr, .group_arrival, &.{id}, crashed, origin);
+
+    // Start it.
+    const count = try b.local(.u64);
+    const limits = try b.local(try layouts.insertList(.u64));
+    const no_limit = try b.local(.u64);
+    const supervised = try b.local(.bool);
+    const record = try b.local(try layouts.insertErasedCallable());
+    const path = try b.local(try layouts.insertList(.u64));
+    const no = try b.local(.bool);
+    var body = try store.addCFStmt(.{ .switch_stmt = .{
+        .cond = status,
+        .branches = try store.addCFSwitchBranches(&.{.{ .value = 0, .body = arrived }}),
+        .default_branch = crashed,
+    } }, origin);
+    body = try b.op(status, .group_next, &.{id}, body, origin);
+    body = try b.op(try b.local(.zst), .group_start, &.{id}, body, origin);
+    body = try b.op(try b.local(.zst), .group_push, &.{ id, record, path, no, no }, body, origin);
+    body = try ContinuationPass.packStart(allocator, store, layouts, &b.frame, child.start, &.{function}, record, body, origin);
+    body = try b.literal(no, 0, .bool, body, origin);
+    body = try store.addCFStmt(.{ .assign_list = .{ .target = path, .elems = .empty(), .next = body } }, origin);
+    body = try store.addCFStmt(.{ .assign_low_level = .{
+        .target = try b.local(.zst),
+        .op = .group_init,
+        .rc_effect = try store.addRcEffect(LIR.LowLevel.group_init.rcEffect()),
+        .extra = try store.addStmtRow(LIR.LowLevelExtra, .{ .group_result = .some(child.result) }),
+        .args = try store.addLocalSpan(&.{ id, count, limits, no_limit, supervised }),
+        .next = body,
+    } }, origin);
+    body = try b.literal(supervised, 1, .bool, body, origin);
+    body = try b.literal(no_limit, 0, .u64, body, origin);
+    body = try store.addCFStmt(.{ .assign_list = .{ .target = limits, .elems = .empty(), .next = body } }, origin);
+    body = try b.literal(count, 1, .u64, body, origin);
+    body = try b.literal(id, base.supervised_loop_id, .u64, body, origin);
+
+    const head = try store.addCFStmt(.{ .join = .{
+        .id = restart,
+        .params = try store.addLocalSpan(&.{left}),
+        .body = body,
+        .remainder = try b.jumpWith(restart, left, max_restarts, origin),
+    } }, origin);
+    std.mem.sort(LocalId, b.frame.items, {}, localLessThan);
+    const proc = store.getProcSpecPtr(proc_id);
+    proc.body = .some(head);
+    proc.frame_locals = try store.addLocalSpan(b.frame.items);
+}
+
+fn localLessThan(_: void, a: LocalId, b: LocalId) bool {
+    return @backingInt(a) < @backingInt(b);
+}
+
 /// Promote the task-form loops of one procedure: each call of a task-form
 /// `run_next!` names its loop's id, and the procedure's other helper calls
 /// with that id belong to the same loop.
@@ -338,7 +491,7 @@ fn promoteIn(allocator: Allocator, store: *LirStore, layouts: *layout.Store, loo
             try ids.define(allocator, stmt.assign_ref.target, .{ .copy = stmt.assign_ref.op.source });
         } else if (stmt == .assign_call) switch (store.getProcSpecImmediate(stmt.assign_call.proc).running_set_helper) {
             .run_create, .run_next, .run_spawn, .run_cancel => try calls.append(allocator, stmt_id),
-            .none, .run_entry, .run_arrived, .run_ended => {},
+            .none, .run_entry, .run_arrived, .run_ended, .run_supervised => {},
         };
     }
 
@@ -381,7 +534,7 @@ fn promoteIn(allocator: Allocator, store: *LirStore, layouts: *layout.Store, loo
             },
             .run_spawn => try promoter.promoteSpawn(stmt_id, loop),
             .run_cancel => try promoter.promoteCancel(stmt_id),
-            .none, .run_entry, .run_arrived, .run_ended => unreachable, // `calls` holds only these four helpers' calls.
+            .none, .run_entry, .run_arrived, .run_ended, .run_supervised => unreachable, // `calls` holds only these four helpers' calls.
         }
     }
     var task_form_ids = task_form.keyIterator();

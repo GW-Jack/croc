@@ -151,6 +151,7 @@ fn loopCall(_: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?[*
                 loop.sum += @as(*align(1) const u64, @ptrCast(arrival.slot)).*;
                 loop.arrivals += 1;
             },
+            .crashed => unreachable, // rationale: none of these groups is supervised
             .ended => {
                 task_mod.groupFree(loop.group.?);
                 @as(*align(1) u64, @ptrCast(ret.?)).* = loop.sum;

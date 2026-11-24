@@ -16983,7 +16983,7 @@ fn expectRunningSetHelperProcs(lowered: *const lir.CheckedPipeline.LoweredProgra
                 .run_entry => calls_entry = true,
                 .run_arrived => calls_arrived = true,
                 .run_ended => calls_ended = true,
-                .none, .run_create, .run_next, .run_spawn, .run_cancel => {},
+                .none, .run_create, .run_next, .run_spawn, .run_cancel, .run_supervised => {},
             }
         }
         try std.testing.expect(calls_entry);

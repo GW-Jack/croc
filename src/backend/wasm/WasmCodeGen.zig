@@ -13449,8 +13449,8 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
         // builtin, with each list passed as its bytes and length (design.md
         // "Backends"). An operation with no result leaves the unit i32 0.
         .group_init => {
-            // (id, entry count, limits, root limit, task); the builtin also
-            // takes the result slots' size and alignment and the drop of a
+            // (id, entry count, limits, root limit, supervised, task); the builtin
+            // also takes the result slots' size and alignment and the drop of a
             // result nobody takes.
             self.requireBuiltinCalls("group_init");
             const result_layout = ll.group_result.get() orelse
@@ -13463,10 +13463,11 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
             try self.emitProcLocal(GuardedList.at(args, 1));
             try self.emitLocalGets(.{ limits.bytes, limits.len });
             try self.emitProcLocal(GuardedList.at(args, 3));
+            try self.emitProcLocal(GuardedList.at(args, 4));
             try self.emitI64Const(@intCast(size_align.size));
             try self.emitI64Const(@intCast(size_align.alignment.toByteUnits()));
             try self.emitOptionalFunctionTableIndexConst(drop_index);
-            try self.emitProcLocal(GuardedList.at(args, 4));
+            try self.emitProcLocal(GuardedList.at(args, 5));
             try self.emitBuiltinCall(.group_init);
             try self.emitI32Const(0);
         },

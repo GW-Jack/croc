@@ -5766,7 +5766,7 @@ pub const ReportBuilder = struct {
 
     fn buildRunningSetHelperUseReport(self: *Self, data: RunningSetHelperUse) Allocator.Error!Report {
         return self.buildHighlightedRegionReport("Compiler Only Function", "This uses a function only the compiler may call.", .runtime_error, data.region, &.{
-            D.bytes("The running-set functions of `Concurrently` run `for!` loops over plans, and only the compiler calls them. This use crashes if it runs."),
+            D.bytes("The running-set functions of `Concurrently` run `for!` loops over plans and supervised functions, and only the compiler calls them. This use crashes if it runs."),
         });
     }
 

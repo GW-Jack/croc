@@ -33719,9 +33719,11 @@ The fixpoint's seeds are the body-less procedures marked `may`: a
 procedure the native cache supplies, whose producer committed its mark. A
 procedure whose body holds a `group_next` is a seed too. A loop has the task
 form only because an entry may suspend, so a program with a `group_next`
-always has a body-less seed as well, and a program without one skips the
-walk; a Debug compiler walks anyway and checks that no `group_next` is
-there. It propagates from each seed to the callers that call it directly and commits
+has a body-less seed as well, unless the `group_next` is a supervised set's.
+In a `Tasks` build the `run_supervised!` specializations (Plans And Concurrent
+Loops, "Supervision.") are seeds too, before promotion as after it. A program
+with no seed skips the walk; a Debug compiler walks anyway and checks that no
+`group_next` is there. The fixpoint propagates from each seed to the callers that call it directly and commits
 both marks on every procedure with a body, so a recomputation after rewrites
 replaces stale marks rather than adding to them. Erased calls are never
 sites here; the continuation pass rejects an erased-callable procedure that
@@ -33936,8 +33938,8 @@ and a resume entry like any site that is not a tail site, with three
 differences:
 
 - Its pending test is a switch on `s` whose `group_pending` branch (2) sets
-  the task's pending flag and takes the pending edge; an arrival (0) or the
-  end (1) goes on. `group_next` has already parked the task on the set.
+  the task's pending flag and takes the pending edge; an arrival (0), the
+  end (1) or a supervised entry's crash (3) goes on. `group_next` has already parked the task on the set.
 - Its saved values always include the loop id `id`, even where the code
   after the site never reads it, since the resume entry does.
 - Its result does not arrive anywhere while the task is parked: a report
@@ -34007,19 +34009,22 @@ is the one named. Like a call, an operation names its task last, and the
 continuation pass, which gives each task-form procedure its task, appends
 it. Before the pass an operation's first operand is the loop id and it has
 no task:
-- `group_init(id, entry_count, limits, root_limit, task)` opens the running
-  set for `entry_count` entries, owned by `task`. It borrows `limits`, a
-  `List(U64)`, and takes `root_limit` as `flatten` encodes it. The
+- `group_init(id, entry_count, limits, root_limit, supervised, task)` opens the
+  running set for `entry_count` entries, owned by `task`. It borrows `limits`,
+  a `List(U64)`, and takes `root_limit` as `flatten` encodes it. `supervised`
+  is a `Bool`, true only for a supervised set, which has one entry. The
   operation's extra fields name the layout of an entry's result, which
   sizes the slots and gives the drop for a result nobody takes;
 - `group_push(id, start, limit_path, shielded, background, task)` adds one
   entry. It takes the start record and borrows `limit_path`, a `List(U64)`;
 - `group_start(id, task)` starts the entries their limits allow;
 - `group_next(id, task)` is a `U32`: 0 when a result arrived, 1 when the set
-  has ended, 2 when the owner must suspend parked on it;
+  has ended, 2 when the owner must suspend parked on it, and 3 when a supervised
+  set's entry crashed;
 - `group_arrival(id, task)` is the arrived entry's slot, typed by its
   target's `Ptr` layout. Its `ptr_load` is the owned result, like a hosted
-  result's;
+  result's. After a 3 it is the address of the crash's message, whose
+  `ptr_load` is an owned `Str`;
 - `group_spawn(id, start, task)` adds a spawned entry and takes its start
   record;
 - `group_cancel(id, task)` is a loop exit's cancel, and `group_free(id,
@@ -34184,8 +34189,8 @@ exit: cancel_group(g); repeat next(g) until Ended, dropping what arrives
 **Helper marks.** Under the Monotype strategy, every LIR specialization of a
 Builtin running-set helper records which helper it is in
 `LirProcSpec.running_set_helper`: `run_create`, `run_next`, `run_spawn`,
-`run_cancel`, `run_entry`, `run_arrived` or `run_ended`, and `none` for
-every other procedure. The sequential `run_next!` builds its result through
+`run_cancel`, `run_entry`, `run_arrived`, `run_ended` or `run_supervised`, and
+`none` for every other procedure. The sequential `run_next!` builds its result through
 `run_arrived` and `run_ended`, and the task form calls them where a result
 arrives and where the loop ends. LIR construction sets it from the helper's
 Builtin declaration; every copy of a procedure keeps it, and so do LIR images and the
@@ -34322,7 +34327,7 @@ copies, in any statement order. Promotion finds the loop's
 `run_next!`'s body. It rewrites each call in place, so the loop's code
 around them is unchanged:
 - `r = run_create!(id, entries, limit_paths, shielded, background, limits,
-  root_limit)` becomes `group_init(id, n, limits, root_limit)`, with `n`
+  root_limit)` becomes `group_init(id, n, limits, root_limit, False)`, with `n`
   the entries' length and the result layout `a` in its extra fields. A loop
   over `i < n` follows that packs entry `i`'s start record and runs
   `group_push(id, start, limit_paths[i], shielded[i], background[i])`. Then
@@ -34380,13 +34385,48 @@ In the sequential form, `all_ok!` never starts the entries after the first
 `Err`, and `race!` returns its first function's result without starting the
 others.
 
-`Concurrent.supervise!(opts, f)` is not a loop:
-- In a `Tasks` build it always runs `f` as a child task, since only a
-  child's own resume can catch its crash. It uses the runtime's internal
-  `task_spawn` and `task_await`, whose report can be a crash that no
-  program sees. It starts `f` again after each crash until `max_restarts`
-  restarts have happened, then crashes with the last message.
-- In a `None` build it calls `f` once.
+**Supervision.** `Concurrent.supervise!` is not a loop:
+
+```text
+Concurrent.supervise! : { max_restarts : U64 }, (() => item) => item
+run_supervised!       : U64, (() => item) => item
+```
+
+It calls the helper `run_supervised!(max_restarts, f)`, which only the compiler
+may call, as with the other running-set helpers, and which no pass inlines. Its
+Roc body ignores the limit and is `run_entry!(f)`, so a `None` build runs `f`
+once, and a crash in it is the program's crash.
+
+A `Tasks` build always runs `f` as a child task, even an `f` that can't
+suspend, since only a child's own resume can catch its crash. So in a `Tasks`
+build every `run_supervised!` specialization may suspend: it is a seed of the
+suspension marks (Suspendability), and promotion replaces its body with a loop
+over running sets of one entry:
+
+```text
+restart(left):
+  group_init(id, 1, [], 0, supervised)
+  group_push(id, start record of f, [], unshielded, foreground)
+  group_start(id)
+  match group_next(id)
+    0 => result = ptr_load(group_arrival(id)); group_free(id); return result
+    3 => message = ptr_load(group_arrival(id)); group_free(id)
+         if left == 0 then crash message else restart(left - 1)
+```
+
+The set is *supervised*: its entry's crash is a report, and not a crash of its
+owner. `group_next` takes that report with the status 3, and `group_arrival` is
+then the address of the message, a `Str` the caller moves out. So `f` is started
+again after each crash until `max_restarts` restarts have happened, and then
+`supervise!` crashes with the last message. No program sees a crash report. The
+entry is cancelled only with its owner, whose code doesn't run again, so this
+code never takes the status 1. Every supervised set has the id
+`supervised_loop_id`, which Monotype mints for no loop. A procedure opens one at
+a time, and an operation names its owner's innermost open set, so one id serves
+under nesting and recursion.
+
+On a target without a crash exit (The Task Runtime), wasm included, a crash ends
+the process, in a supervised function too.
 
 ### Host Contract
 
@@ -34752,8 +34792,8 @@ status only after all of its descendants have.
 **Wait sources.** A task parks on exactly one of these, each with a wake
 word of its own (parked bit and count):
 - its hosted operation;
-- one group, whose count may exceed 1;
-- a `supervise!` child.
+- one group, whose count may exceed 1. A `supervise!` child is the one entry of
+  a supervised group.
 
 **Limits.** A group keeps a running count for each limit. When a child
 reports, the runtime decrements its limits' counts and starts the next
@@ -34771,8 +34811,9 @@ aborted through `abort`, as a root's is.
 
 **Crashes.** A child's crash exit catches the crash in its own resume, as a
 root's does. The child's descendants are cancelled, and once they have
-reported, the child reports `Crashed` to its group. The group's owner gets
-a crash pending with the same message. It runs no more Roc code, and how
+reported, the child reports `Crashed` to its group. A supervised group keeps
+the report and its message for `next`, and the owner runs on. The owner of any
+other group gets a crash pending with the same message. It runs no more Roc code, and how
 it gets there depends on where it is parked:
 - on that group: the report readies it;
 - on its own hosted operation: a loop body can call a `suspending` hosted
@@ -34786,8 +34827,8 @@ message. No code runs in between, so this cannot be told apart from
 crashing there at once.
 
 The owner's crash then cancels all of its entries, shielded ones included,
-and propagates up the same way. Propagation stops at a `supervise!`, which
-takes the report as a crash, or at a root, which returns
+and propagates up the same way. Propagation stops at a supervised group, whose
+owner is in `supervise!`, or at a root, which returns
 `ROC_TASK_CRASHED`.
 
 **The runtime's operations.** `src/builtins/task.zig` implements the
@@ -34813,8 +34854,9 @@ loop operations as `groupCreate` (or its three steps `groupInit`,
 
 A compiled loop reaches them through eight builtins, `roc_builtins_group_*`:
 - `group` is three calls. `group_init` sizes the group for the plan's
-  entries and takes its `limits` (borrowed) and `root_limit` as `flatten`
-  encodes it: 0 for none, otherwise 1 + the root limit's index.
+  entries and takes its `limits` (borrowed), its `root_limit` as `flatten`
+  encodes it: 0 for none, otherwise 1 + the root limit's index, and whether it
+  is supervised.
   `group_push` adds one entry, taking its start record and borrowing its
   `limit_path`, with its two marks as flags. `group_start` starts the
   entries the limits allow. The loop over entries is the program's own
@@ -34822,8 +34864,10 @@ A compiled loop reaches them through eight builtins, `roc_builtins_group_*`:
   consumed value, and the runtime never takes a list whose items it
   would have to retain or release;
 - `group_next` returns 0 when a result arrived, 1 when the group has
-  ended, or 2 for pending. After a 0, `group_arrival` gives the arrived
-  entry's slot, and the loop moves the result out of it;
+  ended, 2 for pending, or 3 when a supervised group's entry crashed. After a
+  0, `group_arrival` gives the arrived entry's slot, and the loop moves the
+  result out of it. After a 3 it gives the message's address, and
+  `supervise!` moves the `Str` out;
 - `group_spawn`, `group_cancel` and `group_free` are `spawn_in`,
   `cancel_group` and freeing a group that has ended;
 - the result drop has the shape of an erased capture's `on_drop`, which
@@ -34938,9 +34982,9 @@ byte:
   `_next`, `_arrival`, `_spawn`, `_cancel`, `_free`). Each takes the loop id
   first, as a `U64`, and the owner task last. In between:
   - `group_init` passes the entry count, then `limits` as its bytes pointer
-    and length, then the root limit. It also passes the size and alignment
-    of an entry's result, from the layout its extra fields name, and the
-    drop of a result nobody takes. That drop is the result layout's
+    and length, then the root limit and `supervised` as a C `bool`. It also
+    passes the size and alignment of an entry's result, from the layout its
+    extra fields name, and the drop of a result nobody takes. That drop is the result layout's
     `host_drop` RC helper, which `hostDrop` selects, made the way the backend
     makes a capture's `on_drop`, or null when results hold nothing to
     release.

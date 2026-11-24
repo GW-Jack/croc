@@ -9,6 +9,7 @@ const std = @import("std");
 
 const crash_exit = @import("task_crash_exit.zig");
 const erased_callable = @import("erased_callable.zig");
+const str = @import("str.zig");
 const utils = @import("utils.zig");
 
 const RocOps = utils.RocOps;
@@ -775,6 +776,9 @@ pub const GroupSpec = struct {
     /// Releases `result_drop_context` when the group closes; null when it
     /// needs no release.
     result_drop_release: ?ResultDropReleaseFn = null,
+    /// Whether an entry's crash is a report for `groupNext` instead of its
+    /// owner's crash (`Group.supervised`).
+    supervised: bool = false,
 };
 
 /// What `groupNext` found.
@@ -782,6 +786,9 @@ pub const Next = union(enum) {
     /// The entry at `index` finished; its result is in `slot`, and the
     /// caller moves it out.
     arrived: struct { index: u32, slot: [*]u8 },
+    /// The entry of a supervised group crashed; `message` is its crash's,
+    /// and the caller moves it out.
+    crashed: struct { message: *str.RocStr },
     /// Every entry has finished, been cancelled or been dropped.
     ended,
     /// Nothing has arrived: the owner suspends here, parked on the group's
@@ -847,6 +854,13 @@ pub const Group = struct {
     /// Whether only background entries were left and `groupNext` cancelled
     /// them: what arrives after is dropped, and the loop ends.
     ending: bool,
+    /// Whether this is `supervise!`'s set: its one entry's crash is a report
+    /// `groupNext` takes, and not a crash of its owner (design.md "Plans And
+    /// Concurrent Loops", "Supervision.").
+    supervised: bool,
+    /// The message of a supervised entry's crash, from its report until
+    /// `groupNext` takes it or the owner's finish drops it.
+    crash_message: str.RocStr,
 
     const Limit = struct { allowed: u64, running: u64 };
 
@@ -982,7 +996,14 @@ pub const Group = struct {
         self.live -= 1;
         if (!entry.background) self.foreground_left -= 1;
         for (self.path(entry)) |limit| self.limits[limit].running -= 1;
-        if (child.status == .crashed) owner.takeCrash(child.crash_message[0..child.crash_message_len]);
+        if (child.status == .crashed) {
+            const message = child.crash_message[0..child.crash_message_len];
+            if (self.supervised) {
+                self.crash_message = str.RocStr.fromSlice(message, owner.ops);
+            } else {
+                owner.takeCrash(message);
+            }
+        }
         child.release();
         self.reports[self.reports_len] = index;
         self.reports_len += 1;
@@ -1018,6 +1039,7 @@ pub const Group = struct {
     fn dropResult(self: *Group, index: u32) void {
         const entry = &self.entries[index];
         entry.state = .taken;
+        if (entry.outcome == .crashed and self.supervised) self.crash_message.decref(self.owner.ops);
         if (entry.outcome != .done) return;
         if (self.result_drop) |drop| drop(entry.slot, self.result_drop_context, self.owner.ops);
     }
@@ -1082,7 +1104,7 @@ fn growArray(ops: *RocOps, items: *anyopaque, old: u32, new: u32, size: usize, a
 /// in input order. Called from the owner's code during its resume.
 pub fn groupCreate(owner: *RocTask, spec: GroupSpec) *Group {
     if (spec.marks.len != spec.starts.len) utils.builtinInvariant(owner.ops, "a group's marks don't match its entries");
-    const group = groupInit(owner, spec.loop_id, spec.starts.len, spec.limits, spec.root_limit, spec.slot_size, spec.slot_alignment, spec.result_drop, spec.result_drop_context, spec.result_drop_release);
+    const group = groupInit(owner, spec.loop_id, spec.starts.len, spec.limits, spec.root_limit, spec.slot_size, spec.slot_alignment, spec.result_drop, spec.result_drop_context, spec.result_drop_release, spec.supervised);
     for (spec.starts, spec.marks) |start_record, marks| groupPush(group, start_record, marks.limit_path, marks.shielded, marks.background);
     groupStart(group);
     return group;
@@ -1103,8 +1125,10 @@ pub fn groupInit(
     result_drop: ?ResultDropFn,
     result_drop_context: ?*anyopaque,
     result_drop_release: ?ResultDropReleaseFn,
+    supervised: bool,
 ) *Group {
     const ops = owner.ops;
+    if (supervised and entry_count != 1) utils.builtinInvariant(ops, "a supervised group was made for more or fewer entries than one");
     const group: *Group = @ptrCast(@alignCast(ops.alloc(@alignOf(Group), @sizeOf(Group))));
     const stride = std.mem.alignForward(usize, slot_size, slot_alignment);
     group.* = .{
@@ -1137,6 +1161,8 @@ pub fn groupInit(
         .unstarted = 0,
         .foreground_left = 0,
         .ending = false,
+        .supervised = supervised,
+        .crash_message = undefined,
     };
     if (limits.len > 0) {
         group.limits = @ptrCast(@alignCast(ops.alloc(@alignOf(Group.Limit), limits.len * @sizeOf(Group.Limit))));
@@ -1162,7 +1188,8 @@ pub fn openGroup(owner: *RocTask, loop_id: u64) *Group {
     return group;
 }
 
-/// The slot of the entry whose arrival `groupNext` last reported.
+/// The slot of the entry whose arrival `groupNext` last reported, or the
+/// message of the crash it last reported.
 pub fn groupArrival(group: *const Group) [*]u8 {
     return group.arrival;
 }
@@ -1201,9 +1228,15 @@ pub fn groupNext(group: *Group) Next {
                 return .{ .arrived = .{ .index = index, .slot = entry.slot } };
             },
             .cancelled => entry.state = .taken,
-            // The owner crashes before it runs code again, so its code never
-            // sees a crash report.
-            .crashed, .pending => utils.builtinInvariant(owner.ops, "a loop's next took a crash report or one from a running entry"),
+            .crashed => {
+                // The owner of any other group crashes before it runs code
+                // again, so its code never sees a crash report.
+                if (!group.supervised) utils.builtinInvariant(owner.ops, "a loop's next took a crash report");
+                entry.state = .taken;
+                group.arrival = @ptrCast(&group.crash_message);
+                return .{ .crashed = .{ .message = &group.crash_message } };
+            },
+            .pending => utils.builtinInvariant(owner.ops, "a loop's next took a report from a running entry"),
         }
     }
     if (group.live == 0 and group.unstarted == 0) return .ended;

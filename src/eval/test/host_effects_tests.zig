@@ -1689,6 +1689,45 @@ pub const tests = [_]TestCase{
         .returned,
         0,
     ),
+    // design.md "Plans And Concurrent Loops", "Supervision.": a `None` build
+    // runs the function once.
+    moduleTestWithLiveAllocations(
+        "Concurrent library: without tasks supervise! runs its function once",
+        \\named! : Str -> (() => Str)
+        \\named! = |name| || {
+        \\    dbg name
+        \\    name
+        \\}
+        \\
+        \\main : () => {}
+        \\main = || {
+        \\    long = "a name padded past the small string length"
+        \\    result = Concurrent.supervise!({ max_restarts: 2 }, named!(long))
+        \\    expect result == long
+        \\    {}
+        \\}
+    ,
+        &.{dbg("\"a name padded past the small string length\"")},
+        .returned,
+        0,
+    ),
+    moduleTestWithLiveAllocations(
+        "Concurrent library: without tasks a crash in supervise!'s function is the program's",
+        \\main : () => {}
+        \\main = || {
+        \\    Concurrent.supervise!(
+        \\        { max_restarts: 2 },
+        \\        || {
+        \\            dbg "run"
+        \\            crash "the only run crashed"
+        \\        },
+        \\    )
+        \\}
+    ,
+        &.{ dbg("\"run\""), crashed("the only run crashed") },
+        .crashed,
+        0,
+    ),
     moduleTestWithLiveAllocations(
         "for!: return exits the enclosing function from inside the loop",
         \\counter! : U64 => Try((U64, U64), [NoMore])

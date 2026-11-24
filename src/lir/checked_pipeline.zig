@@ -2277,7 +2277,7 @@ fn finishLoweredOutput(
     // The procedure-local rewrites read which procedures may suspend
     // (design.md "Suspendability"), so the marks are committed first.
     var suspension_marks_scope = PassStepScope.begin(target.timing, .suspension_marks);
-    try SuspensionMarks.run(allocator, &lowered.lir_result.store);
+    try SuspensionMarks.run(allocator, &lowered.lir_result.store, target.concurrency_mode);
     suspension_marks_scope.end();
     var local_pass_metrics: LirPassParallelMetrics = .{};
     var pass_target = target;
@@ -2369,7 +2369,7 @@ fn finishLoweredOutput(
         try ContinuationPass.run(allocator, &result.store, &result.layouts, .{
             .procs = result.root_procs.items,
             .provided = provided,
-            .tasks = target.concurrency_mode == .tasks,
+            .mode = target.concurrency_mode,
         });
     }
     continuation_scope.end();
@@ -2714,7 +2714,7 @@ const RunningSetHelperScratch = struct {
                 try self.define(stmt.assign_ref.target, .{ .copy = stmt.assign_ref.op.source });
             } else if (stmt == .assign_call) {
                 switch (store.getProcSpec(stmt.assign_call.proc).running_set_helper) {
-                    .none, .run_entry, .run_arrived, .run_ended => {},
+                    .none, .run_entry, .run_arrived, .run_ended, .run_supervised => {},
                     .run_create, .run_next, .run_spawn, .run_cancel => try self.calls.append(self.allocator, stmt_id),
                 }
             }

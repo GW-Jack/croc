@@ -449,7 +449,8 @@ pub const Constants = struct {
     /// 210: canonical IR has the `spawn` expression and its diagnostic.
     /// 211: module environments record the Builtin running-set helper
     /// definitions, each `spawn`'s plan loop, and plan loops' dispatch.
-    pub const CACHE_VERSION = 211;
+    /// 212: recorded running-set helpers include `run_supervised!`.
+    pub const CACHE_VERSION = 212;
 };
 
 /// Configuration for the Roc cache system.

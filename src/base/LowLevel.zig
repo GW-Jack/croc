@@ -702,10 +702,11 @@ pub const LowLevel = enum(u16) {
     // pass. Each names its running set by the loop's id, a `U64`, and the
     // owner task, last: the owner's innermost open set. The pass appends the
     // task to each, as it does at a call; before that, the task is absent.
-    /// (id, entry_count, limits, root_limit, task) -> {}: open loop `id`'s
-    /// set for `entry_count` entries, borrowing `limits` (`List(U64)`);
-    /// `root_limit` is 0 for none or 1 + the root limit's index. The extra
-    /// fields name the layout of an entry's result.
+    /// (id, entry_count, limits, root_limit, supervised, task) -> {}: open
+    /// loop `id`'s set for `entry_count` entries, borrowing `limits`
+    /// (`List(U64)`); `root_limit` is 0 for none or 1 + the root limit's
+    /// index. `supervised` (`Bool`) makes the crash of the set's one entry a
+    /// report. The extra fields name the layout of an entry's result.
     group_init,
     /// (id, start, limit_path, shielded, background, task) -> {}: add the
     /// next entry, taking its start record and borrowing `limit_path`.
@@ -713,9 +714,11 @@ pub const LowLevel = enum(u16) {
     /// (id, task) -> {}: start the entries their limits allow.
     group_start,
     /// (id, task) -> U32: 0 when a result arrived, 1 when the set has ended,
-    /// 2 when the owner suspends parked on it.
+    /// 2 when the owner suspends parked on it, 3 when a supervised set's entry
+    /// crashed.
     group_next,
-    /// (id, task) -> Ptr(T): the slot of the entry that just arrived.
+    /// (id, task) -> Ptr(T): the slot of the entry that just arrived, or after
+    /// a crash the address of its message, a `Str`.
     group_arrival,
     /// (id, start, task) -> {}: add a spawned entry, taking its start
     /// record.

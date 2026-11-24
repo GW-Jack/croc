@@ -156,6 +156,13 @@ const library_tests = [_]TestCase{
         .expected = .{ .inspect_str = "\"only\"" },
     },
     .{
+        .name = "Concurrent.supervise! returns its function's result",
+        .source =
+        \\Concurrent.supervise!({ max_restarts: 3 }, || Concurrent.supervise!({ max_restarts: 0 }, || "inner").concat(" outer"))
+        ,
+        .expected = .{ .inspect_str = "\"inner outer\"" },
+    },
+    .{
         .name = "Concurrent.both! returns both results",
         .source =
         \\Concurrent.both!(|| 1.U64, || "two")

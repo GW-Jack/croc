@@ -22,6 +22,7 @@ const SiteStmt = ContinuationSites.SiteStmt;
 const SuspensionMarks = @import("suspension_marks.zig");
 const RunningSetPromotion = @import("running_set_promotion.zig");
 const invariant = @import("base").invariant;
+const ConcurrencyMode = @import("base").ConcurrencyMode;
 
 const LIR = core.LIR;
 const LirStore = core.LirStore;
@@ -60,10 +61,10 @@ pub const Roots = struct {
     /// Whether each root is a platform `provides` entry. Only those may
     /// suspend: nothing else reaches a `suspending` hosted procedure.
     provided: []const bool,
-    /// A `Tasks` build: every `provides` root is started as a task, whether
-    /// or not it may suspend, so the host's signature depends only on the
-    /// platform's mode.
-    tasks: bool = false,
+    /// The platform's mode. In a `Tasks` build every `provides` root is
+    /// started as a task, whether or not it may suspend, so the host's
+    /// signature depends only on the mode.
+    mode: ConcurrencyMode = .none,
 
     pub const none: Roots = .{ .procs = &.{}, .provided = &.{} };
 };
@@ -103,7 +104,7 @@ const ProcPlan = struct {
     task: LocalId,
 };
 
-/// Promote task-form concurrent loops, give every procedure that may suspend
+/// Promote task-form concurrent loops and supervision, give every procedure that may suspend
 /// its task argument, make the continuation and resume entry of each of its
 /// sites that is not a tail site, add the pending edges, and give
 /// `suspending` hosted procedures the host's shape. Each `provides` root that may suspend is started as a task:
@@ -111,7 +112,7 @@ const ProcPlan = struct {
 pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots: Roots) Allocator.Error!void {
     // A promoted loop's `group_next` is a park site, so promotion comes
     // before any procedure's sites are found.
-    try RunningSetPromotion.run(allocator, store, layouts);
+    try RunningSetPromotion.run(allocator, store, layouts, roots.mode);
 
     var plans = std.ArrayList(ProcPlan).empty;
     defer {
@@ -134,7 +135,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
         errdefer sites.deinit();
         try plans.append(allocator, .{ .proc = proc_id, .sites = sites, .task = undefined });
     }
-    if (plans.items.len == 0 and !roots.tasks) return;
+    if (plans.items.len == 0 and roots.mode != .tasks) return;
 
     // The task: a hidden argument after the explicit ones, passed on at
     // every site to a procedure. A hosted site takes it in the host's
@@ -251,11 +252,11 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
     for (roots.procs, roots.provided) |*root, provided| {
         const may_suspend = store.getProcSpecImmediate(root.*).suspends != .never;
         if (may_suspend and !provided) invariant("a root that is not a provides entry may suspend", .{});
-        if (!provided or !(may_suspend or roots.tasks)) continue;
+        if (!provided or !(may_suspend or roots.mode == .tasks)) continue;
         root.* = try startRoot(allocator, store, layouts, root.*, may_suspend, buffers);
     }
 
-    try SuspensionMarks.run(allocator, store);
+    try SuspensionMarks.run(allocator, store, roots.mode);
     if (builtin.mode == .debug) try verify(allocator, store);
 }
 
@@ -1418,7 +1419,7 @@ const Fixture = struct {
             .body = .some(body),
             .ret_layout = .u64,
         }, .none);
-        try SuspensionMarks.run(testing.allocator, &self.store);
+        try SuspensionMarks.run(testing.allocator, &self.store, .none);
         return id;
     }
 
@@ -1863,7 +1864,7 @@ test "in a Tasks build a provides root that never suspends is still started as a
     const count = f.store.procSpecCount();
     var roots = [_]ProcId{quiet};
 
-    try run(testing.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .tasks = true });
+    try run(testing.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .mode = .tasks });
 
     const start: ProcId = @fromBackingInt(@intCast(count));
     const entry: ProcId = @fromBackingInt(@intCast(count + 1));

@@ -46,6 +46,10 @@ const Host = struct {
     /// Entries whose code started, by id.
     var started: [32]u8 = undefined;
     var started_count: usize = 0;
+    /// Crashes a supervised loop record took, and the last one's message.
+    var crashes: usize = 0;
+    var crash_message: [64]u8 = undefined;
+    var crash_message_len: usize = 0;
     /// Children whose terminal status the host saw, by status.
     var ended: [4]usize = @splat(0);
 
@@ -58,6 +62,8 @@ const Host = struct {
         max_live = 0;
         arrival_count = 0;
         started_count = 0;
+        crashes = 0;
+        crash_message_len = 0;
         ended = @splat(0);
     }
 
@@ -174,7 +180,10 @@ fn entryCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: 
     @as(*align(1) u64, @ptrCast(ret.?)).* = step.result;
 }
 
-const crash_messages = [_][]const u8{ "entry 0 crashed", "entry 1 crashed", "entry 2 crashed", "entry 3 crashed", "entry 4 crashed", "entry 5 crashed" };
+const crash_messages = [_][]const u8{ "entry 0 crashed", "entry 1 crashed", "entry 2 crashed", "entry 3 crashed", "entry 4 crashed", "entry 5 crashed", long_crash_message };
+
+/// Too long for a small string, so a message nobody releases is a leak.
+const long_crash_message = "entry 6 crashed, and says so at length";
 
 fn noDrop(_: ?[*]u8, _: *RocOps) callconv(.c) void {}
 
@@ -213,6 +222,11 @@ const Loop = struct {
     crash_on_first: bool = false,
     /// Run this loop in the body when the first result arrives.
     inner_on_first: ?*Loop = null,
+    /// The entry's steps when a supervised set's crash restarts it, which it
+    /// does at most this many times.
+    restart: ?EntryStep = null,
+    restarts_left: usize = 0,
+    restart_starts: [1][*]u8 = undefined,
     /// Drive the group through the C ABI a compiled task-form loop calls,
     /// with `result_drop` as the results' drop, rather than the Zig API.
     through_abi: bool = false,
@@ -227,7 +241,7 @@ fn loopCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?
     const loop: *Loop = @as(*align(1) const *Loop, @ptrCast(capture.?)).*;
     const task: *RocTask = @as(*const *RocTask, @ptrCast(@alignCast(args.?))).*;
     if (loop.group == null) loop.group = if (loop.through_abi) createThroughAbi(task, loop) else task_mod.groupCreate(task, loop.spec);
-    const group = loop.group.?;
+    var group = loop.group.?;
     loop.in_body_pause = false;
     while (true) {
         switch (if (loop.through_abi) nextThroughAbi(task) else task_mod.groupNext(group)) {
@@ -267,6 +281,24 @@ fn loopCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?
                 if (ret) |out| @as(*align(1) u64, @ptrCast(out)).* = loop.arrivals;
                 return;
             },
+            .crashed => |crash| {
+                const message = crash.message.asSlice();
+                Host.crashes += 1;
+                Host.crash_message_len = message.len;
+                @memcpy(Host.crash_message[0..message.len], message);
+                crash.message.decref(task.ops);
+                if (loop.through_abi) dev_wrappers.roc_builtins_group_free(abi_loop_id, task) else task_mod.groupFree(group);
+                if (loop.restarts_left == 0) {
+                    loop.ended = true;
+                    @as(*align(1) u64, @ptrCast(ret.?)).* = loop.arrivals;
+                    return;
+                }
+                loop.restarts_left -= 1;
+                loop.restart_starts = .{startRecord(task.ops, loop.restart.?)};
+                loop.spec.starts = &loop.restart_starts;
+                group = if (loop.through_abi) createThroughAbi(task, loop) else task_mod.groupCreate(task, loop.spec);
+                loop.group = group;
+            },
             .pending => {
                 task.pushRecord(record(task, &loopCall, std.mem.asBytes(&loop)), null);
                 task.setPending();
@@ -285,7 +317,7 @@ const abi_loop_id: u64 = 7;
 fn createThroughAbi(task: *RocTask, loop: *const Loop) *Group {
     const plan = loop.spec;
     const root_limit: u64 = if (plan.root_limit) |root| @as(u64, root) + 1 else 0;
-    dev_wrappers.roc_builtins_group_init(abi_loop_id, plan.starts.len, @ptrCast(plan.limits.ptr), plan.limits.len, root_limit, plan.slot_size, plan.slot_alignment, loop.result_drop, task);
+    dev_wrappers.roc_builtins_group_init(abi_loop_id, plan.starts.len, @ptrCast(plan.limits.ptr), plan.limits.len, root_limit, plan.supervised, plan.slot_size, plan.slot_alignment, loop.result_drop, task);
     for (plan.starts, plan.marks) |start_record, marks| {
         var path: [8]u64 = undefined;
         for (marks.limit_path, path[0..marks.limit_path.len]) |limit, *wide| wide.* = limit;
@@ -301,6 +333,7 @@ fn nextThroughAbi(task: *RocTask) task_mod.Next {
         0 => .{ .arrived = .{ .index = 0, .slot = dev_wrappers.roc_builtins_group_arrival(abi_loop_id, task) } },
         1 => .ended,
         2 => .pending,
+        3 => .{ .crashed = .{ .message = @ptrCast(@alignCast(dev_wrappers.roc_builtins_group_arrival(abi_loop_id, task))) } },
         else => fail("group_next returned an unknown status"),
     };
 }
@@ -563,6 +596,122 @@ test "an entry's crash crashes its parked owner with the same message and cancel
     try std.testing.expectEqual(@as(usize, 1), Host.ended[@backingInt(Status.crashed)]);
     try std.testing.expectEqual(@as(usize, 1), Host.ended[@backingInt(Status.cancelled)]);
     try std.testing.expectEqual(@as(usize, 1), Host.aborts);
+    task.free();
+    try std.testing.expectEqual(@as(usize, 0), env.getAllocationCount());
+}
+
+/// The set of one supervised entry.
+fn supervisedSpec(starts: []const [*]u8) task_mod.GroupSpec {
+    var result = spec(starts, &.{plain}, &.{}, null);
+    result.supervised = true;
+    return result;
+}
+
+fn checkSupervisedRestarts(through_abi: bool) error{ TestExpectedEqual, TestUnexpectedResult }!void {
+    var env = utils.TestEnv.init(std.testing.allocator);
+    defer env.deinit();
+    const ops = env.getOps();
+    Host.reset();
+    const crashing: EntryStep = .{ .id = 6, .pauses = 1, .result = 0, .crashes = true };
+    const starts = [_][*]u8{startRecord(ops, crashing)};
+    var loop: Loop = .{ .spec = supervisedSpec(&starts), .restart = crashing, .restarts_left = 2, .through_abi = through_abi };
+    var root: u64 = 99;
+    const task = rootTask(ops, &loop, &root);
+    // The owner takes each crash and runs on: two restarts, then it ends with
+    // no arrival.
+    try std.testing.expectEqual(Status.done, Host.run(task, null));
+    try std.testing.expectEqual(@as(u64, 0), root);
+    try std.testing.expectEqual(@as(usize, 3), Host.crashes);
+    try std.testing.expectEqualStrings(long_crash_message, Host.crash_message[0..Host.crash_message_len]);
+    try std.testing.expectEqual(@as(usize, 3), Host.ended[@backingInt(Status.crashed)]);
+    task.free();
+    try std.testing.expectEqual(@as(usize, 0), env.getAllocationCount());
+}
+
+test "a supervised entry's crash is a report its owner takes, with the message" {
+    try checkSupervisedRestarts(false);
+}
+
+test "a supervised entry's crash is a report its owner takes through the group C ABI" {
+    try checkSupervisedRestarts(true);
+}
+
+test "a supervised entry that returns arrives as any entry does" {
+    var env = utils.TestEnv.init(std.testing.allocator);
+    defer env.deinit();
+    const ops = env.getOps();
+    Host.reset();
+    const starts = [_][*]u8{startRecord(ops, .{ .id = 0, .pauses = 1, .result = 60, .crashes = false })};
+    var loop: Loop = .{ .spec = supervisedSpec(&starts) };
+    var root: u64 = 0;
+    const task = rootTask(ops, &loop, &root);
+    try std.testing.expectEqual(Status.done, Host.run(task, null));
+    try std.testing.expectEqualSlices(u8, &.{60}, Host.arrivals[0..Host.arrival_count]);
+    try std.testing.expectEqual(@as(usize, 0), Host.crashes);
+    task.free();
+    try std.testing.expectEqual(@as(usize, 0), env.getAllocationCount());
+}
+
+test "a supervised entry's crash cancels its own entries and reports once they have" {
+    var env = utils.TestEnv.init(std.testing.allocator);
+    defer env.deinit();
+    const ops = env.getOps();
+    Host.reset();
+    const inner_starts = [_][*]u8{
+        startRecord(ops, .{ .id = 6, .pauses = 1, .result = 0, .crashes = true }),
+        startRecord(ops, .{ .id = 1, .pauses = 5, .result = 71 }),
+        startRecord(ops, .{ .id = 2, .pauses = 5, .result = 72 }),
+    };
+    var inner: Loop = .{ .spec = spec(&inner_starts, &.{ plain, plain, plain }, &.{}, null) };
+    const starts = [_][*]u8{startRecord(ops, .{ .id = 0, .pauses = 0, .result = 70, .inner = &inner })};
+    var loop: Loop = .{ .spec = supervisedSpec(&starts), .restart = .{ .id = 0, .pauses = 0, .result = 73 }, .restarts_left = 1 };
+    var root: u64 = 0;
+    const task = rootTask(ops, &loop, &root);
+    try std.testing.expectEqual(Status.done, Host.run(task, null));
+    // The grandchild crashed and its siblings were cancelled, then the entry
+    // crashed with its message, and the restarted one arrived.
+    try std.testing.expectEqual(@as(usize, 1), Host.crashes);
+    try std.testing.expectEqualStrings(long_crash_message, Host.crash_message[0..Host.crash_message_len]);
+    try std.testing.expectEqual(@as(usize, 2), Host.ended[@backingInt(Status.crashed)]);
+    try std.testing.expectEqual(@as(usize, 2), Host.ended[@backingInt(Status.cancelled)]);
+    try std.testing.expectEqual(@as(usize, 2), Host.aborts);
+    try std.testing.expectEqualSlices(u8, &.{73}, Host.arrivals[0..Host.arrival_count]);
+    task.free();
+    try std.testing.expectEqual(@as(usize, 0), env.getAllocationCount());
+}
+
+test "cancelling the owner of a supervised entry cancels the entry" {
+    var env = utils.TestEnv.init(std.testing.allocator);
+    defer env.deinit();
+    const ops = env.getOps();
+    Host.reset();
+    const starts = [_][*]u8{startRecord(ops, .{ .id = 6, .pauses = 3, .result = 0, .crashes = true })};
+    var loop: Loop = .{ .spec = supervisedSpec(&starts) };
+    var root: u64 = 0;
+    const task = rootTask(ops, &loop, &root);
+    try std.testing.expectEqual(Status.cancelled, Host.run(task, 1));
+    try std.testing.expectEqual(@as(usize, 0), Host.crashes);
+    try std.testing.expectEqual(@as(usize, 1), Host.aborts);
+    try std.testing.expectEqual(@as(usize, 1), Host.ended[@backingInt(Status.cancelled)]);
+    task.free();
+    try std.testing.expectEqual(@as(usize, 0), env.getAllocationCount());
+}
+
+test "cancelling the owner of a supervised entry whose crash it has not taken drops the message" {
+    var env = utils.TestEnv.init(std.testing.allocator);
+    defer env.deinit();
+    const ops = env.getOps();
+    Host.reset();
+    const starts = [_][*]u8{startRecord(ops, .{ .id = 6, .pauses = 0, .result = 0, .crashes = true })};
+    var loop: Loop = .{ .spec = supervisedSpec(&starts) };
+    var root: u64 = 0;
+    const task = rootTask(ops, &loop, &root);
+    try std.testing.expectEqual(Status.pending, Host.resumeTask(task));
+    try std.testing.expectEqual(@as(usize, 1), Host.ready_len);
+    try std.testing.expectEqual(Status.crashed, Host.resumeTask(Host.ready[0]));
+    task.cancel(&Host.abortTask, &Host.readyTask);
+    try std.testing.expectEqual(Status.cancelled, Host.resumeTask(task));
+    try std.testing.expectEqual(@as(usize, 0), Host.crashes);
     task.free();
     try std.testing.expectEqual(@as(usize, 0), env.getAllocationCount());
 }

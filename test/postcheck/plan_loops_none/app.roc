@@ -23,6 +23,8 @@ main! = |name| {
 		"nested" => nested!()
 		"children" => children!()
 		"after_break" => after_break!()
+		"supervise" => supervise!()
+		"supervise_crash" => supervise_crash!()
 		_ => "unknown"
 	}
 	Host.log!("end ${name}")
@@ -213,4 +215,62 @@ after_break! = || {
 		$joined = Str.concat($joined, body)
 	}
 	$joined
+}
+
+# A supervised function that fetches, one that doesn't, one that supervises
+# another and runs a loop, and supervised entries.
+supervise! : () => Str
+supervise! = || {
+	fetched = Concurrent.supervise!({ max_restarts: 3 }, work!("a"))
+	Host.log!("fetched ${fetched}")
+	logged = Concurrent.supervise!(
+		{ max_restarts: 0 },
+		|| {
+			Host.log!("no fetch")
+			Str.concat(fetched, "!")
+		},
+	)
+	nested = Concurrent.supervise!(
+		{ max_restarts: 1 },
+		|| {
+			var $joined = Concurrent.supervise!({ max_restarts: 1 }, work!("b"))
+			for! body in List.concurrently([work!("c"), work!("d")]) {
+				$joined = Str.concat($joined, body)
+			}
+			$joined
+		},
+	)
+	var $joined = Str.concat(logged, nested)
+	for! body in List.concurrently([|| Concurrent.supervise!({ max_restarts: 1 }, work!("e")), work!("f")]) {
+		Host.log!("got ${body}")
+		$joined = Str.concat($joined, body)
+	}
+	$joined
+}
+
+# Every run crashes after its loop. The inner supervise! gives up after its
+# third run, and the outer one restarts it once. A `None` build would crash in
+# the first run, so it doesn't run this case.
+supervise_crash! : () => Str
+supervise_crash! = || {
+	Concurrent.supervise!(
+		{ max_restarts: 1 },
+		|| {
+			Host.log!("outer")
+			Concurrent.supervise!({ max_restarts: 2 }, || crashing!("x"))
+		},
+	)
+}
+
+crashing! : Str => Str
+crashing! = |name| {
+	Host.log!("run")
+	var $bytes = 0
+	for! body in List.concurrently([work!(name)]) {
+		$bytes = $bytes + Str.count_utf8_bytes(body)
+	}
+	if $bytes > 0 {
+		crash "the run crashed"
+	}
+	name
 }

@@ -1027,7 +1027,7 @@ test "a pausing call may return a tag union, on LLVM" {
 const plan_loop_tasks_path = "test/postcheck/plan_loops_tasks/app.roc";
 const plan_loop_none_path = "test/postcheck/plan_loops_none/app.roc";
 const plan_loop_cases = [_][]const u8{
-    "basic", "limits", "spawn", "background", "break", "return", "try", "nested", "children", "after_break",
+    "basic", "limits", "spawn", "background", "break", "return", "try", "nested", "children", "after_break", "supervise",
 };
 
 /// What a run of one case gave: its result, and the hosted calls it made.
@@ -1461,4 +1461,74 @@ test "concurrent loops take the interpreter's steps under a queue, cancelled aft
 test "concurrent loops take the interpreter's steps under a queue, cancelled after any resume, on the wasm backend" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     try checkQueueRuns(.{ .specialization_strategy = .lss, .target_usize = .u32 }, compareQueueWasm);
+}
+
+// Supervision (design.md "Plans And Concurrent Loops", "Supervision."): every
+// run of the function crashes, so the inner `supervise!` runs it three times,
+// the outer one runs that twice, and the last crash is the root's.
+
+fn superviseCrash(comptime R: type, program: R.Program) E2eError!void {
+    root_url = "supervise_crash";
+    defer root_url = url;
+    var run: R = undefined;
+    try run.init(program, .ready);
+    defer run.deinit();
+    var result: RocStr = RocStr.empty();
+    const task = try run.startRoot(program, &result);
+    const status = run.host.driveTree(task) catch return error.TestUnexpectedResult;
+    try std.testing.expectEqual(builtins.task.Status.crashed, status);
+    try std.testing.expectEqualStrings("the run crashed", task.crash_message[0..task.crash_message_len]);
+    run.host.freeTask(task);
+    if (task_test_host.c_abi_failure) |err| return err;
+
+    const one_run = [_][]const u8{ "log(run)", "log(start x)", "fetch(x)", "log(finish x)" };
+    const inner = [_][]const u8{"log(outer)"} ++ one_run ++ one_run ++ one_run;
+    const want = [_][]const u8{"log(begin supervise_crash)"} ++ inner ++ inner;
+    try std.testing.expectEqual(want.len, run.host.trace.items.len);
+    for (want, run.host.trace.items) |want_entry, got_entry| try std.testing.expectEqualStrings(want_entry, got_entry);
+    // Nothing a crashing frame held was on the heap, so nothing leaks.
+    try run.runtime.checkForLeaks();
+}
+
+fn superviseCrashInterpreter(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    superviseCrash(Run, lowered) catch |err| {
+        std.log.err("supervising on the interpreter failed: {s}", .{@errorName(err)});
+        return error.TestUnexpectedResult;
+    };
+}
+
+fn superviseCrashDev(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    var program: DevProgram = undefined;
+    program.init(lowered) catch return error.TestUnexpectedResult;
+    defer program.deinit();
+    superviseCrash(DevRun, &program) catch |err| {
+        std.log.err("supervising on the dev backend failed: {s}", .{@errorName(err)});
+        return error.TestUnexpectedResult;
+    };
+}
+
+fn superviseCrashLlvm(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    var program: LlvmProgram = undefined;
+    program.init(lowered) catch return error.TestUnexpectedResult;
+    defer program.deinit();
+    superviseCrash(LlvmRun, &program) catch |err| {
+        std.log.err("supervising on LLVM failed: {s}", .{@errorName(err)});
+        return error.TestUnexpectedResult;
+    };
+}
+
+test "supervise! restarts a crashing function up to its limit and then crashes with its message, on the interpreter" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    try harness.runAppPathLoweredInspection(plan_loop_tasks_path, plan_loop_options, superviseCrashInterpreter);
+}
+
+test "supervise! restarts a crashing function up to its limit and then crashes with its message, on the dev backend" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
+    try harness.runAppPathLoweredInspection(plan_loop_tasks_path, plan_loop_options, superviseCrashDev);
+}
+
+test "supervise! restarts a crashing function up to its limit and then crashes with its message, on LLVM" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    try harness.runAppPathLoweredInspection(plan_loop_tasks_path, plan_loop_options, superviseCrashLlvm);
 }

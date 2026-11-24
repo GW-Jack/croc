@@ -15,11 +15,16 @@ winner! : (() => Str) => Str
 winner! = |f| Concurrent.race!(f, [|| "b"])
 
 mixed! = || Concurrent.race!(|| 1.U64, [|| 2.U8])
+
+supervised! = || Concurrent.supervise!({ max_restarts: 3 }, || "a")
+
+no_limit! = || Concurrent.supervise!({}, || "a")
 ~~~
 # EXPECTED
 TYPE MISMATCH - concurrent_library_types.md:1:34:1:44
 TYPE MISMATCH - concurrent_library_types.md:3:20:3:49
 TYPE MISMATCH - concurrent_library_types.md:10:30:10:32
+TYPE MISMATCH - concurrent_library_types.md:14:38:14:40
 # PROBLEMS
 ~~~clojure
 (reports
@@ -152,7 +157,47 @@ TYPE MISMATCH - concurrent_library_types.md:10:30:10:32
 			(annotation-start code-block)
 			(indent 1)
 			(text "(() => item), List(() => item) => item")
-			(annotation-end))))
+			(annotation-end)))
+	(report
+		(severity runtime_error)
+		(title "Type Mismatch")
+		(region (start 14 38) (end 14 40))
+		(headline
+			(reflow "The")
+			(reflow " ")
+			(reflow "first")
+			(reflow " ")
+			(reflow "argument being passed to this function has the wrong type."))
+		(document
+			(source-region (file "concurrent_library_types.md") (start 14 38) (end 14 40) (annotation error) (line-text "no_limit! = || Concurrent.supervise!({}, || \"a\")"))
+			(line-break)
+			(reflow "This argument has the type:")
+			(line-break)
+			(line-break)
+			(annotation-start code-block)
+			(indent 1)
+			(text "{}")
+			(annotation-end)
+			(line-break)
+			(line-break)
+			(reflow "But the function needs the")
+			(reflow " ")
+			(reflow "first")
+			(reflow " ")
+			(reflow "argument to be:")
+			(line-break)
+			(line-break)
+			(annotation-start code-block)
+			(indent 1)
+			(text "{ max_restarts: U64 }")
+			(annotation-end)
+			(line-break)
+			(line-break)
+			(annotated emphasis "Hint:")
+			(reflow " ")
+			(reflow "This record is missing the field:")
+			(reflow " ")
+			(annotated code "max_restarts"))))
 ~~~
 # TOKENS
 ~~~zig
@@ -162,6 +207,8 @@ LowerIdent,OpAssign,OpBar,OpBar,UpperIdent,NoSpaceDotLowerIdent,NoSpaceOpenRound
 LowerIdent,OpColon,OpenRound,NoSpaceOpenRound,CloseRound,OpFatArrow,UpperIdent,CloseRound,OpFatArrow,UpperIdent,
 LowerIdent,OpAssign,OpBar,LowerIdent,OpBar,UpperIdent,NoSpaceDotLowerIdent,NoSpaceOpenRound,LowerIdent,Comma,OpenSquare,OpBar,OpBar,StringStart,StringPart,StringEnd,CloseSquare,CloseRound,
 LowerIdent,OpAssign,OpBar,OpBar,UpperIdent,NoSpaceDotLowerIdent,NoSpaceOpenRound,OpBar,OpBar,Int,NoSpaceDotUpperIdent,Comma,OpenSquare,OpBar,OpBar,Int,NoSpaceDotUpperIdent,CloseSquare,CloseRound,
+LowerIdent,OpAssign,OpBar,OpBar,UpperIdent,NoSpaceDotLowerIdent,NoSpaceOpenRound,OpenCurly,LowerIdent,OpColon,Int,CloseCurly,Comma,OpBar,OpBar,StringStart,StringPart,StringEnd,CloseRound,
+LowerIdent,OpAssign,OpBar,OpBar,UpperIdent,NoSpaceDotLowerIdent,NoSpaceOpenRound,OpenCurly,CloseCurly,Comma,OpBar,OpBar,StringStart,StringPart,StringEnd,CloseRound,
 EndOfFile,
 ~~~
 # PARSE
@@ -234,7 +281,31 @@ EndOfFile,
 					(e-list
 						(e-lambda
 							(args)
-							(e-typed-int (raw "2") (type "U8")))))))))
+							(e-typed-int (raw "2") (type "U8")))))))
+		(s-decl
+			(p-ident (raw "supervised!"))
+			(e-lambda
+				(args)
+				(e-apply
+					(e-ident (raw "Concurrent.supervise!"))
+					(e-record
+						(field (field "max_restarts")
+							(e-int (raw "3"))))
+					(e-lambda
+						(args)
+						(e-string
+							(e-string-part (raw "a")))))))
+		(s-decl
+			(p-ident (raw "no_limit!"))
+			(e-lambda
+				(args)
+				(e-apply
+					(e-ident (raw "Concurrent.supervise!"))
+					(e-record)
+					(e-lambda
+						(args)
+						(e-string
+							(e-string-part (raw "a")))))))))
 ~~~
 # FORMATTED
 ~~~roc
@@ -253,7 +324,7 @@ NO CHANGE
 		(e-lambda
 			(args)
 			(e-runtime-error (tag "erroneous_value_expr")
-				(e-call (constraint-fn-var 332)
+				(e-call (constraint-fn-var 352)
 					(e-lookup-external
 						(builtin))
 					(e-list
@@ -265,7 +336,7 @@ NO CHANGE
 		(p-assign (ident "pair!"))
 		(e-lambda
 			(args)
-			(e-call (constraint-fn-var 366)
+			(e-call (constraint-fn-var 386)
 				(e-lookup-external
 					(builtin))
 				(e-lambda
@@ -279,7 +350,7 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-assign (ident "f")))
-			(e-call (constraint-fn-var 389)
+			(e-call (constraint-fn-var 409)
 				(e-lookup-external
 					(builtin))
 				(e-lookup-local
@@ -300,6 +371,26 @@ NO CHANGE
 		(p-assign (ident "mixed!"))
 		(e-lambda
 			(args)
+			(e-runtime-error (tag "erroneous_value_expr"))))
+	(d-let
+		(p-assign (ident "supervised!"))
+		(e-lambda
+			(args)
+			(e-call (constraint-fn-var 451)
+				(e-lookup-external
+					(builtin))
+				(e-record
+					(fields
+						(field (name "max_restarts")
+							(e-num (value "3")))))
+				(e-lambda
+					(args)
+					(e-string
+						(e-literal (string "a")))))))
+	(d-let
+		(p-assign (ident "no_limit!"))
+		(e-lambda
+			(args)
 			(e-runtime-error (tag "erroneous_value_expr")))))
 ~~~
 # TYPES
@@ -310,11 +401,15 @@ NO CHANGE
 		(patt (type "() -> _ret"))
 		(patt (type "() => (U64, U8)"))
 		(patt (type "(() => Str) => Str"))
+		(patt (type "() -> _ret"))
+		(patt (type "() => item where [item.from_quote : Str -> Try(item, [BadQuotedBytes(Str)])]"))
 		(patt (type "() -> _ret")))
 	(expressions
 		(expr (type "() -> _ret"))
 		(expr (type "() -> _ret"))
 		(expr (type "() => (U64, U8)"))
 		(expr (type "(() => Str) => Str"))
+		(expr (type "() -> _ret"))
+		(expr (type "() => item where [item.from_quote : Str -> Try(item, [BadQuotedBytes(Str)])]"))
 		(expr (type "() -> _ret"))))
 ~~~

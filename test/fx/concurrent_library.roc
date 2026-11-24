@@ -7,6 +7,7 @@ import pf.Stdout
 # pause, each loop runs them one at a time in input order, so `all_ok!` never
 # starts the entries after the first `Err`, `race!` never starts any function
 # after its first, and a background entry after the others never starts.
+# `supervise!` runs its function once, as no child task.
 
 entry! : Str, U64 -> (() => U64)
 entry! = |name, n| || {
@@ -52,4 +53,6 @@ main! = || {
 
 	(first, second) = Concurrent.both!(entry!("j", 10), || "k")
 	Stdout.line!("both ${first.to_str()} ${second}")
+
+	Stdout.line!("supervise ${Concurrent.supervise!({ max_restarts: 1 }, entry!("l", 11)).to_str()}")
 }

@@ -5472,12 +5472,13 @@ pub const MonoLlvmCodeGen = struct {
                 try self.loadPointer(limits),
                 try self.loadUsize(try self.offsetPtr(limits, self.rocListLenOffset())),
                 try self.loadLocalScalar(GuardedList.at(args, 3), .u64),
+                try self.loadLocalBool(GuardedList.at(args, 4)),
                 (builder.intConst(.i64, size_align.size) catch return error.OutOfMemory).toValue(),
                 (builder.intConst(.i64, size_align.alignment.toByteUnits()) catch return error.OutOfMemory).toValue(),
                 try self.erasedCallbackValue(lir.ContinuationPass.hostDrop(self.layouts(), result_layout)),
                 owner,
             };
-            return self.callBuiltinVoid(.group_init, &.{ .i64, .i64, ptr_ty, usize_ty, .i64, .i64, .i64, ptr_ty, ptr_ty }, &values);
+            return self.callBuiltinVoid(.group_init, &.{ .i64, .i64, ptr_ty, usize_ty, .i64, .i1, .i64, .i64, ptr_ty, ptr_ty }, &values);
         }
         if (op == .group_push) {
             const path = self.slot(GuardedList.at(args, 2)).ptr;

@@ -36424,6 +36424,7 @@ const BodyContext = struct {
         // the plan loops its draft has lowered.
         const owner = self.draft.demand_owner orelse Common.invariant("a plan loop was lowered outside a reserved specialization");
         task.plan_loop.id = (@as(u64, @backingInt(owner)) << 32) | self.draft.plan_loop_count;
+        if (task.plan_loop.id == base.supervised_loop_id) Common.invariant("a plan loop's id is the supervised sets' id");
         self.draft.plan_loop_count += 1;
         task.stage = .plan_flat;
         return self.iteratorDispatchStep(.{

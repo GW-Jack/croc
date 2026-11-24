@@ -393,3 +393,19 @@ test "a promoted loop cancels its set and drains it on the wasm backend" {
     run.session.free();
     try std.testing.expectEqual(@as(i64, 0), run.session.liveAllocations());
 }
+
+test "a supervised function that can't suspend runs as a child task on the wasm backend" {
+    var f = try Fixture.initFor(std.testing.allocator, .u32);
+    defer f.deinit();
+    const entry = try lir_test.supervisedProgram(&f);
+    var run: WasmRun = undefined;
+    try run.init(&f, entry, &.{.opaque_ptr});
+    defer run.deinit();
+    const root = run.session.alloc(8, 8);
+    const task = try run.startRoot(root);
+    try lir_test.driveSupervised(WasmRun, &run, task);
+    try std.testing.expectEqual(lir_test.supervised_result, std.mem.readInt(u64, run.session.memory()[root..][0..8], .little));
+    try run.call(shim_symbols.roc_task_free, task);
+    run.session.free();
+    try std.testing.expectEqual(@as(i64, 0), run.session.liveAllocations());
+}

@@ -5050,10 +5050,10 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 // names the set by the loop id first and the owner task last
                 // (design.md "Records And The Task").
                 .group_init => {
-                    // (id, entry count, limits, root limit, task); the builtin
-                    // also takes the result slots' size and alignment and the
-                    // drop of a result nobody takes.
-                    expectArgCount(ll.op, args, 5);
+                    // (id, entry count, limits, root limit, supervised, task);
+                    // the builtin also takes the result slots' size and
+                    // alignment and the drop of a result nobody takes.
+                    expectArgCount(ll.op, args, 6);
                     const result_layout = ll.group_result.get() orelse
                         base.invariant("LIR/codegen invariant violated: group_init names no result layout", .{});
                     const size_align = self.layout_store.layoutSizeAlign(self.layout_store.getLayout(result_layout));
@@ -5061,7 +5061,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const count_off = try self.ensureOnStack(try self.emitValueLocal(GuardedList.at(args, 1)), 8);
                     const limits_off = try self.ensureOnStack(try self.emitValueLocal(GuardedList.at(args, 2)), roc_list_size);
                     const root_off = try self.ensureOnStack(try self.emitValueLocal(GuardedList.at(args, 3)), 8);
-                    const task_off = try self.ensureOnStack(try self.emitValueLocal(GuardedList.at(args, 4)), 8);
+                    const supervised_reg = try self.ensureInGeneralReg(try self.emitValueLocal(GuardedList.at(args, 4)));
+                    const task_off = try self.ensureOnStack(try self.emitValueLocal(GuardedList.at(args, 5)), 8);
                     const drop_reg = try self.materializeErasedCallableOnDrop(lir.ContinuationPass.hostDrop(self.layout_store, result_layout));
                     var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
                     defer builder.deinit();
@@ -5070,12 +5071,13 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     try builder.addMemArg(frame_ptr, limits_off + list_bytes_offset);
                     try builder.addMemArg(frame_ptr, limits_off + list_len_offset);
                     try builder.addMemArg(frame_ptr, root_off);
+                    try builder.addRegArg(supervised_reg);
                     try builder.addImmArg(@intCast(size_align.size));
                     try builder.addImmArg(@intCast(size_align.alignment.toByteUnits()));
                     try builder.addRegArg(drop_reg);
                     try builder.addMemArg(frame_ptr, task_off);
                     try self.callBuiltin(&builder, .group_init);
-                    self.codegen.freeGeneral(drop_reg);
+                    self.freeGenerals(.{ supervised_reg, drop_reg });
                     return .{ .immediate_i64 = 0 };
                 },
                 .group_push => {

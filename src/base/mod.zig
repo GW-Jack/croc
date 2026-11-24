@@ -49,6 +49,8 @@ pub const InternedBytes = @import("InternedBytes.zig");
 pub const SpecializationStrategy = @import("SpecializationStrategy.zig").SpecializationStrategy;
 pub const ConcurrencyMode = @import("ConcurrencyMode.zig").ConcurrencyMode;
 pub const RunningSetHelper = @import("RunningSetHelper.zig").RunningSetHelper;
+/// The loop id of every supervised running set.
+pub const supervised_loop_id = @import("RunningSetHelper.zig").supervised_loop_id;
 pub const TypeDigestHasher = @import("TypeDigestHasher.zig");
 pub const recursive_digest = @import("recursive_digest.zig");
 /// SHA-256 on the CPU's SHA-256 instructions, interchangeable with `std.crypto.hash.sha2.Sha256`.

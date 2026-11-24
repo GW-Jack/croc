@@ -253,7 +253,7 @@ pub fn pausingProgram(f: *Fixture, hosted_ret: layout.Idx, add: bool) TaskOpsTes
         .body = .some(site),
         .ret_layout = .u64,
     }, .none);
-    try lir.SuspensionMarks.run(allocator, &f.store);
+    try lir.SuspensionMarks.run(allocator, &f.store, .none);
     var roots = [_]LIR.LirProcSpecId{g};
     try lir.ContinuationPass.run(allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true} });
     return roots[0];
@@ -299,7 +299,7 @@ pub fn pausingTwiceProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
         .body = .some(first),
         .ret_layout = .u64,
     }, .none);
-    try lir.SuspensionMarks.run(allocator, &f.store);
+    try lir.SuspensionMarks.run(allocator, &f.store, .none);
     var roots = [_]LIR.LirProcSpecId{g};
     try lir.ContinuationPass.run(allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true} });
     return roots[0];
@@ -354,7 +354,7 @@ pub fn pausingNestedProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
         } }, .test_fixture)),
         .ret_layout = .u64,
     }, .none);
-    try lir.SuspensionMarks.run(allocator, &f.store);
+    try lir.SuspensionMarks.run(allocator, &f.store, .none);
     var roots = [_]LIR.LirProcSpecId{g};
     try lir.ContinuationPass.run(allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true} });
     return roots[0];
@@ -571,17 +571,18 @@ fn literal(f: *Fixture, target: LocalId, value: i64, layout_idx: layout.Idx, nex
 /// The loop id the running-set tests' loops name their sets by.
 const test_loop_id: i64 = 3;
 
-/// `group_init(id, count, [], 0, task)` for a set of `count` entries with
-/// results of `result`, before `next`; `id`, `limits` and `no_limit` are
+/// `group_init(id, count, [], 0, False, task)` for a set of `count` entries
+/// with results of `result`, before `next`; `id`, `limits` and `no_limit` are
 /// the caller's locals, which this defines.
 fn groupInit(f: *Fixture, id: LocalId, count: i64, result: layout.Idx, task: ?LocalId, next: CFStmtId) TaskOpsTestError!CFStmtId {
     const count_local = try f.local(.u64);
     const no_limit = try f.local(.u64);
     const limits = try f.local(try f.layouts.insertList(.u64));
+    const unsupervised = try f.local(.bool);
     const unit = try f.local(.zst);
     var args = std.ArrayList(LocalId).empty;
     defer args.deinit(f.allocator);
-    try args.appendSlice(f.allocator, &.{ id, count_local, limits, no_limit });
+    try args.appendSlice(f.allocator, &.{ id, count_local, limits, no_limit, unsupervised });
     if (task) |owner| try args.append(f.allocator, owner);
     var head = try f.store.addCFStmt(.{ .assign_low_level = .{
         .target = unit,
@@ -592,6 +593,7 @@ fn groupInit(f: *Fixture, id: LocalId, count: i64, result: layout.Idx, task: ?Lo
         .next = next,
     } }, .test_fixture);
     head = try f.store.addCFStmt(.{ .assign_list = .{ .target = limits, .elems = .empty(), .next = head } }, .test_fixture);
+    head = try literal(f, unsupervised, 0, .bool, head);
     head = try literal(f, no_limit, 0, .u64, head);
     head = try literal(f, count_local, count, .u64, head);
     return try literal(f, id, test_loop_id, .u64, head);
@@ -851,7 +853,7 @@ fn parkingProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
     }, .none);
     f.locals.clearRetainingCapacity();
 
-    try lir.SuspensionMarks.run(f.allocator, &f.store);
+    try lir.SuspensionMarks.run(f.allocator, &f.store, .none);
     var roots = [_]LIR.LirProcSpecId{g};
     try lir.ContinuationPass.run(f.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true} });
     try indexJoinPoints(f);
@@ -1221,7 +1223,7 @@ pub fn promotionProgram(f: *Fixture, background: [3]bool, body: LoopBody, releas
     }, .none);
     f.locals.clearRetainingCapacity();
 
-    try lir.SuspensionMarks.run(f.allocator, &f.store);
+    try lir.SuspensionMarks.run(f.allocator, &f.store, .none);
     var roots = [_]LIR.LirProcSpecId{g};
     try lir.ContinuationPass.run(f.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true} });
     try indexJoinPoints(f);
@@ -1353,6 +1355,81 @@ test "promotion cancels a loop's running set and drains it through run_next!" {
     var native: NativeRun = .{};
     try driveCancelLoop(NativeRun, &native, task);
     try std.testing.expectEqual(cancel_loop_result, root);
+    task.free();
+    try f.runtime_env.checkForLeaks();
+}
+
+/// The result of `supervisedProgram`'s function.
+pub const supervised_result: u64 = 41;
+
+/// The provides root `g() = run_supervised!(2, 41)` in a `Tasks` build, where
+/// `run_entry!` returns its entry and can't suspend. Promotes it with the
+/// continuation pass and returns the task entry that takes `g`'s place.
+pub fn supervisedProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
+    const entry = blk: {
+        const c = try f.local(.u64);
+        break :blk try helperProc(f, .run_entry, &.{c}, try f.ret(c));
+    };
+    const supervised = blk: {
+        const max_restarts = try f.local(.u64);
+        const function = try f.local(.u64);
+        const x = try f.local(.u64);
+        break :blk try helperProc(f, .run_supervised, &.{ max_restarts, function }, try callStmt(f, x, entry, &.{function}, try f.ret(x)));
+    };
+    const max_restarts = try f.local(.u64);
+    const function = try f.local(.u64);
+    const x = try f.local(.u64);
+    var head = try callStmt(f, x, supervised, &.{ max_restarts, function }, try f.ret(x));
+    head = try literal(f, function, supervised_result, .u64, head);
+    head = try literal(f, max_restarts, 2, .u64, head);
+    const g = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = .empty(),
+        .frame_locals = try f.store.addLocalSpan(f.locals.items),
+        .body = .some(head),
+        .ret_layout = .u64,
+    }, .none);
+    f.locals.clearRetainingCapacity();
+
+    try lir.SuspensionMarks.run(f.allocator, &f.store, .tasks);
+    try std.testing.expectEqual(LIR.Suspends.may, f.store.getProcSpec(supervised).suspends);
+    try std.testing.expectEqual(LIR.Suspends.never, f.store.getProcSpec(entry).suspends);
+    var roots = [_]LIR.LirProcSpecId{g};
+    try lir.ContinuationPass.run(f.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .mode = .tasks });
+    try indexJoinPoints(f);
+    return roots[0];
+}
+
+/// Run `supervisedProgram`'s task through its steps: the function is a child
+/// task though it can't suspend, and its result is the root's.
+pub fn driveSupervised(comptime Run: type, run: *Run, task: Run.Task) Run.Error!void {
+    const Status = builtins.task.Status;
+    run.begin();
+    try std.testing.expectEqual(Status.pending, try run.resumeTask(task));
+    try std.testing.expectEqual(@as(usize, 1), run.readied().len);
+    const child = run.readied()[0];
+    try std.testing.expect(child != task);
+    try std.testing.expectEqual(Status.done, try run.resumeTask(child));
+    try std.testing.expectEqual(task, run.readied()[run.readied().len - 1]);
+    try std.testing.expectEqual(Status.done, try run.resumeTask(task));
+}
+
+test "promotion runs a supervised function that can't suspend as a child task" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const entry = try supervisedProgram(&f);
+
+    var static_strings = try eval.Interpreter.buildStaticStrings(f.allocator, &f.store);
+    defer static_strings.deinit();
+    var interp = try eval.Interpreter.init(f.allocator, &f.store, &f.layouts, static_strings.view(), f.runtime_env.get_ops());
+    defer interp.deinit();
+
+    var root: u64 = 0;
+    const task = try startEntry(&interp, entry, &root);
+    var native: NativeRun = .{};
+    try driveSupervised(NativeRun, &native, task);
+    try std.testing.expectEqual(supervised_result, root);
     task.free();
     try f.runtime_env.checkForLeaks();
 }

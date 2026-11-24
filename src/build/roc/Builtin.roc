@@ -4009,6 +4009,12 @@ Builtin :: [].{
 		run_entry! : (() => item) => item
 		run_entry! = |entry| entry()
 
+		# `Concurrent.supervise!`'s helper. The sequential form ignores the restart
+		# limit; in a `Tasks` build the compiler replaces the body with a loop that
+		# runs `f` as a child task and restarts it when it crashes.
+		run_supervised! : U64, (() => item) => item
+		run_supervised! = |_max_restarts, f| Concurrently.run_entry!(f)
+
 		run_arrived : Running(item), item -> (Running(item), [Arrived(item), Ended])
 		run_arrived = |running, arrived| (running, Arrived(arrived))
 
@@ -4063,6 +4069,15 @@ Builtin :: [].{
 			}
 			crash "Concurrent.race!: a loop over a plan with an entry ended before one arrived"
 		}
+
+		## Runs the function and returns its result. On a platform with
+		## `concurrency: Tasks`, the function is started again each time it
+		## crashes, at most `max_restarts` times; if it crashes after that, this
+		## crashes with its last message. On any other platform it runs once, and
+		## a crash in it is the program's crash. On a target where a crash ends
+		## the process, such as WebAssembly, the function is never restarted.
+		supervise! : { max_restarts : U64 }, (() => item) => item
+		supervise! = |{ max_restarts }, f| Concurrently.run_supervised!(max_restarts, f)
 	}
 
 	## A type has a default sort order when its module provides

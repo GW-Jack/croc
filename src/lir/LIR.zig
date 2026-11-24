@@ -1096,7 +1096,8 @@ pub const Suspends = enum(u8) {
 /// any (design.md "Plans And Concurrent Loops"). A concurrent loop's
 /// sequential form calls these helpers; the continuation pass finds a loop's
 /// calls by this mark and the loop id each call passes first, and promotes
-/// a loop whose entries may suspend to the task form. It never matches a
+/// a loop whose entries may suspend to the task form. In a `Tasks` build it
+/// also promotes the body of every `run_supervised`. It never matches a
 /// helper by name or body.
 pub const RunningSetHelper = enum(u8) {
     none,
@@ -1110,6 +1111,9 @@ pub const RunningSetHelper = enum(u8) {
     /// and where the loop ends (`run_ended`).
     run_arrived,
     run_ended,
+    /// `Concurrent.supervise!`'s helper: runs a function once, or in a
+    /// `Tasks` build as a child task that is restarted when it crashes.
+    run_supervised,
 };
 
 /// Where the erased calls a callee left pending are run. A tail call through

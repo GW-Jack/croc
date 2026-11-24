@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 const core = @import("lir_core");
 const body_clone = @import("body_clone.zig");
 const invariant = @import("base").invariant;
+const ConcurrencyMode = @import("base").ConcurrencyMode;
 
 const LIR = core.LIR;
 const LirStore = core.LirStore;
@@ -43,8 +44,12 @@ const Walk = struct {
 
 /// Commit `suspends` on every procedure with a body and `suspension_site` on
 /// every direct call.
-pub fn run(allocator: Allocator, store: *LirStore) Allocator.Error!void {
-    if (!anySeed(store)) {
+///
+/// `mode` is the platform's: in a `Tasks` build every `run_supervised`
+/// specialization is a seed (design.md "Plans And Concurrent Loops",
+/// "Supervision.").
+pub fn run(allocator: Allocator, store: *LirStore, mode: ConcurrencyMode) Allocator.Error!void {
+    if (!anySeed(store, mode)) {
         // Nothing can suspend: commit `never` without walking. A Debug
         // compiler walks anyway and checks that no call is a site. Nor is
         // there a `group_next`: a loop has the task form only when an entry
@@ -69,6 +74,11 @@ pub fn run(allocator: Allocator, store: *LirStore) Allocator.Error!void {
     var walk = try walkBodies(allocator, store);
     defer walk.deinit(allocator);
     const calls = &walk.calls;
+    if (mode == .tasks) {
+        for (0..store.procSpecCount()) |index| {
+            if (supervises(store.getProcSpecImmediate(@fromBackingInt(@as(u32, @intCast(index)))))) walk.parks.set(index);
+        }
+    }
     var may = try maySuspend(allocator, store, calls.items, &walk.parks);
     defer may.deinit(allocator);
 
@@ -87,11 +97,19 @@ pub fn run(allocator: Allocator, store: *LirStore) Allocator.Error!void {
     if (builtin.mode == .debug) try verify(allocator, store, calls.items, &walk.parks);
 }
 
-/// Whether any body-less procedure is marked as one that may suspend.
-fn anySeed(store: *const LirStore) bool {
+/// Whether a procedure is a `run_supervised` specialization this compilation
+/// has the body of; a cached one's producer committed its mark.
+fn supervises(proc: *const LIR.LirProcSpec) bool {
+    return proc.running_set_helper == .run_supervised and proc.body.get() != null;
+}
+
+/// Whether any body-less procedure is marked as one that may suspend, or a
+/// `Tasks` build holds a `run_supervised` specialization.
+fn anySeed(store: *const LirStore, mode: ConcurrencyMode) bool {
     for (0..store.procSpecCount()) |index| {
         const proc = store.getProcSpecImmediate(@fromBackingInt(@as(u32, @intCast(index))));
         if (proc.body.get() == null and proc.suspends == .may) return true;
+        if (mode == .tasks and supervises(proc)) return true;
     }
     return false;
 }
@@ -128,7 +146,7 @@ fn walkBodies(allocator: Allocator, store: *const LirStore) Allocator.Error!Walk
 }
 
 /// The procedures that may suspend: the seeds, the procedures that hold a
-/// `group_next`, and every procedure that directly calls one that may.
+/// `group_next` or supervise, and every procedure that directly calls one that may.
 fn maySuspend(allocator: Allocator, store: *const LirStore, calls: []const DirectCall, parks: *const std.bit_set.DynamicBitSetUnmanaged) Allocator.Error!std.bit_set.DynamicBitSetUnmanaged {
     const proc_count = store.procSpecCount();
     var may = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(allocator, proc_count);
@@ -237,7 +255,7 @@ test "a suspending seed marks its direct callers transitively, and only them" {
     const other = try addRelay(&store, 5, plain);
     const leaf = try addRelay(&store, 6, null);
 
-    try run(a, &store);
+    try run(a, &store, .none);
 
     try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(seed).suspends);
     try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(relay.proc).suspends);
@@ -257,13 +275,13 @@ test "running again replaces stale marks" {
     const plain = try addBodyless(&store, 2, .never);
     const relay = try addRelay(&store, 3, seed);
     const root = try addRelay(&store, 4, relay.proc);
-    try run(a, &store);
+    try run(a, &store, .none);
     try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(root.proc).suspends);
 
     // A rewrite retargets the relay's call to a procedure that never
     // suspends; the relay and its caller stop being suspendable.
     store.getCFStmtPtr(relay.call.?).assign_call.proc = plain;
-    try run(a, &store);
+    try run(a, &store, .none);
     try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(relay.proc).suspends);
     try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(root.proc).suspends);
     try testing.expect(!isSite(&store, relay.call.?));
@@ -277,7 +295,7 @@ test "without a suspending seed every procedure with a body is never" {
     const plain = try addBodyless(&store, 1, .never);
     const relay = try addRelay(&store, 2, plain);
     store.getProcSpecPtr(relay.proc).suspends = .may;
-    try run(a, &store);
+    try run(a, &store, .none);
     try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(relay.proc).suspends);
     try testing.expect(!isSite(&store, relay.call.?));
 }
@@ -301,7 +319,7 @@ test "a recursive cycle through a suspending call is marked as a whole" {
     const odd_back_call = try store.addCFStmt(.{ .assign_call = .{ .target = odd_value, .proc = even.proc, .args = .empty(), .next = odd_seed_call } }, .test_fixture);
     store.getProcSpecPtr(odd.proc).body = .some(odd_back_call);
 
-    try run(a, &store);
+    try run(a, &store, .none);
     try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(even.proc).suspends);
     try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(odd.proc).suspends);
     try testing.expect(isSite(&store, even_call));
@@ -334,7 +352,7 @@ test "a running set's next makes its procedure suspend, and its callers" {
     const caller = try addRelay(&store, 3, parking);
     const leaf = try addRelay(&store, 4, null);
 
-    try run(a, &store);
+    try run(a, &store, .none);
 
     try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(seed).suspends);
     try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(parking).suspends);

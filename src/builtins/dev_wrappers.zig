@@ -1492,7 +1492,8 @@ pub fn roc_builtins_task_cancel(roc_task: *task.RocTask, abort: task.AbortFn, re
 /// And Concurrent Loops", "Child Tasks"): open the running set of loop
 /// `loop_id`, owned by `owner`, for `entry_count` entries. `limits` is the
 /// flattened plan's `limits`, borrowed; `root_limit` is its `root_limit`, 0
-/// for none or 1 + the root limit's index. `result_drop` releases an entry
+/// for none or 1 + the root limit's index. `supervised` marks `supervise!`'s
+/// set, whose one entry's crash is a report. `result_drop` releases an entry
 /// result nobody takes, the way an erased capture's `on_drop` does, or is
 /// null when results hold nothing to release. `roc_builtins_group_push`
 /// then adds each entry and `roc_builtins_group_start` starts them.
@@ -1500,7 +1501,7 @@ pub fn roc_builtins_task_cancel(roc_task: *task.RocTask, abort: task.AbortFn, re
 /// Every `roc_builtins_group_*` call names its set by the loop's id and the
 /// owner, last, as the continuation pass appends a task: the owner's
 /// innermost open set (`task.openGroup`).
-pub fn roc_builtins_group_init(loop_id: u64, entry_count: u64, limits_bytes: ?[*]const u8, limits_len: usize, root_limit: u64, slot_size: u64, slot_alignment: u64, result_drop: ?erased_callable.OnDropFn, owner: *task.RocTask) callconv(.c) void {
+pub fn roc_builtins_group_init(loop_id: u64, entry_count: u64, limits_bytes: ?[*]const u8, limits_len: usize, root_limit: u64, supervised: bool, slot_size: u64, slot_alignment: u64, result_drop: ?erased_callable.OnDropFn, owner: *task.RocTask) callconv(.c) void {
     const limits: []const u64 = if (limits_len == 0) &.{} else @as([*]const u64, @ptrCast(@alignCast(limits_bytes.?)))[0..limits_len];
     _ = task.groupInit(
         owner,
@@ -1513,6 +1514,7 @@ pub fn roc_builtins_group_init(loop_id: u64, entry_count: u64, limits_bytes: ?[*
         if (result_drop == null) null else &dropResultThrough,
         if (result_drop) |drop| @ptrCast(@constCast(drop)) else null,
         null,
+        supervised,
     );
 }
 
@@ -1539,17 +1541,20 @@ pub fn roc_builtins_group_start(loop_id: u64, owner: *task.RocTask) callconv(.c)
 /// `roc_builtins_group_arrival` then gives its slot for the caller to move
 /// the result out of; 1 when the set has ended; 2 when nothing has
 /// arrived, so the owner suspends, parked on the set, and calls this again
-/// when resumed.
+/// when resumed; 3 when a supervised set's entry crashed, and
+/// `roc_builtins_group_arrival` then gives the address of the message, a
+/// `Str` for the caller to move out.
 pub fn roc_builtins_group_next(loop_id: u64, owner: *task.RocTask) callconv(.c) u32 {
     return switch (task.groupNext(task.openGroup(owner, loop_id))) {
         .arrived => 0,
         .ended => 1,
         .pending => 2,
+        .crashed => 3,
     };
 }
 
 /// The slot of the entry whose arrival `roc_builtins_group_next` last
-/// reported.
+/// reported, or the message of the crash it did.
 pub fn roc_builtins_group_arrival(loop_id: u64, owner: *task.RocTask) callconv(.c) [*]u8 {
     return task.groupArrival(task.openGroup(owner, loop_id));
 }

@@ -6696,7 +6696,7 @@ pub const Interpreter = struct {
                 const drop = try self.groupResultDrop(result_layout);
                 const root_limit = args[3].read(u64);
                 _ = builtins.task.groupInit(
-                    taskOf(self.readPointerInt(args[4])),
+                    taskOf(self.readPointerInt(args[5])),
                     args[0].read(u64),
                     @intCast(args[1].read(u64)),
                     listItems(u64, valueToRocList(args[2])),
@@ -6706,6 +6706,7 @@ pub const Interpreter = struct {
                     if (drop == null) null else &interpreterGroupResultDrop,
                     drop,
                     if (drop == null) null else &interpreterGroupResultDropRelease,
+                    args[4].read(u8) != 0,
                 );
                 break :blk Value.zst;
             },
@@ -6724,6 +6725,7 @@ pub const Interpreter = struct {
                     .arrived => 0,
                     .ended => 1,
                     .pending => 2,
+                    .crashed => 3,
                 };
                 const val = try self.alloc(ll.ret_layout);
                 val.write(u32, status);

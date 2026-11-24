@@ -3158,6 +3158,7 @@ const Lowerer = struct {
             .run_entry => .run_entry,
             .run_arrived => .run_arrived,
             .run_ended => .run_ended,
+            .run_supervised => .run_supervised,
         };
     }
 
