@@ -22,6 +22,7 @@ main! = |name| {
 		"try" => try_case!()
 		"nested" => nested!()
 		"children" => children!()
+		"after_break" => after_break!()
 		_ => "unknown"
 	}
 	Host.log!("end ${name}")
@@ -187,6 +188,29 @@ children! = || {
 		Host.log!("body ${body}")
 		inner = Host.fetch!("${body}-again")
 		$joined = Str.concat($joined, inner)
+	}
+	$joined
+}
+
+# The code after a loop that can break is reached by two paths, and holds a
+# concurrent loop of its own.
+after_break! : () => Str
+after_break! = || {
+	var $joined = ""
+	var $i = 0.U64
+	while $i < 3 {
+		if Host.fetch!("w") == "stop" {
+			break
+		}
+		$i = $i + 1
+	}
+	for! body in List.concurrently([work!("a"), work!("b")]) {
+		if body == "a/body" {
+			break
+		}
+	}
+	for! body in List.concurrently([work!("c"), work!("d")]) {
+		$joined = Str.concat($joined, body)
 	}
 	$joined
 }

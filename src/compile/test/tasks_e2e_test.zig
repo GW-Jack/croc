@@ -961,7 +961,7 @@ test "a pausing call may return a tag union, on LLVM" {
 const plan_loop_tasks_path = "test/postcheck/plan_loops_tasks/app.roc";
 const plan_loop_none_path = "test/postcheck/plan_loops_none/app.roc";
 const plan_loop_cases = [_][]const u8{
-    "basic", "limits", "spawn", "background", "break", "return", "try", "nested", "children",
+    "basic", "limits", "spawn", "background", "break", "return", "try", "nested", "children", "after_break",
 };
 
 /// What a run of one case gave: its result, and the hosted calls it made.
