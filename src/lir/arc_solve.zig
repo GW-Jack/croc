@@ -3043,7 +3043,8 @@ fn updateBindingsAfterReturns(
 /// Follows the borrow-capable definitions from `start` to the first
 /// borrowed parameter, already resolved local, cycle, or non-qualifying
 /// definition, and binds every link on that chain: to the chain's leader
-/// when the leader is a once-bound anchor, otherwise to itself.
+/// when the leader is a once-bound anchor, otherwise to the link nearest
+/// that leader.
 fn resolveBindingChain(
     solver: *Solver,
     start: u32,
@@ -3072,15 +3073,19 @@ fn resolveBindingChain(
         };
     const leader_is_anchor = leader_once_bound and
         (!borrowed.isSet(chain_leader) or paramIsBorrowed(solver, chain_leader));
+    // The last link is bound once, so when the chain's leader cannot anchor
+    // it, it owns its unit and anchors the links after it. Resolving the
+    // links in separate calls, from any starting link, reaches the same
+    // groups.
+    const anchor = if (leader_is_anchor)
+        chain_leader
+    else
+        chain.getLastOrNull() orelse chain_leader;
     for (chain.items) |link| {
         on_chain.unset(link);
         resolved.set(link);
-        if (leader_is_anchor and link != chain_leader) {
-            borrowed.set(link);
-            leader[link] = chain_leader;
-        } else {
-            leader[link] = link;
-        }
+        leader[link] = anchor;
+        if (link != anchor) borrowed.set(link);
     }
     resolved.set(chain_leader);
 }
@@ -7160,6 +7165,49 @@ test "ARC public solve cleans up every coordinator allocation failure" {
     // Heap-layout dependent remaps would vary the allocation count between runs.
     var deterministic = DeterministicAllocator.init(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(deterministic.allocator(), Probe.run, .{ &f, rc_local, caller });
+}
+
+test "binding: a borrow chain from a twice-bound local anchors on its first link in any local order" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var f = try UniquenessTest.init();
+    defer f.deinit();
+    const param = try f.local(f.list);
+    const callee = try f.proc(&.{param}, try f.ret(param), f.list);
+
+    // `result = callee(view)` borrows from `view` only once the callee's
+    // return is solved as borrowed, so the incremental update resolves it
+    // alone, and the full solve reaches it before `view`.
+    const flag = try f.local(.u64);
+    const result = try f.local(f.list);
+    const view = try f.local(f.list);
+    const list = try f.local(f.list);
+    const rest = try f.store.addCFStmt(.{ .assign_ref = .{
+        .target = view,
+        .op = .local(list),
+        .next = try f.call(result, callee, &.{view}, try f.ret(flag)),
+    } }, .test_fixture);
+    const arms = [_]LIR.CFStmtId{
+        try f.store.addCFStmt(.{ .assign_list = .{ .target = list, .elems = LIR.LocalSpan.empty(), .next = rest } }, .test_fixture),
+        try f.store.addCFStmt(.{ .assign_list = .{ .target = list, .elems = LIR.LocalSpan.empty(), .next = rest } }, .test_fixture),
+    };
+    const caller = try f.proc(&.{flag}, try f.store.addCFStmt(.{ .switch_stmt = .{
+        .cond = flag,
+        .branches = try f.store.addCFSwitchBranches(&[_]LIR.CFSwitchBranch{.{ .value = 1, .body = arms[0] }}),
+        .default_branch = arms[1],
+        .default_is_cold = false,
+        .continuation = null,
+    } }, .test_fixture), .u64);
+
+    const rc_local = try allocator.alloc(bool, f.store.localCount());
+    defer allocator.free(rc_local);
+    @memset(rc_local, true);
+    rc_local[@backingInt(flag)] = false;
+    var solution = try solve(allocator, &f.store, &f.layouts, rc_local, &.{caller}, true);
+    defer solution.deinit();
+    try testing.expect(!solution.isBorrowed(view));
+    try testing.expect(solution.isBorrowed(result));
+    try testing.expectEqual(view, solution.leaderOf(result));
 }
 
 test "ordered-use inventory transfer cleans up on allocation failure" {

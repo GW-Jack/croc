@@ -27101,6 +27101,12 @@ Signatures solve in two phases:
    whose lender mask names exactly one refcounted argument is borrow-capable
    in the caller, anchored on that argument.
 
+A chain of borrow-capable bindings ends at the first one that isn't. When that
+one can't anchor a borrow, such as a local bound more than once, the link
+nearest it owns its unit and anchors the rest of the chain. The groups are the
+same whichever link resolution starts from, so re-resolving only the changed
+bindings agrees with a full solve.
+
 Unique-return bits use a separate monotone worklist over typed uniqueness
 entries collected by the same structural walk. A proc bit feeds only its
 direct-call result locals;
