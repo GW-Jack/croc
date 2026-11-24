@@ -35057,8 +35057,9 @@ root, resumes it and is the only thread that runs Roc code, so resumes
 never overlap (P10). A fixed pool of *workers* runs the blocking
 operations. A suspending call copies what its operation needs out of its
 arguments, releases them on the scheduler thread (P5), queues a job and
-returns `ROC_PENDING`. A worker runs the job, builds its result with
-`roc_alloc` and writes `*out`. So a Roc value is allocated on a worker
+returns `ROC_PENDING`. A worker runs the job into the host's own memory,
+then *delivers* it: it builds the result with `roc_alloc`, writes `*out` and
+wakes the task. So a Roc value is allocated on a worker
 thread but released on the scheduler thread, and its refcount is only ever
 touched on the scheduler thread. The host's allocator is thread-safe (P6).
 Each queue is a mutex and a condition variable. The ready queue orders the
@@ -35072,14 +35073,38 @@ scheduler resumes only tasks it takes off that queue (P1). A worker that
 finishes before the task parks readies nothing: the resume still running
 consumes the completion and carries on instead of pausing.
 
-**Supervision.** The scheduler resumes the root until it reports a terminal
-status:
+**Child tasks.** The runtime readies a child as it readies the root, so the
+ready queue holds any number of tasks, and the scheduler resumes them in the
+order they were readied. A resume that returns a terminal status for a task
+other than the root says the runtime has freed it; the scheduler forgets it
+(P8). Two entries that each wait for a worker wait at the same time.
+
+**Aborts.** A running loop that leaves early, or whose entry crashes, has
+the runtime abort its children's operations (Child Tasks), so the host
+implements `roc_task_abort`. The host keeps its undelivered jobs by task under
+one lock, *the operations lock*:
+- delivery takes the lock for all of its steps, and removes the job first;
+- `roc_task_abort` takes it too, removes the task's job if there still is
+  one, and marks it abandoned. An abandoned job is never delivered, so after
+  the abort returns no one writes the slot or wakes the task (P4). If the
+  job was already delivered, abort does nothing;
+- an abandoned job has allocated nothing with `roc_alloc`, so dropping it
+  touches no Roc memory. A line it read from standard input goes back to be
+  read again.
+
+A worker blocks only in `poll`, on what it waits for and on a pipe of its
+own. An abort of the job it runs writes to the pipe, so a sleep or a read of
+standard input ends at once and gives its worker back. A job no worker has
+begun is dropped when one takes it. `File.read_utf8!` reads without waiting
+on the pipe, since a regular file does not block for long.
+
+**Supervision.** The scheduler resumes tasks until the root reports a
+terminal status:
 - on `DONE` it reads the exit code, frees the root, stops the workers and
   checks that every allocation it served was released;
 - on `CRASHED` it prints the message to stderr, frees the root and exits
   with status 1, without the leak check;
-- the host never cancels, so `CANCELLED` and `roc_task_abort` are
-  unreachable; its `roc_task_abort` panics.
+- the host never cancels the root, so `CANCELLED` is unreachable.
 
 The host links libc on every target, for threads and a thread-safe `malloc`.
 

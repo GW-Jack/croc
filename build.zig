@@ -369,7 +369,7 @@ fn testPlatformUsesThreads(platform_dir: []const u8) bool {
 }
 
 /// The reference `Tasks` platform declares no Windows targets: its host
-/// links libc for threads, `malloc` and `nanosleep`.
+/// links libc for threads, `malloc`, `poll` and `pipe`.
 fn testPlatformHasWindowsHost(platform_dir: []const u8) bool {
     return !std.mem.eql(u8, platform_dir, "tasks-platform");
 }

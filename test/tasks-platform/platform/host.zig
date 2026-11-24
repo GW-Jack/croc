@@ -2,16 +2,17 @@
 //! Reference Platform").
 //!
 //! The main thread is the scheduler: it creates the root task with
-//! `roc_main`, resumes it, and is the only thread that runs Roc code. A
-//! fixed pool of workers runs the blocking operations. A suspending call
-//! copies what its operation needs, releases its arguments, queues a job and
-//! returns `ROC_PENDING`. A worker runs the job, writes the result to the
-//! call's `out` and wakes the task through the program's `roc_task_wake`. If
-//! the task had parked, that hands it back through the host's
-//! `roc_task_ready`, which queues it for the scheduler to resume. The root's
-//! `I32` is the exit status. A crashed root prints
-//! its message and exits with status 1. After a root that finishes, the host
-//! fails the run unless every allocation it served was released.
+//! `roc_main`, resumes it and its child tasks, and is the only thread that
+//! runs Roc code. A fixed pool of workers runs the blocking operations. A
+//! suspending call copies what its operation needs, releases its arguments,
+//! queues a job and returns `ROC_PENDING`. A worker runs the job, writes the
+//! result to the call's `out` and wakes the task through the program's
+//! `roc_task_wake`. If the task had parked, that hands it back through the
+//! host's `roc_task_ready`, which queues it for the scheduler to resume.
+//! `roc_task_abort` drops a task's job, interrupting the worker that runs it.
+//! The root's `I32` is the exit status. A crashed root prints its message and
+//! exits with status 1. After a root that finishes, the host fails the run
+//! unless every allocation it served was released.
 //!
 //! `--alloc=cache` serves allocations from per-size free lists that only the
 //! scheduler thread may use, for measuring what allocation costs a pause
@@ -156,6 +157,83 @@ const Job = struct {
     task: *RocTask,
     out: *anyopaque,
     operation: Operation,
+    /// The worker that runs the job, once one has begun it. Guarded by
+    /// `g_operations`.
+    worker: ?*Worker = null,
+    /// `roc_task_abort` dropped the job: it must not be delivered (P4).
+    /// Guarded by `g_operations`.
+    abandoned: bool = false,
+};
+
+/// A worker thread, and the pipe an abort of its job writes one byte to.
+const Worker = struct {
+    thread: std.Thread = undefined,
+    pipe: [2]std.c.fd_t = undefined,
+};
+
+/// The undelivered jobs, by the task each one's call parked. A task waits on
+/// at most one call. Delivering a job and aborting it both take the lock, so
+/// nothing writes the slot or wakes the task after `roc_task_abort` returns
+/// (P4).
+const Operations = struct {
+    mutex: std.Io.Mutex = .init,
+    jobs: std.AutoHashMapUnmanaged(*RocTask, *Job) = .empty,
+
+    fn add(operations: *Operations, job: *Job) void {
+        operations.mutex.lockUncancelable(io());
+        defer operations.mutex.unlock(io());
+        operations.jobs.putNoClobber(std.heap.c_allocator, job.task, job) catch host_alloc.allocFailed();
+    }
+
+    /// `worker` took `job` off the queue. Whether it should run it.
+    fn begin(operations: *Operations, job: *Job, worker: *Worker) bool {
+        operations.mutex.lockUncancelable(io());
+        defer operations.mutex.unlock(io());
+        if (job.abandoned) return false;
+        job.worker = worker;
+        return true;
+    }
+
+    /// Start delivering `job`, unless it was aborted. Delivery holds the
+    /// lock until `endDelivery`.
+    fn beginDelivery(operations: *Operations, job: *Job) bool {
+        operations.mutex.lockUncancelable(io());
+        if (job.abandoned) {
+            operations.mutex.unlock(io());
+            return false;
+        }
+        std.debug.assert(operations.jobs.remove(job.task)); // rationale: a job stays until it is delivered or abandoned
+        return true;
+    }
+
+    /// The result is in `out`. A wake before the task parks readies nothing:
+    /// the resume still running carries on with the result instead of
+    /// pausing.
+    fn endDelivery(operations: *Operations, job: *Job) void {
+        roc_task_wake(job.task);
+        operations.mutex.unlock(io());
+    }
+
+    /// The worker is done with `job`. An abort that found it running wrote
+    /// one byte to the worker's pipe, which must not reach its next job.
+    fn finish(operations: *Operations, job: *Job) void {
+        operations.mutex.lockUncancelable(io());
+        defer operations.mutex.unlock(io());
+        if (!job.abandoned) return;
+        const worker = job.worker orelse return;
+        var byte: [1]u8 = undefined;
+        while (std.c.read(worker.pipe[0], &byte, 1) != 1) {}
+    }
+
+    fn abort(operations: *Operations, task: *RocTask) void {
+        operations.mutex.lockUncancelable(io());
+        defer operations.mutex.unlock(io());
+        const entry = operations.jobs.fetchRemove(task) orelse return;
+        const job = entry.value;
+        job.abandoned = true;
+        const worker = job.worker orelse return;
+        while (std.c.write(worker.pipe[1], "x", 1) != 1) {}
+    }
 };
 
 /// A first-in, first-out queue of jobs that blocks on pop. Its mutex hands
@@ -200,41 +278,38 @@ const Queue = struct {
 /// A worker's push happens-after the result it wrote, and the scheduler's
 /// pop happens-before the resume, through the mutex (P2).
 const ReadyQueue = struct {
-    /// Without spawning, the root is the only task, so at most one is ever
-    /// ready. Tasks spawned later need room for each one.
-    const capacity = 1;
-
     mutex: std.Io.Mutex = .init,
     nonempty: std.Io.Condition = .init,
-    tasks: [capacity]*RocTask = undefined,
-    len: usize = 0,
+    tasks: std.Deque(*RocTask) = .empty,
 
     fn push(queue: *ReadyQueue, task: *RocTask) void {
         queue.mutex.lockUncancelable(io());
         defer queue.mutex.unlock(io());
-        std.debug.assert(queue.len < capacity); // rationale: each task is readied once per park, and only the root exists
-        queue.tasks[queue.len] = task;
-        queue.len += 1;
+        queue.tasks.pushBack(std.heap.c_allocator, task) catch host_alloc.allocFailed();
         queue.nonempty.signal(io());
     }
 
+    /// The task readied first, waiting for one if there is none.
     fn pop(queue: *ReadyQueue) *RocTask {
         queue.mutex.lockUncancelable(io());
         defer queue.mutex.unlock(io());
-        while (queue.len == 0) queue.nonempty.waitUncancelable(io(), &queue.mutex);
-        queue.len -= 1;
-        return queue.tasks[queue.len];
+        while (true) {
+            if (queue.tasks.popFront()) |task| return task;
+            queue.nonempty.waitUncancelable(io(), &queue.mutex);
+        }
     }
 };
 
 /// Jobs waiting for a worker.
 var g_jobs: Queue = .{};
 var g_ready: ReadyQueue = .{};
-var g_workers: [worker_count]std.Thread = undefined;
+var g_operations: Operations = .{};
+var g_workers: [worker_count]Worker = @splat(.{});
 
 fn park(task: *RocTask, out: *anyopaque, operation: Operation) u32 {
     const job = std.heap.c_allocator.create(Job) catch host_alloc.allocFailed();
     job.* = .{ .task = task, .out = out, .operation = operation };
+    g_operations.add(job);
     g_jobs.push(job);
     return poll_pending;
 }
@@ -285,15 +360,17 @@ fn hostedStdoutLine(line: RocStr) callconv(.c) void {
     owned.decref(&g_roc_ops);
 }
 
-/// `void roc_task_abort(RocTask *task)`, which every `Tasks` host defines.
-/// This host never cancels (design.md "The Reference Platform").
-fn taskAbort(_: *RocTask) callconv(.c) void {
-    @panic("roc_task_abort: the reference platform never cancels a task");
+/// `void roc_task_abort(RocTask *task)`, which every `Tasks` host defines:
+/// the runtime cancels a child task, or crashes a task, parked on a call. It
+/// runs on the scheduler thread, inside a resume.
+fn taskAbort(task: *RocTask) callconv(.c) void {
+    g_operations.abort(task);
 }
 
-/// `void roc_task_ready(RocTask *task)`, which every `Tasks` host defines: a
-/// wake found the task parked, so it may be resumed. It runs on whichever
-/// thread woke the task.
+/// `void roc_task_ready(RocTask *task)`, which every `Tasks` host defines: the
+/// task may be resumed. A wake calls it on the thread that woke the task, and
+/// the runtime calls it inside a resume for a child it starts, or for an
+/// owner whose child reported.
 fn taskReady(task: *RocTask) callconv(.c) void {
     g_ready.push(task);
 }
@@ -310,82 +387,126 @@ comptime {
     host_alloc.exportRuntimeSymbols(getOps, .{});
 }
 
-fn workerMain() void {
+fn workerMain(worker: *Worker) void {
     while (g_jobs.pop()) |job| {
-        run(job);
-        // A wake before the task parks readies nothing: the resume still
-        // running carries on with the result instead of pausing.
-        const task = job.task;
+        if (g_operations.begin(job, worker)) run(job, worker);
+        g_operations.finish(job);
+        switch (job.operation) {
+            .read_file => |path| std.heap.c_allocator.free(path),
+            .read_line, .sleep => {},
+        }
         std.heap.c_allocator.destroy(job);
-        roc_task_wake(task);
     }
 }
 
-/// Run `job`'s operation and write its result to `out` (P3). The result is
-/// allocated here, on the worker; the program releases it on the scheduler.
-fn run(job: *Job) void {
+/// Run `job`'s operation, and unless it is aborted meanwhile, write its
+/// result to `out` and wake its task (P3). The result is allocated here, on
+/// the worker; the program releases it on the scheduler.
+fn run(job: *Job, worker: *Worker) void {
     switch (job.operation) {
         .read_line => {
+            // Held to the delivery, so a line that isn't delivered goes back
+            // before another worker can read the one after it.
+            g_stdin_mutex.lockUncancelable(io());
+            defer g_stdin_mutex.unlock(io());
+            const line_len = findLine(worker) orelse return;
+            if (!g_operations.beginDelivery(job)) return;
             const out: *RocStr = @ptrCast(@alignCast(job.out));
-            out.* = readLine();
+            out.* = RocStr.fromSlice(g_stdin.items[0..line_len], &g_roc_ops);
+            g_operations.endDelivery(job);
+            // The newline goes with the line, unless the input ended first.
+            const taken = @min(line_len + 1, g_stdin.items.len);
+            g_stdin.replaceRangeAssumeCapacity(0, taken, &.{});
         },
         .read_file => |path| {
+            const contents = readFile(path);
+            defer contents.deinit();
+            if (!g_operations.beginDelivery(job)) return;
             const out: *ReadResult = @ptrCast(@alignCast(job.out));
-            out.* = readFile(path);
-            std.heap.c_allocator.free(path);
+            out.* = contents.result();
+            g_operations.endDelivery(job);
         },
         .sleep => |millis| {
-            const ts: std.c.timespec = .{
-                .sec = @intCast(millis / std.time.ms_per_s),
-                .nsec = @intCast((millis % std.time.ms_per_s) * std.time.ns_per_ms),
-            };
-            var remaining = ts;
-            while (std.c.nanosleep(&remaining, &remaining) != 0) {}
+            if (pollFor(worker, null, millis) == .aborted) return;
+            if (!g_operations.beginDelivery(job)) return;
+            g_operations.endDelivery(job);
         },
     }
 }
 
-/// Buffered standard input, read by whichever worker runs a `Stdin.line!`.
-var g_stdin_mutex: std.Io.Mutex = .init;
-var g_stdin_buffer: [4096]u8 = undefined;
-var g_stdin_start: usize = 0;
-var g_stdin_end: usize = 0;
+/// Why `pollFor` returned.
+const Polled = enum { readable, timed_out, aborted };
 
-fn readLine() RocStr {
-    g_stdin_mutex.lockUncancelable(io());
-    defer g_stdin_mutex.unlock(io());
-    var line: std.ArrayList(u8) = .empty;
-    defer line.deinit(std.heap.c_allocator);
+/// Wait until `fd` can be read without blocking, `millis` have passed, or the
+/// job `worker` runs is aborted. Null waits for neither of the first two.
+fn pollFor(worker: *Worker, fd: ?std.c.fd_t, millis: ?u64) Polled {
+    const start = hostedClockMonotonicNs();
     while (true) {
-        if (g_stdin_start == g_stdin_end) {
-            g_stdin_start = 0;
-            g_stdin_end = 0;
-            // End of input, or a read error, ends the last line.
-            g_stdin_end = std.Io.File.stdin().readStreaming(io(), &.{&g_stdin_buffer}) catch break;
+        var timeout: c_int = -1;
+        if (millis) |total| {
+            const elapsed_ns = hostedClockMonotonicNs() - start;
+            const total_ns = std.math.mul(u64, total, std.time.ns_per_ms) catch std.math.maxInt(u64);
+            if (elapsed_ns >= total_ns) return .timed_out;
+            // Rounded up, so a sleep is never shorter than it says.
+            const left = std.math.divCeil(u64, total_ns - elapsed_ns, std.time.ns_per_ms) catch unreachable; // rationale: the divisor is a nonzero constant
+            timeout = @intCast(@min(left, std.math.maxInt(c_int)));
         }
-        const pending = g_stdin_buffer[g_stdin_start..g_stdin_end];
-        if (std.mem.findScalar(u8, pending, '\n')) |newline| {
-            line.appendSlice(std.heap.c_allocator, pending[0..newline]) catch host_alloc.allocFailed();
-            g_stdin_start += newline + 1;
-            break;
-        }
-        line.appendSlice(std.heap.c_allocator, pending) catch host_alloc.allocFailed();
-        g_stdin_start = g_stdin_end;
+        var fds = [2]std.c.pollfd{
+            .{ .fd = worker.pipe[0], .events = std.c.POLL.IN, .revents = 0 },
+            .{ .fd = fd orelse -1, .events = std.c.POLL.IN, .revents = 0 },
+        };
+        // Zero is a timeout and a negative count a signal; both look again.
+        if (std.c.poll(&fds, if (fd == null) 1 else 2, timeout) <= 0) continue;
+        if (fds[0].revents != 0) return .aborted;
+        // End of input, or an error, is found by the read that follows.
+        if (fds[1].revents != 0) return .readable;
     }
-    return RocStr.fromSlice(line.items, &g_roc_ops);
 }
 
-fn readFile(path: []const u8) ReadResult {
-    const contents = readAll(path) catch |err| return .{
-        .payload = RocStr.fromSlice(@errorName(err), &g_roc_ops),
-        .tag = ReadResult.err_tag,
-    };
-    defer std.heap.c_allocator.free(contents);
-    if (!std.unicode.utf8ValidateSlice(contents)) return .{
-        .payload = RocStr.fromSlice("InvalidUtf8", &g_roc_ops),
-        .tag = ReadResult.err_tag,
-    };
-    return .{ .payload = RocStr.fromSlice(contents, &g_roc_ops), .tag = ReadResult.ok_tag };
+/// Standard input read but not yet taken by a `Stdin.line!`, guarded by the
+/// mutex.
+var g_stdin_mutex: std.Io.Mutex = .init;
+var g_stdin: std.ArrayList(u8) = .empty;
+
+/// The length of the first line of `g_stdin`, reading until there is one, or
+/// null if the job `worker` runs is aborted first. End of input, or a read
+/// error, ends the last line.
+fn findLine(worker: *Worker) ?usize {
+    while (true) {
+        if (std.mem.findScalar(u8, g_stdin.items, '\n')) |newline| return newline;
+        const stdin = std.Io.File.stdin();
+        if (pollFor(worker, stdin.handle, null) == .aborted) return null;
+        var chunk: [4096]u8 = undefined;
+        const n = stdin.readStreaming(io(), &.{&chunk}) catch return g_stdin.items.len;
+        g_stdin.appendSlice(std.heap.c_allocator, chunk[0..n]) catch host_alloc.allocFailed();
+    }
+}
+
+/// What reading a file gave, in the host's own memory.
+const FileContents = union(enum) {
+    ok: []u8,
+    err: []const u8,
+
+    fn deinit(contents: FileContents) void {
+        switch (contents) {
+            .ok => |bytes| std.heap.c_allocator.free(bytes),
+            .err => {},
+        }
+    }
+
+    fn result(contents: FileContents) ReadResult {
+        return switch (contents) {
+            .ok => |bytes| .{ .payload = RocStr.fromSlice(bytes, &g_roc_ops), .tag = ReadResult.ok_tag },
+            .err => |reason| .{ .payload = RocStr.fromSlice(reason, &g_roc_ops), .tag = ReadResult.err_tag },
+        };
+    }
+};
+
+fn readFile(path: []const u8) FileContents {
+    const contents = readAll(path) catch |err| return .{ .err = @errorName(err) };
+    if (std.unicode.utf8ValidateSlice(contents)) return .{ .ok = contents };
+    std.heap.c_allocator.free(contents);
+    return .{ .err = "InvalidUtf8" };
 }
 
 fn readAll(path: []const u8) (std.Io.File.OpenError || std.Io.File.ReadStreamingError || std.mem.Allocator.Error)![]u8 {
@@ -433,33 +554,36 @@ fn main(argc: c_int, argv: [*][*:0]u8) callconv(.c) c_int {
     };
 }
 
-const HostError = error{ TaskCrashed, UnexpectedStatus, Leaked, ThreadSpawnFailed };
+const HostError = error{ TaskCrashed, UnexpectedStatus, Leaked, PipeFailed, ThreadSpawnFailed };
 
 fn platformMain() HostError!c_int {
     var started: usize = 0;
     defer {
         g_jobs.close();
-        for (g_workers[0..started]) |worker| worker.join();
+        for (g_workers[0..started]) |*worker| worker.thread.join();
     }
     while (started < worker_count) : (started += 1) {
-        g_workers[started] = std.Thread.spawn(.{}, workerMain, .{}) catch return error.ThreadSpawnFailed;
+        const worker = &g_workers[started];
+        if (std.c.pipe(&worker.pipe) != 0) return error.PipeFailed;
+        worker.thread = std.Thread.spawn(.{}, workerMain, .{worker}) catch return error.ThreadSpawnFailed;
     }
 
     var exit_code: i32 = undefined;
     const root = roc_main(&exit_code);
-    var status = roc_task_resume(root);
-    while (status == @backingInt(TaskStatus.pending)) {
-        if (g_yielded) |task| {
+    var task = root;
+    const status = while (true) {
+        const status = roc_task_resume(task);
+        // Only the root's status ends the program. A terminal status of
+        // another task says the runtime has freed it (P8).
+        if (task == root and status != @backingInt(TaskStatus.pending)) break status;
+        if (g_yielded) |yielded| {
             // A yield parked the task with no worker: wake it now, after the
             // park, so the wake hands it back through `roc_task_ready`.
             g_yielded = null;
-            roc_task_wake(task);
+            roc_task_wake(yielded);
         }
-        // The root parked on one call; resume it once a wake hands it back.
-        const task = g_ready.pop();
-        std.debug.assert(task == root); // rationale: without spawning, the root is the only task
-        status = roc_task_resume(task);
-    }
+        task = g_ready.pop();
+    };
     if (status == @backingInt(TaskStatus.crashed)) {
         var len: usize = 0;
         const message = roc_task_crash_message(root, &len);
