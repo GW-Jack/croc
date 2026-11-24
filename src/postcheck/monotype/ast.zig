@@ -373,6 +373,10 @@ pub const FnTemplate = struct {
     /// that body, so a caller that substitutes it at a call depends on no
     /// source but its own.
     provided_low_level: ProvidedLowLevel = .none,
+    /// The Builtin running-set helper the checked template is, if it is one
+    /// (`CheckedProcedureTemplate.running_set_helper`). Inlining never
+    /// substitutes such a function, and LIR lowering marks its procedure.
+    running_set_helper: base.RunningSetHelper = .none,
     /// The checked template is called at exactly one site of its module's
     /// source and from nowhere else (`templateHasSingleSourceCall`), stamped
     /// when Monotype finalizes the program. Dev inline analysis decides
@@ -406,7 +410,7 @@ pub const FnTemplate = struct {
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(FnTemplate) == 464);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(FnTemplate) == 468);
 }
 
 /// A specialized Monotype function.
@@ -1896,7 +1900,7 @@ pub const Def = struct {
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(Def) == 536);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(Def) == 540);
 }
 
 /// Body availability for a top-level or generated Monotype definition.

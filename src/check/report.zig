@@ -103,7 +103,7 @@ const PolymorphicValueAnnotation = problem_mod.PolymorphicValueAnnotation;
 const EffectfulTopLevel = problem_mod.EffectfulTopLevel;
 const EffectfulComptimeExpression = problem_mod.EffectfulComptimeExpression;
 const EffectfulExpect = problem_mod.EffectfulExpect;
-const ConcurrentLoopNotLowered = problem_mod.ConcurrentLoopNotLowered;
+const RunningSetHelperUse = problem_mod.RunningSetHelperUse;
 const SpawnOutsidePlanLoop = problem_mod.SpawnOutsidePlanLoop;
 const EffectfulFunctionName = problem_mod.EffectfulFunctionName;
 const RedundantOpenTagUnion = problem_mod.RedundantOpenTagUnion;
@@ -1107,8 +1107,8 @@ pub const ReportBuilder = struct {
             .effectful_expect => |data| {
                 return self.buildEffectfulExpectReport(data);
             },
-            .concurrent_loop_not_lowered => |data| {
-                return self.buildConcurrentLoopNotLoweredReport(data);
+            .running_set_helper_use => |data| {
+                return self.buildRunningSetHelperUseReport(data);
             },
             .spawn_outside_plan_loop => |data| {
                 return self.buildSpawnOutsidePlanLoopReport(data);
@@ -2773,7 +2773,7 @@ pub const ReportBuilder = struct {
             return switch (plan.protocol) {
                 .iter => .iter,
                 .stream => .stream,
-                .plan => unreachable, // a plan loop's dispatch is rejected, so it reports no missing method
+                .plan => unreachable, // rationale: a plan loop's `flatten` dispatches on its `Concurrently` source, which declares it
             };
         }
         return null;
@@ -5764,9 +5764,9 @@ pub const ReportBuilder = struct {
         });
     }
 
-    fn buildConcurrentLoopNotLoweredReport(self: *Self, data: ConcurrentLoopNotLowered) Allocator.Error!Report {
-        return self.buildHighlightedRegionReport("Concurrent Loop Not Supported Yet", "This `for!` loop runs a plan, and this compiler can't compile concurrent loops yet.", .runtime_error, data.region, &.{
-            D.bytes("The loop crashes if it runs."),
+    fn buildRunningSetHelperUseReport(self: *Self, data: RunningSetHelperUse) Allocator.Error!Report {
+        return self.buildHighlightedRegionReport("Compiler Only Function", "This uses a function only the compiler may call.", .runtime_error, data.region, &.{
+            D.bytes("The running-set functions of `Concurrently` run `for!` loops over plans, and only the compiler calls them. This use crashes if it runs."),
         });
     }
 

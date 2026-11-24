@@ -33645,7 +33645,9 @@ fn checkLeafExpr(self: *Self, frame: *ExprCheckFrame, expected: Expected, env: *
                     defReference(ext_ref.other_cir, ext_ref.other_cir.store.getDef(target_def))
                 else
                     .value;
-                if (reference == .derived_method) {
+                if (target_is_def and try self.rejectRunningSetHelperUse(ext_ref.other_cir, target_def, expr_idx, expr_var, expr_region)) {
+                    // Reported and marked erroneous.
+                } else if (reference == .derived_method) {
                     try self.checkDerivedMethodReference(expr_idx, expr_var, ext_ref.other_cir, false, reference.derived_method, expr_region, env);
                 } else if (reference == .valueless) {
                     try self.reportValuelessDeclarationUse(expr_var, expr_region);
@@ -35546,13 +35548,13 @@ const ActivePlanLoop = struct {
     item_var: Var,
 };
 
-/// The item var of the plan loop a `spawn` checked now adds its entry to: the
-/// innermost one in the function being checked, or null when there is none.
-fn spawnPlanLoopItemVar(self: *const Self) ?Var {
+/// The plan loop a `spawn` checked now adds its entry to: the innermost one
+/// in the function being checked, or null when there is none.
+fn spawnPlanLoop(self: *const Self) ?ActivePlanLoop {
     const loops = self.active_plan_loops.items;
     std.debug.assert(self.plan_loops_floor <= loops.len); // rationale: a floor is set from the stack's length and loops above it pop before it is restored
     if (loops.len == self.plan_loops_floor) return null;
-    return loops[loops.len - 1].item_var;
+    return loops[loops.len - 1];
 }
 
 /// Close the plan loop `state` pushed, if it pushed one. The loop must be the
@@ -35633,9 +35635,7 @@ fn resumeForLoop(self: *Self, state: *ForLoopCheck, expected: Expected, env: *En
     }
     const pattern = state.pattern;
     const iterable = state.iterable;
-    const loop_region = state.loop_region;
     const item_var: Var = ModuleEnv.varFrom(pattern);
-    const iterable_region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(iterable));
     const iterable_var: Var = ModuleEnv.varFrom(iterable);
 
     if (!state.valid_pattern) {
@@ -35656,16 +35656,10 @@ fn resumeForLoop(self: *Self, state: *ForLoopCheck, expected: Expected, env: *En
         try self.callLikeOperandsContainErroneousValue(&.{iterable});
     // design.md "Plans And Concurrent Loops": a `for!` whose source's checked
     // type is `Concurrently(a)` takes the plan protocol, decided here from the
-    // type as checked so far, and its items are the plan's `a`. No backend
-    // compiles a plan loop yet, so it is reported, and its dispatch is
-    // rejected as an erroneous iterable's is: the loop crashes if it runs.
+    // type as checked so far, and its items are the plan's `a`. It dispatches
+    // `flatten` and the running-set helpers instead of `stream` and `next!`.
     const plan_item_var: ?Var = if (state.kind == .stream and !iterable_is_erroneous) self.concurrentlyItemVar(iterable_var) else null;
-    if (plan_item_var) |plan_item| {
-        _ = try self.unify(plan_item, item_var, env);
-        _ = try self.problems.appendProblem(.{ .concurrent_loop_not_lowered = .{ .region = loop_region } });
-    }
-    const dispatch_rejected = iterable_is_erroneous or plan_item_var != null;
-    if (!dispatch_rejected) {
+    if (!iterable_is_erroneous) {
         try self.late_rejectable_for_loops.append(self.gpa, .{
             .owner = if (state.loop_expr) |expr|
                 .{ .expr = expr.expr_idx }
@@ -35674,6 +35668,31 @@ fn resumeForLoop(self: *Self, state: *ForLoopCheck, expected: Expected, env: *En
             .iterable = iterable,
         });
     }
+    if (plan_item_var) |plan_item| {
+        _ = try self.unify(plan_item, item_var, env);
+        try self.checkPlanLoopDispatch(state, item_var, env);
+    } else {
+        try self.checkIteratorLoopDispatch(state, item_var, iterable_is_erroneous, env);
+    }
+
+    // A `spawn` in the body adds its entry to this loop.
+    if (plan_item_var) |plan_item| {
+        try self.active_plan_loops.append(self.gpa, .{ .loop_node = state.loop_node, .item_var = plan_item });
+        state.plan_loop_pushed = true;
+    }
+
+    state.phase = .body;
+    return .{ .expr = state.body, .expected = expected.forStatement().guardHoistSelection() };
+}
+
+/// Make and record an iterator or stream loop's `iter`/`stream` and
+/// `next`/`next!` dispatches. An erroneous iterable's are rejected, so the
+/// loop crashes if it runs.
+fn checkIteratorLoopDispatch(self: *Self, state: *ForLoopCheck, item_var: Var, dispatch_rejected: bool, env: *Env) std.mem.Allocator.Error!void {
+    const iterable = state.iterable;
+    const loop_region = state.loop_region;
+    const iterable_region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(iterable));
+    const iterable_var: Var = ModuleEnv.varFrom(iterable);
     const iterator_var = try self.mkForLoopSequenceVar(state.kind, item_var, env, iterable_region);
     const iter_method = try @constCast(self.cir).insertIdent(base.Ident.for_text(switch (state.kind) {
         .iter => "iter",
@@ -35716,7 +35735,7 @@ fn resumeForLoop(self: *Self, state: *ForLoopCheck, expected: Expected, env: *En
 
     try self.cir.recordForLoopDispatchPlan(
         state.loop_node,
-        ModuleEnv.nodeIdxFrom(pattern),
+        ModuleEnv.nodeIdxFrom(state.pattern),
         ModuleEnv.nodeIdxFrom(iterable),
         iterator_var,
         step_var,
@@ -35725,20 +35744,103 @@ fn resumeForLoop(self: *Self, state: *ForLoopCheck, expected: Expected, env: *En
         iter_method,
         next_method,
         step.topology,
-        if (plan_item_var != null) .plan else switch (state.kind) {
+        switch (state.kind) {
             .iter => .iter,
             .stream => .stream,
         },
+        .none,
     );
+}
 
-    // A `spawn` in the body adds its entry to this loop.
-    if (plan_item_var) |plan_item| {
-        try self.active_plan_loops.append(self.gpa, .{ .loop_node = state.loop_node, .item_var = plan_item });
-        state.plan_loop_pushed = true;
+/// design.md "Plans And Concurrent Loops", "Sequential lowering.": a plan
+/// loop dispatches `flatten` on its source, and the running-set helpers
+/// `run_create!`, `run_next!`, `run_spawn!` and `run_cancel!` on the source's
+/// type. Their types share the flattened plan's fields, the running set and
+/// the items, so lowering reads every type it needs from these dispatches.
+fn checkPlanLoopDispatch(self: *Self, state: *ForLoopCheck, item_var: Var, env: *Env) std.mem.Allocator.Error!void {
+    const iterable = state.iterable;
+    const region = state.loop_region;
+    const iterable_region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(iterable));
+    const plan_var: Var = ModuleEnv.varFrom(iterable);
+    const cir: *ModuleEnv = @constCast(self.cir);
+
+    const field_names = [_][]const u8{ "entries", "limit_paths", "shielded", "background", "limits", "root_limit" };
+    var field_idents: [field_names.len]Ident.Idx = undefined;
+    var field_vars: [field_names.len]Var = undefined;
+    var record_fields: [field_names.len]types_mod.RecordField = undefined;
+    for (field_names, &field_idents, &field_vars, &record_fields) |name, *ident, *field_var, *field| {
+        ident.* = try cir.insertIdent(base.Ident.for_text(name));
+        field_var.* = try self.fresh(env, region);
+        field.* = .{ .name = ident.*, .presence = .required(field_var.*) };
+    }
+    const flat_var = try self.freshFromContent(.{ .structure = .{ .record = .{
+        .fields = try self.types.appendRecordFields(&record_fields),
+        .ext = try self.freshFromContent(.{ .structure = .empty_record }, env, region),
+    } } }, env, region);
+
+    const running_var = try self.fresh(env, region);
+    const id_var = try self.freshFromContent(try self.mkNumberTypeContent(.u64), env, region);
+    const arrived_ident = try cir.insertIdent(base.Ident.for_text("Arrived"));
+    const ended_ident = try cir.insertIdent(base.Ident.for_text("Ended"));
+    const step_tags = [_]types_mod.Tag{
+        try self.types.mkTag(arrived_ident, &.{item_var}),
+        try self.types.mkTag(ended_ident, &.{}),
+    };
+    const step_tag_var = try self.freshFromContent(
+        try self.types.mkTagUnion(&step_tags, try self.freshFromContent(.{ .structure = .empty_tag_union }, env, region)),
+        env,
+        region,
+    );
+    const step_var = try self.freshFromContent(.{ .structure = .{ .tuple = .{
+        .elems = try self.types.appendVars(&.{ running_var, step_tag_var }),
+    } } }, env, region);
+    const entry_var = try self.fresh(env, region);
+
+    const flatten_method = try cir.insertIdent(base.Ident.for_text("flatten"));
+    const flatten_fn_var = try self.mkSyntheticReceiverDispatchConstraint(plan_var, &.{}, flat_var, flatten_method, env, iterable_region);
+    const create_method = try cir.insertIdent(base.Ident.for_text("run_create!"));
+    var create_args: [1 + field_names.len]Var = undefined;
+    create_args[0] = id_var;
+    @memcpy(create_args[1..], &field_vars);
+    const create_fn_var = try self.mkTypeMethodCallConstraint(plan_var, &create_args, running_var, create_method, env, region, null);
+    const next_method = try cir.insertIdent(base.Ident.for_text("run_next!"));
+    const next_fn_var = try self.mkTypeMethodCallConstraint(plan_var, &.{ id_var, running_var }, step_var, next_method, env, region, null);
+    const spawn_method = try cir.insertIdent(base.Ident.for_text("run_spawn!"));
+    const spawn_fn_var = try self.mkTypeMethodCallConstraint(plan_var, &.{ id_var, running_var, entry_var }, running_var, spawn_method, env, region, null);
+    const cancel_method = try cir.insertIdent(base.Ident.for_text("run_cancel!"));
+    const cancel_fn_var = try self.mkTypeMethodCallConstraint(plan_var, &.{ id_var, running_var }, running_var, cancel_method, env, region, null);
+
+    for ([_]Var{ flatten_fn_var, create_fn_var, next_fn_var, spawn_fn_var, cancel_fn_var }) |fn_var| {
+        try self.recordLoopDispatch(fn_var, iterable);
     }
 
-    state.phase = .body;
-    return .{ .expr = state.body, .expected = expected.forStatement().guardHoistSelection() };
+    var flat_field_idents: [field_names.len]u32 = undefined;
+    for (field_idents, &flat_field_idents) |ident, *raw| raw.* = @bitCast(ident);
+    try self.cir.recordForLoopDispatchPlan(
+        state.loop_node,
+        ModuleEnv.nodeIdxFrom(state.pattern),
+        ModuleEnv.nodeIdxFrom(iterable),
+        running_var,
+        step_var,
+        flatten_fn_var,
+        next_fn_var,
+        flatten_method,
+        next_method,
+        ModuleEnv.IteratorStepTopology.plan,
+        .plan,
+        .{
+            .create_fn_var = @backingInt(create_fn_var),
+            .spawn_fn_var = @backingInt(spawn_fn_var),
+            .cancel_fn_var = @backingInt(cancel_fn_var),
+            .create_method_ident = @bitCast(create_method),
+            .spawn_method_ident = @bitCast(spawn_method),
+            .cancel_method_ident = @bitCast(cancel_method),
+            .flat_field_idents = flat_field_idents,
+            .arrived_tag_ident = @bitCast(arrived_ident),
+            .ended_tag_ident = @bitCast(ended_ident),
+            .flat_var = @backingInt(flat_var),
+        },
+    );
 }
 
 fn resumeForExprCheck(self: *Self, task: *ExprTask, state: *ForLoopCheck, env: *Env, child_does_fx: ?bool) std.mem.Allocator.Error!ExprStep {
@@ -37289,8 +37391,10 @@ fn resumeSpawnCheck(self: *Self, task: *ExprTask, state: *SingleChildCheck, env:
         return .{ .child = .{ .expr = operand, .expected = frame.nested_expected.forStatement() } };
     }
     task.does_fx = true;
-    if (self.spawnPlanLoopItemVar()) |item_var| {
-        const entry_content = try self.types.mkFuncEffectful(&.{}, item_var);
+    if (self.spawnPlanLoop()) |plan_loop| {
+        // Lowering adds the entry with this loop's `run_spawn!`.
+        try self.cir.recordSpawnPlanLoop(ModuleEnv.nodeIdxFrom(frame.expr_idx), plan_loop.loop_node);
+        const entry_content = try self.types.mkFuncEffectful(&.{}, plan_loop.item_var);
         const entry_var = try self.freshFromContent(entry_content, env, frame.expr_region);
         const result = try self.unifyOwnedRelation(entry_var, ModuleEnv.varFrom(operand), env, .none, .construction);
         if (result.isProblem()) try self.markErroneousValueExpr(frame.expr_idx);
@@ -38639,6 +38743,32 @@ fn rejectValuelessMethodDispatch(
                 .region = self.cir.store.getExprRegion(expr_idx),
             } });
         }
+    }
+    try self.poisonConstraintFailure(dispatcher_var, constraint, env, failure_expr);
+    try self.markStaticDispatchRejected(constraint);
+    return true;
+}
+
+/// design.md "Plans And Concurrent Loops", "Sequential lowering.": only the
+/// compiler calls a Builtin running-set helper, through the dispatches a plan
+/// loop records (`loop_dispatch_iterables`), and the Builtin module's own
+/// helpers call each other. Any other dispatch to one is reported and rejected,
+/// so it crashes if it runs.
+fn rejectRunningSetHelperDispatch(
+    self: *Self,
+    lookup: StaticDispatchMethodBinding,
+    dispatcher_var: Var,
+    constraint: StaticDispatchConstraint,
+    env: *Env,
+    failure_expr: ?CIR.Expr.Idx,
+) Allocator.Error!bool {
+    if (lookup.env.runningSetHelperForDef(lookup.binding.def_idx) == .none) return false;
+    if (self.cir.module_role == .builtin) return false;
+    if (self.loop_dispatch_iterables.get(constraint.fn_var) != null) return false;
+    if (failure_expr orelse self.constraintSourceExpr(dispatcher_var, constraint)) |expr_idx| {
+        _ = try self.problems.appendProblem(.{ .running_set_helper_use = .{
+            .region = self.cir.store.getExprRegion(expr_idx),
+        } });
     }
     try self.poisonConstraintFailure(dispatcher_var, constraint, env, failure_expr);
     try self.markStaticDispatchRejected(constraint);
@@ -41187,7 +41317,7 @@ fn mkTypeMethodCallConstraint(
     method_name: Ident.Idx,
     env: *Env,
     region: Region,
-    method_expr_idx: CIR.Expr.Idx,
+    method_expr_idx: ?CIR.Expr.Idx,
 ) Allocator.Error!Var {
     const args_range = try self.types.appendVars(arg_vars);
     const constraint_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
@@ -41807,6 +41937,7 @@ fn checkResolvedAssociatedTarget(
     region: Region,
     env: *Env,
 ) Allocator.Error!void {
+    if (try self.rejectRunningSetHelperUse(target_env, target_def_idx, expr_idx, expr_var, region)) return;
     const target_def = target_env.store.getDef(target_def_idx);
     switch (defReference(target_env, target_def)) {
         .derived_method => |derived| {
@@ -56655,6 +56786,13 @@ inline fn processDeferredDispatchEntryRelations(
                     env,
                     failure_expr,
                 )) continue;
+                if (try self.rejectRunningSetHelperDispatch(
+                    method_lookup,
+                    deferred_constraint.var_,
+                    constraint,
+                    env,
+                    failure_expr,
+                )) continue;
                 if (constraint.fn_name.eql(self.cir.idents.from_numeral) and
                     !self.nominalIsBuiltinNumberType(nominal_type))
                 {
@@ -62770,6 +62908,26 @@ fn stepDerivedMethodCall(self: *Self, task: *ExprTask, state: *CallCheck, env: *
         task.does_fx = true;
     }
     return .done;
+}
+
+/// design.md "Plans And Concurrent Loops", "Sequential lowering.": a name
+/// outside the Builtin module that refers to a Builtin running-set helper, by
+/// calling it or naming it as a value, is reported and becomes erroneous, so it
+/// crashes if it runs. Only the compiler calls the helpers, through the
+/// dispatches a plan loop records (`rejectRunningSetHelperDispatch`).
+fn rejectRunningSetHelperUse(
+    self: *Self,
+    target_env: *const ModuleEnv,
+    target_def_idx: CIR.Def.Idx,
+    expr_idx: CIR.Expr.Idx,
+    expr_var: Var,
+    region: Region,
+) Allocator.Error!bool {
+    if (target_env.runningSetHelperForDef(target_def_idx) == .none) return false;
+    if (self.cir.module_role == .builtin) return false;
+    _ = try self.problems.appendProblem(.{ .running_set_helper_use = .{ .region = region } });
+    try self.markErroneousNameUse(expr_idx, expr_var);
+    return true;
 }
 
 fn reportValuelessDeclarationUse(

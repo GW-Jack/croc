@@ -42,8 +42,6 @@ SPAWN OUTSIDE CONCURRENT LOOP - spawn_outside_concurrent_loop.md:4:3:4:10
 SPAWN OUTSIDE CONCURRENT LOOP - spawn_outside_concurrent_loop.md:10:4:10:11
 SPAWN OUTSIDE CONCURRENT LOOP - spawn_outside_concurrent_loop.md:17:11:17:18
 SPAWN OUTSIDE CONCURRENT LOOP - spawn_outside_concurrent_loop.md:26:5:26:12
-CONCURRENT LOOP NOT SUPPORTED YET - spawn_outside_concurrent_loop.md:16:3:19:4
-CONCURRENT LOOP NOT SUPPORTED YET - spawn_outside_concurrent_loop.md:24:3:29:4
 # PROBLEMS
 ~~~clojure
 (reports
@@ -110,29 +108,7 @@ CONCURRENT LOOP NOT SUPPORTED YET - spawn_outside_concurrent_loop.md:24:3:29:4
 			(annotated code "spawn")
 			(reflow " only works directly inside the body of a ")
 			(annotated code "for!")
-			(reflow " loop over a plan. It can't be used in a function or closure defined inside the loop, because the loop's running entries can't be captured.")))
-	(report
-		(severity runtime_error)
-		(title "Concurrent Loop Not Supported Yet")
-		(region (start 16 3) (end 19 4))
-		(headline
-			(reflow "This `for!` loop runs a plan, and this compiler can't compile concurrent loops yet."))
-		(document
-			(source-region (file "spawn_outside_concurrent_loop.md") (start 16 3) (end 19 4) (annotation error) (line-text "\t\tfor! _x in List.concurrently(fs) {\n\t\t\tg = || spawn f\n\t\t\tg()\n\t\t}"))
-			(line-break)
-			(line-break)
-			(reflow "The loop crashes if it runs.")))
-	(report
-		(severity runtime_error)
-		(title "Concurrent Loop Not Supported Yet")
-		(region (start 24 3) (end 29 4))
-		(headline
-			(reflow "This `for!` loop runs a plan, and this compiler can't compile concurrent loops yet."))
-		(document
-			(source-region (file "spawn_outside_concurrent_loop.md") (start 24 3) (end 29 4) (annotation error) (line-text "\t\tfor! _x in List.concurrently(fs) {\n\t\t\texpect {\n\t\t\t\tspawn f\n\t\t\t\tBool.True\n\t\t\t}\n\t\t}"))
-			(line-break)
-			(line-break)
-			(reflow "The loop crashes if it runs."))))
+			(reflow " loop over a plan. It can't be used in a function or closure defined inside the loop, because the loop's running entries can't be captured."))))
 ~~~
 # TOKENS
 ~~~zig
@@ -329,7 +305,7 @@ NO CHANGE
 			(e-block
 				(s-for-bang
 					(p-assign (ident "_x"))
-					(e-call (constraint-fn-var 444)
+					(e-call (constraint-fn-var 452)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local
@@ -344,7 +320,7 @@ NO CHANGE
 									(args)
 									(e-runtime-error (tag "spawn_outside_concurrent_loop")))))
 						(s-expr
-							(e-call (constraint-fn-var 460)
+							(e-call (constraint-fn-var 592)
 								(e-lookup-local
 									(p-assign (ident "g")))))
 						(e-empty_record)))
@@ -367,7 +343,7 @@ NO CHANGE
 			(e-block
 				(s-for-bang
 					(p-assign (ident "_x"))
-					(e-call (constraint-fn-var 473)
+					(e-call (constraint-fn-var 605)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local

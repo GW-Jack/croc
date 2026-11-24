@@ -28,7 +28,6 @@ Loops := [].{
 ~~~
 # EXPECTED
 SPAWN OUTSIDE PLAN LOOP - spawn_outside_plan_loop.md:5:4:5:11
-CONCURRENT LOOP NOT SUPPORTED YET - spawn_outside_plan_loop.md:11:3:18:4
 SPAWN OUTSIDE PLAN LOOP - spawn_outside_plan_loop.md:14:6:14:13
 # PROBLEMS
 ~~~clojure
@@ -44,17 +43,6 @@ SPAWN OUTSIDE PLAN LOOP - spawn_outside_plan_loop.md:14:6:14:13
 			(line-break)
 			(line-break)
 			(reflow "A `spawn` adds an entry to the innermost `for!` loop around it that runs a plan, a value of type `Concurrently(a)`. The `for!` loops around this one run streams instead, so the `spawn` crashes if it runs.")))
-	(report
-		(severity runtime_error)
-		(title "Concurrent Loop Not Supported Yet")
-		(region (start 11 3) (end 18 4))
-		(headline
-			(reflow "This `for!` loop runs a plan, and this compiler can't compile concurrent loops yet."))
-		(document
-			(source-region (file "spawn_outside_plan_loop.md") (start 11 3) (end 18 4) (annotation error) (line-text "\t\tfor! _x in List.concurrently(fs) {\n\t\t\tg! = || {\n\t\t\t\tfor! _y in xs {\n\t\t\t\t\tspawn f\n\t\t\t\t}\n\t\t\t}\n\t\t\tg!()\n\t\t}"))
-			(line-break)
-			(line-break)
-			(reflow "The loop crashes if it runs.")))
 	(report
 		(severity runtime_error)
 		(title "Spawn Outside Plan Loop")
@@ -209,7 +197,7 @@ NO CHANGE
 			(e-block
 				(s-for-bang
 					(p-assign (ident "_x"))
-					(e-call (constraint-fn-var 393)
+					(e-call (constraint-fn-var 401)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local
@@ -234,7 +222,7 @@ NO CHANGE
 												(e-empty_record)))
 										(e-empty_record)))))
 						(s-expr
-							(e-call (constraint-fn-var 442)
+							(e-call (constraint-fn-var 574)
 								(e-lookup-local
 									(p-assign (ident "g!")))))
 						(e-empty_record)))

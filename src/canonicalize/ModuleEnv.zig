@@ -481,6 +481,18 @@ pub const ProvidedLowLevelDef = extern struct {
     pub const SafeList = collections.SafeList(@This());
 };
 
+/// A Builtin definition that is a running-set helper (design.md "Plans And
+/// Concurrent Loops"). Canonicalization of the Builtin module records it by
+/// the definition's qualified ident; later stages read the kind from here and
+/// never recognize a helper by its name or body.
+pub const RunningSetHelperDef = extern struct {
+    def_idx: u32,
+    helper: base.RunningSetHelper,
+    _padding: [3]u8 = .{ 0, 0, 0 },
+
+    pub const SafeList = collections.SafeList(@This());
+};
+
 /// Exact checker-owned shape of an iterator step result.
 pub const IteratorStepTopology = extern struct {
     done_tag_ident: u32,
@@ -490,6 +502,19 @@ pub const IteratorStepTopology = extern struct {
     rest_field_ident: u32,
     one_payload_var: u32,
     skip_payload_var: u32,
+
+    /// What a loop taking the plan protocol records: its step,
+    /// `(Running(item), [Arrived(item), Ended])`, is described by its
+    /// `PlanLoopDispatch`, and no stage reads this topology for it.
+    pub const plan: IteratorStepTopology = .{
+        .done_tag_ident = 0,
+        .one_tag_ident = 0,
+        .skip_tag_ident = 0,
+        .item_field_ident = 0,
+        .rest_field_ident = 0,
+        .one_payload_var = 0,
+        .skip_payload_var = 0,
+    };
 };
 
 /// The protocol a checked `for` loop runs, chosen by checking (design.md
@@ -501,6 +526,32 @@ pub const ForLoopProtocol = enum(u32) {
     plan,
 };
 
+/// The running-set helper calls of a loop that takes the plan protocol
+/// (design.md "Plans And Concurrent Loops", "Sequential lowering."), each a
+/// synthetic dispatch on the loop's `Concurrently(a)` source type whose
+/// dispatcher is not one of its arguments. `flatten` and `run_next!` are the
+/// loop's `iter_fn_var` and `next_fn_var`.
+pub const PlanLoopDispatch = extern struct {
+    create_fn_var: u32,
+    spawn_fn_var: u32,
+    cancel_fn_var: u32,
+    create_method_ident: u32,
+    spawn_method_ident: u32,
+    cancel_method_ident: u32,
+    /// The fields of `flatten`'s result, in `run_create!`'s argument order
+    /// after the loop id: entries, limit_paths, shielded, background, limits,
+    /// root_limit.
+    flat_field_idents: [6]u32,
+    /// The tags of `run_next!`'s step, the second element of its result.
+    arrived_tag_ident: u32,
+    ended_tag_ident: u32,
+    /// `flatten`'s result record.
+    flat_var: u32,
+
+    /// The value a loop that does not take the plan protocol records.
+    pub const none: PlanLoopDispatch = std.mem.zeroes(PlanLoopDispatch);
+};
+
 /// Checked dispatch and topology metadata for one source `for` loop.
 /// Later stages consume these exact identities instead of inferring the
 /// iterator protocol from names or row shapes.
@@ -508,18 +559,33 @@ pub const ForLoopDispatchPlan = extern struct {
     node_idx: u32,
     pattern_idx: u32,
     iterable_idx: u32,
+    /// The iterator a `for` or stream loop steps; a plan loop's running set.
     iterator_var: u32,
+    /// The step an iterator's `next` returns; a plan loop's `run_next!`
+    /// result.
     step_var: u32,
     iter_fn_var: u32,
     next_fn_var: u32,
-    /// The method dispatched on the loop operand: `iter` for `for`, `stream` for `for!`.
+    /// The method dispatched on the loop operand: `iter` for `for`, `stream`
+    /// for a stream `for!`, `flatten` for a plan loop.
     iter_method_ident: u32,
-    /// The method that pulls each step: `next` for `for`, `next!` for `for!`.
+    /// The method that pulls each step: `next` for `for`, `next!` for a
+    /// stream `for!`, `run_next!` for a plan loop.
     next_method_ident: u32,
+    /// An iterator step's shape; zero for a plan loop.
     step_topology: IteratorStepTopology,
-    /// A `plan` loop's dispatch functions are rejected until a backend
-    /// compiles plan loops.
     protocol: ForLoopProtocol,
+    /// A plan loop's other helper calls; `PlanLoopDispatch.none` otherwise.
+    plan: PlanLoopDispatch,
+
+    pub const SafeList = collections.SafeList(@This());
+};
+
+/// The plan loop a checked `spawn` adds its entry to: the innermost plan loop
+/// enclosing it in its function (design.md "Plans And Concurrent Loops").
+pub const SpawnPlanLoop = extern struct {
+    spawn_node: u32,
+    loop_node: u32,
 
     pub const SafeList = collections.SafeList(@This());
 };
@@ -1201,9 +1267,13 @@ method_idents: MethodIdents,
 method_defs: MethodDefs,
 /// Compiler-authored low-level implementations, ordered by definition index.
 provided_low_level_defs: ProvidedLowLevelDef.SafeList,
+/// Builtin running-set helper definitions, ordered by definition index.
+running_set_helper_defs: RunningSetHelperDef.SafeList,
 
 /// Dispatch plans attached by checking to source `for` loop nodes.
 for_loop_dispatch_plans: ForLoopDispatchPlan.SafeList,
+/// The plan loop each checked `spawn` adds to.
+spawn_plan_loops: SpawnPlanLoop.SafeList,
 /// Base-256 bytes referenced by `numeral_literals`.
 numeral_digit_bytes: collections.SafeList(u8),
 /// Exact numeric literals attached to source expression and pattern nodes.
@@ -1662,7 +1732,9 @@ pub fn initWithSourceDigest(
         .method_idents = MethodIdents.init(),
         .method_defs = MethodDefs.init(),
         .provided_low_level_defs = try ProvidedLowLevelDef.SafeList.initCapacity(gpa, 4),
+        .running_set_helper_defs = try RunningSetHelperDef.SafeList.initCapacity(gpa, 0),
         .for_loop_dispatch_plans = try ForLoopDispatchPlan.SafeList.initCapacity(gpa, 4),
+        .spawn_plan_loops = try SpawnPlanLoop.SafeList.initCapacity(gpa, 0),
         .numeral_digit_bytes = try collections.SafeList(u8).initCapacity(gpa, 32),
         .numeral_literals = try NumeralLiteral.SafeList.initCapacity(gpa, 8),
         .numeric_suffix_targets = try NumericSuffixTarget.SafeList.initCapacity(gpa, 8),
@@ -1708,7 +1780,9 @@ pub fn deinit(self: *Self) void {
     self.method_idents.deinit(self.gpa);
     self.method_defs.deinit(self.gpa);
     self.provided_low_level_defs.deinit(self.gpa);
+    self.running_set_helper_defs.deinit(self.gpa);
     self.for_loop_dispatch_plans.deinit(self.gpa);
+    self.spawn_plan_loops.deinit(self.gpa);
     self.numeral_digit_bytes.deinit(self.gpa);
     self.numeral_literals.deinit(self.gpa);
     self.numeric_suffix_targets.deinit(self.gpa);
@@ -1823,6 +1897,15 @@ pub fn providedLowLevelForDef(self: *const Self, def_idx: CIR.Def.Idx) ?base.Low
         }
     }
     return null;
+}
+
+/// The running-set helper `def_idx` is, or `none`.
+pub fn runningSetHelperForDef(self: *const Self, def_idx: CIR.Def.Idx) base.RunningSetHelper {
+    const wanted: u32 = @backingInt(def_idx);
+    for (self.running_set_helper_defs.items()) |entry| {
+        if (entry.def_idx == wanted) return entry.helper;
+    }
+    return .none;
 }
 
 /// Return the current producer-authored exact strict-demand relation.
@@ -4242,7 +4325,9 @@ pub const Serialized = extern struct {
     method_idents: MethodIdents.Serialized,
     method_defs: MethodDefs.Serialized,
     provided_low_level_defs: ProvidedLowLevelDef.SafeList.Serialized,
+    running_set_helper_defs: RunningSetHelperDef.SafeList.Serialized,
     for_loop_dispatch_plans: ForLoopDispatchPlan.SafeList.Serialized,
+    spawn_plan_loops: SpawnPlanLoop.SafeList.Serialized,
     numeral_digit_bytes: collections.SafeList(u8).Serialized,
     numeral_literals: NumeralLiteral.SafeList.Serialized,
     numeric_suffix_targets: NumericSuffixTarget.SafeList.Serialized,
@@ -4377,7 +4462,9 @@ pub const Serialized = extern struct {
         try self.method_idents.serialize(&env.method_idents, allocator, writer);
         try self.method_defs.serialize(&env.method_defs, allocator, writer);
         try self.provided_low_level_defs.serialize(&env.provided_low_level_defs, allocator, writer);
+        try self.running_set_helper_defs.serialize(&env.running_set_helper_defs, allocator, writer);
         try self.for_loop_dispatch_plans.serialize(&env.for_loop_dispatch_plans, allocator, writer);
+        try self.spawn_plan_loops.serialize(&env.spawn_plan_loops, allocator, writer);
         try self.numeral_digit_bytes.serialize(&env.numeral_digit_bytes, allocator, writer);
         try self.numeral_literals.serialize(&env.numeral_literals, allocator, writer);
         try self.numeric_suffix_targets.serialize(&env.numeric_suffix_targets, allocator, writer);
@@ -4495,7 +4582,9 @@ pub const Serialized = extern struct {
             .method_idents = self.method_idents.deserializeInto(base_addr),
             .method_defs = self.method_defs.deserializeInto(base_addr),
             .provided_low_level_defs = self.provided_low_level_defs.deserializeInto(base_addr),
+            .running_set_helper_defs = self.running_set_helper_defs.deserializeInto(base_addr),
             .for_loop_dispatch_plans = self.for_loop_dispatch_plans.deserializeInto(base_addr),
+            .spawn_plan_loops = self.spawn_plan_loops.deserializeInto(base_addr),
             .numeral_digit_bytes = self.numeral_digit_bytes.deserializeInto(base_addr),
             .numeral_literals = self.numeral_literals.deserializeInto(base_addr),
             .numeric_suffix_targets = self.numeric_suffix_targets.deserializeInto(base_addr),
@@ -4564,6 +4653,7 @@ pub fn recordForLoopDispatchPlan(
     next_method: Ident.Idx,
     step_topology: IteratorStepTopology,
     protocol: ForLoopProtocol,
+    plan_dispatch: PlanLoopDispatch,
 ) std.mem.Allocator.Error!void {
     const raw_node: u32 = @backingInt(node_idx);
     const raw_pattern: u32 = @backingInt(pattern_idx);
@@ -4582,6 +4672,7 @@ pub fn recordForLoopDispatchPlan(
             .next_method_ident = @bitCast(next_method),
             .step_topology = step_topology,
             .protocol = protocol,
+            .plan = plan_dispatch,
         };
         return;
     }
@@ -4597,7 +4688,25 @@ pub fn recordForLoopDispatchPlan(
         .next_method_ident = @bitCast(next_method),
         .step_topology = step_topology,
         .protocol = protocol,
+        .plan = plan_dispatch,
     });
+}
+
+/// Record the plan loop the checked `spawn` at `spawn_node` adds to.
+pub fn recordSpawnPlanLoop(self: *Self, spawn_node: Node.Idx, loop_node: Node.Idx) std.mem.Allocator.Error!void {
+    _ = try self.spawn_plan_loops.append(self.gpa, .{
+        .spawn_node = @backingInt(spawn_node),
+        .loop_node = @backingInt(loop_node),
+    });
+}
+
+/// The plan loop the checked `spawn` at `spawn_node` adds to, or null for a
+/// `spawn` outside every plan loop of its function.
+pub fn spawnPlanLoop(self: *const Self, spawn_node: u32) ?u32 {
+    for (self.spawn_plan_loops.items()) |entry| {
+        if (entry.spawn_node == spawn_node) return entry.loop_node;
+    }
+    return null;
 }
 
 /// Record exact base-256 digits for a numeric source node.

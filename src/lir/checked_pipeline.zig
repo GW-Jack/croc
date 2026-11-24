@@ -32,6 +32,7 @@ pub const LiteralDemand = postcheck.LiteralDemand;
 const TagReachability = @import("tag_reachability.zig");
 const ReachableProcs = @import("reachable_procs.zig");
 const ContinuationPass = @import("continuation_pass.zig");
+const body_clone = @import("body_clone.zig");
 const DebugPrint = @import("debug_print.zig");
 const LIR = core.LIR;
 const CheckedArithmetic = core.CheckedArithmetic;
@@ -2270,6 +2271,7 @@ fn finishLoweredOutput(
     frozen: *?LirProgram.FrozenStaticData,
 ) LowerResourceError!LoweredProgram {
     verifyArithmeticBoundary(&lowered.lir_result.store);
+    try verifyRunningSetHelperCalls(allocator, &lowered.lir_result.store);
     var lir_passes_timing_scope = PipelineStageScope.begin(target.timing, .lir_passes);
     defer lir_passes_timing_scope.end();
     // The procedure-local rewrites read which procedures may suspend
@@ -2632,6 +2634,135 @@ fn verifyArithmeticBoundary(store: *const core.LirStore) void {
         }
     }
 }
+
+/// Within each procedure, every call of a running-set helper that takes a
+/// loop id passes it first as a `U64` local holding an integer literal of
+/// that procedure, an `i64_literal` or `i128_literal`, directly or through a
+/// chain of `ref.local` copies in any statement order; each id has exactly
+/// one `run_create!` call, and every id a `run_next!`, `run_spawn!` or
+/// `run_cancel!` call passes has its `run_create!` call in the same procedure
+/// (design.md "Plans And Concurrent Loops", "Sequential lowering."). These
+/// are the shapes running-set promotion reads (`running_set_promotion.zig`,
+/// `LoopIds`), so this accepts and rejects exactly what it does.
+fn verifyRunningSetHelperCalls(allocator: Allocator, store: *const core.LirStore) Allocator.Error!void {
+    if (builtin.mode != .debug) return;
+    var scratch: RunningSetHelperScratch = .init(allocator);
+    defer scratch.deinit();
+    for (0..store.procSpecCount()) |index| {
+        const proc_id: LIR.LirProcSpecId = @fromBackingInt(@intCast(index));
+        const body = store.getProcSpec(proc_id).body.get() orelse continue;
+        try scratch.verifyProc(store, body);
+    }
+}
+
+/// The per-procedure tables `verifyRunningSetHelperCalls` rebuilds for each
+/// procedure body it walks.
+const RunningSetHelperScratch = struct {
+    allocator: Allocator,
+    visited: collections.DenseMap(LIR.CFStmtId, void),
+    work: std.ArrayList(LIR.CFStmtId),
+    /// What each local's integer-literal or `ref.local` definitions say
+    /// about the loop id it may hold.
+    defs: collections.DenseMap(LIR.LocalId, LoopIdDef),
+    calls: std.ArrayList(LIR.CFStmtId),
+    created: std.AutoHashMap(u64, void),
+
+    const LoopIdDef = union(enum) {
+        literal: i128,
+        copy: LIR.LocalId,
+        /// Defined more than once, so it holds no one value.
+        several,
+    };
+
+    fn init(allocator: Allocator) RunningSetHelperScratch {
+        return .{
+            .allocator = allocator,
+            .visited = collections.DenseMap(LIR.CFStmtId, void).init(allocator),
+            .work = .empty,
+            .defs = collections.DenseMap(LIR.LocalId, LoopIdDef).init(allocator),
+            .calls = .empty,
+            .created = std.AutoHashMap(u64, void).init(allocator),
+        };
+    }
+
+    fn deinit(self: *RunningSetHelperScratch) void {
+        self.visited.deinit();
+        self.work.deinit(self.allocator);
+        self.defs.deinit();
+        self.calls.deinit(self.allocator);
+        self.created.deinit();
+    }
+
+    fn verifyProc(self: *RunningSetHelperScratch, store: *const core.LirStore, body: LIR.CFStmtId) Allocator.Error!void {
+        self.visited.clearRetainingCapacity();
+        self.work.clearRetainingCapacity();
+        self.defs.clearRetainingCapacity();
+        self.calls.clearRetainingCapacity();
+        self.created.clearRetainingCapacity();
+        try self.work.append(self.allocator, body);
+        while (self.work.pop()) |stmt_id| {
+            if ((try self.visited.getOrPut(stmt_id)).found_existing) continue;
+            const stmt = store.getCFStmt(stmt_id);
+            if (stmt == .assign_literal) {
+                const value = stmt.assign_literal.value;
+                if (value == .i64_literal) {
+                    try self.define(stmt.assign_literal.target, .{ .literal = value.i64_literal.value });
+                } else if (value == .i128_literal) {
+                    try self.define(stmt.assign_literal.target, .{ .literal = store.stmtRow(value.i128_literal).value });
+                }
+            } else if (stmt == .assign_ref and stmt.assign_ref.op.kind == .local) {
+                try self.define(stmt.assign_ref.target, .{ .copy = stmt.assign_ref.op.source });
+            } else if (stmt == .assign_call) {
+                switch (store.getProcSpec(stmt.assign_call.proc).running_set_helper) {
+                    .none, .run_entry, .run_arrived, .run_ended => {},
+                    .run_create, .run_next, .run_spawn, .run_cancel => try self.calls.append(self.allocator, stmt_id),
+                }
+            }
+            try body_clone.appendSuccessors(store, &self.work, stmt_id, self.allocator);
+        }
+        for (self.calls.items) |stmt_id| {
+            const call = store.getCFStmt(stmt_id).assign_call;
+            if (store.getProcSpec(call.proc).running_set_helper != .run_create) continue;
+            const id = self.loopId(store, call);
+            if ((try self.created.getOrPut(id)).found_existing) checkedPipelineInvariant("two run_create! calls of one loop id in one procedure");
+        }
+        for (self.calls.items) |stmt_id| {
+            const call = store.getCFStmt(stmt_id).assign_call;
+            if (store.getProcSpec(call.proc).running_set_helper == .run_create) continue;
+            if (!self.created.contains(self.loopId(store, call))) {
+                checkedPipelineInvariant("a running-set helper call named a loop id no run_create! call in its procedure creates");
+            }
+        }
+    }
+
+    fn define(self: *RunningSetHelperScratch, local: LIR.LocalId, def: LoopIdDef) Allocator.Error!void {
+        const entry = try self.defs.getOrPut(local);
+        entry.value_ptr.* = if (entry.found_existing) .several else def;
+    }
+
+    /// The loop id a running-set helper call passes first: the literal its
+    /// `U64` argument holds, following copies back to it in any statement
+    /// order.
+    fn loopId(self: *const RunningSetHelperScratch, store: *const core.LirStore, call: @FieldType(LIR.CFStmt, "assign_call")) u64 {
+        const args = store.getLocalSpan(call.args);
+        if (collections.GuardedList.borrowLen(args) == 0) checkedPipelineInvariant("a running-set helper call passed no loop id");
+        var at = collections.GuardedList.at(args, 0);
+        if (store.getLocal(at).layout_idx != .u64) checkedPipelineInvariant("a running-set helper's loop id is not a U64");
+        // A chain longer than the number of definitions goes round a cycle.
+        for (0..self.defs.count() + 1) |_| {
+            const def = self.defs.get(at) orelse checkedPipelineInvariant("a running-set helper's loop id is not an integer literal of its procedure");
+            switch (def) {
+                .literal => |value| {
+                    if (value < 0 or value > std.math.maxInt(u64)) checkedPipelineInvariant("a running-set helper's loop id does not fit a U64");
+                    return @intCast(value);
+                },
+                .copy => |source| at = source,
+                .several => checkedPipelineInvariant("a running-set helper's loop id is defined more than once"),
+            }
+        }
+        checkedPipelineInvariant("a running-set helper's loop id copies itself");
+    }
+};
 
 fn verifyCheckedBoundary(modules: CheckedModuleSet, target: TargetConfig) Allocator.Error!void {
     if (builtin.mode != .debug) return;

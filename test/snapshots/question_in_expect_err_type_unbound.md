@@ -124,7 +124,7 @@ expect parse("5")? == 5
 				(e-match
 					(match
 						(cond
-							(e-call (constraint-fn-var 300)
+							(e-call (constraint-fn-var 308)
 								(e-lookup-local
 									(p-assign (ident "parse")))
 								(e-string

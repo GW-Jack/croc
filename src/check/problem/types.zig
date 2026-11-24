@@ -103,7 +103,7 @@ pub const Problem = union(enum) {
     effectful_top_level: EffectfulTopLevel,
     effectful_comptime_expression: EffectfulComptimeExpression,
     effectful_expect: EffectfulExpect,
-    concurrent_loop_not_lowered: ConcurrentLoopNotLowered,
+    running_set_helper_use: RunningSetHelperUse,
     spawn_outside_plan_loop: SpawnOutsidePlanLoop,
     effectful_function_name: EffectfulFunctionName,
     annotation_only_value: AnnotationOnlyValue,
@@ -352,9 +352,10 @@ pub const EffectfulExpect = struct {
     region: base.Region,
 };
 
-/// A `for!` loop over a plan (design.md "Plans And Concurrent Loops"). It
-/// checks, but no backend compiles it yet, so the loop crashes if it runs.
-pub const ConcurrentLoopNotLowered = struct {
+/// A use of a Builtin running-set helper outside the compiler's lowering of a
+/// `for!` loop over a plan (design.md "Plans And Concurrent Loops",
+/// "Sequential lowering."). The use crashes if it runs.
+pub const RunningSetHelperUse = struct {
     region: base.Region,
 };
 

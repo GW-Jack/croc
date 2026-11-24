@@ -1566,6 +1566,10 @@ pub const IteratorDispatchOperand = union(enum) {
     interpolation_iterator,
     /// The interpolated value an interpolation appends next.
     interpolation_value,
+    /// A value a plan loop's lowering computes before a running-set helper
+    /// call: the `i`th of that call's arguments, in order (design.md "Plans
+    /// And Concurrent Loops", "Sequential lowering.").
+    plan_loop_operand: u32,
 };
 
 /// Public `IteratorDispatchCall` declaration.
@@ -1573,7 +1577,10 @@ pub const IteratorDispatchCall = struct {
     method: canonical.MethodNameId,
     dispatcher_ty: CheckedTypeId,
     callable_ty: CheckedTypeId,
-    dispatcher_arg_index: u32,
+    /// The argument whose type the method is dispatched on, or `type_only`
+    /// for a running-set helper, dispatched on its plan loop's source type,
+    /// which none of its arguments has.
+    dispatcher: StaticDispatchDispatcher,
     /// Range into `StaticDispatchPlanTable.iter_operand_pool` (transform B).
     args: artifact_serialize.Span = .{},
     /// Assigned by `resolveTotalDispatchPlans` during CheckedModule construction; the default is
@@ -1624,17 +1631,60 @@ pub const IteratorRepresentationTopology = struct {
 /// an interpolation's `iter` over an empty list and `append` over its
 /// iterator for each interpolated value.
 pub const IteratorForPlan = struct {
+    /// `flatten` for a plan loop.
     iter: IteratorDispatchCall,
-    /// `next` for a loop, `append` for an interpolation.
+    /// `next` for a loop, `run_next!` for a plan loop, `append` for an
+    /// interpolation.
     next: IteratorDispatchCall,
     item_ty: CheckedTypeId,
+    /// The iterator; a plan loop's running set.
     iterator_ty: CheckedTypeId,
     site: Site,
 
     pub const Site = union(enum) {
         for_loop: ForLoop,
         interpolation: Interpolation,
+        plan_loop: PlanLoop,
     };
+
+    /// A `for!` loop over a plan (design.md "Plans And Concurrent Loops",
+    /// "Sequential lowering."). Its `iter` is `flatten` and its `next` is
+    /// `run_next!`; the other running-set helpers are here.
+    pub const PlanLoop = struct {
+        iterable: CIR.Expr.Idx,
+        create: IteratorDispatchCall,
+        spawn: IteratorDispatchCall,
+        cancel: IteratorDispatchCall,
+        /// `flatten`'s result record.
+        flat_ty: CheckedTypeId,
+        /// Its fields, in `run_create!`'s argument order after the loop id.
+        flat_fields: [6]canonical.RecordFieldLabelId,
+        /// `run_next!`'s result: the running set and the step.
+        step_ty: CheckedTypeId,
+        arrived_tag: canonical.TagLabelId,
+        ended_tag: canonical.TagLabelId,
+    };
+
+    /// Every dispatch call of the plan, `iter` and `next` first.
+    pub fn callPtrs(self: *IteratorForPlan, buf: *[5]*IteratorDispatchCall) []*IteratorDispatchCall {
+        buf[0] = &self.iter;
+        buf[1] = &self.next;
+        switch (self.site) {
+            .for_loop, .interpolation => return buf[0..2],
+            .plan_loop => |*plan_loop| {
+                buf[2] = &plan_loop.create;
+                buf[3] = &plan_loop.spawn;
+                buf[4] = &plan_loop.cancel;
+                return buf[0..5];
+            },
+        }
+    }
+
+    /// The plan's plan-loop site; the plan is a plan loop's.
+    pub fn planLoopSite(self: IteratorForPlan) PlanLoop {
+        std.debug.assert(self.site == .plan_loop); // rationale: only a plan loop's lowering asks for its plan-loop site
+        return self.site.plan_loop;
+    }
 
     pub const ForLoop = struct {
         iterable: CIR.Expr.Idx,
@@ -1937,14 +1987,14 @@ pub const StaticDispatchPlanTable = struct {
                             .method = try names.internMethodName("iter"),
                             .dispatcher_ty = seed_list_ty,
                             .callable_ty = try checkedTypeIdForVar(allocator, module, checked_types, iter_fn_var),
-                            .dispatcher_arg_index = 0,
+                            .dispatcher = .{ .arg = 0 },
                             .args = iter_ar,
                         },
                         .next = .{
                             .method = try names.internMethodName("append"),
                             .dispatcher_ty = iterator_ty,
                             .callable_ty = try checkedTypeIdForVar(allocator, module, checked_types, append_fn_var),
-                            .dispatcher_arg_index = 0,
+                            .dispatcher = .{ .arg = 0 },
                             .args = append_ar,
                         },
                         .item_ty = try checkedTypeIdForVar(allocator, module, checked_types, item_var),
@@ -2244,6 +2294,78 @@ pub const StaticDispatchPlanTable = struct {
             const next_callable_ty = try checkedTypeIdForVar(allocator, module, checked_types, @fromBackingInt(@intCast(for_plan.next_fn_var)));
             const iterator_ty = try checkedTypeIdForVar(allocator, module, checked_types, @fromBackingInt(@intCast(for_plan.iterator_var)));
             const step_ty = try checkedTypeIdForVar(allocator, module, checked_types, @fromBackingInt(@intCast(for_plan.step_var)));
+            switch (for_plan.protocol) {
+                .iter, .stream => {},
+                .plan => {
+                    // design.md "Plans And Concurrent Loops", "Sequential
+                    // lowering.": every helper call is dispatched on the
+                    // source's type, and only `flatten` receives the source.
+                    const plan_dispatch = for_plan.plan;
+                    const source_ty = try checkedTypeIdForVar(allocator, module, checked_types, module.exprType(iterable_idx));
+                    const idents = module.identStoreConst();
+                    const plan_call = struct {
+                        fn make(
+                            alloc: Allocator,
+                            pool: *std.ArrayList(IteratorDispatchOperand),
+                            method: canonical.MethodNameId,
+                            dispatcher_ty: CheckedTypeId,
+                            callable_ty: CheckedTypeId,
+                            arity: u32,
+                        ) Allocator.Error!IteratorDispatchCall {
+                            var operands: [8]IteratorDispatchOperand = undefined;
+                            for (operands[0..arity], 0..) |*operand, i| operand.* = .{ .plan_loop_operand = @intCast(i) };
+                            return .{
+                                .method = method,
+                                .dispatcher_ty = dispatcher_ty,
+                                .callable_ty = callable_ty,
+                                .dispatcher = .type_only,
+                                .args = try pushOperands(IteratorDispatchOperand, pool, alloc, operands[0..arity]),
+                            };
+                        }
+                    };
+                    const create_fn_var: Var = @fromBackingInt(@intCast(plan_dispatch.create_fn_var));
+                    const spawn_fn_var: Var = @fromBackingInt(@intCast(plan_dispatch.spawn_fn_var));
+                    const cancel_fn_var: Var = @fromBackingInt(@intCast(plan_dispatch.cancel_fn_var));
+                    var flat_fields: [6]canonical.RecordFieldLabelId = undefined;
+                    for (plan_dispatch.flat_field_idents, &flat_fields) |ident, *field| {
+                        field.* = try names.internRecordFieldIdent(idents, @bitCast(ident));
+                    }
+                    var flatten_args = [_]IteratorDispatchOperand{.{ .checked_expr = iterable_expr }};
+                    const iterator_for_id: IteratorForPlanId = @fromBackingInt(@intCast(@as(u32, @intCast(iterator_for_plans.items.len))));
+                    try iterator_for_plans.append(allocator, .{
+                        .iter = .{
+                            .method = try names.internMethodIdent(idents, @bitCast(for_plan.iter_method_ident)),
+                            .dispatcher_ty = source_ty,
+                            .callable_ty = iter_callable_ty,
+                            .dispatcher = .{ .arg = 0 },
+                            .args = try pushOperands(IteratorDispatchOperand, &iter_operand_pool, allocator, &flatten_args),
+                        },
+                        .next = try plan_call.make(allocator, &iter_operand_pool, try names.internMethodIdent(idents, @bitCast(for_plan.next_method_ident)), source_ty, next_callable_ty, 2),
+                        .item_ty = item_ty,
+                        .iterator_ty = iterator_ty,
+                        .site = .{ .plan_loop = .{
+                            .iterable = iterable_expr,
+                            .create = try plan_call.make(allocator, &iter_operand_pool, try names.internMethodIdent(idents, @bitCast(plan_dispatch.create_method_ident)), source_ty, try checkedTypeIdForVar(allocator, module, checked_types, create_fn_var), 7),
+                            .spawn = try plan_call.make(allocator, &iter_operand_pool, try names.internMethodIdent(idents, @bitCast(plan_dispatch.spawn_method_ident)), source_ty, try checkedTypeIdForVar(allocator, module, checked_types, spawn_fn_var), 3),
+                            .cancel = try plan_call.make(allocator, &iter_operand_pool, try names.internMethodIdent(idents, @bitCast(plan_dispatch.cancel_method_ident)), source_ty, try checkedTypeIdForVar(allocator, module, checked_types, cancel_fn_var), 2),
+                            .flat_ty = try checkedTypeIdForVar(allocator, module, checked_types, @fromBackingInt(@intCast(plan_dispatch.flat_var))),
+                            .flat_fields = flat_fields,
+                            .step_ty = step_ty,
+                            .arrived_tag = try names.internTagIdent(idents, @bitCast(plan_dispatch.arrived_tag_ident)),
+                            .ended_tag = try names.internTagIdent(idents, @bitCast(plan_dispatch.ended_tag_ident)),
+                        } },
+                    });
+                    try iterator_plan_sources.append(allocator, .{
+                        .iter_dispatcher_var = module.exprType(iterable_idx),
+                        .next_dispatcher_var = module.exprType(iterable_idx),
+                        .iter_fn_var = @fromBackingInt(@intCast(for_plan.iter_fn_var)),
+                        .next_fn_var = @fromBackingInt(@intCast(for_plan.next_fn_var)),
+                        .plan_fn_vars = .{ create_fn_var, spawn_fn_var, cancel_fn_var },
+                    });
+                    try iterator_for_by_node.append(allocator, .{ .key = @backingInt(for_node_idx), .val = @backingInt(iterator_for_id) });
+                    continue;
+                },
+            }
             const step_topology = IteratorStepTopology{
                 .done_tag = try names.internTagIdent(module.identStoreConst(), @bitCast(for_plan.step_topology.done_tag_ident)),
                 .one_tag = try names.internTagIdent(module.identStoreConst(), @bitCast(for_plan.step_topology.one_tag_ident)),
@@ -2266,14 +2388,14 @@ pub const StaticDispatchPlanTable = struct {
                     .method = try names.internMethodIdent(module.identStoreConst(), @bitCast(for_plan.iter_method_ident)),
                     .dispatcher_ty = try checkedTypeIdForVar(allocator, module, checked_types, module.exprType(iterable_idx)),
                     .callable_ty = iter_callable_ty,
-                    .dispatcher_arg_index = 0,
+                    .dispatcher = .{ .arg = 0 },
                     .args = iter_ar,
                 };
                 const next_call = IteratorDispatchCall{
                     .method = try names.internMethodIdent(module.identStoreConst(), @bitCast(for_plan.next_method_ident)),
                     .dispatcher_ty = iterator_ty,
                     .callable_ty = next_callable_ty,
-                    .dispatcher_arg_index = 0,
+                    .dispatcher = .{ .arg = 0 },
                     .args = next_ar,
                 };
 
@@ -2502,6 +2624,9 @@ pub const IteratorPlanSource = struct {
     next_dispatcher_var: Var,
     iter_fn_var: Var,
     next_fn_var: Var,
+    /// A plan loop's `run_create!`, `run_spawn!` and `run_cancel!`
+    /// callables, each dispatched on `iter_dispatcher_var`; null otherwise.
+    plan_fn_vars: ?[3]Var = null,
 };
 
 /// Build-time-only outputs of `StaticDispatchPlanTable.fromModule` consumed by

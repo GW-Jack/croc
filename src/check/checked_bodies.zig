@@ -652,6 +652,13 @@ pub const CheckedBodies = struct {
         return plans.quotePlanForNode(raw_node);
     }
 
+    /// The node of the plan loop the `spawn` expression `spawn` adds its
+    /// entry to, as checking bound it; null for a `spawn` outside every plan
+    /// loop of its function, which is erroneous.
+    pub fn spawnPlanLoop(self: CheckedBodies, spawn: ExprId) ?u32 {
+        return self.env.spawnPlanLoop(@backingInt(spawn));
+    }
+
     /// A `for` expression's or statement's iterator plan. Absent before plans
     /// exist.
     pub fn iteratorForPlan(self: CheckedBodies, raw_node: u32) ?IteratorForPlanId {

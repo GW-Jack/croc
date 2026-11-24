@@ -94,9 +94,9 @@ _ = function(value)
 			(args
 				(p-assign (ident "convertible")))
 			(e-block
-				(e-dispatch-call (method "ok_or") (constraint-fn-var 270)
+				(e-dispatch-call (method "ok_or") (constraint-fn-var 278)
 					(receiver
-						(e-dispatch-call (method "to_u32_try") (constraint-fn-var 263)
+						(e-dispatch-call (method "to_u32_try") (constraint-fn-var 271)
 							(receiver
 								(e-lookup-local
 									(p-assign (ident "convertible"))))
@@ -121,7 +121,7 @@ _ = function(value)
 			(ty-lookup (name "U32") (builtin))))
 	(d-let
 		(p-underscore)
-		(e-call (constraint-fn-var 288)
+		(e-call (constraint-fn-var 296)
 			(e-lookup-local
 				(p-assign (ident "function")))
 			(e-lookup-local

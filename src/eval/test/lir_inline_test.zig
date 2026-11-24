@@ -16913,3 +16913,92 @@ test "range proving: a product guarded by a hoisted limit test overflows where t
     try std.testing.expect(proved_run.events.len >= 6);
     try expectRecordedRunsEqual(plain_run, proved_run);
 }
+
+/// A running-set helper's name, as the suffix of its procedures' debug names,
+/// and the mark its specializations carry.
+const RunningSetHelperName = struct {
+    suffix: []const u8,
+    helper: LIR.RunningSetHelper,
+};
+
+const running_set_helper_names = [_]RunningSetHelperName{
+    .{ .suffix = "run_create!", .helper = .run_create },
+    .{ .suffix = "run_next!", .helper = .run_next },
+    .{ .suffix = "run_spawn!", .helper = .run_spawn },
+    .{ .suffix = "run_cancel!", .helper = .run_cancel },
+    .{ .suffix = "run_entry!", .helper = .run_entry },
+    .{ .suffix = "run_arrived", .helper = .run_arrived },
+    .{ .suffix = "run_ended", .helper = .run_ended },
+};
+
+fn expectRunningSetHelperProcs(lowered: *const lir.CheckedPipeline.LoweredProgram) TestError!void {
+    const allocator = std.testing.allocator;
+    const store = &lowered.lir_result.store;
+    var named: [running_set_helper_names.len]usize = @splat(0);
+    var marked: [running_set_helper_names.len]usize = @splat(0);
+    for (0..store.procSpecCount()) |index| {
+        const proc_id: LIR.LirProcSpecId = @fromBackingInt(@intCast(index));
+        const mark = store.getProcSpec(proc_id).running_set_helper;
+        for (running_set_helper_names, 0..) |entry, slot| {
+            if (mark == entry.helper) marked[slot] += 1;
+        }
+        const name = store.procDebugName(proc_id) orelse continue;
+        for (running_set_helper_names, 0..) |entry, slot| {
+            if (!std.mem.endsWith(u8, name, entry.suffix)) continue;
+            named[slot] += 1;
+            try std.testing.expectEqual(entry.helper, mark);
+        }
+        if (mark != .run_next) continue;
+        // `run_next!` calls `run_entry!`, `run_arrived` and `run_ended`
+        // directly, so the task form can replace each one.
+        const callees = try collectAssignCallProcs(allocator, lowered, proc_id);
+        defer allocator.free(callees);
+        var calls_entry = false;
+        var calls_arrived = false;
+        var calls_ended = false;
+        for (callees) |callee| {
+            switch (store.getProcSpec(callee).running_set_helper) {
+                .run_entry => calls_entry = true,
+                .run_arrived => calls_arrived = true,
+                .run_ended => calls_ended = true,
+                .none, .run_create, .run_next, .run_spawn, .run_cancel => {},
+            }
+        }
+        try std.testing.expect(calls_entry);
+        try std.testing.expect(calls_arrived);
+        try std.testing.expect(calls_ended);
+    }
+    for (named, marked) |name_count, mark_count| {
+        try std.testing.expect(name_count > 0);
+        try std.testing.expectEqual(name_count, mark_count);
+    }
+}
+
+test "running-set helper specializations carry their marks, and run_next! calls run_entry!, run_arrived and run_ended directly" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\main : U64 => U64
+        \\main = |n| {
+        \\    var $sum = 0
+        \\    for! x in List.concurrently([|| n, || n + 1, || n + 2]) {
+        \\        if x == 1 {
+        \\            spawn || 4
+        \\        }
+        \\        if x == 3 {
+        \\            break
+        \\        }
+        \\        $sum = $sum + x
+        \\    }
+        \\    $sum
+        \\}
+    ;
+    // Only lambda-set specialization marks helper procedures: a `Tasks`
+    // program, whose loops the continuation pass promotes by these marks,
+    // compiles only under it.
+    for ([_]lir.CheckedPipeline.InlineMode{ .procedures, .wrappers }) |inline_mode| {
+        var lowered = try lowerModuleWithOptions(allocator, source, inline_mode, .{ .specialization_strategy = .lss });
+        defer lowered.deinit(allocator);
+        errdefer std.debug.print("running-set helper procedures: inline mode {s}\n", .{@tagName(inline_mode)});
+        try expectRunningSetHelperProcs(&lowered.lowered);
+    }
+}

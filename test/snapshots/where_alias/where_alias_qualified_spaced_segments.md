@@ -78,7 +78,7 @@ describe = |value| value.to_str()
 		(e-lambda
 			(args
 				(p-assign (ident "value")))
-			(e-dispatch-call (method "to_str") (constraint-fn-var 263)
+			(e-dispatch-call (method "to_str") (constraint-fn-var 271)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "value"))))

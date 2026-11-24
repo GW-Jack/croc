@@ -220,7 +220,7 @@ pub const Store = struct {
                     .effectful_top_level,
                     .effectful_comptime_expression,
                     .effectful_expect,
-                    .concurrent_loop_not_lowered,
+                    .running_set_helper_use,
                     .spawn_outside_plan_loop,
                     .effectful_function_name,
                     .annotation_only_value,

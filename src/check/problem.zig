@@ -113,7 +113,7 @@ pub const PolymorphicValueAnnotation = types.PolymorphicValueAnnotation;
 pub const EffectfulTopLevel = types.EffectfulTopLevel;
 pub const EffectfulComptimeExpression = types.EffectfulComptimeExpression;
 pub const EffectfulExpect = types.EffectfulExpect;
-pub const ConcurrentLoopNotLowered = types.ConcurrentLoopNotLowered;
+pub const RunningSetHelperUse = types.RunningSetHelperUse;
 pub const SpawnOutsidePlanLoop = types.SpawnOutsidePlanLoop;
 pub const EffectfulFunctionName = types.EffectfulFunctionName;
 

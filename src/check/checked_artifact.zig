@@ -15749,6 +15749,24 @@ const EvidencePass = struct {
             chain,
             policy,
         )) orelse return;
+        switch (plan.site) {
+            .for_loop, .interpolation => std.debug.assert(src.plan_fn_vars == null), // rationale: only a plan loop's source records helper callables
+            .plan_loop => |*plan_loop| {
+                const fn_vars = src.plan_fn_vars orelse unreachable; // rationale: the registry records a plan loop's helper callables with its plan
+                for ([_]*static_dispatch.IteratorDispatchCall{ &plan_loop.create, &plan_loop.spawn, &plan_loop.cancel }, fn_vars) |call, fn_var| {
+                    call.resolution = (try self.resolveObligation(
+                        src.iter_dispatcher_var,
+                        call.dispatcher_ty,
+                        call.method,
+                        null,
+                        fn_var,
+                        null,
+                        chain,
+                        policy,
+                    )) orelse return;
+                }
+            },
+        }
         self.iterator_plan_resolved[raw] = true;
     }
 
@@ -18145,9 +18163,9 @@ const CheckedTemplateRefCollector = struct {
         }
         try self.iterator_refs.append(self.allocator, plan_id);
         try self.iterator_ref_scopes.append(self.allocator, self.currentScope());
-        const plan = self.static_dispatch_plans.iterator_for_plans.items()[raw];
-        try self.pushIteratorDispatchCall(plan.iter);
-        try self.pushIteratorDispatchCall(plan.next);
+        var plan = self.static_dispatch_plans.iterator_for_plans.items()[raw];
+        var calls: [5]*static_dispatch.IteratorDispatchCall = undefined;
+        for (plan.callPtrs(&calls)) |call| try self.pushIteratorDispatchCall(call.*);
     }
 
     fn pushIteratorDispatchCall(
@@ -18156,7 +18174,7 @@ const CheckedTemplateRefCollector = struct {
     ) Allocator.Error!void {
         for (call.argsSlice(self.static_dispatch_plans)) |arg| switch (arg) {
             .checked_expr => |expr| try self.pushChild(.{ .expr = expr }),
-            .loop_iterator_state, .interpolation_seed, .interpolation_iterator, .interpolation_value => {},
+            .loop_iterator_state, .interpolation_seed, .interpolation_iterator, .interpolation_value, .plan_loop_operand => {},
         };
     }
 
@@ -18513,6 +18531,9 @@ pub const CheckedProcedureTemplate = struct {
     /// Post-check stages read the operation from here; they never recognize a
     /// low-level wrapper from its body.
     provided_low_level: ?base.LowLevel = null,
+    /// The Builtin running-set helper this template is, if it is one
+    /// (`ModuleEnv.runningSetHelperForDef`). Every specialization carries it.
+    running_set_helper: base.RunningSetHelper = .none,
     /// The scheme's dispatch obligations in canonical order (a range into
     /// `CheckedProcedureTemplateTable.evidence_params_pool`). Every
     /// specialization of this template receives one evidence entry per param.
@@ -18816,6 +18837,7 @@ pub const CheckedProcedureTemplateTable = struct {
                 else
                     .roc,
                 .provided_low_level = module.moduleEnvConst().providedLowLevelForDef(def_idx),
+                .running_set_helper = module.moduleEnvConst().runningSetHelperForDef(def_idx),
             });
         }
 
@@ -21497,7 +21519,8 @@ const ResolvedDispatchCallableSpecializer = struct {
         iterator_plan: *static_dispatch.IteratorForPlan,
         enclosing: EnclosingDispatchIdentity,
     ) Allocator.Error!void {
-        inline for (.{ &iterator_plan.iter, &iterator_plan.next }) |call| {
+        var calls: [5]*static_dispatch.IteratorDispatchCall = undefined;
+        for (iterator_plan.callPtrs(&calls)) |call| {
             switch (call.resolution) {
                 .direct_pending => |node_id| {
                     call.callable_ty = try self.specializeCallable(node_id, call.callable_ty);
@@ -34489,8 +34512,11 @@ pub const CheckedModuleArtifact = struct {
                 }
             }
         }
-        for (table.iterator_for_plans.items(), 0..) |plan, i| {
-            for ([2]static_dispatch.IteratorDispatchCall{ plan.iter, plan.next }) |call| {
+        for (table.iterator_for_plans.items(), 0..) |plan_value, i| {
+            var plan = plan_value;
+            var calls: [5]*static_dispatch.IteratorDispatchCall = undefined;
+            for (plan.callPtrs(&calls)) |call_ptr| {
+                const call = call_ptr.*;
                 switch (call.resolution) {
                     .direct_pending => return .{
                         .kind = .plan_unfinalized_direct,
@@ -39852,8 +39878,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // `serialized_layout_version` only for semantic changes the structural hash
     // cannot observe, as documented at that discriminant.
     const golden: [32]u8 = .{
-        0x39, 0x98, 0xAC, 0x39, 0xD6, 0x87, 0xF6, 0xDB, 0x91, 0x5E, 0x76, 0x51, 0x0D, 0xEE, 0xD0, 0x4C,
-        0x32, 0x10, 0x84, 0x78, 0x0E, 0x9F, 0x4C, 0xA9, 0x7A, 0x92, 0x3A, 0x4F, 0x26, 0x53, 0xED, 0xDF,
+        0xD9, 0x45, 0xF7, 0xA3, 0x54, 0x04, 0x5D, 0x51, 0xD1, 0xE9, 0xA9, 0xB5, 0x5D, 0xC9, 0xF6, 0xC1,
+        0x84, 0x69, 0x39, 0x08, 0xBF, 0xA3, 0xAE, 0xCB, 0xA9, 0x31, 0x4B, 0x86, 0x2F, 0x12, 0xB3, 0xAB,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

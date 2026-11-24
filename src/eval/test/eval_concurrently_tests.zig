@@ -16,10 +16,10 @@ pub const tests = [_]TestCase{
         \\    for entry in flat.entries {
         \\        $results = $results.append(entry())
         \\    }
-        \\    ($results, flat.marks, flat.limits, flat.root_limit)
+        \\    ($results, flat.limit_paths, flat.shielded, flat.background, flat.limits, flat.root_limit)
         \\}
         ,
-        .expected = .{ .inspect_str = "([10, 20, 30], [{ background: False, limit_path: [], shielded: False }, { background: False, limit_path: [], shielded: False }, { background: False, limit_path: [], shielded: False }], [], 0)" },
+        .expected = .{ .inspect_str = "([10, 20, 30], [[], [], []], [False, False, False], [False, False, False], [], 0)" },
     },
     .{
         .name = "Concurrently.concat puts the first plan's entries before the second's",
@@ -31,10 +31,10 @@ pub const tests = [_]TestCase{
         \\    for entry in flat.entries {
         \\        $results = $results.append(entry())
         \\    }
-        \\    ($results, flat.marks.len(), flat.root_limit)
+        \\    ($results, flat.limit_paths.len(), flat.shielded.len(), flat.background.len(), flat.root_limit)
         \\}
         ,
-        .expected = .{ .inspect_str = "([\"a\", \"b\", \"c\", \"d\"], 4, 0)" },
+        .expected = .{ .inspect_str = "([\"a\", \"b\", \"c\", \"d\"], 4, 4, 4, 0)" },
     },
     .{
         .name = "Concurrently.flatten numbers limits in preorder and paths list them outermost first",
@@ -42,7 +42,7 @@ pub const tests = [_]TestCase{
         \\{
         \\    inner = List.concurrently([|| 2.U64]).limit(1).limit(3)
         \\    flat = List.concurrently([|| 1.U64]).limit(4).concat(inner).limit(2).flatten()
-        \\    (flat.limits, flat.marks.map(|mark| mark.limit_path), flat.root_limit)
+        \\    (flat.limits, flat.limit_paths, flat.root_limit)
         \\}
         ,
         .expected = .{ .inspect_str = "([2, 4, 3, 1], [[0, 1], [0, 2, 3]], 1)" },
@@ -63,10 +63,10 @@ pub const tests = [_]TestCase{
         \\{
         \\    plain = List.concurrently([|| 1.U64])
         \\    flat = plain.concat(plain.shielded()).concat(plain.background()).concat(plain.shielded().background().limit(5)).flatten()
-        \\    flat.marks.map(|mark| (mark.shielded, mark.background, mark.limit_path))
+        \\    (flat.shielded, flat.background, flat.limit_paths)
         \\}
         ,
-        .expected = .{ .inspect_str = "[(False, False, []), (True, False, []), (False, True, []), (True, True, [0])]" },
+        .expected = .{ .inspect_str = "([False, True, False, True], [False, False, True, True], [[], [], [], [0]])" },
     },
     .{
         .name = "Concurrently.limit crashes on a limit of zero",

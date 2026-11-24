@@ -129,7 +129,7 @@ NO CHANGE
 		(e-block
 			(s-let
 				(p-applied-tag)
-				(e-call (constraint-fn-var 290)
+				(e-call (constraint-fn-var 298)
 					(e-lookup-external
 						(builtin))
 					(e-list
@@ -144,7 +144,7 @@ NO CHANGE
 		(e-block
 			(s-let
 				(p-applied-tag)
-				(e-call (constraint-fn-var 313)
+				(e-call (constraint-fn-var 321)
 					(e-lookup-external
 						(builtin))
 					(e-list
@@ -160,7 +160,7 @@ NO CHANGE
 			(e-block
 				(s-let
 					(p-applied-tag)
-					(e-call (constraint-fn-var 331)
+					(e-call (constraint-fn-var 339)
 						(e-lookup-external
 							(builtin))
 						(e-list
@@ -177,7 +177,7 @@ NO CHANGE
 			(e-block
 				(s-let
 					(p-applied-tag)
-					(e-call (constraint-fn-var 356)
+					(e-call (constraint-fn-var 364)
 						(e-lookup-external
 							(builtin))
 						(e-list

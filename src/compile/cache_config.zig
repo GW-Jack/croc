@@ -447,7 +447,9 @@ pub const Constants = struct {
     /// 209: common idents include `Builtin.Concurrently`, and for-loop dispatch
     /// plans record the loop protocol.
     /// 210: canonical IR has the `spawn` expression and its diagnostic.
-    pub const CACHE_VERSION = 210;
+    /// 211: module environments record the Builtin running-set helper
+    /// definitions, each `spawn`'s plan loop, and plan loops' dispatch.
+    pub const CACHE_VERSION = 211;
 };
 
 /// Configuration for the Roc cache system.

@@ -34082,20 +34082,23 @@ exit: cancel_group(g); repeat next(g) until Ended, dropping what arrives
   `break`, `return`, `?`, and a `break` or `return` from a loop nested in the
   body.
 - `spawn f` is `spawn_in(g, f)`.
-- `entry_call : (() => a) => a` is a procedure Monotype makes for the loop.
-  It calls one entry, and it is the only place the entries' lambda set is
-  dispatched.
+- `entry_call : (() => a) => a` is the Builtin helper `run_entry!`
+  (Sequential lowering). It calls one entry, and it is the only place the
+  entries' lambda set is dispatched.
 
-**Helper marks.** Every LIR specialization of a Builtin running-set helper
-records which helper it is in `LirProcSpec.running_set_helper`: `run_create`,
-`run_next`, `run_spawn`, `run_cancel`, `run_entry`, `run_arrived` or
-`run_ended`, and `none` for every other procedure. The sequential `run_next!`
-builds its result through `run_arrived` and `run_ended`, and the task form
-calls them where a result arrives and where the loop ends. LIR construction sets it from the helper's Builtin
-declaration; every copy of a procedure keeps it, and so do LIR images and the
+**Helper marks.** Under the Monotype strategy, every LIR specialization of a
+Builtin running-set helper records which helper it is in
+`LirProcSpec.running_set_helper`: `run_create`, `run_next`, `run_spawn`,
+`run_cancel`, `run_entry`, `run_arrived` or `run_ended`, and `none` for
+every other procedure. The sequential `run_next!` builds its result through
+`run_arrived` and `run_ended`, and the task form calls them where a result
+arrives and where the loop ends. LIR construction sets it from the helper's
+Builtin declaration; every copy of a procedure keeps it, and so do LIR images and the
 native cache. The continuation pass finds a loop's operations by this mark
 and the loop id each call passes first, never by a name or by a body's
-shape.
+shape. Boxy marks no procedure: it lowers every plan loop sequentially and
+no Boxy program reaches promotion, since the CLI rejects a `Tasks` platform
+under `--specialize=no`, so no pass reads a mark in a Boxy program.
 
 Each operation carries explicit `RcEffect` data, which ARC reads like any
 other operation's:
@@ -34152,6 +34155,56 @@ destination. The operations:
   it when the limit has room;
 - `cancel_group` drops the entries that haven't started, and cancels the
   running ones unless they are shielded and have begun.
+
+**Sequential lowering.** Both lowering strategies lower a `for!` loop over a
+plan to calls of `Concurrently.flatten` and of the running-set helpers, the
+`run_` methods of `Concurrently`, which only the compiler may call: user
+code that calls or names one is a type error. The running set is the opaque
+`Concurrently.Running(item)`:
+
+```text
+flatten     : Concurrently(item) -> { entries, limit_paths, shielded, background, limits, root_limit }
+run_create! : U64, List(() => item), List(List(U64)), List(Bool), List(Bool), List(U64), U64 => Running(item)
+run_next!   : U64, Running(item) => (Running(item), [Arrived(item), Ended])
+run_spawn!  : U64, Running(item), (() => item) => Running(item)
+run_cancel! : U64, Running(item) => Running(item)
+run_entry!  : (() => item) => item
+run_arrived : Running(item), item -> (Running(item), [Arrived(item), Ended])
+run_ended   : Running(item) -> (Running(item), [Arrived(item), Ended])
+```
+
+`flatten` lists the entries with one mark per entry in parallel lists. The
+loop binds its fields, creates the running set with `run_create!`, and loops
+on `run_next!`: `(r, Arrived(x))` runs the body with `x` and `r` as the
+running set, `(r, Ended)` leaves the loop and drops `r`. The running set is
+the loop's first carried value; it lives only in the loop's locals and in
+loop and join parameters. `spawn f` is `run_spawn!(id, running, f)`, whose
+result becomes the loop's running set, so a `spawn` inside a nested `for`,
+`while`, `if` or `match` carries it out the way a reassigned `var` is
+carried. Every edge out of the body other than a crash or a normal `Ended`
+runs the loop's exit sequence: `run_cancel!`, then `run_next!` until it
+reports `Ended`, dropping what arrives. A `return` or `?` that leaves
+several plan loops runs their exit sequences innermost first. `run_next!`
+calls `run_entry!` on the entry it starts and builds every result with
+`run_arrived` or `run_ended` directly, and no helper is inlined, so the task
+form can replace each one. The sequential helpers ignore the limits, the
+shield and the loop id, and accept an all-empty `run_create!` with root
+limit 0.
+
+Each of a loop's calls passes the loop id first as a local bound to an
+integer literal in the procedure holding the loop, a fresh local per call.
+Monotype mints it as the owning specialization's reserved function id
+shifted left 32 bits, or'd with the loop's index among the plan loops that
+specialization's body lowers, so it is deterministic and unique per source
+loop and owning specialization. Ids stay unique within a procedure after
+inlining: SolvedInline inlines a body only at its single call site, since a
+wrapper can't own a loop and the single-use rules need exactly one call site,
+and the copies of a specialization that lambda-set instances make become
+separate procedures. The id may reach a call through copies of its literal
+local; the LIR checks follow them back to the literal. The Boxy strategy lowers every plan loop
+sequentially; it compiles no `Tasks` program, since the CLI rejects a
+`Tasks` platform under `--specialize=no`, so no Boxy loop's entries can
+suspend.
 
 **The library.** Each of these is ordinary Builtin Roc written with a
 concurrent loop, so it gets both forms:

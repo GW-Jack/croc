@@ -173,8 +173,18 @@ pub fn forEachForLoopDispatchTypeRoot(plan: ModuleEnv.ForLoopDispatchPlan, visit
     try visitor.visit(@fromBackingInt(@intCast(plan.step_var)));
     try visitor.visit(@fromBackingInt(@intCast(plan.iter_fn_var)));
     try visitor.visit(@fromBackingInt(@intCast(plan.next_fn_var)));
-    try visitor.visit(@fromBackingInt(@intCast(plan.step_topology.one_payload_var)));
-    try visitor.visit(@fromBackingInt(@intCast(plan.step_topology.skip_payload_var)));
+    switch (plan.protocol) {
+        .iter, .stream => {
+            try visitor.visit(@fromBackingInt(@intCast(plan.step_topology.one_payload_var)));
+            try visitor.visit(@fromBackingInt(@intCast(plan.step_topology.skip_payload_var)));
+        },
+        .plan => {
+            try visitor.visit(@fromBackingInt(@intCast(plan.plan.create_fn_var)));
+            try visitor.visit(@fromBackingInt(@intCast(plan.plan.spawn_fn_var)));
+            try visitor.visit(@fromBackingInt(@intCast(plan.plan.cancel_fn_var)));
+            try visitor.visit(@fromBackingInt(@intCast(plan.plan.flat_var)));
+        },
+    }
 }
 
 /// The roots of every literal conversion that dispatches to a custom or

@@ -2145,8 +2145,9 @@ pub const LirProcSpec = struct {
     /// body's producer commits it. `SuspensionMarks` computes it for every
     /// procedure with a body.
     suspends: Suspends = .never,
-    /// Set by LIR construction on every specialization of a running-set
-    /// helper, and kept by every copy of the procedure.
+    /// Set by Monotype's LIR construction on every specialization of a
+    /// running-set helper, and kept by every copy of the procedure. Boxy
+    /// sets none (design.md "Plans And Concurrent Loops", "Helper marks.").
     running_set_helper: RunningSetHelper = .none,
     /// Tail-recursion rewrite applied by the TRMC pass, if any.
     tail_transform: TailTransform = .none,

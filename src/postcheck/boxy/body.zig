@@ -116,9 +116,11 @@ pub const Task = union(enum) {
     /// Crash with a checked runtime error, whose value is of this type, or
     /// of no type when the checker gave it the erroneous type.
     runtime_error: ?TypeId,
-    /// Crash as a `spawn` does, once its operand has evaluated: no backend
-    /// compiles the plan loop it adds to yet. Its value is of this type.
-    spawn_not_supported: TypeId,
+    /// Pop a `spawn`'s operand and add it to plan loop `loop`'s running set
+    /// (design.md "Plans And Concurrent Loops", "Sequential lowering.").
+    finish_spawn: struct { loop: u32 },
+    /// Jump to plan loop `loop`'s head `head` with its current running set.
+    plan_loop_continue: struct { head: LIR.JoinPointId, loop: u32 },
     /// Pop the arguments of a call to `callee` and call it.
     /// `adapt` is set for a callee storing record fields of its signature
     /// in presence slots: the types its scheme takes and the arguments'.
@@ -313,7 +315,29 @@ comptime {
 
 /// A loop being lowered: its exit join, and whether anything leaves through
 /// it (a failed condition, or a break).
-pub const LoopExit = struct { join: LIR.JoinPointId, reached: bool };
+pub const LoopExit = struct {
+    join: LIR.JoinPointId,
+    reached: bool,
+    /// What a plan loop's `spawn`s and exit sequences read; null for any
+    /// other loop.
+    plan: ?PlanLoopExit = null,
+};
+
+/// A plan loop's id, plan and types (design.md "Plans And Concurrent
+/// Loops", "Sequential lowering.").
+pub const PlanLoopExit = struct {
+    loop: u32,
+    id: u64,
+    plan: static_dispatch.IteratorForPlanId,
+    running_ty: TypeId,
+    step_ty: TypeId,
+};
+
+/// A plan loop carries its running set under the loop's own node, which
+/// names no pattern, so the binder never collides with a source binder.
+fn planLoopBinder(loop: u32) BinderId {
+    return @fromBackingInt(loop);
+}
 
 /// A value a pattern tests, with the value's type.
 pub const PatternItem = struct { pattern: PatternId, value: LocalId, ty: TypeId };
@@ -703,6 +727,9 @@ pub const Builder = struct {
     merges: std.ArrayList(Merge) = .empty,
     /// The exit joins of the loops being lowered, innermost last.
     loops: std.ArrayList(LoopExit) = .empty,
+    /// Plan loops lowered in this body so far; each takes the next count as
+    /// its index in its loop id.
+    plan_loop_count: u32 = 0,
     next_join: u32 = 0,
     values: std.ArrayList(LocalId) = .empty,
     /// The static data slots of the stored values being restored as parts
@@ -3384,7 +3411,11 @@ pub const Builder = struct {
             },
             .discard => _ = self.popValue(),
             .runtime_error => |ty| try self.runtimeErrorValue(ty),
-            .spawn_not_supported => |ty| try self.crashValue("spawn is not supported yet", ty),
+            .finish_spawn => |spawn| try self.finishSpawn(spawn.loop),
+            .plan_loop_continue => |cont| if (self.hole != null) {
+                const current = self.binders.get(planLoopBinder(cont.loop)) orelse invariant("a plan loop's running set was absent at its continue edge");
+                try self.emitJump(cont.head, current);
+            },
             .retag => |retag| {
                 const value = self.popValue();
                 try self.pushValue(try self.retagValue(value, retag.from, retag.to));
@@ -3476,6 +3507,12 @@ pub const Builder = struct {
                 const value = self.popValue();
                 // Every branch of a construct in tail position returned.
                 if (self.hole == null) return;
+                // A return leaves every plan loop it is in, innermost first.
+                var loop_index = self.loops.items.len;
+                while (loop_index > 0) {
+                    loop_index -= 1;
+                    if (self.loops.items[loop_index].plan) |exit| try self.emitPlanLoopExit(exit);
+                }
                 if (self.result_local) |result| {
                     // An immediately returned call or constructor writes
                     // straight into the caller's result storage.
@@ -4223,18 +4260,16 @@ pub const Builder = struct {
                 try self.pushValue(local);
             },
             .ellipsis => try self.crashValue("not implemented", try self.exprType(expr_id)),
-            // No backend compiles a plan loop yet, so no `spawn` runs
-            // (design.md "Plans And Concurrent Loops"): it evaluates its
-            // operand and crashes.
             .spawn => |operand| {
-                try self.push(.{ .spawn_not_supported = try self.exprType(expr_id) });
-                try self.push(.discard);
+                const loop = self.bodies().spawnPlanLoop(expr_id) orelse invariant("a spawn outside every plan loop reached Boxy lowering without being rejected");
+                try self.push(.{ .finish_spawn = .{ .loop = loop } });
                 try self.push(.{ .expr = operand });
             },
             .break_ => {
                 if (self.loops.items.len == 0) invariant("a break outside every loop reached Boxy lowering");
                 const loop = &self.loops.items[self.loops.items.len - 1];
                 loop.reached = true;
+                if (loop.plan) |exit| try self.emitPlanLoopExit(exit);
                 try self.emitJump(loop.join, null);
                 try self.push(.{ .unreachable_value = try self.exprType(expr_id) });
             },
@@ -10943,6 +10978,7 @@ pub const Builder = struct {
                 if (self.loops.items.len == 0) invariant("a break outside every loop reached Boxy lowering");
                 const loop = &self.loops.items[self.loops.items.len - 1];
                 loop.reached = true;
+                if (loop.plan) |exit| try self.emitPlanLoopExit(exit);
                 try self.emitJump(loop.join, null);
             },
             .expr => |expr| {
@@ -11038,6 +11074,11 @@ pub const Builder = struct {
     pub fn forStart(self: *Builder, loop_node: u32, pattern: PatternId, body: ExprId, plan_id: static_dispatch.IteratorForPlanId) Allocator.Error!void {
         const table = self.view.view.static_dispatch_plans;
         const plan = table.iterator_for_plans.items()[@backingInt(plan_id)];
+        switch (plan.site) {
+            .plan_loop => return self.planLoopStart(loop_node, pattern, body, plan_id),
+            .for_loop => {},
+            .interpolation => invariant("a for loop's iterator plan was an interpolation's"),
+        }
         const iterable = self.popValue();
         const iterator_ty = try self.convert(plan.iterator_ty);
         const for_site = plan.forLoopSite();
@@ -11092,6 +11133,156 @@ pub const Builder = struct {
         try self.push(.{ .push_value = rest.value });
         try self.push(.discard);
         try self.push(.{ .expr = body });
+    }
+
+    /// `for! pattern in plan { body }` (design.md "Plans And Concurrent
+    /// Loops", "Sequential lowering."): `flatten`, `run_create!`, then a
+    /// loop carrying the running set that calls `run_next!` and runs the body
+    /// on `Arrived`.
+    fn planLoopStart(self: *Builder, loop_node: u32, pattern: PatternId, body: ExprId, plan_id: static_dispatch.IteratorForPlanId) Allocator.Error!void {
+        const plan = self.view.view.static_dispatch_plans.iterator_for_plans.items()[@backingInt(plan_id)];
+        const site = plan.planLoopSite();
+        const iterable = self.popValue();
+        const flat_ty = try self.convert(site.flat_ty);
+        const step_ty = try self.convert(site.step_ty);
+        const running_ty = (try self.planStepTypes(step_ty)).running;
+        // Unique per source loop and owning worker: the worker, then the
+        // loop's index among the plan loops its body lowers.
+        const id = (@as(u64, @backingInt(self.worker_id)) << 32) | self.plan_loop_count;
+        self.plan_loop_count += 1;
+
+        const flat = try self.emitDispatch(plan.iter.resolution, plan.iter.callable_ty, &.{iterable}, flat_ty);
+        const names = self.view.nameStore();
+        var create_args: [7]LocalId = undefined;
+        create_args[0] = try self.planLoopIdLocal(id);
+        for (site.flat_fields, create_args[1..]) |label, *arg| {
+            const name = try self.program.store.internName(names.recordFieldLabelText(label));
+            arg.* = (try self.recordFieldValue(flat, flat_ty, name)).value;
+        }
+        const created = try self.emitDispatch(site.create.resolution, site.create.callable_ty, &create_args, running_ty);
+
+        const binders = try self.bodies().loopMutationBinders(loop_node);
+        const exit_merge = try self.beginMerge(binders, .joined);
+        const head_merge = try self.beginMerge(binders, .joined);
+        const exit = self.freshJoin();
+        const head = self.freshJoin();
+        const state = try self.localOf(running_ty, .frame);
+        const after = try self.declareMergeJoin(exit, null, exit_merge);
+        const head_body = try self.declareMergeJoin(head, state, head_merge);
+        try self.emitJump(head, created);
+        self.store.shapes.loop = true;
+
+        self.hole = head_body;
+        if (head_merge) |m| try self.enterMerge(m);
+        const next_id = try self.planLoopIdLocal(id);
+        const step_value = try self.emitDispatch(plan.next.resolution, plan.next.callable_ty, &.{ next_id, state }, step_ty);
+        const parts = try self.planStepParts(step_value, step_ty);
+        const arrived = try self.program.store.internName(names.tagLabelText(site.arrived_tag));
+        const ended = try self.program.store.internName(names.tagLabelText(site.ended_tag));
+
+        // Ended: leave the loop, dropping the running set.
+        const arrived_hole = try self.newHole();
+        try self.branchOnTag(parts.tag, parts.tag_ty, ended, arrived_hole);
+        try self.emitJump(exit, null);
+        // Arrived: bind the item and the running set, run the body, continue
+        // with the running set the body leaves.
+        self.hole = arrived_hole;
+        const item = try self.tagPayloadValue(parts.tag, parts.tag_ty, arrived, 0);
+        try self.binders.put(self.allocator, planLoopBinder(loop_node), parts.running);
+        try self.bindIrrefutable(pattern, item.value, item.ty);
+        try self.loops.append(self.allocator, .{ .join = exit, .reached = true, .plan = .{
+            .loop = loop_node,
+            .id = id,
+            .plan = plan_id,
+            .running_ty = running_ty,
+            .step_ty = step_ty,
+        } });
+        try self.push(.end_loop);
+        if (exit_merge) |m| try self.push(.{ .enter_merge = m });
+        try self.push(.{ .resume_at = after });
+        try self.push(.{ .plan_loop_continue = .{ .head = head, .loop = loop_node } });
+        try self.push(.discard);
+        try self.push(.{ .expr = body });
+    }
+
+    const PlanStepTypes = struct { tuple: TypeId, running: TypeId, tag: TypeId };
+
+    /// `run_next!`'s result type: the running set and the step tag union.
+    fn planStepTypes(self: *Builder, step_ty: TypeId) Allocator.Error!PlanStepTypes {
+        const tuple_ty = try self.structuralType(step_ty);
+        const elems = switch (self.program.store.get(tuple_ty)) {
+            .tuple => |span| self.program.store.span(span),
+            .primitive, .empty_record, .record, .tag_union, .list, .box, .nominal, .function, .variable => invariant("run_next!'s result is not a tuple"),
+        };
+        if (elems.len != 2) invariant("run_next!'s result is not a running set and step pair");
+        return .{ .tuple = tuple_ty, .running = elems[0], .tag = elems[1] };
+    }
+
+    const PlanStepParts = struct { running: LocalId, tag: LocalId, tag_ty: TypeId };
+
+    fn planStepParts(self: *Builder, step_value: LocalId, step_ty: TypeId) Allocator.Error!PlanStepParts {
+        const types_ = try self.planStepTypes(step_ty);
+        return .{
+            .running = try self.readField(types_.tuple, step_value, 0, types_.running),
+            .tag = try self.readField(types_.tuple, step_value, 1, types_.tag),
+            .tag_ty = types_.tag,
+        };
+    }
+
+    /// Bind a fresh local to the literal loop id; every running-set helper
+    /// call takes its own.
+    fn planLoopIdLocal(self: *Builder, id: u64) Allocator.Error!LocalId {
+        const local = try self.closedLocal(.u64);
+        try self.emitLinear(.{ .assign_literal = .{ .target = local, .value = .{ .i64_literal = .{ .value = @bitCast(id), .layout_idx = .u64 } }, .next = undefined } });
+        return local;
+    }
+
+    /// A plan loop's exit sequence: `run_cancel!` on its current running
+    /// set, then `run_next!` until it reports `Ended`, dropping what
+    /// arrives.
+    fn emitPlanLoopExit(self: *Builder, exit: PlanLoopExit) Allocator.Error!void {
+        const plan = self.view.view.static_dispatch_plans.iterator_for_plans.items()[@backingInt(exit.plan)];
+        const site = plan.planLoopSite();
+        const current = self.binders.get(planLoopBinder(exit.loop)) orelse invariant("a plan loop exit reached lowering without the loop's running set");
+        const cancel_id = try self.planLoopIdLocal(exit.id);
+        const cancelled = try self.emitDispatch(site.cancel.resolution, site.cancel.callable_ty, &.{ cancel_id, current }, exit.running_ty);
+        const drain_exit = self.freshJoin();
+        const drain_head = self.freshJoin();
+        const state = try self.localOf(exit.running_ty, .frame);
+        const after = try self.declareMergeJoin(drain_exit, null, null);
+        const head_body = try self.declareMergeJoin(drain_head, state, null);
+        try self.emitJump(drain_head, cancelled);
+        self.hole = head_body;
+        const next_id = try self.planLoopIdLocal(exit.id);
+        const step_value = try self.emitDispatch(plan.next.resolution, plan.next.callable_ty, &.{ next_id, state }, exit.step_ty);
+        const parts = try self.planStepParts(step_value, exit.step_ty);
+        const ended = try self.program.store.internName(self.view.nameStore().tagLabelText(site.ended_tag));
+        const arrived_hole = try self.newHole();
+        try self.branchOnTag(parts.tag, parts.tag_ty, ended, arrived_hole);
+        try self.emitJump(drain_exit, null);
+        self.hole = arrived_hole;
+        try self.emitJump(drain_head, parts.running);
+        self.hole = after;
+    }
+
+    /// `spawn f`: `run_spawn!` on its plan loop's current running set, whose
+    /// result becomes the loop's running set.
+    fn finishSpawn(self: *Builder, loop: u32) Allocator.Error!void {
+        const entry = self.popValue();
+        if (self.hole != null) {
+            const exit = for (0..self.loops.items.len) |offset| {
+                const candidate = self.loops.items[self.loops.items.len - 1 - offset].plan orelse continue;
+                if (candidate.loop == loop) break candidate;
+            } else invariant("a spawn reached Boxy lowering outside the plan loop checking bound it to");
+            const plan = self.view.view.static_dispatch_plans.iterator_for_plans.items()[@backingInt(exit.plan)];
+            const site = plan.planLoopSite();
+            const current = self.binders.get(planLoopBinder(loop)) orelse invariant("a spawn reached Boxy lowering without its plan loop's running set");
+            const id = try self.planLoopIdLocal(exit.id);
+            const running = try self.emitDispatch(site.spawn.resolution, site.spawn.callable_ty, &.{ id, current, entry }, exit.running_ty);
+            try self.binders.put(self.allocator, planLoopBinder(loop), running);
+        }
+        // A `spawn`'s value is `{}`.
+        try self.pushValue(if (self.hole != null) try self.unitValue() else try self.closedLocal(.zst));
     }
 
     /// Continue at the next statement when `value` (of `ty`) holds tag

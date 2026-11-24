@@ -383,12 +383,12 @@ written_method = written.foo()
 			(e-block
 				(s-type-var-alias (alias "A") (type-var "a")
 					(ty-rigid-var (name "a")))
-				(e-dispatch-call (method "encode") (constraint-fn-var 318)
+				(e-dispatch-call (method "encode") (constraint-fn-var 326)
 					(receiver
-						(e-call (constraint-fn-var 317)
+						(e-call (constraint-fn-var 325)
 							(e-lookup-local
 								(p-assign (ident "f")))
-							(e-type-dispatch-call (method "d") (type-dispatch-stmt 21) (constraint-fn-var 313)
+							(e-type-dispatch-call (method "d") (type-dispatch-stmt 21) (constraint-fn-var 321)
 								(args
 									(e-num (value "41"))))))
 					(args))))
@@ -410,12 +410,12 @@ written_method = written.foo()
 						(ty-lookup (name "I64") (builtin)))))))
 	(d-let
 		(p-assign (ident "materialized"))
-		(e-call (constraint-fn-var 331)
+		(e-call (constraint-fn-var 339)
 			(e-runtime-error (tag "erroneous_value_expr"))
 			(e-lambda
 				(args
 					(p-assign (ident "n")))
-				(e-dispatch-call (method "plus") (constraint-fn-var 329)
+				(e-dispatch-call (method "plus") (constraint-fn-var 337)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "n"))))

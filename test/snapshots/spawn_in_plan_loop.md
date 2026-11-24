@@ -38,34 +38,9 @@ Loops := [].{
 }
 ~~~
 # EXPECTED
-CONCURRENT LOOP NOT SUPPORTED YET - spawn_in_plan_loop.md:5:3:10:4
-CONCURRENT LOOP NOT SUPPORTED YET - spawn_in_plan_loop.md:17:3:28:4
+NIL
 # PROBLEMS
-~~~clojure
-(reports
-	(report
-		(severity runtime_error)
-		(title "Concurrent Loop Not Supported Yet")
-		(region (start 5 3) (end 10 4))
-		(headline
-			(reflow "This `for!` loop runs a plan, and this compiler can't compile concurrent loops yet."))
-		(document
-			(source-region (file "spawn_in_plan_loop.md") (start 5 3) (end 10 4) (annotation error) (line-text "\t\tfor! x in List.concurrently(fs) {\n\t\t\tspawn f\n\t\t\tspawn || f()\n\t\t\tspawn (f)\n\t\t\t$sum = $sum + x\n\t\t}"))
-			(line-break)
-			(line-break)
-			(reflow "The loop crashes if it runs.")))
-	(report
-		(severity runtime_error)
-		(title "Concurrent Loop Not Supported Yet")
-		(region (start 17 3) (end 28 4))
-		(headline
-			(reflow "This `for!` loop runs a plan, and this compiler can't compile concurrent loops yet."))
-		(document
-			(source-region (file "spawn_in_plan_loop.md") (start 17 3) (end 28 4) (annotation error) (line-text "\t\tfor! x in List.concurrently(fs) {\n\t\t\tfor r in results {\n\t\t\t\tmatch r {\n\t\t\t\t\tOk(v) => spawn make(v)\n\t\t\t\t\tErr(_) => {}\n\t\t\t\t}\n\t\t\t}\n\t\t\tif x > 10 {\n\t\t\t\tspawn make(x)\n\t\t\t}\n\t\t\t$sum = $sum + x\n\t\t}"))
-			(line-break)
-			(line-break)
-			(reflow "The loop crashes if it runs."))))
-~~~
+NIL
 # TOKENS
 ~~~zig
 UpperIdent,OpColonEqual,OpenSquare,CloseSquare,Dot,OpenCurly,
@@ -243,7 +218,7 @@ NO CHANGE
 					(e-num (value "0")))
 				(s-for-bang
 					(p-assign (ident "x"))
-					(e-call (constraint-fn-var 385)
+					(e-call (constraint-fn-var 393)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local
@@ -260,7 +235,7 @@ NO CHANGE
 										(capture (ident "f")))
 									(e-lambda
 										(args)
-										(e-call (constraint-fn-var 400)
+										(e-call (constraint-fn-var 532)
 											(e-lookup-local
 												(p-assign (ident "f"))))))))
 						(s-expr
@@ -269,7 +244,7 @@ NO CHANGE
 									(p-assign (ident "f")))))
 						(s-reassign
 							(p-var-assign (ident "$sum"))
-							(e-dispatch-call (method "plus") (constraint-fn-var 405)
+							(e-dispatch-call (method "plus") (constraint-fn-var 537)
 								(receiver
 									(e-lookup-local
 										(p-var-assign (ident "$sum"))))
@@ -301,7 +276,7 @@ NO CHANGE
 					(e-num (value "0")))
 				(s-for-bang
 					(p-assign (ident "x"))
-					(e-call (constraint-fn-var 429)
+					(e-call (constraint-fn-var 561)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local
@@ -325,7 +300,7 @@ NO CHANGE
 															(p-applied-tag)))
 													(value
 														(e-spawn
-															(e-call (constraint-fn-var 490)
+															(e-call (constraint-fn-var 693)
 																(e-lookup-local
 																	(p-assign (ident "make")))
 																(e-lookup-local
@@ -341,7 +316,7 @@ NO CHANGE
 							(e-if
 								(if-branches
 									(if-branch
-										(e-dispatch-call (method "is_gt") (constraint-fn-var 500)
+										(e-dispatch-call (method "is_gt") (constraint-fn-var 703)
 											(receiver
 												(e-lookup-local
 													(p-assign (ident "x"))))
@@ -349,7 +324,7 @@ NO CHANGE
 												(e-num (value "10"))))
 										(e-block
 											(e-spawn
-												(e-call (constraint-fn-var 504)
+												(e-call (constraint-fn-var 707)
 													(e-lookup-local
 														(p-assign (ident "make")))
 													(e-lookup-local
@@ -358,7 +333,7 @@ NO CHANGE
 									(e-empty_record))))
 						(s-reassign
 							(p-var-assign (ident "$sum"))
-							(e-dispatch-call (method "plus") (constraint-fn-var 405)
+							(e-dispatch-call (method "plus") (constraint-fn-var 537)
 								(receiver
 									(e-lookup-local
 										(p-var-assign (ident "$sum"))))

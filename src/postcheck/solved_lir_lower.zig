@@ -438,7 +438,7 @@ const FnEntry = struct {
 };
 
 comptime {
-    std.debug.assert(@sizeOf(FnEntry) == 552);
+    std.debug.assert(@sizeOf(FnEntry) == 556);
 }
 
 const LoweredFnBody = struct {
@@ -3145,6 +3145,22 @@ const Lowerer = struct {
         return if (suspending) .may else .never;
     }
 
+    /// The running-set helper mark of a procedure lowered from `source`
+    /// (design.md "Plans And Concurrent Loops", "Helper marks.").
+    fn runningSetHelperForSource(source: ?Mono.FnTemplate) LIR.RunningSetHelper {
+        const template = source orelse return .none;
+        return switch (template.running_set_helper) {
+            .none => .none,
+            .run_create => .run_create,
+            .run_next => .run_next,
+            .run_spawn => .run_spawn,
+            .run_cancel => .run_cancel,
+            .run_entry => .run_entry,
+            .run_arrived => .run_arrived,
+            .run_ended => .run_ended,
+        };
+    }
+
     /// `fn_id`'s own function type at instance `env`.
     fn ownFnType(self: *const Lowerer, fn_id: Lifted.FnId, env: Env) Ref {
         const solved_fn_ty = self.resolveRef(.{ .ty = self.solved.fn_tys.items[@backingInt(fn_id)], .env = env });
@@ -3297,6 +3313,7 @@ const Lowerer = struct {
             .abi = if (spec.abi == .erased) .erased_callable else .roc,
             .hosted = .of(try self.hostedProcForSource(source_fn.source)),
             .suspends = suspendsForSource(source_fn.source),
+            .running_set_helper = runningSetHelperForSource(source_fn.source),
             .code_key = code_key,
             .stack_probe = self.stackProbeForProc(args_span, LIR.LocalSpan.empty(), ret_layout),
         }, proc_loc);

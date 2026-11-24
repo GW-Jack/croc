@@ -4727,6 +4727,7 @@ const TaskStorage = struct {
     hosted_evidence: BoxPool(BodyContext.HostedEvidenceTask) = .{},
     loops: BoxPool(BodyContext.LoopTask) = .{},
     iterator_dispatches: BoxPool(BodyContext.IteratorDispatchTask) = .{},
+    spawns: BoxPool(BodyContext.SpawnTask) = .{},
     nominals: BoxPool(BodyContext.InstNominalTask) = .{},
     declared_orders: BoxPool(BodyContext.InstDeclaredOrderTask) = .{},
     decl_backings: BoxPool(BodyContext.InstDeclBackingTask) = .{},
@@ -4776,7 +4777,13 @@ const NestedRelationBase = struct {
     variables: std.ArrayList(InstantiatedVariable) = .empty,
 
     fn relate(self: *NestedRelationBase, entry: BinderMap.Entry) Allocator.Error!void {
-        try self.ctx.constrainCheckedInterfaceToCell(checkedBinderType(self.ctx.view, entry.binder), self.ctx.localTypeCell(entry.local));
+        // A plan loop's running set is bound under the loop's node, which is
+        // no pattern and has no binder type. No source name reads it, so no
+        // nested function captures it and it has no relation to make
+        // (design.md "Plans And Concurrent Loops", "Sequential lowering.").
+        if (self.ctx.view.bodies.iteratorForPlan(@backingInt(entry.binder)) == null) {
+            try self.ctx.constrainCheckedInterfaceToCell(checkedBinderType(self.ctx.view, entry.binder), self.ctx.localTypeCell(entry.local));
+        }
         try self.related.put(entry.binder, entry.local);
     }
 };
@@ -9396,6 +9403,7 @@ const Builder = struct {
             std.debug.print("CENSUS_UNKEYED\t{s}\t{s}{d}\t{s}\n", .{ name, where, position, @tagName(spec_identity.callable) });
         }
         fn_template.provided_low_level = .of(template.provided_low_level);
+        fn_template.running_set_helper = template.running_set_helper;
         if (template.target != .hosted and !try self.monoFnTypeMentionsFunction(lower_fn_ty)) {
             const key = Ast.specIdentityKey(spec_identity);
             fn_template.spec_key = key;
@@ -19388,6 +19396,10 @@ const BodyDraftStore = struct {
     /// one; a commit after that specialization was upgraded treats the whole
     /// draft as evaluation demand.
     demand_owner: ?Ast.FnId = null,
+    /// Plan loops lowered in this draft so far; each takes the next count
+    /// as its index in its loop id (design.md "Plans And Concurrent Loops",
+    /// "Sequential lowering.").
+    plan_loop_count: u32 = 0,
     /// Depth of the literal-conversion lowerings in progress. A literal
     /// root's conversion runs during compile-time evaluation, so every
     /// request made while lowering it is an evaluation request.
@@ -21988,6 +22000,9 @@ const ActiveReturnTarget = struct {
     cell: DraftTypeCell,
     /// The lambda's result, which every return of the lambda names.
     output: DraftReturnTargetId,
+    /// How many loop contexts enclose the lambda: a return leaves the plan
+    /// loops above this floor, each through its exit sequence.
+    loop_floor: usize,
 };
 
 const ActiveConstBindingId = enum(u32) { _ };
@@ -23385,7 +23400,9 @@ const BodyContext = struct {
         iterator_body: struct {
             body: ExprSite,
             result_cell: DraftTypeCell,
-            rest_expr: DraftExprId,
+            /// The iterator's rest; null for a plan loop, whose running set
+            /// is its first carry.
+            rest_expr: ?DraftExprId,
             carries: []const LoopCarry,
         },
     };
@@ -25736,6 +25753,9 @@ const BodyContext = struct {
         local: DraftLocalId,
         binder: BinderId,
     ) Allocator.Error!void {
+        // A plan loop's running set is carried under the loop's own node,
+        // which names no pattern (design.md "Sequential lowering.").
+        if (source_view.bodies.iteratorForPlan(@backingInt(binder)) != null) return;
         const pattern = source_view.bodies.pattern(binder);
         if (pattern.data != .assign) return;
         const source = source_view.module_env.common.source;
@@ -26878,6 +26898,7 @@ const BodyContext = struct {
         std.mem.sort(BinderMap.Entry, entries, {}, BinderMap.Entry.binderLessThan);
         for (entries) |entry| {
             if (moduleBytesEqual(scheme.view.key.bytes, self.view.key.bytes) and
+                self.view.bodies.iteratorForPlan(@backingInt(entry.binder)) == null and
                 try self.checkedTypeMentionsSchemeVar(checkedBinderType(self.view, entry.binder), scheme.scheme_vars)) continue;
             try relation_base.relate(entry);
         }
@@ -31950,7 +31971,7 @@ const BodyContext = struct {
             .saved_region = self.builder.current_region,
             .exhaustiveness_scope = undefined,
         };
-        self.current_return_target = .{ .lambda = lambda_id, .cell = ret_cell, .output = return_output };
+        self.current_return_target = .{ .lambda = lambda_id, .cell = ret_cell, .output = return_output, .loop_floor = self.loop_contexts.items.len };
         errdefer self.current_return_target = lowering.saved_return_target;
         errdefer self.builder.current_loc = lowering.saved_loc;
         errdefer self.builder.current_region = lowering.saved_region;
@@ -32046,7 +32067,7 @@ const BodyContext = struct {
         else
             ret_cell;
         const body_ret_cell = lowering.body_ret_cell;
-        self.current_return_target = .{ .lambda = lambda_id, .cell = body_ret_cell, .output = return_output };
+        self.current_return_target = .{ .lambda = lambda_id, .cell = body_ret_cell, .output = return_output, .loop_floor = self.loop_contexts.items.len };
         if (lowering.materialized_args.items.len != 0) {
             lowering.body = .{ .materialized = try self.materializedArgsRequest(
                 lowering.materialized_args.items,
@@ -34198,6 +34219,8 @@ const BodyContext = struct {
         divergent: DivergentTask,
         /// A divergent expression's operands, each for its effect.
         operand_sequence: OperandSequenceTask,
+        /// A `spawn`. Boxed: its dispatch reads argument locals it owns.
+        spawn: *SpawnTask,
         /// A loop statement.
         loop: *LoopTask,
         /// An iterator method call. Boxed: its method lookup is far larger
@@ -35533,12 +35556,13 @@ const BodyContext = struct {
         lambda: ExprSite,
         context: checked.CheckedReturnContext,
         target: DraftReturnTargetId = undefined,
+        loop_floor: usize = 0,
     };
 
     fn stepReturn(self: *BodyContext, frame: *LowerFrame, task: *ReturnTask, input: ?LowerResult) Allocator.Error!LowerStep {
         if (frame.cursor != 0) {
             return .{ .ret = .{ .data = .{ .return_ = .{
-                .value = input.?.exprValue(),
+                .value = try self.withPlanLoopExits(input.?.exprValue(), task.loop_floor),
                 .target = task.target,
             } } } };
         }
@@ -35549,6 +35573,7 @@ const BodyContext = struct {
             Common.invariant("checked return target disagreed with the active lambda specialization");
         }
         task.target = target.output;
+        task.loop_floor = target.loop_floor;
         // `?` contributes its source error row to the enclosing result;
         // it does not equate those rows. Keep the checked source type so
         // the explicit return boundary can convert it to the target.
@@ -35786,10 +35811,82 @@ const BodyContext = struct {
         /// A retired expression crashes with the checked runtime error once
         /// every operand it still evaluates has evaluated.
         runtime_error,
-        /// A `spawn` crashes once its operand has evaluated, since no
-        /// backend compiles the plan loop it adds to yet.
-        spawn_not_supported,
     };
+
+    /// A `spawn`: its operand, then `run_spawn!` on its plan loop's current
+    /// running set, whose result becomes the loop's running set.
+    const SpawnTask = struct {
+        operand: CIR.Expr.Idx,
+        loop: u32,
+        ty: Type.TypeId,
+        stage: enum { start, operand, call } = .start,
+        operand_expr: DraftExprId = undefined,
+        args: [3]DraftTypedLocal = undefined,
+        id_value: DraftExprId = undefined,
+    };
+
+    fn stepSpawn(self: *BodyContext, task: *SpawnTask, input: ?LowerResult) Allocator.Error!LowerStep {
+        switch (task.stage) {
+            .start => {
+                task.stage = .operand;
+                return requestLowerTask(self, .{ .expr = .{ .expr = ExprSite.read(task.operand) } });
+            },
+            .operand => {
+                const exit = self.planLoopExitFor(task.loop);
+                task.operand_expr = input.?.exprValue();
+                const u64_ty = try self.primitiveType(.u64);
+                const u64_cell: DraftTypeCell = .{ .sealed = u64_ty };
+                const current = self.binders.get(planLoopBinder(task.loop)) orelse
+                    Common.invariant("a spawn reached lowering without its plan loop's running set");
+                const operand_cell = self.exprTypeCell(task.operand_expr);
+                task.args = .{
+                    .{ .local = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), u64_cell, null), .ty = u64_cell },
+                    .{ .local = current, .ty = self.localTypeCell(current) },
+                    .{ .local = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), operand_cell, null), .ty = operand_cell },
+                };
+                task.id_value = try self.intLiteralExpr(exit.id, u64_ty);
+                task.stage = .call;
+                return self.iteratorDispatchStep(.{
+                    .plan = exit.spawn,
+                    .pre_lowered = .{ .plan_loop = &task.args },
+                    .expected_ret_ty = null,
+                });
+            },
+            .call => {
+                const call = input.?.exprValue();
+                const running_cell = self.exprTypeCell(call);
+                const running = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), running_cell, null);
+                try self.binders.put(planLoopBinder(task.loop), running);
+                const unit = try self.addExpr(.{ .ty = task.ty, .data = .unit });
+                const bind_running = try self.addExpr(.{ .ty = task.ty, .data = .{ .let_ = .{
+                    .bind = try self.addPatWithTypeCell(running_cell, .{ .bind = running }),
+                    .value = call,
+                    .rest = unit,
+                } } });
+                const bind_id = try self.addExpr(.{ .ty = task.ty, .data = .{ .let_ = .{
+                    .bind = try self.addPatWithTypeCell(task.args[0].ty, .{ .bind = task.args[0].local }),
+                    .value = task.id_value,
+                    .rest = bind_running,
+                } } });
+                return .{ .ret = .{ .data = .{ .let_ = .{
+                    .bind = try self.addPatWithTypeCell(task.args[2].ty, .{ .bind = task.args[2].local }),
+                    .value = task.operand_expr,
+                    .rest = bind_id,
+                } } } };
+            },
+        }
+    }
+
+    /// The innermost enclosing plan loop context of the loop node `loop`.
+    fn planLoopExitFor(self: *BodyContext, loop: u32) PlanLoopExit {
+        var index = self.loop_contexts.items.len;
+        while (index > 0) {
+            index -= 1;
+            const exit = self.loop_contexts.items[index].plan orelse continue;
+            if (exit.loop == loop) return exit;
+        }
+        Common.invariant("a spawn reached lowering outside the plan loop checking bound it to");
+    }
 
     fn releaseOperandSequenceTask(self: *BodyContext, task: *OperandSequenceTask) void {
         self.allocator.free(task.operands);
@@ -35895,10 +35992,6 @@ const BodyContext = struct {
             .runtime_error => try self.finishOperandSequence(task, try self.addExpr(.{
                 .ty = task.ty,
                 .data = .{ .checked_error = try self.addStringLiteral("runtime error") },
-            })),
-            .spawn_not_supported => try self.finishOperandSequence(task, try self.addExpr(.{
-                .ty = task.ty,
-                .data = .{ .crash = try self.addStringLiteral("spawn is not supported yet") },
             })),
         };
     }
@@ -36080,7 +36173,7 @@ const BodyContext = struct {
             for_: CheckedForLoop,
             condition: struct { loop: checked_bodies.ConditionLoop, statement: CIR.Statement.Idx, condition: WhileCondition },
         },
-        stage: union(enum) { start, crashing_iter: DispatchCrashReason, initial_iterator, step_expr, one_body, cond, body } = .start,
+        stage: union(enum) { start, crashing_iter: DispatchCrashReason, initial_iterator, step_expr, one_body, cond, body, plan_flat, plan_created, plan_cancel, plan_step, plan_body } = .start,
         carries: []LoopCarry = &.{},
         loop_cell: DraftTypeCell = undefined,
         /// The binder mappings the loop parameters replace.
@@ -36102,9 +36195,44 @@ const BodyContext = struct {
         one_tag_pat: DraftPatId = undefined,
         cond: DraftExprId = undefined,
         break_body: DraftExprId = undefined,
+        /// A plan loop's own lowering state.
+        plan_loop: PlanLoopLowering = .{},
+    };
+
+    /// A plan loop lowers to `flatten`, `run_create!`, and a loop that calls
+    /// `run_next!` and runs its body on `Arrived` (design.md "Plans And
+    /// Concurrent Loops", "Sequential lowering.").
+    const PlanLoopLowering = struct {
+        id: u64 = 0,
+        /// The statements before the loop: the flattened plan's fields and
+        /// the running set's creation. Owned.
+        setup: std.ArrayList(DraftStmtId) = .empty,
+        /// `run_create!`'s arguments: the loop id, then the flattened plan's
+        /// fields.
+        create_args: [7]DraftTypedLocal = undefined,
+        running_initial: DraftLocalId = undefined,
+        running_param: DraftTypedLocal = undefined,
+        /// The running set, then the loop's other carries. Owned.
+        all_carries: []LoopCarry = &.{},
+        /// The arguments of the `run_cancel!` call lowered only to resolve
+        /// its callee for the loop's exit sequences.
+        cancel_args: [2]DraftTypedLocal = undefined,
+        next_args: [2]DraftTypedLocal = undefined,
+        /// The loop body's statement binding `run_next!`'s literal id. Owned.
+        next_id_statements: std.ArrayList(DraftStmtId) = .empty,
+        next: PreparedHelperCall = undefined,
+        cancel: PreparedHelperCall = undefined,
+        step: PlanStepShape = undefined,
+        ended: DraftBranch = undefined,
     };
 
     fn releaseLoopTask(self: *BodyContext, task: *LoopTask) void {
+        task.plan_loop.setup.deinit(self.allocator);
+        task.plan_loop.setup = .empty;
+        task.plan_loop.next_id_statements.deinit(self.allocator);
+        task.plan_loop.next_id_statements = .empty;
+        self.allocator.free(task.plan_loop.all_carries);
+        task.plan_loop.all_carries = &.{};
         self.leaveIteratorOneScope(task);
         task.one_saved.deinit(self.allocator);
         task.one_saved = .empty;
@@ -36158,6 +36286,11 @@ const BodyContext = struct {
                     .for_ => |for_| {
                         const plan_id = for_.plan orelse Common.invariant("checked iterator for reached Monotype without an iterator dispatch plan");
                         task.plan = self.view.static_dispatch_plans.iterator_for_plans.items()[@backingInt(plan_id)];
+                        switch (task.plan.site) {
+                            .plan_loop => return self.beginPlanLoop(task),
+                            .for_loop => {},
+                            .interpolation => Common.invariant("a for loop's iterator plan was an interpolation's"),
+                        }
                         // An `iter` call that cannot run evaluates the
                         // iterable it receives and then crashes; a `next`
                         // call that cannot run crashes once `iter` has
@@ -36260,7 +36393,225 @@ const BodyContext = struct {
                 return try self.beginConditionLoopBody(task);
             },
             .body => return self.finishConditionLoop(task, input.?.exprValue()),
+            .plan_flat => return self.planLoopCreate(task, input.?.exprValue()),
+            .plan_created => return self.planLoopResolveCancel(task, input.?.exprValue()),
+            .plan_cancel => return self.planLoopNext(task),
+            .plan_step => {
+                task.step_expr = input.?.exprValue();
+                return self.beginPlanArrivedBranch(task);
+            },
+            .plan_body => return self.finishPlanLoop(task, input.?.exprValue()),
         }
+    }
+
+    fn beginPlanLoop(self: *BodyContext, task: *LoopTask) Allocator.Error!LowerStep {
+        const site = task.plan.planLoopSite();
+        // A `flatten` call that cannot run evaluates the plan it receives,
+        // then crashes, like an iterator's `iter`.
+        if (self.dispatchCrashReason(task.plan.iter.resolution)) |reason| {
+            task.stage = .{ .crashing_iter = reason };
+            return requestLowerTask(self, .{ .discarded = .{ .expr = ExprSite.read(site.iterable) } });
+        }
+        for ([_]static_dispatch.IteratorDispatchCall{ task.plan.next, site.create, site.spawn, site.cancel }) |call| {
+            if (self.dispatchCrashReason(call.resolution) != null) Common.invariant("a running-set helper's dispatch did not resolve to its Builtin method");
+        }
+        // The id is unique per source loop and owning specialization: the
+        // specialization's reserved function, then the loop's index among
+        // the plan loops its draft has lowered.
+        const owner = self.draft.demand_owner orelse Common.invariant("a plan loop was lowered outside a reserved specialization");
+        task.plan_loop.id = (@as(u64, @backingInt(owner)) << 32) | self.draft.plan_loop_count;
+        self.draft.plan_loop_count += 1;
+        task.stage = .plan_flat;
+        return self.iteratorDispatchStep(.{
+            .plan = task.plan.iter,
+            .pre_lowered = .{},
+            .expected_ret_ty = null,
+        });
+    }
+
+    /// Bind the flattened plan's fields, then create the running set.
+    fn planLoopCreate(self: *BodyContext, task: *LoopTask, flat: DraftExprId) Allocator.Error!LowerStep {
+        const site = task.plan.planLoopSite();
+        const plan_loop = &task.plan_loop;
+        const flat_cell = self.exprTypeCell(flat);
+        try self.constrainCheckedInterfaceToCell(site.flat_ty, flat_cell);
+        const flat_node = try flat_cell.toGraphNode(self.graph);
+        plan_loop.create_args[0] = try self.planLoopIdLocal(plan_loop.id, &plan_loop.setup);
+        var destructs: [6]DraftRecordDestruct = undefined;
+        for (site.flat_fields, &destructs, plan_loop.create_args[1..]) |label, *destruct, *arg| {
+            const name = try recordFieldName(self.nameStoreMut(), self.view, label);
+            const cell = DraftTypeCell.fromGraphNode(try self.graph.recordFieldNode(flat_node, name));
+            const local = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), cell, null);
+            arg.* = .{ .local = local, .ty = cell };
+            destruct.* = .{ .name = name, .pattern = try self.addPatWithTypeCell(cell, .{ .bind = local }) };
+        }
+        try plan_loop.setup.append(self.allocator, try self.addStmt(.{ .let_ = .{
+            .pat = try self.addPatWithTypeCell(flat_cell, .{ .record = try self.addRecordDestructSpan(&destructs) }),
+            .value = flat,
+        } }));
+        task.stage = .plan_created;
+        return self.iteratorDispatchStep(.{
+            .plan = site.create,
+            .pre_lowered = .{ .plan_loop = &plan_loop.create_args },
+            .expected_ret_ty = null,
+        });
+    }
+
+    /// Bind the created running set, then resolve `run_cancel!` for the
+    /// loop's exit sequences. The call lowered to resolve it is never placed
+    /// in the body.
+    fn planLoopResolveCancel(self: *BodyContext, task: *LoopTask, created: DraftExprId) Allocator.Error!LowerStep {
+        const site = task.plan.planLoopSite();
+        const plan_loop = &task.plan_loop;
+        const running_cell = self.exprTypeCell(created);
+        plan_loop.running_initial = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), running_cell, null);
+        try plan_loop.setup.append(self.allocator, try self.addStmt(.{ .let_ = .{
+            .pat = try self.addPatWithTypeCell(running_cell, .{ .bind = plan_loop.running_initial }),
+            .value = created,
+        } }));
+        plan_loop.running_param = .{ .local = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), running_cell, null), .ty = running_cell };
+        const u64_cell: DraftTypeCell = .{ .sealed = try self.primitiveType(.u64) };
+        plan_loop.cancel_args = .{
+            .{ .local = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), u64_cell, null), .ty = u64_cell },
+            plan_loop.running_param,
+        };
+        task.stage = .plan_cancel;
+        return self.iteratorDispatchStep(.{
+            .plan = site.cancel,
+            .pre_lowered = .{ .plan_loop = &plan_loop.cancel_args },
+            .expected_ret_ty = null,
+            .prepared = &plan_loop.cancel,
+        });
+    }
+
+    /// Enter the loop with the running set as its first carry, then call
+    /// `run_next!` on it.
+    fn planLoopNext(self: *BodyContext, task: *LoopTask) Allocator.Error!LowerStep {
+        const site = task.plan.planLoopSite();
+        const plan_loop = &task.plan_loop;
+        const loop = task.kind.for_.loop;
+        plan_loop.all_carries = try self.allocator.alloc(LoopCarry, 1 + task.carries.len);
+        plan_loop.all_carries[0] = .{
+            .binder = planLoopBinder(loop),
+            .initial_local = plan_loop.running_initial,
+            .param_local = plan_loop.running_param.local,
+            .ty = plan_loop.running_param.ty,
+        };
+        @memcpy(plan_loop.all_carries[1..], task.carries);
+        for (plan_loop.all_carries) |carry| {
+            try self.saveBinder(carry.binder, &task.saved);
+            try self.binders.put(carry.binder, carry.param_local);
+        }
+        task.binders_replaced = true;
+        plan_loop.step = try self.planStepShape(site, task.plan.item_ty);
+        plan_loop.next_args = .{ try self.planLoopIdLocal(plan_loop.id, &plan_loop.next_id_statements), plan_loop.running_param };
+        task.stage = .plan_step;
+        return self.iteratorDispatchStep(.{
+            .plan = task.plan.next,
+            .pre_lowered = .{ .plan_loop = &plan_loop.next_args },
+            .expected_ret_ty = DraftTypeCell.fromGraphNode(plan_loop.step.step_node),
+            .prepared = &plan_loop.next,
+        });
+    }
+
+    /// Make the loop the `break`, `spawn`, and exit target, build the
+    /// `Ended` branch, then lower the body under the `Arrived` branch.
+    fn beginPlanArrivedBranch(self: *BodyContext, task: *LoopTask) Allocator.Error!LowerStep {
+        const site = task.plan.planLoopSite();
+        const plan_loop = &task.plan_loop;
+        const for_ = task.kind.for_;
+        const step = plan_loop.step;
+        try self.loop_contexts.append(self.allocator, .{
+            .result_cell = task.loop_cell,
+            .carries = task.carries,
+            .plan = .{
+                .loop = for_.loop,
+                .id = plan_loop.id,
+                .spawn = site.spawn,
+                .next = plan_loop.next,
+                .cancel = plan_loop.cancel,
+                .step = step,
+            },
+        });
+        task.loop_context_pushed = true;
+        const running_cell = DraftTypeCell.fromGraphNode(step.running_node);
+        plan_loop.ended = .{
+            .pat = try self.planStepPattern(step, try self.addPatWithTypeCell(running_cell, .wildcard), step.ended, null),
+            .body = try self.iteratorLoopDoneBody(task),
+        };
+
+        try self.savePatternBinders(for_.pattern, &task.one_saved);
+        for (plan_loop.all_carries) |carry| try self.saveBinder(carry.binder, &task.one_saved);
+        task.one_guard_frames = self.runtime_demand_guard_frames;
+        task.one_scope_entered = true;
+        const item_cell = DraftTypeCell.fromGraphNode(step.item_node);
+        try self.constrainCheckedInterfaceToCell(self.view.bodies.pattern(for_.pattern).ty, item_cell);
+
+        const rest = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), running_cell, null);
+        try self.binders.put(planLoopBinder(for_.loop), rest);
+        const item_local: ?DraftLocalId = if (try self.patternNeedsExplicitBinding(for_.pattern))
+            try self.addLocalWithBinderCell(self.builder.symbols.fresh(), item_cell, null)
+        else
+            null;
+        const item_pat = if (item_local) |local|
+            try self.addPatWithTypeCell(item_cell, .{ .bind = local })
+        else
+            try self.lowerPatternAtNode(for_.pattern, step.item_node);
+        task.one_tag_pat = try self.planStepPattern(step, try self.addPatWithTypeCell(running_cell, .{ .bind = rest }), step.arrived, item_pat);
+
+        task.stage = .plan_body;
+        const local = item_local orelse return try self.loopBodyStep(for_.body, task.loop_cell, null, plan_loop.all_carries);
+        const item_expr = try self.addExprWithTypeCell(item_cell, .{ .local = local });
+        const miss = try self.addExprWithTypeCell(task.loop_cell, .{ .crash = try self.addStringLiteral("pattern match failed") });
+        return requestLowerTask(self, .{ .materialize = .{ .root = .{
+            .pattern = for_.pattern,
+            .value = item_expr,
+            .value_cell = item_cell,
+            .result_cell = task.loop_cell,
+            .continuation = .{ .iterator_body = .{
+                .body = for_.body,
+                .result_cell = task.loop_cell,
+                .rest_expr = null,
+                .carries = plan_loop.all_carries,
+            } },
+            .miss = miss,
+            .success_guard = null,
+            .mode = .then_root,
+        } } });
+    }
+
+    fn finishPlanLoop(self: *BodyContext, task: *LoopTask, arrived_body: DraftExprId) Allocator.Error!LowerStep {
+        const plan_loop = &task.plan_loop;
+        const arrived: DraftBranch = .{ .pat = task.one_tag_pat, .body = arrived_body };
+        self.leaveIteratorOneScope(task);
+        const branches = [_]DraftBranch{ arrived, plan_loop.ended };
+        const match_expr = try self.addExprWithTypeCell(task.loop_cell, .{ .match_ = .{
+            .scrutinee = task.step_expr,
+            .branches = try self.addBranchSpan(&branches),
+        } });
+        const body = try self.addExprWithTypeCell(task.loop_cell, .{ .block = .{
+            .statements = try self.addStmtSpan(plan_loop.next_id_statements.items),
+            .final_expr = match_expr,
+        } });
+
+        const carries = plan_loop.all_carries;
+        const params = try self.allocator.alloc(DraftTypedLocal, carries.len);
+        defer self.allocator.free(params);
+        const initial_values = try self.allocator.alloc(DraftExprId, carries.len);
+        defer self.allocator.free(initial_values);
+        for (carries, params, initial_values) |carry, *param, *initial| {
+            param.* = .{ .local = carry.param_local, .ty = carry.ty };
+            initial.* = try self.addExprWithTypeCell(carry.ty, .{ .local = carry.initial_local });
+        }
+        const loop_expr = try self.addExprWithTypeCell(task.loop_cell, .{ .loop_ = .{
+            .params = try self.draft.addTypedLocalSpan(params),
+            .initial_values = try self.addExprSpan(initial_values),
+            .body = body,
+        } });
+        return self.finishLoop(task, .{ .block = .{
+            .statements = try self.addStmtSpan(plan_loop.setup.items),
+            .final_expr = loop_expr,
+        } });
     }
 
     /// A loop body lowered as statements whose final expression is
@@ -36398,6 +36749,8 @@ const BodyContext = struct {
         interpolation_seed: ?DraftTypedLocal = null,
         interpolation_iterator: ?DraftTypedLocal = null,
         interpolation_value: ?DraftTypedLocal = null,
+        /// A running-set helper call's arguments, in order.
+        plan_loop: []const DraftTypedLocal = &.{},
 
         /// The pre-lowered local `operand` names, or null for a checked
         /// expression.
@@ -36408,6 +36761,7 @@ const BodyContext = struct {
                 .interpolation_seed => self.interpolation_seed orelse Common.invariant("interpolation iter dispatch reached Monotype without its seed list local"),
                 .interpolation_iterator => self.interpolation_iterator orelse Common.invariant("interpolation append dispatch reached Monotype without its iterator local"),
                 .interpolation_value => self.interpolation_value orelse Common.invariant("interpolation append dispatch reached Monotype without its value local"),
+                .plan_loop_operand => |index| if (index < self.plan_loop.len) self.plan_loop[index] else Common.invariant("running-set helper dispatch reached Monotype without its argument locals"),
             };
         }
     };
@@ -36418,6 +36772,9 @@ const BodyContext = struct {
         plan: static_dispatch.IteratorDispatchCall,
         pre_lowered: PreLoweredIteratorOperands,
         expected_ret_ty: ?DraftTypeCell,
+        /// Where a plan loop keeps the resolved call, to call the helper
+        /// again in its exit sequences.
+        prepared: ?*PreparedHelperCall = null,
         call_ctx: ?*BodyContext = null,
         lookup: MethodLookup = undefined,
         callee: DraftFnSlot = undefined,
@@ -36450,7 +36807,10 @@ const BodyContext = struct {
             return self.nextIteratorDispatchOperand(task, plan_args);
         }
         frame.cursor = 1;
-        if (plan.dispatcher_arg_index >= plan_args.len) Common.invariant("iterator dispatch plan dispatcher argument index was outside the argument span");
+        switch (plan.dispatcher) {
+            .arg => |index| if (index >= plan_args.len) Common.invariant("iterator dispatch plan dispatcher argument index was outside the argument span"),
+            .type_only => {},
+        }
 
         const lookup = try self.withLocalProcContext(self.iteratorMethodLookup(plan));
         task.lookup = lookup;
@@ -36473,19 +36833,26 @@ const BodyContext = struct {
             }
         }
 
-        const dispatcher_node = plan_fn.args[plan.dispatcher_arg_index];
-        try call_ctx.constrainCheckedInterfaceToCell(plan.dispatcher_ty, DraftTypeCell.fromGraphNode(dispatcher_node));
-        const actual_dispatcher_node = try self.iteratorOperandNode(plan_args[plan.dispatcher_arg_index], task.pre_lowered);
-        try relateRequestComponent(self.graph, dispatcher_node, actual_dispatcher_node);
-        // A producer-authored request intentionally remains in a different
-        // class from its checked-public operand. The directed relation above
-        // validates their complete public interface; ordinary operands still
-        // require the single checked class.
-        if (!self.graph.sameClass(dispatcher_node, actual_dispatcher_node) and
-            !try self.graph.containsGeneratedPrivate(dispatcher_node) and
-            !try self.graph.containsGeneratedPrivate(actual_dispatcher_node))
-        {
-            Common.invariant("iterator dispatch plan dispatcher operand differed from the checked dispatcher type");
+        switch (plan.dispatcher) {
+            // A running-set helper is dispatched on its plan loop's source
+            // type, which none of its arguments has.
+            .type_only => {},
+            .arg => |dispatcher_index| {
+                const dispatcher_node = plan_fn.args[dispatcher_index];
+                try call_ctx.constrainCheckedInterfaceToCell(plan.dispatcher_ty, DraftTypeCell.fromGraphNode(dispatcher_node));
+                const actual_dispatcher_node = try self.iteratorOperandNode(plan_args[dispatcher_index], task.pre_lowered);
+                try relateRequestComponent(self.graph, dispatcher_node, actual_dispatcher_node);
+                // A producer-authored request intentionally remains in a different
+                // class from its checked-public operand. The directed relation above
+                // validates their complete public interface; ordinary operands still
+                // require the single checked class.
+                if (!self.graph.sameClass(dispatcher_node, actual_dispatcher_node) and
+                    !try self.graph.containsGeneratedPrivate(dispatcher_node) and
+                    !try self.graph.containsGeneratedPrivate(actual_dispatcher_node))
+                {
+                    Common.invariant("iterator dispatch plan dispatcher operand differed from the checked dispatcher type");
+                }
+            },
         }
         const fn_nodes = try self.graph.functionNodes(completed_callable_node);
         if (fn_nodes.args.len != plan_args.len) {
@@ -36524,12 +36891,15 @@ const BodyContext = struct {
                 .child => |step| return step,
             }
         }
+        const callee = try self.draftProcCalleeForSlot(task.callee);
+        const captures = try self.methodTargetCaptureSpan(task.lookup);
+        if (task.prepared) |prepared| prepared.* = .{ .callee = callee, .captures = captures, .ret_node = task.ret_node };
         const lowered = try self.addExprWithTypeCell(
             DraftTypeCell.fromGraphNode(task.ret_node),
             .{ .call_proc = .{
-                .callee = try self.draftProcCalleeForSlot(task.callee),
+                .callee = callee,
                 .args = try self.addExprSpan(task.args),
-                .captures = try self.methodTargetCaptureSpan(task.lookup),
+                .captures = captures,
             } },
         );
         self.releaseIteratorDispatchTask(task);
@@ -37108,6 +37478,7 @@ const BodyContext = struct {
             .value_then_state => |*task| self.releaseValueThenStateTask(task),
             .discarded => |*task| self.releaseDiscardedTask(task),
             .operand_sequence => |*task| self.releaseOperandSequenceTask(task),
+            .spawn => |task| self.destroyLowerTaskBox(task),
             .statement => |*task| self.releaseStatementTask(task),
             .loop => |task| {
                 self.releaseLoopTask(task);
@@ -37183,6 +37554,7 @@ const BodyContext = struct {
             .inspected => |*task| return self.stepInspected(frame, task, input),
             .divergent => |*task| return self.stepDivergent(frame, task, input),
             .operand_sequence => |*task| return self.stepOperandSequence(task, input),
+            .spawn => |task| return self.stepSpawn(task, input),
             .loop => |task| return self.stepLoop(task, input),
             .iterator_dispatch => |task| return self.stepIteratorDispatch(frame, task, input),
             .materialize => |*task| return self.stepMaterialize(task, input),
@@ -38245,14 +38617,15 @@ const BodyContext = struct {
             .ellipsis => .{ .crash = try self.addStringLiteral("not implemented") },
             .crash => |msg| .{ .crash = try self.lowerStringLiteral(msg) },
             .dbg => |child| return requestLowerTask(self, .{ .inspected = .{ .expr = ExprSite.read(child) } }),
-            // No backend compiles a plan loop yet, so no `spawn` runs
-            // (design.md "Plans And Concurrent Loops"): it evaluates its
-            // operand and crashes.
-            .spawn => |operand| return requestLowerTask(self, .{ .operand_sequence = .{
-                .operands = try self.exprRefsOf(&.{operand}),
+            // `run_spawn!` adds the operand to its plan loop's running set
+            // (design.md "Plans And Concurrent Loops", "Sequential
+            // lowering.").
+            .spawn => |operand| return requestLowerTask(self, .{ .spawn = try self.boxLowerTask(SpawnTask, .{
+                .operand = operand,
+                .loop = self.view.bodies.spawnPlanLoop(expr_id.node()) orelse
+                    Common.invariant("a spawn outside every plan loop reached Monotype without being rejected"),
                 .ty = ty,
-                .tail = .spawn_not_supported,
-            } }),
+            }) }),
             .expect_err => |expect_err| return requestLowerTask(self, .{ .inspected = .{
                 .expr = ExprSite.read(expect_err.expr),
                 .expect_err_snippet = expect_err.snippet,
@@ -67192,7 +67565,176 @@ const BodyContext = struct {
     const LoopContext = struct {
         result_cell: DraftTypeCell,
         carries: []const LoopCarry,
+        /// What a plan loop's `spawn`s and exits read; null for any other
+        /// loop.
+        plan: ?PlanLoopExit = null,
     };
+
+    /// A running-set helper call as its dispatch resolved it, so a plan
+    /// loop's exit sequences call the helper again at the same types.
+    const PreparedHelperCall = struct {
+        callee: DraftProcCallee,
+        captures: DraftSpan(DraftExprId),
+        ret_node: NodeId,
+    };
+
+    /// What a plan loop's `spawn`s and exit sequences read (design.md "Plans
+    /// And Concurrent Loops", "Sequential lowering.").
+    const PlanLoopExit = struct {
+        loop: u32,
+        id: u64,
+        spawn: static_dispatch.IteratorDispatchCall,
+        next: PreparedHelperCall,
+        cancel: PreparedHelperCall,
+        step: PlanStepShape,
+    };
+
+    /// `run_next!`'s result: the running set and the step tag union.
+    const PlanStepShape = struct {
+        step_node: NodeId,
+        running_node: NodeId,
+        tag_node: NodeId,
+        item_node: NodeId,
+        arrived: names.TagNameId,
+        ended: names.TagNameId,
+    };
+
+    /// A plan loop carries its running set under the loop's own node, which
+    /// names no pattern, so the binder never collides with a source binder.
+    fn planLoopBinder(loop: u32) BinderId {
+        return @fromBackingInt(loop);
+    }
+
+    /// Bind a fresh local to the literal loop id; every running-set helper
+    /// call takes its own.
+    fn planLoopIdLocal(self: *BodyContext, id: u64, statements: *std.ArrayList(DraftStmtId)) Allocator.Error!DraftTypedLocal {
+        const u64_ty = try self.primitiveType(.u64);
+        const cell: DraftTypeCell = .{ .sealed = u64_ty };
+        const local = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), cell, null);
+        try statements.append(self.allocator, try self.addStmt(.{ .let_ = .{
+            .pat = try self.addPatWithTypeCell(cell, .{ .bind = local }),
+            .value = try self.intLiteralExpr(id, u64_ty),
+        } }));
+        return .{ .local = local, .ty = cell };
+    }
+
+    fn preparedHelperCall(self: *BodyContext, prepared: PreparedHelperCall, args: []const DraftTypedLocal) Allocator.Error!DraftExprId {
+        var arg_exprs: [2]DraftExprId = undefined;
+        if (args.len > arg_exprs.len) Common.invariant("a prepared running-set helper call took more than two arguments");
+        for (args, 0..) |arg, i| arg_exprs[i] = try self.addExprWithTypeCell(arg.ty, .{ .local = arg.local });
+        return try self.addExprWithTypeCell(DraftTypeCell.fromGraphNode(prepared.ret_node), .{ .call_proc = .{
+            .callee = prepared.callee,
+            .args = try self.addExprSpan(arg_exprs[0..args.len]),
+            .captures = prepared.captures,
+        } });
+    }
+
+    /// `(running, Arrived(payload))` or `(running, Ended)`.
+    fn planStepPattern(self: *BodyContext, step: PlanStepShape, running: DraftPatId, tag: names.TagNameId, payload: ?DraftPatId) Allocator.Error!DraftPatId {
+        const tag_pat = try self.addPatWithTypeCell(DraftTypeCell.fromGraphNode(step.tag_node), .{ .tag = .{
+            .name = tag,
+            .payloads = if (payload) |pat| try self.addPatSpan(&.{pat}) else .empty(),
+        } });
+        return try self.addPatWithTypeCell(DraftTypeCell.fromGraphNode(step.step_node), .{ .tuple = try self.addPatSpan(&.{ running, tag_pat }) });
+    }
+
+    fn planStepShape(self: *BodyContext, site: static_dispatch.IteratorForPlan.PlanLoop, item_ty: checked.CheckedTypeId) Allocator.Error!PlanStepShape {
+        const step_node = try self.lowerTypeNode(site.step_ty);
+        const items = try self.graph.tupleItemNodes(step_node);
+        if (items.len != 2) Common.invariant("run_next!'s result was not a running set and step pair");
+        const arrived = try tagName(self.nameStoreMut(), self.view, site.arrived_tag);
+        const ended = try tagName(self.nameStoreMut(), self.view, site.ended_tag);
+        try self.requireIteratorStepTagArity(items[1], arrived, 1);
+        try self.requireIteratorStepTagArity(items[1], ended, 0);
+        const item_node = try self.graph.tagPayloadNode(items[1], arrived, 0);
+        try self.constrainCheckedInterfaceToCell(item_ty, DraftTypeCell.fromGraphNode(item_node));
+        return .{
+            .step_node = step_node,
+            .running_node = items[0],
+            .tag_node = items[1],
+            .item_node = item_node,
+            .arrived = arrived,
+            .ended = ended,
+        };
+    }
+
+    /// Append a plan loop's exit sequence (design.md "Sequential lowering."):
+    /// `run_cancel!` on the loop's current running set, then `run_next!`
+    /// until it reports `Ended`, every call with a fresh literal id local.
+    fn appendPlanLoopExit(self: *BodyContext, exit: PlanLoopExit, statements: *std.ArrayList(DraftStmtId)) Allocator.Error!void {
+        const current = self.binders.get(planLoopBinder(exit.loop)) orelse
+            Common.invariant("a plan loop exit reached lowering without the loop's running set");
+        const running_cell = DraftTypeCell.fromGraphNode(exit.step.running_node);
+        const cancel_id = try self.planLoopIdLocal(exit.id, statements);
+        const cancelled = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), running_cell, null);
+        try statements.append(self.allocator, try self.addStmt(.{ .let_ = .{
+            .pat = try self.addPatWithTypeCell(running_cell, .{ .bind = cancelled }),
+            .value = try self.preparedHelperCall(exit.cancel, &.{ cancel_id, .{ .local = current, .ty = self.localTypeCell(current) } }),
+        } }));
+
+        const unit_cell: DraftTypeCell = .{ .sealed = try self.unitType() };
+        const param = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), running_cell, null);
+        var body_statements = std.ArrayList(DraftStmtId).empty;
+        defer body_statements.deinit(self.allocator);
+        const next_id = try self.planLoopIdLocal(exit.id, &body_statements);
+        const step = try self.preparedHelperCall(exit.next, &.{ next_id, .{ .local = param, .ty = running_cell } });
+        const rest = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), running_cell, null);
+        const item_wildcard = try self.addPatWithTypeCell(DraftTypeCell.fromGraphNode(exit.step.item_node), .wildcard);
+        const rest_expr = try self.addExprWithTypeCell(running_cell, .{ .local = rest });
+        const branches = [_]DraftBranch{
+            .{
+                .pat = try self.planStepPattern(exit.step, try self.addPatWithTypeCell(running_cell, .{ .bind = rest }), exit.step.arrived, item_wildcard),
+                .body = try self.continueWith(unit_cell, &.{rest_expr}),
+            },
+            .{
+                .pat = try self.planStepPattern(exit.step, try self.addPatWithTypeCell(running_cell, .wildcard), exit.step.ended, null),
+                .body = try self.addExprWithTypeCell(unit_cell, .{ .break_ = null }),
+            },
+        };
+        const match_expr = try self.addExprWithTypeCell(unit_cell, .{ .match_ = .{
+            .scrutinee = step,
+            .branches = try self.addBranchSpan(&branches),
+        } });
+        const body = try self.addExprWithTypeCell(unit_cell, .{ .block = .{
+            .statements = try self.addStmtSpan(body_statements.items),
+            .final_expr = match_expr,
+        } });
+        const params = [_]DraftTypedLocal{.{ .local = param, .ty = running_cell }};
+        const initial = [_]DraftExprId{try self.addExprWithTypeCell(running_cell, .{ .local = cancelled })};
+        const drain = try self.addExprWithTypeCell(unit_cell, .{ .loop_ = .{
+            .params = try self.draft.addTypedLocalSpan(&params),
+            .initial_values = try self.addExprSpan(&initial),
+            .body = body,
+        } });
+        try statements.append(self.allocator, try self.addStmt(.{ .expr = drain }));
+    }
+
+    /// A returned value followed by the exit sequence of every plan loop the
+    /// return leaves, innermost first, when there is one.
+    fn withPlanLoopExits(self: *BodyContext, value: DraftExprId, loop_floor: usize) Allocator.Error!DraftExprId {
+        if (loop_floor > self.loop_contexts.items.len) Common.invariant("a return's loop floor was above its enclosing loops");
+        const contexts = self.loop_contexts.items[loop_floor..];
+        for (contexts) |context| {
+            if (context.plan != null) break;
+        } else return value;
+        const cell = self.exprTypeCell(value);
+        const local = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), cell, null);
+        var statements = std.ArrayList(DraftStmtId).empty;
+        defer statements.deinit(self.allocator);
+        try statements.append(self.allocator, try self.addStmt(.{ .let_ = .{
+            .pat = try self.addPatWithTypeCell(cell, .{ .bind = local }),
+            .value = value,
+        } }));
+        var index = contexts.len;
+        while (index > 0) {
+            index -= 1;
+            if (contexts[index].plan) |exit| try self.appendPlanLoopExit(exit, &statements);
+        }
+        return try self.addExprWithTypeCell(cell, .{ .block = .{
+            .statements = try self.addStmtSpan(statements.items),
+            .final_expr = try self.addExprWithTypeCell(cell, .{ .local = local }),
+        } });
+    }
 
     fn loopExitStatement(self: *BodyContext, expr: DraftExprId, carries: []const LoopCarry, loop_cell: DraftTypeCell) Allocator.Error!DraftStmt {
         if (carries.len == 0) return .{ .expr = expr };
@@ -67271,7 +67813,7 @@ const BodyContext = struct {
                         request_arg.* = formal_node;
                     }
                 },
-                .loop_iterator_state, .interpolation_seed, .interpolation_iterator, .interpolation_value => {
+                .loop_iterator_state, .interpolation_seed, .interpolation_iterator, .interpolation_value, .plan_loop_operand => {
                     const local = pre_lowered.typedLocal(operand).?;
                     request_arg.* = try checkedMonoRequestNode(
                         self.graph,
@@ -67424,10 +67966,19 @@ const BodyContext = struct {
 
     fn breakCurrentLoopExprData(self: *BodyContext) Allocator.Error!BodyExprData {
         const loop = self.currentLoopContext();
-        return if (loop.carries.len == 0)
+        const data: BodyExprData = if (loop.carries.len == 0)
             .{ .break_ = null }
         else
             .{ .break_ = try self.loopStateExpr(loop.result_cell, loop.carries) };
+        // Leaving a plan loop early runs its exit sequence first.
+        const exit = loop.plan orelse return data;
+        var statements = std.ArrayList(DraftStmtId).empty;
+        defer statements.deinit(self.allocator);
+        try self.appendPlanLoopExit(exit, &statements);
+        return .{ .block = .{
+            .statements = try self.addStmtSpan(statements.items),
+            .final_expr = try self.addExprWithTypeCell(loop.result_cell, data),
+        } };
     }
 
     fn continueWith(self: *BodyContext, cell: DraftTypeCell, values: []const DraftExprId) Allocator.Error!DraftExprId {

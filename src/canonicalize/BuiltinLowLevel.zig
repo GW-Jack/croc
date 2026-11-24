@@ -100,6 +100,39 @@ pub fn isIntrinsicAnnotation(env: *const ModuleEnv, ident: base.Ident.Idx) bool 
 pub fn apply(env: *ModuleEnv) (Allocator.Error || error{ UnsupportedBuiltinAnnotationOnly, BuiltinLowLevelAnnotationMustBeFunction, LowLevelOperationsNotFound })!void {
     var new_def_indices = try replaceProvidedByCompilerLowLevels(env);
     defer new_def_indices.deinit(env.gpa);
+    try recordRunningSetHelpers(env);
+}
+
+/// Each running-set helper's qualified Builtin name (design.md "Plans And
+/// Concurrent Loops", "Sequential lowering.").
+pub const running_set_helper_names = [_]struct { name: []const u8, helper: base.RunningSetHelper }{
+    .{ .name = "Builtin.Concurrently.run_create!", .helper = .run_create },
+    .{ .name = "Builtin.Concurrently.run_next!", .helper = .run_next },
+    .{ .name = "Builtin.Concurrently.run_spawn!", .helper = .run_spawn },
+    .{ .name = "Builtin.Concurrently.run_cancel!", .helper = .run_cancel },
+    .{ .name = "Builtin.Concurrently.run_entry!", .helper = .run_entry },
+    .{ .name = "Builtin.Concurrently.run_arrived", .helper = .run_arrived },
+    .{ .name = "Builtin.Concurrently.run_ended", .helper = .run_ended },
+};
+
+/// Record which Builtin definitions are the running-set helpers, matched by
+/// their definitions' qualified idents, in definition order.
+fn recordRunningSetHelpers(env: *ModuleEnv) Allocator.Error!void {
+    var idents: [running_set_helper_names.len]base.Ident.Idx = undefined;
+    for (running_set_helper_names, &idents) |entry, *ident| {
+        ident.* = env.common.findIdent(entry.name) orelse unreachable; // rationale: Builtin.roc declares every running-set helper, so its qualified ident exists
+    }
+    var found: usize = 0;
+    for (env.store.sliceDefs(env.all_defs)) |def_idx| {
+        const pattern = env.store.getPattern(env.store.getDef(def_idx).pattern);
+        if (pattern != .assign) continue;
+        for (idents, running_set_helper_names) |ident, entry| {
+            if (!pattern.assign.ident.eql(ident)) continue;
+            _ = try env.running_set_helper_defs.append(env.gpa, .{ .def_idx = @backingInt(def_idx), .helper = entry.helper });
+            found += 1;
+        }
+    }
+    std.debug.assert(found == running_set_helper_names.len); // rationale: Builtin.roc defines each helper exactly once
 }
 
 const LowLevelMap = std.AutoHashMap(base.Ident.Idx, CIR.Expr.LowLevel);

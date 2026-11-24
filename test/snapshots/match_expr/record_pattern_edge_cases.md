@@ -170,7 +170,7 @@ match ... {
 							(p-assign (ident "#interp_0"))
 							(e-lookup-local
 								(p-assign (ident "c"))))
-						(e-interpolation (constraint-fn-var 362) (dispatcher-var 16)
+						(e-interpolation (constraint-fn-var 370) (dispatcher-var 16)
 							(first
 								(e-literal (string "deeply nested: ")))
 							(parts
@@ -195,7 +195,7 @@ match ... {
 							(p-assign (ident "#interp_1"))
 							(e-lookup-local
 								(p-assign (ident "x"))))
-						(e-interpolation (constraint-fn-var 404) (dispatcher-var 31)
+						(e-interpolation (constraint-fn-var 412) (dispatcher-var 31)
 							(first
 								(e-literal (string "mixed with empty: ")))
 							(parts
@@ -227,7 +227,7 @@ match ... {
 							(p-assign (ident "#interp_3"))
 							(e-lookup-local
 								(p-assign (ident "simple"))))
-						(e-interpolation (constraint-fn-var 440) (dispatcher-var 53)
+						(e-interpolation (constraint-fn-var 448) (dispatcher-var 53)
 							(first
 								(e-literal (string "mixed: ")))
 							(parts
@@ -266,7 +266,7 @@ match ... {
 							(p-assign (ident "#interp_5"))
 							(e-lookup-local
 								(p-assign (ident "d"))))
-						(e-interpolation (constraint-fn-var 479) (dispatcher-var 77)
+						(e-interpolation (constraint-fn-var 487) (dispatcher-var 77)
 							(first
 								(e-literal (string "multiple nested: ")))
 							(parts
@@ -290,7 +290,7 @@ match ... {
 							(p-assign (ident "#interp_6"))
 							(e-lookup-local
 								(p-assign (ident "x"))))
-						(e-interpolation (constraint-fn-var 510) (dispatcher-var 90)
+						(e-interpolation (constraint-fn-var 518) (dispatcher-var 90)
 							(first
 								(e-literal (string "renamed: ")))
 							(parts
@@ -320,12 +320,12 @@ match ... {
 								(p-assign (ident "firstName"))))
 						(s-let
 							(p-assign (ident "#interp_8"))
-							(e-dispatch-call (method "to_str") (constraint-fn-var 533)
+							(e-dispatch-call (method "to_str") (constraint-fn-var 541)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "userAge"))))
 								(args)))
-						(e-interpolation (constraint-fn-var 548) (dispatcher-var 113)
+						(e-interpolation (constraint-fn-var 556) (dispatcher-var 113)
 							(first
 								(e-literal (string "renamed nested: ")))
 							(parts

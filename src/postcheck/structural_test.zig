@@ -1351,7 +1351,7 @@ test "Monotype returns consume the active specialization return cell" {
         "fn stepReturn(",
         "const InspectedTask = struct",
     );
-    try expectContains(lower_source, "self.current_return_target = .{ .lambda = lambda_id, .cell = body_ret_cell, .output = return_output }");
+    try expectContains(lower_source, "self.current_return_target = .{ .lambda = lambda_id, .cell = body_ret_cell, .output = return_output, .loop_floor = self.loop_contexts.items.len }");
     try expectContains(lower_return, "task.lambda != target.lambda");
     try expectContains(lower_return, "requestLowerChild(self, task.expr, target.cell)");
     // A return names its lambda's result, which the lambda settles once its

@@ -452,7 +452,7 @@ run = |{}| {
 					(e-match
 						(match
 							(cond
-								(e-call (constraint-fn-var 683)
+								(e-call (constraint-fn-var 691)
 									(e-lookup-local
 										(p-assign (ident "query")))
 									(e-string
@@ -509,7 +509,7 @@ run = |{}| {
 					(e-match
 						(match
 							(cond
-								(e-call (constraint-fn-var 755)
+								(e-call (constraint-fn-var 763)
 									(e-lookup-local
 										(p-assign (ident "find")))
 									(e-lookup-local
@@ -543,7 +543,7 @@ run = |{}| {
 					(e-match
 						(match
 							(cond
-								(e-call (constraint-fn-var 801)
+								(e-call (constraint-fn-var 809)
 									(e-lookup-local
 										(p-assign (ident "find")))
 									(e-lookup-local
@@ -572,7 +572,7 @@ run = |{}| {
 															(p-assign (ident "#err")))))))))))))
 				(e-tag (name "Ok")
 					(args
-						(e-dispatch-call (method "plus") (constraint-fn-var 830)
+						(e-dispatch-call (method "plus") (constraint-fn-var 838)
 							(receiver
 								(e-lookup-local
 									(p-assign (ident "listing"))))
@@ -590,7 +590,7 @@ run = |{}| {
 					(e-match
 						(match
 							(cond
-								(e-call (constraint-fn-var 857)
+								(e-call (constraint-fn-var 865)
 									(e-lookup-local
 										(p-assign (ident "find")))
 									(e-lookup-local
@@ -622,7 +622,7 @@ run = |{}| {
 					(e-match
 						(match
 							(cond
-								(e-call (constraint-fn-var 907)
+								(e-call (constraint-fn-var 915)
 									(e-lookup-local
 										(p-assign (ident "find")))
 									(e-lookup-local
@@ -647,7 +647,7 @@ run = |{}| {
 												(builtin)
 												(e-tag (name "Err")
 													(args
-														(e-call (constraint-fn-var 938)
+														(e-call (constraint-fn-var 946)
 															(e-lambda
 																(args
 																	(p-assign (ident "err")))
@@ -662,7 +662,7 @@ run = |{}| {
 																(p-assign (ident "#err"))))))))))))))
 				(e-tag (name "Ok")
 					(args
-						(e-dispatch-call (method "plus") (constraint-fn-var 940)
+						(e-dispatch-call (method "plus") (constraint-fn-var 948)
 							(receiver
 								(e-lookup-local
 									(p-assign (ident "listing"))))
@@ -680,7 +680,7 @@ run = |{}| {
 					(e-match
 						(match
 							(cond
-								(e-call (constraint-fn-var 967)
+								(e-call (constraint-fn-var 975)
 									(e-lookup-local
 										(p-assign (ident "find")))
 									(e-lookup-local
@@ -712,7 +712,7 @@ run = |{}| {
 					(e-match
 						(match
 							(cond
-								(e-call (constraint-fn-var 1017)
+								(e-call (constraint-fn-var 1025)
 									(e-lookup-local
 										(p-assign (ident "find")))
 									(e-lookup-local
@@ -746,7 +746,7 @@ run = |{}| {
 					(e-match
 						(match
 							(cond
-								(e-call (constraint-fn-var 1063)
+								(e-call (constraint-fn-var 1071)
 									(e-lookup-local
 										(p-assign (ident "find")))
 									(e-lookup-local
@@ -775,9 +775,9 @@ run = |{}| {
 															(p-assign (ident "#err")))))))))))))
 				(e-tag (name "Ok")
 					(args
-						(e-dispatch-call (method "plus") (constraint-fn-var 1094)
+						(e-dispatch-call (method "plus") (constraint-fn-var 1102)
 							(receiver
-								(e-dispatch-call (method "plus") (constraint-fn-var 1092)
+								(e-dispatch-call (method "plus") (constraint-fn-var 1100)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "first"))))
@@ -798,7 +798,7 @@ run = |{}| {
 					(e-match
 						(match
 							(cond
-								(e-call (constraint-fn-var 1115)
+								(e-call (constraint-fn-var 1123)
 									(e-lookup-local
 										(p-assign (ident "query")))
 									(e-string
@@ -830,7 +830,7 @@ run = |{}| {
 					(e-match
 						(match
 							(cond
-								(e-call (constraint-fn-var 1144)
+								(e-call (constraint-fn-var 1152)
 									(e-lookup-local
 										(p-assign (ident "query")))
 									(e-string
@@ -861,7 +861,7 @@ run = |{}| {
 																	(p-assign (ident "#err")))))))))))))))
 				(e-tag (name "Ok")
 					(args
-						(e-dispatch-call (method "plus") (constraint-fn-var 1174)
+						(e-dispatch-call (method "plus") (constraint-fn-var 1182)
 							(receiver
 								(e-lookup-local
 									(p-assign (ident "listing"))))
@@ -899,7 +899,7 @@ run = |{}| {
 					(e-match
 						(match
 							(cond
-								(e-call (constraint-fn-var 1192)
+								(e-call (constraint-fn-var 1200)
 									(e-lookup-local
 										(p-assign (ident "first")))
 									(e-empty_record)))
@@ -930,7 +930,7 @@ run = |{}| {
 					(e-match
 						(match
 							(cond
-								(e-call (constraint-fn-var 1232)
+								(e-call (constraint-fn-var 1240)
 									(e-lookup-local
 										(p-assign (ident "find")))
 									(e-lookup-local
@@ -962,7 +962,7 @@ run = |{}| {
 					(e-match
 						(match
 							(cond
-								(e-call (constraint-fn-var 1264)
+								(e-call (constraint-fn-var 1272)
 									(e-lookup-local
 										(p-assign (ident "first")))
 									(e-empty_record)))
@@ -995,7 +995,7 @@ run = |{}| {
 					(e-match
 						(match
 							(cond
-								(e-call (constraint-fn-var 1315)
+								(e-call (constraint-fn-var 1323)
 									(e-lookup-local
 										(p-assign (ident "find")))
 									(e-lookup-local
@@ -1036,7 +1036,7 @@ run = |{}| {
 			(e-block
 				(s-let
 					(p-underscore)
-					(e-call (constraint-fn-var 1389)
+					(e-call (constraint-fn-var 1397)
 						(e-lookup-local
 							(p-assign (ident "reversed")))
 						(e-lambda
@@ -1047,7 +1047,7 @@ run = |{}| {
 									(e-typed-int (value "1") (type "U64")))))))
 				(s-let
 					(p-underscore)
-					(e-call (constraint-fn-var 1426)
+					(e-call (constraint-fn-var 1434)
 						(e-lookup-local
 							(p-assign (ident "nested")))
 						(e-lambda
@@ -1058,7 +1058,7 @@ run = |{}| {
 									(e-tag (name "QueryFailed")))))))
 				(s-let
 					(p-underscore)
-					(e-call (constraint-fn-var 1451)
+					(e-call (constraint-fn-var 1459)
 						(e-lookup-local
 							(p-assign (ident "repeated")))
 						(e-lambda
@@ -1069,7 +1069,7 @@ run = |{}| {
 									(e-typed-int (value "1") (type "U64")))))))
 				(s-let
 					(p-underscore)
-					(e-call (constraint-fn-var 1475)
+					(e-call (constraint-fn-var 1483)
 						(e-lookup-local
 							(p-assign (ident "annotated")))
 						(e-lambda
@@ -1080,7 +1080,7 @@ run = |{}| {
 									(e-tag (name "NotFound")))))))
 				(s-let
 					(p-underscore)
-					(e-call (constraint-fn-var 1526)
+					(e-call (constraint-fn-var 1534)
 						(e-lookup-local
 							(p-assign (ident "exposed_tail")))
 						(e-lambda

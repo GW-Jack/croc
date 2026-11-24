@@ -1,6 +1,6 @@
 # META
 ~~~ini
-description=for! over a Concurrently plan, built directly or by method, binds the plan's item type and is reported as not compiled yet
+description=for! over a Concurrently plan, built directly or by method, binds the plan's item type
 type=file:Loops.roc
 ~~~
 # SOURCE
@@ -35,47 +35,11 @@ Loops := [].{
 }
 ~~~
 # EXPECTED
-CONCURRENT LOOP NOT SUPPORTED YET - plan_loop_not_lowered.md:5:3:7:4
-CONCURRENT LOOP NOT SUPPORTED YET - plan_loop_not_lowered.md:14:3:16:4
-CONCURRENT LOOP NOT SUPPORTED YET - plan_loop_not_lowered.md:23:3:25:4
-TYPE MISMATCH - plan_loop_not_lowered.md:22:12:22:14
-TYPE MISMATCH - plan_loop_not_lowered.md:26:3:26:5
+TYPE MISMATCH - plan_loop_item_type.md:22:12:22:14
+TYPE MISMATCH - plan_loop_item_type.md:26:3:26:5
 # PROBLEMS
 ~~~clojure
 (reports
-	(report
-		(severity runtime_error)
-		(title "Concurrent Loop Not Supported Yet")
-		(region (start 5 3) (end 7 4))
-		(headline
-			(reflow "This `for!` loop runs a plan, and this compiler can't compile concurrent loops yet."))
-		(document
-			(source-region (file "plan_loop_not_lowered.md") (start 5 3) (end 7 4) (annotation error) (line-text "\t\tfor! x in List.concurrently(fs) {\n\t\t\t$sum = $sum + x\n\t\t}"))
-			(line-break)
-			(line-break)
-			(reflow "The loop crashes if it runs.")))
-	(report
-		(severity runtime_error)
-		(title "Concurrent Loop Not Supported Yet")
-		(region (start 14 3) (end 16 4))
-		(headline
-			(reflow "This `for!` loop runs a plan, and this compiler can't compile concurrent loops yet."))
-		(document
-			(source-region (file "plan_loop_not_lowered.md") (start 14 3) (end 16 4) (annotation error) (line-text "\t\tfor! x in fs.concurrently().limit(2) {\n\t\t\t$sum = $sum + x\n\t\t}"))
-			(line-break)
-			(line-break)
-			(reflow "The loop crashes if it runs.")))
-	(report
-		(severity runtime_error)
-		(title "Concurrent Loop Not Supported Yet")
-		(region (start 23 3) (end 25 4))
-		(headline
-			(reflow "This `for!` loop runs a plan, and this compiler can't compile concurrent loops yet."))
-		(document
-			(source-region (file "plan_loop_not_lowered.md") (start 23 3) (end 25 4) (annotation error) (line-text "\t\tfor! x in List.concurrently(fs) {\n\t\t\t$s = x\n\t\t}"))
-			(line-break)
-			(line-break)
-			(reflow "The loop crashes if it runs.")))
 	(report
 		(severity runtime_error)
 		(title "Type Mismatch")
@@ -83,7 +47,7 @@ TYPE MISMATCH - plan_loop_not_lowered.md:26:3:26:5
 		(headline
 			(reflow "This string literal is being used where a non-string type is needed."))
 		(document
-			(source-region (file "plan_loop_not_lowered.md") (start 22 12) (end 22 14) (annotation error) (line-text "\t\tvar $s = \"\""))
+			(source-region (file "plan_loop_item_type.md") (start 22 12) (end 22 14) (annotation error) (line-text "\t\tvar $s = \"\""))
 			(line-break)
 			(reflow "The type was determined to be:")
 			(line-break)
@@ -99,7 +63,7 @@ TYPE MISMATCH - plan_loop_not_lowered.md:26:3:26:5
 		(headline
 			(reflow "This expression is used in an unexpected way."))
 		(document
-			(source-region (file "plan_loop_not_lowered.md") (start 26 3) (end 26 5) (annotation error) (line-text "\t\t$s"))
+			(source-region (file "plan_loop_item_type.md") (start 26 3) (end 26 5) (annotation error) (line-text "\t\t$s"))
 			(line-break)
 			(reflow "It has the type:")
 			(line-break)
@@ -281,7 +245,7 @@ NO CHANGE
 					(e-num (value "0")))
 				(s-for-bang
 					(p-assign (ident "x"))
-					(e-call (constraint-fn-var 337)
+					(e-call (constraint-fn-var 345)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local
@@ -289,7 +253,7 @@ NO CHANGE
 					(e-block
 						(s-reassign
 							(p-var-assign (ident "$sum"))
-							(e-dispatch-call (method "plus") (constraint-fn-var 350)
+							(e-dispatch-call (method "plus") (constraint-fn-var 482)
 								(receiver
 									(e-lookup-local
 										(p-var-assign (ident "$sum"))))
@@ -316,9 +280,9 @@ NO CHANGE
 					(e-num (value "0")))
 				(s-for-bang
 					(p-assign (ident "x"))
-					(e-dispatch-call (method "limit") (constraint-fn-var 366)
+					(e-dispatch-call (method "limit") (constraint-fn-var 498)
 						(receiver
-							(e-dispatch-call (method "concurrently") (constraint-fn-var 357)
+							(e-dispatch-call (method "concurrently") (constraint-fn-var 489)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "fs"))))
@@ -328,7 +292,7 @@ NO CHANGE
 					(e-block
 						(s-reassign
 							(p-var-assign (ident "$sum"))
-							(e-dispatch-call (method "plus") (constraint-fn-var 350)
+							(e-dispatch-call (method "plus") (constraint-fn-var 482)
 								(receiver
 									(e-lookup-local
 										(p-var-assign (ident "$sum"))))
@@ -355,7 +319,7 @@ NO CHANGE
 					(e-runtime-error (tag "erroneous_value_expr")))
 				(s-for-bang
 					(p-assign (ident "x"))
-					(e-call (constraint-fn-var 404)
+					(e-call (constraint-fn-var 607)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local

@@ -2098,7 +2098,14 @@ const ReassignmentPublisher = struct {
                 try self.pushExpr(binop.lhs);
                 try self.pushExpr(binop.rhs);
             },
-            .unary_minus, .dbg, .spawn => |child| try self.pushExpr(child),
+            .unary_minus, .dbg => |child| try self.pushExpr(child),
+            // A `spawn` updates its plan loop's running set, which lowering
+            // carries under the loop's node as its binder (design.md "Plans
+            // And Concurrent Loops", "Sequential lowering.").
+            .spawn => |child| {
+                if (bodies.spawnPlanLoop(id)) |loop| try self.scratch.append(self.allocator, @fromBackingInt(@intCast(loop)));
+                try self.pushExpr(child);
+            },
             // An expect body can only reassign vars declared inside it
             // (canonicalization rejects the rest), so it carries no state
             // through an enclosing construct.

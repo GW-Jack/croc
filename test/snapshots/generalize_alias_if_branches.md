@@ -99,11 +99,11 @@ main = (picked(1), picked("a"))
 		(p-assign (ident "main"))
 		(e-tuple
 			(elems
-				(e-call (constraint-fn-var 253)
+				(e-call (constraint-fn-var 261)
 					(e-lookup-local
 						(p-assign (ident "picked")))
 					(e-runtime-error (tag "erroneous_value_expr")))
-				(e-call (constraint-fn-var 254)
+				(e-call (constraint-fn-var 262)
 					(e-lookup-local
 						(p-assign (ident "picked")))
 					(e-runtime-error (tag "erroneous_value_expr")))))))

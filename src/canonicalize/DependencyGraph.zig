@@ -428,6 +428,12 @@ const DispatchResolution = struct {
     }
 };
 
+/// A loop's dispatch callables, the first `len` of `vars`.
+const LoopDispatchVars = struct {
+    vars: [5]Var,
+    len: u8,
+};
+
 const DemandAnalyzer = struct {
     cir: *const ModuleEnv,
     allocator: std.mem.Allocator,
@@ -446,7 +452,9 @@ const DemandAnalyzer = struct {
     foreign: ?ForeignCallees = null,
     scheme_use_by_node: collections.DenseMap(CIR.Node.Idx, u32),
     /// The `iter` and `next` dispatch callables of each `for` loop, by node.
-    for_loop_dispatch: std.AutoHashMapUnmanaged(u32, [2]Var) = .{},
+    /// Each loop's dispatch callables: `iter` and `next`, then a plan loop's
+    /// `run_create!`, `run_spawn!` and `run_cancel!`.
+    for_loop_dispatch: std.AutoHashMapUnmanaged(u32, LoopDispatchVars) = .{},
     summaries: collections.DenseMap(CIR.Expr.Idx, DemandSummary),
     active_lambdas: collections.DenseMap(CIR.Expr.Idx, void),
     /// The lambdas of `summary_defs`, whose summaries `computeSummaries`
@@ -563,10 +571,19 @@ const DemandAnalyzer = struct {
         }
 
         for (cir.for_loop_dispatch_plans.items()) |plan| {
-            try analyzer.for_loop_dispatch.put(allocator, plan.node_idx, .{
-                @fromBackingInt(@intCast(plan.iter_fn_var)),
-                @fromBackingInt(@intCast(plan.next_fn_var)),
-            });
+            var vars: LoopDispatchVars = .{ .vars = undefined, .len = 2 };
+            vars.vars[0] = @fromBackingInt(@intCast(plan.iter_fn_var));
+            vars.vars[1] = @fromBackingInt(@intCast(plan.next_fn_var));
+            switch (plan.protocol) {
+                .iter, .stream => {},
+                .plan => {
+                    vars.vars[2] = @fromBackingInt(@intCast(plan.plan.create_fn_var));
+                    vars.vars[3] = @fromBackingInt(@intCast(plan.plan.spawn_fn_var));
+                    vars.vars[4] = @fromBackingInt(@intCast(plan.plan.cancel_fn_var));
+                    vars.len = 5;
+                },
+            }
+            try analyzer.for_loop_dispatch.put(allocator, plan.node_idx, vars);
         }
 
         return analyzer;
@@ -928,7 +945,7 @@ const DemandAnalyzer = struct {
         node_idx: CIR.Node.Idx,
     ) std.mem.Allocator.Error!void {
         const fn_vars = self.for_loop_dispatch.get(@backingInt(node_idx)) orelse return;
-        for (fn_vars) |fn_var| try self.applyDispatchRequirement(walk, current, fn_var, null);
+        for (fn_vars.vars[0..fn_vars.len]) |fn_var| try self.applyDispatchRequirement(walk, current, fn_var, null);
     }
 
     /// A call whose target this module's demand cannot name invokes some

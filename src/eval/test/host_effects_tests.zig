@@ -1449,6 +1449,118 @@ pub const tests = [_]TestCase{
         .returned,
         0,
     ),
+    // design.md "Plans And Concurrent Loops", "Sequential lowering.": a
+    // `for!` over a plan runs its entries one at a time, in order.
+    moduleTestWithLiveAllocations(
+        "for! over a plan: runs entries in order, spawned entries after them, and background entries only while a foreground entry is left",
+        \\entry! : Str, U64 -> (() => U64)
+        \\entry! = |name, n| || {
+        \\    dbg name
+        \\    n
+        \\}
+        \\
+        \\main : () => {}
+        \\main = || {
+        \\    var $sum = 0
+        \\    late = List.concurrently([entry!("late", 100)]).background()
+        \\    plan = List.concurrently([entry!("a", 1), entry!("b", 2)]).limit(1).shielded().concat(late)
+        \\    for! x in plan {
+        \\        dbg x
+        \\        if x == 1 {
+        \\            for n in [3.U64] {
+        \\                match n {
+        \\                    3 => spawn entry!("c", n)
+        \\                    _ => {}
+        \\                }
+        \\            }
+        \\        }
+        \\        $sum = $sum + x
+        \\    }
+        \\    expect $sum == 106
+        \\    for! x in List.concurrently([entry!("d", 4)]).concat(List.concurrently([entry!("never", 0)]).background()) {
+        \\        dbg x
+        \\    }
+        \\    {}
+        \\}
+    ,
+        &.{ dbg("\"a\""), dbg("1"), dbg("\"b\""), dbg("2"), dbg("\"late\""), dbg("100"), dbg("\"c\""), dbg("3"), dbg("\"d\""), dbg("4") },
+        .returned,
+        0,
+    ),
+    moduleTestWithLiveAllocations(
+        "for! over a plan: break and return cancel the entries that have not started, innermost loop first",
+        \\entry! : Str, U64 -> (() => U64)
+        \\entry! = |name, n| || {
+        \\    dbg name
+        \\    n
+        \\}
+        \\
+        \\first_big! : List(() => U64) => U64
+        \\first_big! = |fs| {
+        \\    for! x in List.concurrently(fs) {
+        \\        for! y in List.concurrently([entry!("inner", x), entry!("second", 0)]) {
+        \\            if y > 1 {
+        \\                return y
+        \\            }
+        \\        }
+        \\    }
+        \\    0
+        \\}
+        \\
+        \\main : () => {}
+        \\main = || {
+        \\    for! x in List.concurrently([entry!("first", 1), entry!("dropped", 2)]) {
+        \\        dbg x
+        \\        break
+        \\    }
+        \\    big = first_big!([|| 1, || 5, || 9])
+        \\    expect big == 5
+        \\    {}
+        \\}
+    ,
+        &.{ dbg("\"first\""), dbg("1"), dbg("\"inner\""), dbg("\"second\""), dbg("\"inner\"") },
+        .returned,
+        0,
+    ),
+    moduleTestWithLiveAllocations(
+        "for! over a plan: ? leaves the loop and cancels the entries that have not started",
+        \\ok! : Str, U64 -> (() => Try(U64, Str))
+        \\ok! = |name, n| || {
+        \\    dbg name
+        \\    Ok(n)
+        \\}
+        \\
+        \\err! : Str -> (() => Try(U64, Str))
+        \\err! = |name| || {
+        \\    dbg name
+        \\    Err(name)
+        \\}
+        \\
+        \\sum_ok! : List(() => Try(U64, Str)) => Try(U64, Str)
+        \\sum_ok! = |fs| {
+        \\    var $sum = 0
+        \\    for! r in List.concurrently(fs) {
+        \\        $sum = $sum + r?
+        \\    }
+        \\    Ok($sum)
+        \\}
+        \\
+        \\main : () => {}
+        \\main = || {
+        \\    result = sum_ok!([ok!("m", 1), err!("n"), ok!("o", 3)])
+        \\    expect result == Err("n")
+        \\    empty : List(() => U64)
+        \\    empty = []
+        \\    for! x in List.concurrently(empty) {
+        \\        dbg x
+        \\    }
+        \\    {}
+        \\}
+    ,
+        &.{ dbg("\"m\""), dbg("\"n\"") },
+        .returned,
+        0,
+    ),
     moduleTestWithLiveAllocations(
         "for!: return exits the enclosing function from inside the loop",
         \\counter! : U64 => Try((U64, U64), [NoMore])

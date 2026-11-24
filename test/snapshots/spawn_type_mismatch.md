@@ -29,26 +29,12 @@ Loops := [].{
 }
 ~~~
 # EXPECTED
-CONCURRENT LOOP NOT SUPPORTED YET - spawn_type_mismatch.md:4:3:6:4
 TYPE MISMATCH - spawn_type_mismatch.md:5:10:5:11
-CONCURRENT LOOP NOT SUPPORTED YET - spawn_type_mismatch.md:11:3:13:4
 TYPE MISMATCH - spawn_type_mismatch.md:12:10:12:11
-CONCURRENT LOOP NOT SUPPORTED YET - spawn_type_mismatch.md:18:3:20:4
 TYPE MISMATCH - spawn_type_mismatch.md:19:10:19:11
 # PROBLEMS
 ~~~clojure
 (reports
-	(report
-		(severity runtime_error)
-		(title "Concurrent Loop Not Supported Yet")
-		(region (start 4 3) (end 6 4))
-		(headline
-			(reflow "This `for!` loop runs a plan, and this compiler can't compile concurrent loops yet."))
-		(document
-			(source-region (file "spawn_type_mismatch.md") (start 4 3) (end 6 4) (annotation error) (line-text "\t\tfor! x in List.concurrently(fs) {\n\t\t\tspawn x\n\t\t}"))
-			(line-break)
-			(line-break)
-			(reflow "The loop crashes if it runs.")))
 	(report
 		(severity runtime_error)
 		(title "Type Mismatch")
@@ -76,17 +62,6 @@ TYPE MISMATCH - spawn_type_mismatch.md:19:10:19:11
 			(annotation-end)))
 	(report
 		(severity runtime_error)
-		(title "Concurrent Loop Not Supported Yet")
-		(region (start 11 3) (end 13 4))
-		(headline
-			(reflow "This `for!` loop runs a plan, and this compiler can't compile concurrent loops yet."))
-		(document
-			(source-region (file "spawn_type_mismatch.md") (start 11 3) (end 13 4) (annotation error) (line-text "\t\tfor! _x in List.concurrently(fs) {\n\t\t\tspawn f\n\t\t}"))
-			(line-break)
-			(line-break)
-			(reflow "The loop crashes if it runs.")))
-	(report
-		(severity runtime_error)
 		(title "Type Mismatch")
 		(region (start 12 10) (end 12 11))
 		(headline
@@ -110,17 +85,6 @@ TYPE MISMATCH - spawn_type_mismatch.md:19:10:19:11
 			(indent 1)
 			(text "() => U64")
 			(annotation-end)))
-	(report
-		(severity runtime_error)
-		(title "Concurrent Loop Not Supported Yet")
-		(region (start 18 3) (end 20 4))
-		(headline
-			(reflow "This `for!` loop runs a plan, and this compiler can't compile concurrent loops yet."))
-		(document
-			(source-region (file "spawn_type_mismatch.md") (start 18 3) (end 20 4) (annotation error) (line-text "\t\tfor! _x in List.concurrently(fs) {\n\t\t\tspawn f\n\t\t}"))
-			(line-break)
-			(line-break)
-			(reflow "The loop crashes if it runs.")))
 	(report
 		(severity runtime_error)
 		(title "Type Mismatch")
@@ -288,7 +252,7 @@ NO CHANGE
 			(e-block
 				(s-for-bang
 					(p-assign (ident "x"))
-					(e-call (constraint-fn-var 346)
+					(e-call (constraint-fn-var 354)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local
@@ -313,7 +277,7 @@ NO CHANGE
 			(e-block
 				(s-for-bang
 					(p-assign (ident "_x"))
-					(e-call (constraint-fn-var 379)
+					(e-call (constraint-fn-var 511)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local
@@ -341,7 +305,7 @@ NO CHANGE
 			(e-block
 				(s-for-bang
 					(p-assign (ident "_x"))
-					(e-call (constraint-fn-var 413)
+					(e-call (constraint-fn-var 616)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local

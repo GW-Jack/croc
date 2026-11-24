@@ -129,7 +129,7 @@ pub const Fn = struct {
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(Fn) == 572);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(Fn) == 576);
 }
 
 /// What a lifted function body contains, recorded by whoever emitted its

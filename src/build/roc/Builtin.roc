@@ -3919,23 +3919,63 @@ Builtin :: [].{
 		concat = |first, second| Cat(first, second)
 
 		## The compiler calls this to run a `for!` loop over the plan. `entries`
-		## are the plan's functions in input order, and `marks` is parallel to
-		## them. Limit `i` allows `limits[i]` running entries, and an entry's
-		## `limit_path` lists the limits it's under, outermost first. `root_limit`
-		## is 1 when the plan's outermost node is a limit and 0 otherwise: a
-		## spawned entry goes under that limit only.
+		## are the plan's functions in input order, and the other lists are parallel
+		## to them. Limit `i` allows `limits[i]` running entries, and an entry's
+		## `limit_paths` item lists the limits it's under, outermost first.
+		## `root_limit` is 1 when the plan's outermost node is a limit and 0
+		## otherwise: a spawned entry goes under that limit only.
 		## ```roc
 		## expect List.concurrently([|| 1, || 2]).limit(3).flatten().limits == [3]
 		## ```
-		flatten : Concurrently(item) -> { entries : List(() => item), marks : List({ limit_path : List(U64), shielded : Bool, background : Bool }), limits : List(U64), root_limit : U64 }
+		flatten : Concurrently(item) -> { entries : List(() => item), limit_paths : List(List(U64)), shielded : List(Bool), background : List(Bool), limits : List(U64), root_limit : U64 }
 		flatten = |plan| {
-			flat = concurrently_flatten_into(plan, [], Bool.False, Bool.False, { entries: [], marks: [], limits: [] })
+			flat = concurrently_flatten_into(plan, [], Bool.False, Bool.False, { entries: [], limit_paths: [], shielded: [], background: [], limits: [] })
 			root_limit = match plan {
 				Limit(_, _) => 1
 				_ => 0
 			}
-			{ entries: flat.entries, marks: flat.marks, limits: flat.limits, root_limit }
+			{ entries: flat.entries, limit_paths: flat.limit_paths, shielded: flat.shielded, background: flat.background, limits: flat.limits, root_limit }
 		}
+
+		## The running set of a `for!` loop over a plan, in its sequential form
+		## (design.md "Plans And Concurrent Loops"): the entries, which of them are
+		## background, the next one to start, and how many entries that aren't
+		## background haven't started.
+		Running(item) :: { entries : List(() => item), background : List(Bool), next : U64, foreground_left : U64 }
+
+		# The running-set helpers below are called only by the compiler's lowering
+		# of a `for!` loop over a plan; checking rejects every other use. Each takes
+		# the loop's id first, and the sequential form ignores it, the limits and the
+		# shields.
+		run_create! : U64, List(() => item), List(List(U64)), List(Bool), List(Bool), List(U64), U64 => Running(item)
+		run_create! = |_id, entries, _limit_paths, _shielded, backgrounds, _limits, _root_limit|
+			{ entries, background: backgrounds, next: 0, foreground_left: List.count_if(backgrounds, Bool.not) }
+
+		run_next! : U64, Running(item) => (Running(item), [Arrived(item), Ended])
+		run_next! = |_id, running|
+			if running.foreground_left == 0 {
+				Concurrently.run_ended(running)
+			} else {
+				entry = list_get_unsafe(running.entries, running.next)
+				foreground_left = if (list_get_unsafe(running.background, running.next)) running.foreground_left else running.foreground_left - 1
+				Concurrently.run_arrived({ ..running, next: running.next + 1, foreground_left }, Concurrently.run_entry!(entry))
+			}
+
+		run_spawn! : U64, Running(item), (() => item) => Running(item)
+		run_spawn! = |_id, running, entry|
+			{ ..running, entries: List.append(running.entries, entry), background: List.append(running.background, Bool.False), foreground_left: running.foreground_left + 1 }
+
+		run_cancel! : U64, Running(item) => Running(item)
+		run_cancel! = |_id, running| { ..running, foreground_left: 0 }
+
+		run_entry! : (() => item) => item
+		run_entry! = |entry| entry()
+
+		run_arrived : Running(item), item -> (Running(item), [Arrived(item), Ended])
+		run_arrived = |running, arrived| (running, Arrived(arrived))
+
+		run_ended : Running(item) -> (Running(item), [Arrived(item), Ended])
+		run_ended = |running| (running, Ended)
 	}
 
 	## A type has a default sort order when its module provides
@@ -27712,14 +27752,16 @@ iter_from_step = |len_if_known, step| {
 
 # `Concurrently.flatten`'s walk. `acc` holds what the walk has produced so far,
 # and each node appends its entries, their marks and its limits in input order.
-concurrently_flatten_into : Concurrently(item), List(U64), Bool, Bool, { entries : List(() => item), marks : List({ limit_path : List(U64), shielded : Bool, background : Bool }), limits : List(U64) } -> { entries : List(() => item), marks : List({ limit_path : List(U64), shielded : Bool, background : Bool }), limits : List(U64) }
+concurrently_flatten_into : Concurrently(item), List(U64), Bool, Bool, { entries : List(() => item), limit_paths : List(List(U64)), shielded : List(Bool), background : List(Bool), limits : List(U64) } -> { entries : List(() => item), limit_paths : List(List(U64)), shielded : List(Bool), background : List(Bool), limits : List(U64) }
 concurrently_flatten_into = |plan, limit_path, shielded, background, acc|
 	match plan {
 		Each(functions) => {
-			mark = { limit_path, shielded, background }
+			count = List.len(functions)
 			{
 				entries: List.concat(acc.entries, functions),
-				marks: List.concat(acc.marks, List.repeat(mark, List.len(functions))),
+				limit_paths: List.concat(acc.limit_paths, List.repeat(limit_path, count)),
+				shielded: List.concat(acc.shielded, List.repeat(shielded, count)),
+				background: List.concat(acc.background, List.repeat(background, count)),
 				limits: acc.limits,
 			}
 		}
@@ -27729,8 +27771,7 @@ concurrently_flatten_into = |plan, limit_path, shielded, background, acc|
 		}
 		Limit(max_running, inner) => {
 			index = List.len(acc.limits)
-			with_limit = { entries: acc.entries, marks: acc.marks, limits: List.append(acc.limits, max_running) }
-			concurrently_flatten_into(inner, List.append(limit_path, index), shielded, background, with_limit)
+			concurrently_flatten_into(inner, List.append(limit_path, index), shielded, background, { ..acc, limits: List.append(acc.limits, max_running) })
 		}
 		Shielded(inner) => concurrently_flatten_into(inner, limit_path, Bool.True, background, acc)
 		Background(inner) => concurrently_flatten_into(inner, limit_path, shielded, Bool.True, acc)

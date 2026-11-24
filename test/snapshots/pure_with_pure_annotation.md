@@ -120,7 +120,7 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-assign (ident "x")))
-			(e-call (constraint-fn-var 281)
+			(e-call (constraint-fn-var 289)
 				(e-lookup-local
 					(p-assign (ident "add")))
 				(e-lookup-local
@@ -133,7 +133,7 @@ NO CHANGE
 				(ty-lookup (name "I32") (builtin)))))
 	(d-let
 		(p-assign (ident "main!"))
-		(e-call (constraint-fn-var 285)
+		(e-call (constraint-fn-var 293)
 			(e-lookup-local
 				(p-assign (ident "add")))
 			(e-num (value "1"))

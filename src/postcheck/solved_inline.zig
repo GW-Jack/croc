@@ -251,6 +251,10 @@ const InlineAnalyzer = struct {
 
     fn inlineCandidate(self: *const InlineAnalyzer, fn_id: SpecFnId) std.mem.Allocator.Error!?Candidate {
         const template = self.solved.lifted.getFn(self.source(fn_id)).source;
+        // A running-set helper stays a call in every mode: the continuation
+        // pass finds a concurrent loop's operations as calls of these
+        // procedures (design.md "Plans And Concurrent Loops").
+        if (template) |fn_template| if (fn_template.running_set_helper != .none) return null;
         const low_level_rule_admits: ?bool = switch (self.rule) {
             .provided_low_level => (template orelse return null).provided_low_level != .none,
             .type_only_operands => (template orelse return null).provided_low_level == .operation_with_type_only_operands,

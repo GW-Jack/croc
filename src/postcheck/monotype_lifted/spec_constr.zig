@@ -3313,6 +3313,7 @@ const Pass = struct {
     /// these inseparable prevents a mutable output body from being admitted
     /// against an original source body's smaller size.
     fn inlineSourceBody(self: *const Pass, fn_id: Ast.FnId) Allocator.Error!?InlineSourceBody {
+        if (self.isRunningSetHelper(fn_id)) return null;
         const raw = @backingInt(fn_id);
         const body = switch (self.sourceBody(fn_id)) {
             .roc => |body| body,
@@ -3325,7 +3326,17 @@ const Pass = struct {
         return .{ .expr = body, .size = size };
     }
 
+    /// A running-set helper stays a call of its own procedure: the
+    /// continuation pass finds a concurrent loop's operations as calls of
+    /// these procedures (design.md "Plans And Concurrent Loops"), so no
+    /// clone inlines one or specializes it for a call pattern.
+    fn isRunningSetHelper(self: *const Pass, fn_id: Ast.FnId) bool {
+        const template = self.program.getFn(fn_id).source orelse return false;
+        return template.running_set_helper != .none;
+    }
+
     fn recordCallPattern(self: *Pass, fn_id: Ast.FnId, args_span: Ast.Span(Ast.ExprId)) Allocator.Error!void {
+        if (self.isRunningSetHelper(fn_id)) return;
         const raw = @backingInt(fn_id);
         if (!self.plans[raw].source.size.admits()) return;
         const args_rows = try ownedWalkRows(self.program, self.allocator, Ast.ExprId, args_span);
