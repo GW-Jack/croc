@@ -2591,6 +2591,15 @@ pub const Interpreter = struct {
                         current = assign.next;
                         continue;
                     }
+                    if (self.unwinding_pause) {
+                        // The callee paused, so its result is poison. The
+                        // task's pending flag leads the code after the call
+                        // away before it reads the target, so nothing may
+                        // check the poison against the target's layout.
+                        if (self.store.getLocal(assign.target).dyn == null) frame.setLocal(assign.target, result.value);
+                        current = assign.next;
+                        continue;
+                    }
                     if (result_storage) |storage| {
                         try self.finishResultStorage(frame, current, assign.target, storage);
                         current = assign.next;

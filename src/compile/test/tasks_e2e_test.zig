@@ -885,3 +885,68 @@ test "a crash inside a Tasks program compiled by the dev backend ends its task a
     if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
     try harness.runAppPathLoweredInspection(crash_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, crashAllDev);
 }
+
+/// A call that pauses returns a `Try` its caller reads only after the
+/// operation finished, so nothing may look at the poison value the pause
+/// left in its place.
+const tag_result_app_path = "test/postcheck/suspension_tag_result/app.roc";
+
+fn runTagResult(comptime R: type, program: R.Program, mode: task_test_host.Mode) E2eError!void {
+    var run: R = undefined;
+    try run.init(program, mode);
+    defer run.deinit();
+    var result: RocStr = RocStr.empty();
+    const task = try run.startRoot(program, &result);
+    try std.testing.expectEqual(builtins.task.Status.done, try run.host.drive(task));
+    run.host.freeTask(task);
+    if (task_test_host.c_abi_failure) |err| return err;
+    try std.testing.expectEqualStrings(url ++ "/body!", result.asSlice());
+    result.decref(run.runtime.get_ops());
+    try std.testing.expectEqual(@as(u32, if (mode == .pause) 1 else 0), run.host.pauses);
+    try std.testing.expectEqual(@as(usize, 1), run.host.trace.items.len);
+    try std.testing.expectEqualStrings("fetch(" ++ url ++ ")", run.host.trace.items[0]);
+    try run.runtime.checkForLeaks();
+}
+
+fn checkTagResult(comptime R: type, program: R.Program) E2eError!void {
+    for ([_]task_test_host.Mode{ .ready, .pause }) |mode| {
+        runTagResult(R, program, mode) catch |err| {
+            std.log.err("the paused call's tag-union result ({s}) failed: {s}", .{ @tagName(mode), @errorName(err) });
+            return err;
+        };
+    }
+}
+
+fn tagResultInterpreter(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    checkTagResult(Run, lowered) catch return error.TestUnexpectedResult;
+}
+
+fn tagResultDev(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    var program: DevProgram = undefined;
+    program.init(lowered) catch return error.TestUnexpectedResult;
+    defer program.deinit();
+    checkTagResult(DevRun, &program) catch return error.TestUnexpectedResult;
+}
+
+fn tagResultLlvm(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    var program: LlvmProgram = undefined;
+    program.init(lowered) catch return error.TestUnexpectedResult;
+    defer program.deinit();
+    checkTagResult(LlvmRun, &program) catch return error.TestUnexpectedResult;
+}
+
+test "a pausing call may return a tag union, on the interpreter" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    try harness.runAppPathLoweredInspection(tag_result_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, tagResultInterpreter);
+}
+
+test "a pausing call may return a tag union, on the dev backend" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
+    try harness.runAppPathLoweredInspection(tag_result_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, tagResultDev);
+}
+
+test "a pausing call may return a tag union, on LLVM" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    try harness.runAppPathLoweredInspection(tag_result_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, tagResultLlvm);
+}
