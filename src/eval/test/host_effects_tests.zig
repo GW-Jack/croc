@@ -1488,6 +1488,43 @@ pub const tests = [_]TestCase{
         0,
     ),
     moduleTestWithLiveAllocations(
+        "for! over a plan: a spawned closed lambda runs at the loop's item type",
+        \\go! : U64 => Str
+        \\go! = |n| {
+        \\    var $text = ""
+        \\    for! x in List.concurrently([|| Ok({ id: n, name: "a" }), || Err("b")]) {
+        \\        match x {
+        \\            Ok({ id, name }) => {
+        \\                dbg id
+        \\                if id == n {
+        \\                    spawn || Ok({ id: 4, name: "c" })
+        \\                }
+        \\                $text = Str.concat($text, name)
+        \\            }
+        \\            Err(name) => {
+        \\                spawn || Err("d")
+        \\                $text = Str.concat($text, name)
+        \\                if Str.count_utf8_bytes($text) > 3 {
+        \\                    break
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\    $text
+        \\}
+        \\
+        \\main : () => {}
+        \\main = || {
+        \\    text = go!(3)
+        \\    dbg text
+        \\    {}
+        \\}
+    ,
+        &.{ dbg("3"), dbg("4"), dbg("\"abcd\"") },
+        .returned,
+        0,
+    ),
+    moduleTestWithLiveAllocations(
         "for! over a plan: break and return cancel the entries that have not started, innermost loop first",
         \\entry! : Str, U64 -> (() => U64)
         \\entry! = |name, n| || {

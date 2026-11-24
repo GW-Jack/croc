@@ -35828,8 +35828,12 @@ const BodyContext = struct {
     fn stepSpawn(self: *BodyContext, task: *SpawnTask, input: ?LowerResult) Allocator.Error!LowerStep {
         switch (task.stage) {
             .start => {
+                // Lowered at the type of `run_spawn!`'s entry parameter: a
+                // generalized operand's own type can be open.
+                const exit = self.planLoopExitFor(task.loop);
+                const spawn_nodes = try self.graph.functionNodes(try self.instNode(exit.spawn.callable_ty));
                 task.stage = .operand;
-                return requestLowerTask(self, .{ .expr = .{ .expr = ExprSite.read(task.operand) } });
+                return requestLowerChild(self, ExprSite.read(task.operand), DraftTypeCell.fromGraphNode(spawn_nodes.args[2]));
             },
             .operand => {
                 const exit = self.planLoopExitFor(task.loop);

@@ -34183,7 +34183,9 @@ the loop's first carried value; it lives only in the loop's locals and in
 loop and join parameters. `spawn f` is `run_spawn!(id, running, f)`, whose
 result becomes the loop's running set, so a `spawn` inside a nested `for`,
 `while`, `if` or `match` carries it out the way a reassigned `var` is
-carried. Every edge out of the body other than a crash or a normal `Ended`
+carried. Monotype lowers `f` at the type of `run_spawn!`'s entry parameter,
+since a generalized `f`'s own type can be open. Every edge out of the body
+other than a crash or a normal `Ended`
 runs the loop's exit sequence: `run_cancel!`, then `run_next!` until it
 reports `Ended`, dropping what arrives. A `return` or `?` that leaves
 several plan loops runs their exit sequences innermost first. `run_next!`
