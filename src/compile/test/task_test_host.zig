@@ -46,6 +46,11 @@ pub const TestHost = struct {
     aborts: u32 = 0,
     /// How many times a wake told the host a parked task is ready.
     readies: u32 = 0,
+    /// Whether `readyTask` queues a task for `driveTree`.
+    queue_readies: bool = false,
+    /// The tasks `roc_task_ready` gave, not yet resumed: several when the
+    /// root's concurrent loops have children.
+    ready_tasks: std.ArrayList(*RocTask) = .empty,
     /// The task's `roc_task_wake`: a program's own, or `nativeWake`.
     wake: WakeFn = &nativeWake,
     /// The task's `roc_task_resume` and `roc_task_free`: a program's own
@@ -63,6 +68,7 @@ pub const TestHost = struct {
         if (self.pending) |pending| pending.url.decref(self.ops);
         for (self.trace.items) |entry| self.allocator.free(entry);
         self.trace.deinit(self.allocator);
+        self.ready_tasks.deinit(self.allocator);
     }
 
     pub fn handler(self: *TestHost) eval.Interpreter.HostedCallHandler {
@@ -148,6 +154,10 @@ pub const TestHost = struct {
 
     /// Resume `task` through the runtime that made it.
     pub fn resumeTask(self: *TestHost, task: *RocTask) Status {
+        // A resume may hand this host ready tasks and abort operations.
+        const previous = active_host;
+        active_host = self;
+        defer active_host = previous;
         return @fromBackingInt(@as(u8, @intCast(self.resume_task(task))));
     }
 
@@ -164,6 +174,41 @@ pub const TestHost = struct {
             status = self.resumeTask(task);
         }
         return status;
+    }
+
+    /// Run the tree of `root`, whose hosted functions finish in place, under
+    /// the coroutine schedule (design.md "Sequential equivalence"): resume
+    /// the ready task first in the task tree, until the root ends. An entry
+    /// that has not begun waits until its loop asks for its next result,
+    /// unless no other task can run.
+    pub fn driveTree(self: *TestHost, root: *RocTask) error{Stuck}!Status {
+        self.queue_readies = true;
+        defer self.queue_readies = false;
+        var status = self.resumeTask(root);
+        while (status == .pending) {
+            const next = self.takeFirstReady() orelse return error.Stuck;
+            const next_status = self.resumeTask(next);
+            // The runtime frees a child that ends, so only the root's status
+            // outlives its resume.
+            if (next == root) status = next_status;
+        }
+        return status;
+    }
+
+    /// The ready task first in the tree, of the ones whose beginning is asked
+    /// for, or of all of them if no entry that has begun can run.
+    fn takeFirstReady(self: *TestHost) ?*RocTask {
+        const first = self.firstReady(true) orelse self.firstReady(false) orelse return null;
+        return self.ready_tasks.orderedRemove(first);
+    }
+
+    fn firstReady(self: *const TestHost, asked_only: bool) ?usize {
+        var first: ?usize = null;
+        for (self.ready_tasks.items, 0..) |task, i| {
+            if (asked_only and !builtins.task.coroutineMayBegin(task)) continue;
+            if (first == null or builtins.task.treeOrder(task, self.ready_tasks.items[first.?]) == .lt) first = i;
+        }
+        return first;
     }
 
     /// Run `task` until its `pause`th pause (counting from 1), then cancel
@@ -266,10 +311,16 @@ fn cAbiLog(text: RocStr) callconv(.c) void {
     };
 }
 
-/// `void roc_task_ready(RocTask *task)`: the task the host just woke was
-/// parked, so the host may resume it. The driver resumes it next.
-fn readyTask(_: *RocTask) callconv(.c) void {
-    active_host.?.readies += 1;
+/// `void roc_task_ready(RocTask *task)`: the task was parked or is new, so
+/// the host may resume it. A single task's driver resumes it next, and
+/// `driveTree` resumes it once it is first in the tree.
+fn readyTask(task: *RocTask) callconv(.c) void {
+    const host = active_host.?;
+    host.readies += 1;
+    if (!host.queue_readies) return;
+    host.ready_tasks.append(host.allocator, task) catch {
+        if (c_abi_failure == null) c_abi_failure = error.OutOfMemory;
+    };
 }
 
 /// `void roc_task_abort(RocTask *task)`.

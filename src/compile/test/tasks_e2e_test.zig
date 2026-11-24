@@ -24,6 +24,7 @@ const builtins = @import("builtins");
 
 const harness = @import("lower_to_lir_harness.zig");
 const static_data = @import("static_data");
+const CoreCtx = @import("ctx").CoreCtx;
 const task_test_host = @import("task_test_host.zig");
 
 const RocStr = builtins.str.RocStr;
@@ -949,4 +950,259 @@ test "a pausing call may return a tag union, on the dev backend" {
 test "a pausing call may return a tag union, on LLVM" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     try harness.runAppPathLoweredInspection(tag_result_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, tagResultLlvm);
+}
+
+// Sequential equivalence (design.md "Sequential equivalence"): a program's
+// concurrent loops give the same result and make the same hosted calls in
+// the same order when their entries run as child tasks, on a host that
+// finishes every hosted call in place and resumes the ready task first in the
+// task tree, as a `None` build of the same program gives without tasks.
+
+const plan_loop_tasks_path = "test/postcheck/plan_loops_tasks/app.roc";
+const plan_loop_none_path = "test/postcheck/plan_loops_none/app.roc";
+const plan_loop_cases = [_][]const u8{
+    "basic", "limits", "spawn", "background", "break", "return", "try", "nested", "children",
+};
+
+/// What a run of one case gave: its result, and the hosted calls it made.
+const CaseOutcome = struct {
+    result: []u8,
+    trace: [][]u8,
+
+    fn init(result: []const u8, trace: []const []const u8) std.mem.Allocator.Error!CaseOutcome {
+        const gpa = std.testing.allocator;
+        const result_copy = try gpa.dupe(u8, result);
+        errdefer gpa.free(result_copy);
+        const entries = try gpa.alloc([]u8, trace.len);
+        var made: usize = 0;
+        errdefer {
+            for (entries[0..made]) |entry| gpa.free(entry);
+            gpa.free(entries);
+        }
+        for (trace, entries) |entry, *copy| {
+            copy.* = try gpa.dupe(u8, entry);
+            made += 1;
+        }
+        return .{ .result = result_copy, .trace = entries };
+    }
+
+    fn deinit(self: CaseOutcome) void {
+        const gpa = std.testing.allocator;
+        for (self.trace) |entry| gpa.free(entry);
+        gpa.free(self.trace);
+        gpa.free(self.result);
+    }
+};
+
+/// The outcomes of the `None` build, which `recordNoneOutcomes` fills and the
+/// Tasks runs compare with. Tests run one at a time.
+var none_outcomes: ?[plan_loop_cases.len]CaseOutcome = null;
+
+fn freeNoneOutcomes() void {
+    const outcomes = none_outcomes orelse return;
+    for (outcomes) |outcome| outcome.deinit();
+    none_outcomes = null;
+}
+
+/// The host of the `None` build on the interpreter: the same calls, all
+/// answered in place, with no task to park.
+const NoneHost = struct {
+    ops: *builtins.host_abi.RocOps,
+    trace: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *NoneHost) void {
+        for (self.trace.items) |entry| std.testing.allocator.free(entry);
+        self.trace.deinit(std.testing.allocator);
+    }
+
+    fn handler(self: *NoneHost) eval.Interpreter.HostedCallHandler {
+        return .{ .context = self, .dispatch = dispatch };
+    }
+
+    fn dispatch(context: *anyopaque, call: eval.Interpreter.HostedCall) eval.Interpreter.Error!void {
+        const self: *NoneHost = @ptrCast(@alignCast(context));
+        var arg: RocStr = undefined;
+        @memcpy(std.mem.asBytes(&arg), call.args[call.arg_offsets[0]..][0..@sizeOf(RocStr)]);
+        const gpa = std.testing.allocator;
+        if (std.mem.eql(u8, call.symbol, "roc_host_fetch")) {
+            self.note("fetch", arg) catch return error.OutOfMemory;
+            const text = std.fmt.allocPrint(gpa, "{s}/body", .{arg.asSlice()}) catch return error.OutOfMemory;
+            defer gpa.free(text);
+            const result = RocStr.fromSlice(text, self.ops);
+            @memcpy(call.ret[0..@sizeOf(RocStr)], std.mem.asBytes(&result));
+        } else if (std.mem.eql(u8, call.symbol, "roc_host_log")) {
+            self.note("log", arg) catch return error.OutOfMemory;
+        } else {
+            return error.UnsupportedHostedFunction;
+        }
+        arg.decref(self.ops);
+    }
+
+    fn note(self: *NoneHost, name: []const u8, arg: RocStr) std.mem.Allocator.Error!void {
+        const gpa = std.testing.allocator;
+        const entry = try std.fmt.allocPrint(gpa, "{s}({s})", .{ name, arg.asSlice() });
+        errdefer gpa.free(entry);
+        try self.trace.append(gpa, entry);
+    }
+};
+
+/// Run each case of the `None` build and record what it gives.
+fn recordNoneOutcomes(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    recordNone(lowered) catch |err| {
+        std.log.err("the None build of the plan loops failed: {s}", .{@errorName(err)});
+        return error.TestUnexpectedResult;
+    };
+}
+
+fn recordNone(lowered: *const lir.CheckedPipeline.LoweredProgram) E2eError!void {
+    var outcomes: [plan_loop_cases.len]CaseOutcome = undefined;
+    for (plan_loop_cases, 0..) |name, index| {
+        outcomes[index] = noneCase(lowered, name) catch |err| {
+            std.log.err("the None build's case {s} failed: {s}", .{ name, @errorName(err) });
+            for (outcomes[0..index]) |outcome| outcome.deinit();
+            return err;
+        };
+    }
+    none_outcomes = outcomes;
+}
+
+fn noneCase(lowered: *const lir.CheckedPipeline.LoweredProgram, name: []const u8) E2eError!CaseOutcome {
+    const program = &lowered.lir_result;
+    var runtime = eval.RuntimeHostEnv.init(std.testing.allocator);
+    defer runtime.deinit();
+    const ops = runtime.get_ops();
+    var host = NoneHost{ .ops = ops };
+    defer host.deinit();
+    var data = try harness.interpreterStaticData(lowered);
+    defer if (data) |*static| static.deinit();
+    var strings = try eval.LirInterpreter.buildStaticStrings(std.testing.allocator, &program.store);
+    defer strings.deinit();
+    var interpreter = try eval.LirInterpreter.init(std.testing.allocator, &program.store, &program.layouts, strings.view(), ops);
+    defer interpreter.deinit();
+    interpreter.hosted_call_handler = host.handler();
+    if (data) |*static| {
+        static.install(&interpreter);
+        static.ownByInterpreter(&interpreter);
+    }
+    const entry_id = program.root_procs.items[0];
+    const entry = program.store.getProcSpec(entry_id);
+    try std.testing.expectEqual(@import("layout").Idx.str, entry.ret_layout);
+    var arg = RocStr.fromSlice(name, ops);
+    var result: RocStr = RocStr.empty();
+    _ = try interpreter.eval(.{
+        .proc_id = entry_id,
+        .arg_layouts = &.{.str},
+        .ret_layout = entry.ret_layout,
+        .arg_ptr = @ptrCast(&arg),
+        .ret_ptr = @ptrCast(&result),
+    });
+    if ((entry.rc_borrowed_params & 1) != 0) arg.decref(ops);
+    const outcome = try CaseOutcome.init(result.asSlice(), host.trace.items);
+    errdefer outcome.deinit();
+    result.decref(ops);
+    try runtime.checkForLeaks();
+    return outcome;
+}
+
+/// Run each case of the Tasks build under the coroutine schedule and compare
+/// it with the `None` build's outcome.
+fn compareCoroutineRuns(comptime R: type, program: R.Program) E2eError!void {
+    const want_all = none_outcomes orelse return error.TestUnexpectedResult;
+    for (plan_loop_cases, want_all) |name, want| {
+        const got = coroutineCase(R, program, name) catch |err| {
+            std.log.err("the Tasks build's case {s} failed: {s}", .{ name, @errorName(err) });
+            return err;
+        };
+        defer got.deinit();
+        errdefer std.log.err("the Tasks build's case {s} differs from the None build's", .{name});
+        try std.testing.expectEqualStrings(want.result, got.result);
+        try std.testing.expectEqual(want.trace.len, got.trace.len);
+        for (want.trace, got.trace) |want_entry, got_entry| try std.testing.expectEqualStrings(want_entry, got_entry);
+    }
+}
+
+fn coroutineCase(comptime R: type, program: R.Program, name: []const u8) E2eError!CaseOutcome {
+    root_url = name;
+    defer root_url = url;
+    var run: R = undefined;
+    try run.init(program, .ready);
+    defer run.deinit();
+    var result: RocStr = RocStr.empty();
+    const task = try run.startRoot(program, &result);
+    const status = run.host.driveTree(task) catch |err| {
+        std.log.err("{s}: no task is ready: {s}", .{ name, @errorName(err) });
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqual(builtins.task.Status.done, status);
+    run.host.freeTask(task);
+    if (task_test_host.c_abi_failure) |err| return err;
+    const outcome = try CaseOutcome.init(result.asSlice(), run.host.trace.items);
+    errdefer outcome.deinit();
+    result.decref(run.runtime.get_ops());
+    try run.runtime.checkForLeaks();
+    return outcome;
+}
+
+fn compareInterpreter(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    compareCoroutineRuns(Run, lowered) catch return error.TestUnexpectedResult;
+}
+
+fn compareDev(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    var program: DevProgram = undefined;
+    program.init(lowered) catch |err| {
+        std.log.err("compiling the plan loops with the dev backend failed: {s}", .{@errorName(err)});
+        return error.TestUnexpectedResult;
+    };
+    defer program.deinit();
+    compareCoroutineRuns(DevRun, &program) catch return error.TestUnexpectedResult;
+}
+
+fn compareLlvm(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    var program: LlvmProgram = undefined;
+    program.init(lowered) catch |err| {
+        std.log.err("compiling the plan loops with LLVM failed: {s}", .{@errorName(err)});
+        return error.TestUnexpectedResult;
+    };
+    defer program.deinit();
+    compareCoroutineRuns(LlvmRun, &program) catch return error.TestUnexpectedResult;
+}
+
+const plan_loop_options: harness.LirLoweringOptions = .{ .specialization_strategy = .lss, .target_usize = .u64 };
+
+/// Both builds lower the same program: the twin platforms differ only in
+/// declaring tasks and marking `fetch!` suspending.
+fn expectTwinApps() E2eError!void {
+    const gpa = std.testing.allocator;
+    const tasks_app = try readFixture(gpa, plan_loop_tasks_path);
+    defer gpa.free(tasks_app);
+    const none_app = try readFixture(gpa, plan_loop_none_path);
+    defer gpa.free(none_app);
+    try std.testing.expectEqualStrings(tasks_app, none_app);
+}
+
+fn readFixture(gpa: std.mem.Allocator, path: []const u8) E2eError![]u8 {
+    return CoreCtx.os(gpa, gpa, std.testing.io).readFile(path, gpa) catch return error.TestUnexpectedResult;
+}
+
+fn checkSequentialEquivalence(inspect: harness.LoweredInspectFn) E2eError!void {
+    try expectTwinApps();
+    defer freeNoneOutcomes();
+    harness.runAppPathLoweredInspection(plan_loop_none_path, plan_loop_options, recordNoneOutcomes) catch return error.TestUnexpectedResult;
+    harness.runAppPathLoweredInspection(plan_loop_tasks_path, plan_loop_options, inspect) catch return error.TestUnexpectedResult;
+}
+
+test "concurrent loops run on child tasks as a None build runs them, on the interpreter" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    try checkSequentialEquivalence(compareInterpreter);
+}
+
+test "concurrent loops run on child tasks as a None build runs them, on the dev backend" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
+    try checkSequentialEquivalence(compareDev);
+}
+
+test "concurrent loops run on child tasks as a None build runs them, on LLVM" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    try checkSequentialEquivalence(compareLlvm);
 }

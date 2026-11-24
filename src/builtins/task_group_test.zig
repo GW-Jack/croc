@@ -635,9 +635,20 @@ test "the task tree orders an ancestor before its descendants and siblings by cr
     try std.testing.expectEqual(Status.pending, Host.resumeTask(task));
     const first = Host.ready[0];
     const second = Host.ready[1];
+    // The root waits at its loop's next, so it asks for its entries, which
+    // have not begun.
+    try std.testing.expect(task_mod.coroutineMayBegin(first));
+    try std.testing.expect(task_mod.coroutineMayBegin(second));
+    const root_wait = task.wait;
+    task.wait = null;
+    try std.testing.expect(!task_mod.coroutineMayBegin(second));
+    task.wait = root_wait;
     try std.testing.expectEqual(Status.pending, Host.resumeTask(first));
     try std.testing.expectEqual(Status.pending, Host.resumeTask(second));
     const grandchild = Host.ready[2];
+    // The first child waits at its own loop, and the root still at its own.
+    try std.testing.expect(task_mod.coroutineMayBegin(grandchild));
+    try std.testing.expect(task_mod.coroutineMayBegin(second));
     try std.testing.expectEqual(Status.pending, Host.resumeTask(grandchild));
     const Order = std.math.Order;
     try std.testing.expectEqual(Order.lt, task_mod.treeOrder(task, first));

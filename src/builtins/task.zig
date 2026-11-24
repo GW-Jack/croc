@@ -1237,6 +1237,18 @@ pub fn groupFree(group: *Group) void {
     group.close();
 }
 
+/// Whether a host under the coroutine schedule may resume `task` next, as far
+/// as beginning it goes. A task that has begun, or that a cancel asked to
+/// end, always may. An entry that has not begun may only while its owner is
+/// parked on the group that holds it, waiting at its loop's next; otherwise
+/// another task must run first, if one can. For a test host (design.md
+/// "Sequential equivalence"); not part of the host ABI.
+pub fn coroutineMayBegin(task: *const RocTask) bool {
+    if (task.started or task.cancel_requested) return true;
+    const group = task.group orelse return true;
+    return group.owner.wait == group;
+}
+
 /// Where `a` comes in the task tree against `b`, which shares its root: an
 /// ancestor before its descendants, and siblings in the order their entries
 /// were made. For a test host that resumes the ready task first in the tree

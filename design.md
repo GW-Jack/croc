@@ -34805,9 +34805,10 @@ takes their reports, innermost group first, closing a group once its last
 child has reported and parking on the first that still has one running. It
 ends `crashed` with the first crash's message, or `cancelled`.
 
-`treeOrder` compares two tasks of one tree, for a test host that resumes the
-ready task first in the tree (Sequential equivalence). It is a Zig function
-of the runtime, not a host call.
+`treeOrder` compares two tasks of one tree, and `coroutineMayBegin` says
+whether an entry that has not begun is asked for, for a test host that
+resumes the ready task first in the tree (Sequential equivalence). They are
+Zig functions of the runtime, not host calls.
 
 **Monitors.** The runtime monitors (Conformance) also check its own rules in
 safe builds:
@@ -35190,10 +35191,16 @@ compiled away in release builds.
   suspension site.
 - **Sequential equivalence.** A `None` build's results and effects equal
   a `Tasks` build's when the host finishes every hosted call in place and
-  resumes the ready task that comes first in the task tree. In-process
-  tests check it with a Zig test host. The host gets each task's tree path
-  from a test-only builtin, so no export is added and the runtime's symbol
-  set stays the same in every build mode.
+  resumes the ready task that comes first in the task tree, where an entry
+  that has not begun is ready only once its loop waits at its next for the
+  entry's result, or no other task can run. Without the second half, an
+  outer loop's entries, which are made when the loop begins, would run before
+  the entries of a loop nested in its body. In-process tests check it with a
+  Zig test host on the interpreter, dev and LLVM, against a `None` build of the
+  same program on a twin platform. The host orders the ready tasks with
+  `treeOrder` and leaves an unasked entry alone with `coroutineMayBegin`.
+  Both are Zig functions of the runtime, so no export is added and the
+  runtime's symbol set stays the same in every build mode.
 
 `ROC_LIR_DUMP` prints each procedure's `suspends` mark and each suspension
 site, so the pass's output can be read like any other LIR.
