@@ -316,15 +316,22 @@ fn promoteIn(allocator: Allocator, store: *LirStore, layouts: *layout.Store, loo
     var stmts = try bodyStmts(allocator, store, proc_id);
     defer stmts.deinit(allocator);
 
-    // The literal each local holds, if it is one, and the helper calls.
-    var literals = collections.DenseMapUnmanaged(LocalId, i64).empty;
-    defer literals.deinit(allocator);
+    // What the locals say about loop ids, and the helper calls.
+    var ids = LoopIds{};
+    defer ids.deinit(allocator);
     var calls = std.ArrayList(CFStmtId).empty;
     defer calls.deinit(allocator);
     for (stmts.items) |stmt_id| {
         const stmt = store.getCFStmtImmediate(stmt_id).*;
-        if (stmt == .assign_literal and stmt.assign_literal.value == .i64_literal) {
-            try literals.put(allocator, stmt.assign_literal.target, stmt.assign_literal.value.i64_literal.value);
+        if (stmt == .assign_literal) {
+            const value = stmt.assign_literal.value;
+            if (value == .i64_literal) {
+                try ids.define(allocator, stmt.assign_literal.target, .{ .literal = value.i64_literal.value });
+            } else if (value == .i128_literal) {
+                try ids.define(allocator, stmt.assign_literal.target, .{ .literal = store.stmtRow(value.i128_literal).value });
+            }
+        } else if (stmt == .assign_ref and stmt.assign_ref.op.kind == .local) {
+            try ids.define(allocator, stmt.assign_ref.target, .{ .copy = stmt.assign_ref.op.source });
         } else if (stmt == .assign_call) switch (store.getProcSpecImmediate(stmt.assign_call.proc).running_set_helper) {
             .run_create, .run_next, .run_spawn, .run_cancel => try calls.append(allocator, stmt_id),
             .none, .run_entry, .run_arrived, .run_ended => {},
@@ -332,12 +339,12 @@ fn promoteIn(allocator: Allocator, store: *LirStore, layouts: *layout.Store, loo
     }
 
     // The task-form loops, by id.
-    var task_form = std.AutoHashMapUnmanaged(i64, Loop).empty;
+    var task_form = std.AutoHashMapUnmanaged(u64, Loop).empty;
     defer task_form.deinit(allocator);
     for (calls.items) |stmt_id| {
         const assign = store.getCFStmtImmediate(stmt_id).assign_call;
         const loop = loops.get(assign.proc) orelse continue;
-        try task_form.put(allocator, loopId(store, &literals, assign), loop);
+        try task_form.put(allocator, loopId(store, &ids, assign), loop);
     }
     if (task_form.count() == 0) return;
 
@@ -350,15 +357,18 @@ fn promoteIn(allocator: Allocator, store: *LirStore, layouts: *layout.Store, loo
     defer promoter.frame.deinit(allocator);
     defer promoter.joins.deinit();
     try promoter.joins.indexReachable(store, store.getProcSpecImmediate(proc_id).body.get().?);
-    var created = std.AutoHashMapUnmanaged(i64, void).empty;
+    var created = std.AutoHashMapUnmanaged(u64, void).empty;
     defer created.deinit(allocator);
     for (calls.items) |stmt_id| {
         const assign = store.getCFStmtImmediate(stmt_id).assign_call;
-        const id = loopId(store, &literals, assign);
+        const id = loopId(store, &ids, assign);
         const loop = task_form.get(id) orelse continue;
         switch (store.getProcSpecImmediate(assign.proc).running_set_helper) {
             .run_create => {
-                try created.put(allocator, id, {});
+                // Two would share one running set: today's inlining never
+                // copies a loop within a procedure, so fail loudly if it does.
+                const seen = try created.getOrPut(allocator, id);
+                if (seen.found_existing) invariant("two run_create! calls of one loop id in one procedure", .{});
                 try promoter.promoteCreate(stmt_id, loop);
             },
             .run_next => {
@@ -370,16 +380,60 @@ fn promoteIn(allocator: Allocator, store: *LirStore, layouts: *layout.Store, loo
             .none, .run_entry, .run_arrived, .run_ended => unreachable, // `calls` holds only these four helpers' calls.
         }
     }
-    var ids = task_form.keyIterator();
-    while (ids.next()) |id| {
+    var task_form_ids = task_form.keyIterator();
+    while (task_form_ids.next()) |id| {
         if (!created.contains(id.*)) invariant("a task-form loop's run_next! is in a procedure with no run_create! of its id", .{});
     }
     for (promoter.frame.items) |local| try ContinuationPass.appendLocal(store, &store.getProcSpecPtr(proc_id).frame_locals, local);
 }
 
-/// The loop id a helper call passes first, which must be an integer literal
-/// of the same procedure.
-fn loopId(store: *const LirStore, literals: *const collections.DenseMapUnmanaged(LocalId, i64), assign: @FieldType(LIR.CFStmt, "assign_call")) i64 {
+/// The loop id a helper call passes first: a `U64` integer literal of the
+/// same procedure, or a copy of one.
+fn loopId(store: *const LirStore, ids: *const LoopIds, assign: @FieldType(LIR.CFStmt, "assign_call")) u64 {
     const id = GuardedList.at(store.getLocalSpan(assign.args), 0);
-    return literals.get(id) orelse invariant("a running-set helper's loop id is not an integer literal of its procedure", .{});
+    if (store.getLocal(id).layout_idx != .u64) invariant("a running-set helper's loop id is not a U64", .{});
+    return ids.of(id);
 }
+
+/// What a procedure's locals say about its loop ids. Lowering gives a loop
+/// id as an integer literal, `i64_literal` or `i128_literal`, which helper
+/// calls may pass through `ref.local` copies of it.
+const LoopIds = struct {
+    defs: collections.DenseMapUnmanaged(LocalId, Def) = .empty,
+
+    const Def = union(enum) {
+        literal: i128,
+        copy: LocalId,
+        /// Defined more than once, so it holds no one value.
+        several,
+    };
+
+    fn deinit(self: *LoopIds, allocator: Allocator) void {
+        self.defs.deinit(allocator);
+    }
+
+    fn define(self: *LoopIds, allocator: Allocator, local: LocalId, def: Def) Allocator.Error!void {
+        const entry = try self.defs.getOrPut(allocator, local);
+        entry.value_ptr.* = if (entry.found_existing) .several else def;
+    }
+
+    /// The literal `local` holds, following copies back to it in any
+    /// statement order.
+    fn of(self: *const LoopIds, local: LocalId) u64 {
+        var at = local;
+        // A chain longer than the number of definitions goes round a cycle.
+        for (0..self.defs.count() + 1) |_| {
+            const def = self.defs.get(at) orelse
+                invariant("a running-set helper's loop id is not an integer literal of its procedure", .{});
+            switch (def) {
+                .literal => |value| {
+                    if (value < 0 or value > std.math.maxInt(u64)) invariant("a running-set helper's loop id does not fit a U64", .{});
+                    return @intCast(value);
+                },
+                .copy => |source| at = source,
+                .several => invariant("a running-set helper's loop id is defined more than once", .{}),
+            }
+        }
+        invariant("a running-set helper's loop id copies itself", .{});
+    }
+};

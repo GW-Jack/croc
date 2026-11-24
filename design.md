@@ -34301,7 +34301,10 @@ every call of a `run_next!` specialization that may suspend names a
 task-form loop by its loop id. That procedure's calls of the other helpers
 with the same id belong to the loop: Monotype keeps a loop's calls in the
 procedure that holds it, because `Running(a)` never escapes it, and gives
-each loop of each specialization its own id. Promotion finds the loop's
+each loop of each specialization its own id. Promotion reads a call's id
+as LIR lowering leaves it: an `i64_literal` or `i128_literal` of the
+procedure with layout `U64`, which the call may pass through `ref.local`
+copies, in any statement order. Promotion finds the loop's
 `run_entry!`, `run_arrived` and `run_ended` as the calls in that
 `run_next!`'s body. It rewrites each call in place, so the loop's code
 around them is unchanged:
@@ -34322,7 +34325,10 @@ around them is unchanged:
 - `r2 = run_cancel!(id, r)` runs `group_cancel(id)` and binds `r2` to `r`.
 
 A loop id that a promoted `next` names, with no `run_create!` in the same
-procedure, breaks the pass's invariant. Unreachable procedures are dropped
+procedure, breaks the pass's invariant, and so do two `run_create!` calls
+of one id in one procedure: they would share one running set, and today's
+inlining never copies a loop within a procedure. So does an id defined more
+than once, or one that doesn't fit a `U64`. Unreachable procedures are dropped
 before the pass (ReachableProcs), so a `run_next!` specialization that
 promotion leaves uncalled stays in the program. It stays well formed: it
 may suspend, so the pass gives it a task like any other such procedure.

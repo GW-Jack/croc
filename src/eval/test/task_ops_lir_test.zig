@@ -1072,6 +1072,15 @@ const LoopBody = enum {
     first,
 };
 
+/// How a promotion test's loop id reaches its helper calls.
+const IdShape = enum {
+    /// An `i64_literal` the calls pass directly.
+    direct,
+    /// An `i128_literal`, which the calls pass through a `ref.local` copy:
+    /// the shape LIR lowering gives a loop id.
+    copied_i128,
+};
+
 /// The provides root `g()` of a promotion test, in the sequential form:
 ///
 ///     r = run_create!(3, [10, 20, 30], [[], [], []], [F, F, F], background, [], 0)
@@ -1080,7 +1089,7 @@ const LoopBody = enum {
 ///
 /// Promotes it with the continuation pass and returns the task entry that
 /// takes `g`'s place.
-fn promotionProgram(f: *Fixture, background: [3]bool, body: LoopBody) TaskOpsTestError!LIR.LirProcSpecId {
+fn promotionProgram(f: *Fixture, background: [3]bool, body: LoopBody, id_shape: IdShape) TaskOpsTestError!LIR.LirProcSpecId {
     const helpers = try Helpers.make(f);
     const list_u64 = try f.layouts.insertList(.u64);
     const list_list_u64 = try f.layouts.insertList(list_u64);
@@ -1165,7 +1174,18 @@ fn promotionProgram(f: *Fixture, background: [3]bool, body: LoopBody) TaskOpsTes
     head = try f.store.addCFStmt(.{ .assign_list = .{ .target = no_path, .elems = .empty(), .next = head } }, .test_fixture);
     head = try f.store.addCFStmt(.{ .assign_list = .{ .target = entries, .elems = try f.store.addLocalSpan(&values), .next = head } }, .test_fixture);
     for (values, [_]i64{ 10, 20, 30 }) |value, number| head = try literal(f, value, number, .u64, head);
-    head = try literal(f, id, test_loop_id, .u64, head);
+    switch (id_shape) {
+        .direct => head = try literal(f, id, test_loop_id, .u64, head),
+        .copied_i128 => {
+            const id_literal = try f.local(.u64);
+            head = try f.store.addCFStmt(.{ .assign_ref = .{ .target = id, .op = LIR.RefOp.local(id_literal), .next = head } }, .test_fixture);
+            head = try f.store.addCFStmt(.{ .assign_literal = .{
+                .target = id_literal,
+                .value = .{ .i128_literal = try f.store.addStmtRow(LIR.I128Literal, .{ .value = test_loop_id, .layout_idx = .u64 }) },
+                .next = head,
+            } }, .test_fixture);
+        },
+    }
     const g = try f.store.addProcSpec(.{
         .name = f.store.freshSyntheticSymbol(),
         .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
@@ -1193,7 +1213,7 @@ fn startEntry(interp: *eval.Interpreter, entry: LIR.LirProcSpecId, root: *u64) T
 test "promotion runs a loop whose entries may suspend as child tasks and spawns into it" {
     var f = try Fixture.init(std.testing.allocator);
     defer f.deinit();
-    const entry = try promotionProgram(&f, .{ false, true, true }, .sum_and_spawn);
+    const entry = try promotionProgram(&f, .{ false, true, true }, .sum_and_spawn, .direct);
 
     var static_strings = try eval.Interpreter.buildStaticStrings(f.allocator, &f.store);
     defer static_strings.deinit();
@@ -1237,7 +1257,8 @@ test "promotion runs a loop whose entries may suspend as child tasks and spawns 
 test "promotion cancels a loop's running set and drains it through run_next!" {
     var f = try Fixture.init(std.testing.allocator);
     defer f.deinit();
-    const entry = try promotionProgram(&f, .{ false, false, false }, .first);
+    // Its loop id has the shape lowering gives one.
+    const entry = try promotionProgram(&f, .{ false, false, false }, .first, .copied_i128);
 
     var static_strings = try eval.Interpreter.buildStaticStrings(f.allocator, &f.store);
     defer static_strings.deinit();
