@@ -3148,6 +3148,15 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "a for! loop over a plan runs its entries in order, spawns, and cancels on early exits (dev, specialize=yes)", .backend = .dev, .body = .{ .command = .{ .args = &.{ "--opt=dev", "--specialize=yes", "--no-cache" }, .roc_file = "test/fx/plan_loop_sequential.roc", .stdout_exact = "run a\ngot 1\nrun b\ngot 2\nrun c\ngot 3\nsum 6\nrun d\ngot 10\nrun e\ngot 20\nrun f\ngot 30\nrun bg\ngot 1\nrun fg\ngot 2\nrun g\ngot 1\nafter break\nrun i\nrun k\nrun l\nfirst over 2\nrun m\nrun n\nfailed at n\ndone\n", .not_contains = &no_panic_or_invariant_needles } } },
     .{ .id = 0, .suite = .subcommands, .name = "a for! loop over a plan runs its entries in order, spawns, and cancels on early exits (dev, specialize=no)", .backend = .dev, .body = .{ .command = .{ .args = &.{ "--opt=dev", "--specialize=no", "--no-cache" }, .roc_file = "test/fx/plan_loop_sequential.roc", .stdout_exact = "run a\ngot 1\nrun b\ngot 2\nrun c\ngot 3\nsum 6\nrun d\ngot 10\nrun e\ngot 20\nrun f\ngot 30\nrun bg\ngot 1\nrun fg\ngot 2\nrun g\ngot 1\nafter break\nrun i\nrun k\nrun l\nfirst over 2\nrun m\nrun n\nfailed at n\ndone\n", .not_contains = &no_panic_or_invariant_needles } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc run rejects a concurrency Tasks plan loop whose entries may suspend without specialization", .skip = .{ .windows = "test/concurrency-tasks platform does not have Windows host libraries" }, .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=interpreter", "--specialize=no" }, .roc_file = "test/concurrency-tasks/app_plan_loop.roc", .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "concurrency not supported here" }, .{ .stream = .stderr, .text = "--specialize=no" } }, .not_contains = &no_panic_or_invariant_needles } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .interpreter, .name = "roc run runs a concurrency Tasks plan loop's entries as child tasks on the interpreter against a host that pauses at every fetch", .skip = .{ .windows = "test/concurrency-tasks platform does not have Windows host libraries" }, .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=interpreter", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_plan_loop.roc", .app_args = &.{}, .contains = &.{.{ .stream = .stderr, .text = "fetched(https://example.com/concurrency/tasks)fetched(a)fetched(b)\nfetches: 3, pauses: 3\n" }}, .not_contains = &no_panic_or_invariant_needles } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .interpreter, .name = "roc run runs a concurrency Tasks plan loop's entries as child tasks on the interpreter against a host that finishes every fetch at once", .skip = .{ .windows = "test/concurrency-tasks platform does not have Windows host libraries" }, .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=interpreter", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_plan_loop.roc", .app_args = &.{"--finish-at-once"}, .contains = &.{.{ .stream = .stderr, .text = "fetched(https://example.com/concurrency/tasks)fetched(a)fetched(b)\nfetches: 3, pauses: 0\n" }}, .not_contains = &no_panic_or_invariant_needles } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .interpreter, .name = "roc run runs a concurrency Tasks plan loop's entries as child tasks on the interpreter against a host that answers the newest fetch first", .skip = .{ .windows = "test/concurrency-tasks platform does not have Windows host libraries" }, .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=interpreter", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_plan_loop.roc", .app_args = &.{"--answer-newest-first"}, .contains = &.{.{ .stream = .stderr, .text = "fetched(https://example.com/concurrency/tasks)fetched(b)fetched(a)\nfetches: 3, pauses: 3\n" }}, .not_contains = &no_panic_or_invariant_needles } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .dev, .name = "roc run runs a concurrency Tasks plan loop's entries as child tasks on the dev backend against a host that pauses at every fetch", .skip = .{ .windows = "test/concurrency-tasks platform does not have Windows host libraries" }, .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=dev", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_plan_loop.roc", .app_args = &.{}, .contains = &.{.{ .stream = .stderr, .text = "fetched(https://example.com/concurrency/tasks)fetched(a)fetched(b)\nfetches: 3, pauses: 3\n" }}, .not_contains = &no_panic_or_invariant_needles } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .dev, .name = "roc run runs a concurrency Tasks plan loop's entries as child tasks on the dev backend against a host that finishes every fetch at once", .skip = .{ .windows = "test/concurrency-tasks platform does not have Windows host libraries" }, .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=dev", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_plan_loop.roc", .app_args = &.{"--finish-at-once"}, .contains = &.{.{ .stream = .stderr, .text = "fetched(https://example.com/concurrency/tasks)fetched(a)fetched(b)\nfetches: 3, pauses: 0\n" }}, .not_contains = &no_panic_or_invariant_needles } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .dev, .name = "roc run runs a concurrency Tasks plan loop's entries as child tasks on the dev backend against a host that answers the newest fetch first", .skip = .{ .windows = "test/concurrency-tasks platform does not have Windows host libraries" }, .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=dev", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_plan_loop.roc", .app_args = &.{"--answer-newest-first"}, .contains = &.{.{ .stream = .stderr, .text = "fetched(https://example.com/concurrency/tasks)fetched(b)fetched(a)\nfetches: 3, pauses: 3\n" }}, .not_contains = &no_panic_or_invariant_needles } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc run runs a concurrency Tasks plan loop's entries as child tasks on LLVM against a host that pauses at every fetch", .skip = .{ .windows = "test/concurrency-tasks platform does not have Windows host libraries" }, .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=speed", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_plan_loop.roc", .app_args = &.{}, .contains = &.{.{ .stream = .stderr, .text = "fetched(https://example.com/concurrency/tasks)fetched(a)fetched(b)\nfetches: 3, pauses: 3\n" }}, .not_contains = &no_panic_or_invariant_needles } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc run runs a concurrency Tasks plan loop's entries as child tasks on LLVM against a host that finishes every fetch at once", .skip = .{ .windows = "test/concurrency-tasks platform does not have Windows host libraries" }, .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=speed", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_plan_loop.roc", .app_args = &.{"--finish-at-once"}, .contains = &.{.{ .stream = .stderr, .text = "fetched(https://example.com/concurrency/tasks)fetched(a)fetched(b)\nfetches: 3, pauses: 0\n" }}, .not_contains = &no_panic_or_invariant_needles } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc run runs a concurrency Tasks plan loop's entries as child tasks on LLVM against a host that answers the newest fetch first", .skip = .{ .windows = "test/concurrency-tasks platform does not have Windows host libraries" }, .body = .{ .command = .{ .args = &.{ "--no-cache", "--opt=speed", "--specialize=yes" }, .roc_file = "test/concurrency-tasks/app_plan_loop.roc", .app_args = &.{"--answer-newest-first"}, .contains = &.{.{ .stream = .stderr, .text = "fetched(https://example.com/concurrency/tasks)fetched(b)fetched(a)\nfetches: 3, pauses: 3\n" }}, .not_contains = &no_panic_or_invariant_needles } } },
     .{ .id = 0, .suite = .subcommands, .name = "CLI test cache roots are distinct", .body = .{ .custom = .cli_cache_roots_distinct } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check watch inputs reject absolute file imports", .body = .{ .custom = .watch_inputs_reject_absolute_import } },
     // Repro for https://github.com/roc-lang/roc/issues/11714: absolute platform
@@ -3273,6 +3282,10 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc build makes a concurrency Tasks executable on LLVM that runs against a host that finishes every fetch at once", .skip = .{ .windows = "test/concurrency-tasks platform does not have Windows host libraries" }, .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{"--finish-at-once"}, .stderr_contains = "fetched(https://example.com/concurrency/tasks)\nfetches: 1, pauses: 0\n" } } } } },
     .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc build makes a concurrency Tasks executable on LLVM that resumes inside an app procedure", .skip = .{ .windows = "test/concurrency-tasks platform does not have Windows host libraries" }, .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app_fetch_twice.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{}, .stderr_contains = "fetched(fetched(https://example.com/concurrency/tasks))\nfetches: 2, pauses: 2\n" } } } } },
     .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc build makes a concurrency Tasks executable on LLVM that runs with two fetches against a host that finishes them at once", .skip = .{ .windows = "test/concurrency-tasks platform does not have Windows host libraries" }, .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app_fetch_twice.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{"--finish-at-once"}, .stderr_contains = "fetched(fetched(https://example.com/concurrency/tasks))\nfetches: 2, pauses: 0\n" } } } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .dev, .name = "roc build makes a concurrency Tasks executable on the dev backend that runs a plan loop's entries as child tasks against a host that pauses at every fetch", .skip = .{ .windows = "test/concurrency-tasks platform does not have Windows host libraries" }, .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app_plan_loop.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{}, .stderr_contains = "fetched(https://example.com/concurrency/tasks)fetched(a)fetched(b)\nfetches: 3, pauses: 3\n" } } } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .dev, .name = "roc build makes a concurrency Tasks executable on the dev backend that runs a plan loop's entries as child tasks against a host that answers the newest fetch first", .skip = .{ .windows = "test/concurrency-tasks platform does not have Windows host libraries" }, .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app_plan_loop.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{"--answer-newest-first"}, .stderr_contains = "fetched(https://example.com/concurrency/tasks)fetched(b)fetched(a)\nfetches: 3, pauses: 3\n" } } } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc build makes a concurrency Tasks executable on LLVM that runs a plan loop's entries as child tasks against a host that pauses at every fetch", .skip = .{ .windows = "test/concurrency-tasks platform does not have Windows host libraries" }, .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app_plan_loop.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{}, .stderr_contains = "fetched(https://example.com/concurrency/tasks)fetched(a)fetched(b)\nfetches: 3, pauses: 3\n" } } } } },
+    .{ .id = 0, .suite = .subcommands, .backend = .speed, .name = "roc build makes a concurrency Tasks executable on LLVM that runs a plan loop's entries as child tasks against a host that answers the newest fetch first", .skip = .{ .windows = "test/concurrency-tasks platform does not have Windows host libraries" }, .body = .{ .platform = .{ .roc_file = "test/concurrency-tasks/app_plan_loop.roc", .platform = "concurrency-tasks", .test_kind = .{ .specialized_run = .{ .app_args = &.{"--answer-newest-first"}, .stderr_contains = "fetched(https://example.com/concurrency/tasks)fetched(b)fetched(a)\nfetches: 3, pauses: 3\n" } } } } },
     // The host cancels through the program's own `roc_task_cancel`: unwoken,
     // the program aborts the fetch through the host's `roc_task_abort` and
     // readies the task; woken, the wake readied it. The host resumes it once
@@ -15681,10 +15694,13 @@ fn customIssue12741WasmGenericTailCalls(
 /// the platform's wasm host (`wasm_host.zig`), once per host mode set with
 /// `wasm_configure`: pausing at every fetch, answering at once, cancelling a
 /// parked task (the program aborts the fetch through `roc_task_abort`) and a
-/// woken one (the program releases the answer). Each run must report what
-/// the native host reports and leave allocations balanced, and the module
-/// imports nothing but the harness's `env` functions, so the task calls
-/// resolved inside the link.
+/// woken one (the program releases the answer). Then
+/// `test/concurrency-tasks/app_plan_loop.roc`, whose plan loop runs its
+/// entries as child tasks: pausing, answering at once, and answering the
+/// newest fetch first, so the entries arrive in reverse. Each run must report
+/// what the native host reports and leave allocations balanced, and each
+/// module imports nothing but the harness's `env` functions, so the task
+/// calls resolved inside the link.
 fn customTasksWasm(
     io: std.Io,
     allocator: Allocator,
@@ -15693,7 +15709,40 @@ fn customTasksWasm(
     timeout_ms: u64,
     opt_arg: []const u8,
 ) ?TestResult {
-    const output_path = std.fs.path.join(allocator, &.{ env.dirs.work_dir, "tasks.wasm" }) catch |err|
+    const url = "https://example.com/concurrency/tasks";
+    if (runTasksWasm(io, allocator, env, timer, timeout_ms, opt_arg, "test/concurrency-tasks/app_fetch_twice.roc", "tasks.wasm", &.{
+        .{ .mode = 0, .pause = 0, .expected = "fetched(fetched(" ++ url ++ "))\nfetches: 2, pauses: 2\n" },
+        .{ .mode = 1, .pause = 0, .expected = "fetched(fetched(" ++ url ++ "))\nfetches: 2, pauses: 0\n" },
+        .{ .mode = 2, .pause = 1, .expected = "cancelled at pause 1\nfetches: 1, pauses: 1\n" },
+        .{ .mode = 2, .pause = 2, .expected = "cancelled at pause 2\nfetches: 2, pauses: 2\n" },
+        .{ .mode = 3, .pause = 2, .expected = "cancelled at pause 2\nfetches: 2, pauses: 2\n" },
+    })) |failure| return failure;
+    if (runTasksWasm(io, allocator, env, timer, timeout_ms, opt_arg, "test/concurrency-tasks/app_plan_loop.roc", "tasks-plan-loop.wasm", &.{
+        .{ .mode = 0, .pause = 0, .expected = "fetched(" ++ url ++ ")fetched(a)fetched(b)\nfetches: 3, pauses: 3\n" },
+        .{ .mode = 1, .pause = 0, .expected = "fetched(" ++ url ++ ")fetched(a)fetched(b)\nfetches: 3, pauses: 0\n" },
+        .{ .mode = 4, .pause = 0, .expected = "fetched(" ++ url ++ ")fetched(b)fetched(a)\nfetches: 3, pauses: 3\n" },
+    })) |failure| return failure;
+    return customTasksWasmCrash(io, allocator, env, timer, timeout_ms, opt_arg);
+}
+
+/// One run of a Tasks wasm module: the `wasm_configure` mode and pause, and
+/// the report `wasm_main` must return.
+const TasksWasmRun = struct { mode: i32, pause: i32, expected: []const u8 };
+
+/// Build `roc_file` for wasm32 into `output_name` and check each of `runs`
+/// against the platform's wasm host.
+fn runTasksWasm(
+    io: std.Io,
+    allocator: Allocator,
+    env: *const CaseEnv,
+    timer: *harness.Timer,
+    timeout_ms: u64,
+    opt_arg: []const u8,
+    roc_file: []const u8,
+    output_name: []const u8,
+    runs: []const TasksWasmRun,
+) ?TestResult {
+    const output_path = std.fs.path.join(allocator, &.{ env.dirs.work_dir, output_name }) catch |err|
         return customInfraFailure(allocator, timer, "failed to allocate wasm output path: {}", .{err});
     defer allocator.free(output_path);
     const output_arg = outputArg(allocator, output_path) catch |err|
@@ -15702,7 +15751,7 @@ fn customTasksWasm(
 
     if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
         .args = &.{ "build", "--target=wasm32", opt_arg, "--specialize=yes", "--no-cache", output_arg },
-        .roc_file = "test/concurrency-tasks/app_fetch_twice.roc",
+        .roc_file = roc_file,
         .exit = .success,
         .contains = &.{.{ .stream = .stdout, .text = "successfully building" }},
         .not_contains = &.{.{ .stream = .stderr, .text = "panic" }},
@@ -15710,36 +15759,28 @@ fn customTasksWasm(
     if (validateWasmOutput(io, allocator, timer, output_path)) |failure| return failure;
 
     var wasm = setupGlueRuntimeWasm(io, allocator, output_path) catch |err|
-        return customFailure(allocator, timer, "failed to load the Tasks wasm module: {}", .{err});
+        return customFailure(allocator, timer, "failed to load {s} built for wasm: {}", .{ roc_file, err });
     defer wasm.deinit();
     const configure = wasm.module_instance.getFunctionHandle("wasm_configure") catch |err|
         return customFailure(allocator, timer, "the Tasks wasm module has no wasm_configure: {}", .{err});
 
-    const url = "https://example.com/concurrency/tasks";
-    const runs = [_]struct { mode: i32, pause: i32, expected: []const u8 }{
-        .{ .mode = 0, .pause = 0, .expected = "fetched(fetched(" ++ url ++ "))\nfetches: 2, pauses: 2\n" },
-        .{ .mode = 1, .pause = 0, .expected = "fetched(fetched(" ++ url ++ "))\nfetches: 2, pauses: 0\n" },
-        .{ .mode = 2, .pause = 1, .expected = "cancelled at pause 1\nfetches: 1, pauses: 1\n" },
-        .{ .mode = 2, .pause = 2, .expected = "cancelled at pause 2\nfetches: 2, pauses: 2\n" },
-        .{ .mode = 3, .pause = 2, .expected = "cancelled at pause 2\nfetches: 2, pauses: 2\n" },
-    };
     for (runs) |run| {
         var params = [_]bytebox.Val{ .{ .I32 = run.mode }, .{ .I32 = run.pause } };
         var returns: [0]bytebox.Val = undefined;
         _ = wasm.module_instance.invoke(configure, &params, &returns, .{}) catch |err|
             return customFailure(allocator, timer, "wasm_configure({d}, {d}) failed: {}", .{ run.mode, run.pause, err });
         const result = callGlueRuntimeWasmMain(&wasm, allocator) catch |err|
-            return customFailure(allocator, timer, "Tasks wasm run (mode {d}, pause {d}) failed: {}", .{ run.mode, run.pause, err });
+            return customFailure(allocator, timer, "{s} on wasm (mode {d}, pause {d}) failed: {}", .{ roc_file, run.mode, run.pause, err });
         if (!std.mem.eql(u8, result, run.expected)) {
-            return customFailure(allocator, timer, "Tasks wasm run (mode {d}, pause {d}) reported \"{s}\", expected \"{s}\"", .{ run.mode, run.pause, result, run.expected });
+            return customFailure(allocator, timer, "{s} on wasm (mode {d}, pause {d}) reported \"{s}\", expected \"{s}\"", .{ roc_file, run.mode, run.pause, result, run.expected });
         }
         const outstanding = wasmOutstandingAllocations(&wasm) catch |err|
             return customFailure(allocator, timer, "failed to read the Tasks module's allocation counts: {}", .{err});
         if (outstanding != 0) {
-            return customFailure(allocator, timer, "Tasks wasm run (mode {d}, pause {d}) left {d} allocations outstanding", .{ run.mode, run.pause, outstanding });
+            return customFailure(allocator, timer, "{s} on wasm (mode {d}, pause {d}) left {d} allocations outstanding", .{ roc_file, run.mode, run.pause, outstanding });
         }
     }
-    return customTasksWasmCrash(io, allocator, env, timer, timeout_ms, opt_arg);
+    return null;
 }
 
 /// `test/concurrency-tasks/app_crash.roc` built for wasm32: wasm has no
