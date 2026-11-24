@@ -1598,6 +1598,97 @@ pub const tests = [_]TestCase{
         .returned,
         0,
     ),
+    // design.md "Plans And Concurrent Loops", "The library.": in the
+    // sequential form every entry that starts runs to completion in input order.
+    moduleTestWithLiveAllocations(
+        "Concurrent library: all! runs every entry in order, all_ok! stops at the first Err, race! runs only its first function, both! runs both",
+        \\entry! : Str, U64 -> (() => U64)
+        \\entry! = |name, n| || {
+        \\    dbg name
+        \\    n
+        \\}
+        \\
+        \\ok! : Str, U64 -> (() => Try(U64, Str))
+        \\ok! = |name, n| || {
+        \\    dbg name
+        \\    Ok(n)
+        \\}
+        \\
+        \\err! : Str -> (() => Try(U64, Str))
+        \\err! = |name| || {
+        \\    dbg name
+        \\    Err(name)
+        \\}
+        \\
+        \\main : () => {}
+        \\main = || {
+        \\    early = List.concurrently([entry!("early background", 100)]).background()
+        \\    late = List.concurrently([entry!("late background", 200)]).background()
+        \\    all = early.concat(List.concurrently([entry!("a", 1), entry!("b", 2)]).limit(1)).concat(late).all!()
+        \\    expect all == [1, 2]
+        \\    all_ok = Concurrent.all_ok!([ok!("c", 3), err!("d"), ok!("after err", 0)])
+        \\    expect all_ok == Err("d")
+        \\    winner = Concurrent.race!(entry!("e", 5), [entry!("second racer", 0)])
+        \\    expect winner == 5
+        \\    pair = Concurrent.both!(entry!("f", 6), entry!("g", 7))
+        \\    expect pair == (6, 7)
+        \\    {}
+        \\}
+    ,
+        &.{ dbg("\"early background\""), dbg("\"a\""), dbg("\"b\""), dbg("\"c\""), dbg("\"d\""), dbg("\"e\""), dbg("\"f\""), dbg("\"g\"") },
+        .returned,
+        0,
+    ),
+    moduleTestWithLiveAllocations(
+        "Concurrent library: results, dropped results and entries that never start are all released",
+        \\long : Str -> Str
+        \\long = |name| "${name} padded past the small string length"
+        \\
+        \\entry! : Str -> (() => Str)
+        \\entry! = |name| || {
+        \\    dbg name
+        \\    name
+        \\}
+        \\
+        \\ok! : Str -> (() => Try(Str, Str))
+        \\ok! = |name| || {
+        \\    dbg name
+        \\    Ok(name)
+        \\}
+        \\
+        \\err! : Str -> (() => Try(Str, Str))
+        \\err! = |name| || {
+        \\    dbg name
+        \\    Err(name)
+        \\}
+        \\
+        \\main : () => {}
+        \\main = || {
+        \\    early = List.concurrently([entry!(long("early"))]).background()
+        \\    late = List.concurrently([entry!(long("late"))]).background()
+        \\    all = early.concat(List.concurrently([entry!(long("a")), entry!(long("b"))])).concat(late).all!()
+        \\    expect all == [long("a"), long("b")]
+        \\    failed = Concurrent.all_ok!([ok!(long("c")), err!(long("d")), ok!(long("after err"))])
+        \\    expect failed == Err(long("d"))
+        \\    winner = Concurrent.race!(entry!(long("e")), [entry!(long("second racer"))])
+        \\    expect winner == long("e")
+        \\    pair = Concurrent.both!(entry!(long("f")), || 7.U64)
+        \\    expect pair == (long("f"), 7)
+        \\    {}
+        \\}
+    ,
+        &.{
+            dbg("\"early padded past the small string length\""),
+            dbg("\"a padded past the small string length\""),
+            dbg("\"b padded past the small string length\""),
+            dbg("\"c padded past the small string length\""),
+            dbg("\"d padded past the small string length\""),
+            dbg("\"e padded past the small string length\""),
+            dbg("\"f padded past the small string length\""),
+        },
+        .returned,
+        0,
+    ),
     moduleTestWithLiveAllocations(
         "for!: return exits the enclosing function from inside the loop",
         \\counter! : U64 => Try((U64, U64), [NoMore])

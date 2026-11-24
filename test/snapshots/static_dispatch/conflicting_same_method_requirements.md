@@ -163,7 +163,7 @@ main = g([1.U32, 2.U32])
 		(e-lambda
 			(args
 				(p-assign (ident "l")))
-			(e-dispatch-call (method "map") (constraint-fn-var 279)
+			(e-dispatch-call (method "map") (constraint-fn-var 281)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "l"))))
@@ -171,7 +171,7 @@ main = g([1.U32, 2.U32])
 					(e-lambda
 						(args
 							(p-assign (ident "i")))
-						(e-call (constraint-fn-var 278)
+						(e-call (constraint-fn-var 280)
 							(e-lookup-external
 								(builtin))
 							(e-lookup-local
@@ -181,7 +181,7 @@ main = g([1.U32, 2.U32])
 		(e-lambda
 			(args
 				(p-assign (ident "l")))
-			(e-dispatch-call (method "map") (constraint-fn-var 288)
+			(e-dispatch-call (method "map") (constraint-fn-var 290)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "l"))))
@@ -189,7 +189,7 @@ main = g([1.U32, 2.U32])
 					(e-lambda
 						(args
 							(p-assign (ident "i")))
-						(e-call (constraint-fn-var 287)
+						(e-call (constraint-fn-var 289)
 							(e-lookup-external
 								(builtin))
 							(e-lookup-local

@@ -125,7 +125,7 @@ EndOfFile,
 				(p-assign (ident "x")))
 			(e-lookup-local
 				(p-assign (ident "x")))))
-	(e-call (constraint-fn-var 279)
+	(e-call (constraint-fn-var 281)
 		(e-lookup-local
 			(p-assign (ident "f")))
 		(e-tuple

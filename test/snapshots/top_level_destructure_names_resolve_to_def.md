@@ -85,7 +85,7 @@ greeting = f("hello ")
 (can-ir
 	(d-let
 		(p-assign (ident "earlier"))
-		(e-dispatch-call (method "plus") (constraint-fn-var 258)
+		(e-dispatch-call (method "plus") (constraint-fn-var 260)
 			(receiver
 				(e-lookup-local
 					(p-assign (ident "x"))))
@@ -96,7 +96,7 @@ greeting = f("hello ")
 		(e-num (value "1")))
 	(d-let
 		(p-assign (ident "later"))
-		(e-dispatch-call (method "plus") (constraint-fn-var 260)
+		(e-dispatch-call (method "plus") (constraint-fn-var 262)
 			(receiver
 				(e-lookup-local
 					(p-assign (ident "x"))))
@@ -107,7 +107,7 @@ greeting = f("hello ")
 		(e-lambda
 			(args
 				(p-assign (ident "v")))
-			(e-call (constraint-fn-var 266)
+			(e-call (constraint-fn-var 268)
 				(e-lookup-external
 					(builtin))
 				(e-lookup-local
@@ -120,7 +120,7 @@ greeting = f("hello ")
 			(e-literal (string "s"))))
 	(d-let
 		(p-assign (ident "greeting"))
-		(e-call (constraint-fn-var 269)
+		(e-call (constraint-fn-var 271)
 			(e-lookup-local
 				(p-assign (ident "f")))
 			(e-string

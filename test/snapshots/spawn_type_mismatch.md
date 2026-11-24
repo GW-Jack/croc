@@ -252,7 +252,7 @@ NO CHANGE
 			(e-block
 				(s-for-bang
 					(p-assign (ident "x"))
-					(e-call (constraint-fn-var 354)
+					(e-call (constraint-fn-var 356)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local
@@ -277,7 +277,7 @@ NO CHANGE
 			(e-block
 				(s-for-bang
 					(p-assign (ident "_x"))
-					(e-call (constraint-fn-var 511)
+					(e-call (constraint-fn-var 513)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local
@@ -305,7 +305,7 @@ NO CHANGE
 			(e-block
 				(s-for-bang
 					(p-assign (ident "_x"))
-					(e-call (constraint-fn-var 616)
+					(e-call (constraint-fn-var 618)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local

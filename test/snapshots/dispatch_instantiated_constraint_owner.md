@@ -119,7 +119,7 @@ expect f([1].first())
 		(e-lambda
 			(args
 				(p-assign (ident "r")))
-			(e-dispatch-call (method "is_ok") (constraint-fn-var 248)
+			(e-dispatch-call (method "is_ok") (constraint-fn-var 250)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "r"))))
@@ -131,7 +131,7 @@ expect f([1].first())
 				(p-assign (ident "a")))
 			(e-field-access
 				(receiver
-					(e-call (constraint-fn-var 254)
+					(e-call (constraint-fn-var 256)
 						(e-lookup-local
 							(p-assign (ident "g")))
 						(e-lookup-local

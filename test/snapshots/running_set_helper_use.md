@@ -148,9 +148,9 @@ NO CHANGE
 				(p-assign (ident "fs")))
 			(e-field-access
 				(receiver
-					(e-dispatch-call (method "flatten") (constraint-fn-var 324)
+					(e-dispatch-call (method "flatten") (constraint-fn-var 326)
 						(receiver
-							(e-call (constraint-fn-var 322)
+							(e-call (constraint-fn-var 324)
 								(e-lookup-external
 									(builtin))
 								(e-lookup-local

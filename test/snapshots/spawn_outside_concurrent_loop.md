@@ -305,7 +305,7 @@ NO CHANGE
 			(e-block
 				(s-for-bang
 					(p-assign (ident "_x"))
-					(e-call (constraint-fn-var 452)
+					(e-call (constraint-fn-var 454)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local
@@ -320,7 +320,7 @@ NO CHANGE
 									(args)
 									(e-runtime-error (tag "spawn_outside_concurrent_loop")))))
 						(s-expr
-							(e-call (constraint-fn-var 592)
+							(e-call (constraint-fn-var 594)
 								(e-lookup-local
 									(p-assign (ident "g")))))
 						(e-empty_record)))
@@ -343,7 +343,7 @@ NO CHANGE
 			(e-block
 				(s-for-bang
 					(p-assign (ident "_x"))
-					(e-call (constraint-fn-var 605)
+					(e-call (constraint-fn-var 607)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local

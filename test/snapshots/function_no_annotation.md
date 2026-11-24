@@ -108,7 +108,7 @@ NO CHANGE
 			(args
 				(p-assign (ident "x"))
 				(p-assign (ident "y")))
-			(e-dispatch-call (method "times") (constraint-fn-var 259)
+			(e-dispatch-call (method "times") (constraint-fn-var 261)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "x"))))
@@ -126,10 +126,10 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-assign (ident "x")))
-			(e-call (constraint-fn-var 272)
+			(e-call (constraint-fn-var 274)
 				(e-lookup-local
 					(p-assign (ident "print_number!")))
-				(e-call (constraint-fn-var 271)
+				(e-call (constraint-fn-var 273)
 					(e-lookup-local
 						(p-assign (ident "multiply")))
 					(e-lookup-local
@@ -137,7 +137,7 @@ NO CHANGE
 					(e-num (value "2"))))))
 	(d-let
 		(p-assign (ident "main!"))
-		(e-call (constraint-fn-var 286)
+		(e-call (constraint-fn-var 288)
 			(e-lookup-local
 				(p-assign (ident "process!")))
 			(e-num (value "42"))))

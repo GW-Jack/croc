@@ -158,7 +158,7 @@ test = |{}| {
 						(args
 							(p-assign (ident "_fmt"))
 							(p-assign (ident "s")))
-						(e-call (constraint-fn-var 309)
+						(e-call (constraint-fn-var 311)
 							(e-lookup-external
 								(builtin))
 							(e-lookup-local

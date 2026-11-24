@@ -126,7 +126,7 @@ NO CHANGE
 					(p-assign (ident "#interp_0"))
 					(e-lookup-local
 						(p-assign (ident "name"))))
-				(e-interpolation (constraint-fn-var 271) (dispatcher-var 10)
+				(e-interpolation (constraint-fn-var 273) (dispatcher-var 10)
 					(first
 						(e-literal (string "hi ")))
 					(parts
@@ -135,7 +135,7 @@ NO CHANGE
 						(e-literal (string "")))))))
 	(d-let
 		(p-assign (ident "ok"))
-		(e-call (constraint-fn-var 305)
+		(e-call (constraint-fn-var 307)
 			(e-lookup-local
 				(p-assign (ident "greet")))
 			(e-string

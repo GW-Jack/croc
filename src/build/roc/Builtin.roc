@@ -3937,6 +3937,44 @@ Builtin :: [].{
 			{ entries: flat.entries, limit_paths: flat.limit_paths, shielded: flat.shielded, background: flat.background, limits: flat.limits, root_limit }
 		}
 
+		## Runs the plan and returns its entries' results in input order. The
+		## results of background entries are left out.
+		all! : Concurrently(item) => List(item)
+		all! = |plan| {
+			(indexed, count) = concurrently_indexed(plan, 0, Bool.False)
+			var $slots = List.repeat(Err(Pending), count)
+			for! arrival in indexed {
+				match arrival {
+					Kept(index, result) => {
+						$slots = list_set_unsafe($slots, index, Ok(result))
+					}
+					Dropped => {}
+				}
+			}
+			concurrently_filled($slots)
+		}
+
+		## Runs the plan and returns its entries' `Ok` results in input order, or
+		## the first `Err` to arrive, cancelling the entries still running. The
+		## results of background entries are left out, `Err`s included.
+		all_ok! : Concurrently(Try(ok, err)) => Try(List(ok), err)
+		all_ok! = |plan| {
+			(indexed, count) = concurrently_indexed(plan, 0, Bool.False)
+			var $slots = List.repeat(Err(Pending), count)
+			for! arrival in indexed {
+				match arrival {
+					Kept(index, Ok(result)) => {
+						$slots = list_set_unsafe($slots, index, Ok(result))
+					}
+					Kept(_, Err(problem)) => {
+						return Err(problem)
+					}
+					Dropped => {}
+				}
+			}
+			Ok(concurrently_filled($slots))
+		}
+
 		## The running set of a `for!` loop over a plan, in its sequential form
 		## (design.md "Plans And Concurrent Loops"): the entries, which of them are
 		## background, the next one to start, and how many entries that aren't
@@ -3976,6 +4014,55 @@ Builtin :: [].{
 
 		run_ended : Running(item) -> (Running(item), [Arrived(item), Ended])
 		run_ended = |running| (running, Ended)
+	}
+
+	## Runs functions concurrently and combines their results. Each of these is a
+	## `for!` loop over a plan, so where the functions can't pause they run one
+	## at a time, in order.
+	Concurrent :: {}.{
+
+		## Runs every function and returns their results in input order. The same
+		## as `List.concurrently(functions).all!()`.
+		all! : List(() => item) => List(item)
+		all! = |functions| List.concurrently(functions).all!()
+
+		## Runs every function and returns their `Ok` results in input order, or
+		## the first `Err` to arrive, cancelling the functions still running. The
+		## same as `List.concurrently(functions).all_ok!()`.
+		all_ok! : List(() => Try(ok, err)) => Try(List(ok), err)
+		all_ok! = |functions| List.concurrently(functions).all_ok!()
+
+		## Runs both functions and returns both results.
+		both! : (() => first), (() => second) => (first, second)
+		both! = |run_first, run_second| {
+			var $first = Err(Pending)
+			var $second = Err(Pending)
+			for! arrival in List.concurrently([|| First(run_first()), || Second(run_second())]) {
+				match arrival {
+					First(result) => {
+						$first = Ok(result)
+					}
+					Second(result) => {
+						$second = Ok(result)
+					}
+				}
+			}
+			match ($first, $second) {
+				(Ok(first), Ok(second)) => (first, second)
+				(Err(Pending), _) | (_, Err(Pending)) => crash "Concurrent.both!: a loop over two entries ended before both arrived"
+			}
+		}
+
+		## Returns the result of the first function to finish, cancelling the
+		## others. The first function is taken separately so there is always one
+		## to race.
+		race! : (() => item), List(() => item) => item
+		race! = |first, others| {
+			for! winner in List.concurrently([first]).concat(List.concurrently(others)) {
+				return winner
+			}
+			crash "Concurrent.race!: a loop over a plan with an entry ended before one arrived"
+		}
 	}
 
 	## A type has a default sort order when its module provides
@@ -27779,6 +27866,59 @@ concurrently_flatten_into = |plan, limit_path, shielded, background, acc|
 		Shielded(inner) => concurrently_flatten_into(inner, limit_path, Bool.True, background, acc)
 		Background(inner) => concurrently_flatten_into(inner, limit_path, shielded, Bool.True, acc)
 	}
+
+# The plan `Concurrently.all!` and `all_ok!` loop over: `plan` with each entry
+# wrapped, keeping its limits, shields and background marks. An entry that
+# isn't background returns its index among those entries, counted in input
+# order from `next_index`, with its result; a background one returns `Dropped`.
+# Also returns the index after the last one, the number of slots to fill.
+concurrently_indexed : Concurrently(item), U64, Bool -> (Concurrently([Kept(U64, item), Dropped]), U64)
+concurrently_indexed = |plan, next_index, background|
+	match plan {
+		Each(functions) =>
+			if background {
+				dropped = List.map(functions, |function| || concurrently_dropped(function()))
+				(Concurrently.Each(dropped), next_index)
+			} else {
+				kept = List.map_with_index(functions, |function, offset| || Kept(next_index + offset, function()))
+				(Concurrently.Each(kept), next_index + List.len(functions))
+			}
+		Cat(first, second) => {
+			(first_indexed, after_first) = concurrently_indexed(first, next_index, background)
+			(second_indexed, after_second) = concurrently_indexed(second, after_first, background)
+			(Concurrently.Cat(first_indexed, second_indexed), after_second)
+		}
+		Limit(max_running, inner) => {
+			(indexed, after) = concurrently_indexed(inner, next_index, background)
+			(Concurrently.Limit(max_running, indexed), after)
+		}
+		Shielded(inner) => {
+			(indexed, after) = concurrently_indexed(inner, next_index, background)
+			(Concurrently.Shielded(indexed), after)
+		}
+		Background(inner) => {
+			(indexed, after) = concurrently_indexed(inner, next_index, Bool.True)
+			(Concurrently.Background(indexed), after)
+		}
+	}
+
+# A background entry's arrival in `concurrently_indexed`'s plan: its result is
+# left out.
+concurrently_dropped : item -> [Kept(U64, item), Dropped]
+concurrently_dropped = |_result| Dropped
+
+# The results `Concurrently.all!` and `all_ok!` stored by index. A loop that
+# reaches its end has had every entry arrive, so every slot is filled.
+concurrently_filled : List(Try(item, [Pending])) -> List(item)
+concurrently_filled = |slots|
+	List.map(
+		slots,
+		|slot|
+			match slot {
+				Ok(result) => result
+				Err(Pending) => crash "a loop over a plan ended before every entry arrived"
+			},
+	)
 
 # The `Stream` counterpart of `iter_from_step`: every `Stream` source and
 # adapter builds its value through this one registered constructor, so Monotype

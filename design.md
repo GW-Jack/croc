@@ -34348,18 +34348,37 @@ may suspend, so the pass gives it a task like any other such procedure.
 
 **The library.** Each of these is ordinary Builtin Roc written with a
 concurrent loop, so it gets both forms:
-- `Concurrently.all!` and `Concurrently.all_ok!`;
-- `Concurrent.all!`, `all_ok!`, `both!` and `race!`.
+
+```text
+Concurrently.all!    : Concurrently(item) => List(item)
+Concurrently.all_ok! : Concurrently(Try(ok, err)) => Try(List(ok), err)
+Concurrent.all!      : List(() => item) => List(item)
+Concurrent.all_ok!   : List(() => Try(ok, err)) => Try(List(ok), err)
+Concurrent.both!     : (() => first), (() => second) => (first, second)
+Concurrent.race!     : (() => item), List(() => item) => item
+```
+
+`Concurrent` is a Builtin namespace, like `Crypto`. `Concurrent.all!(fs)` is
+`fs.concurrently().all!()`, and likewise `all_ok!`.
 
 How they work:
-- `all!` wraps each entry so its result carries its index, and stores each
-  arrival by index;
-- `all_ok!` returns at the first `Err` to arrive;
-- `race!` returns at the first arrival;
-- `both!` runs two entries over `[First(a), Second(b)]`.
+- `all!` loops over a copy of the plan with each entry wrapped, keeping its
+  limits, shields and background marks. An entry that isn't background
+  returns its index among those entries, counted in input order, with its
+  result. A background entry returns `Dropped`. The body stores each
+  arrival in the slot for its index, so results come back in input order
+  and background entries' results are left out;
+- `all_ok!` is the same loop, and returns at the first `Err` to arrive.
+  Leaving the loop cancels the rest. A background entry's `Err` is left out
+  like its `Ok`;
+- `race!` loops over its first function, then the others, and returns at
+  the first arrival;
+- `both!` runs two entries over `[First(first), Second(second)]` and returns
+  once both have arrived.
 
-Results come back in input order, and background entries' results are left
-out.
+In the sequential form, `all_ok!` never starts the entries after the first
+`Err`, and `race!` returns its first function's result without starting the
+others.
 
 `Concurrent.supervise!(opts, f)` is not a loop:
 - In a `Tasks` build it always runs `f` as a child task, since only a
