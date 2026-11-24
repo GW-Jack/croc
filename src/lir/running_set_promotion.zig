@@ -100,14 +100,18 @@ fn describe(allocator: Allocator, store: *LirStore, layouts: *layout.Store, star
     };
 }
 
-/// Every statement of `proc`'s body.
+/// Every statement of `proc`'s body, once. Paths that share a tail, such as a
+/// loop's `break` and its normal end, reach it once each.
 fn bodyStmts(allocator: Allocator, store: *LirStore, proc: ProcId) Allocator.Error!std.ArrayList(CFStmtId) {
     var all = std.ArrayList(CFStmtId).empty;
     errdefer all.deinit(allocator);
+    var seen = collections.DenseMapUnmanaged(CFStmtId, void).empty;
+    defer seen.deinit(allocator);
     var work = std.ArrayList(CFStmtId).empty;
     defer work.deinit(allocator);
     try work.append(allocator, store.getProcSpecImmediate(proc).body.get() orelse return all);
     while (work.pop()) |stmt_id| {
+        if ((try seen.getOrPut(allocator, stmt_id)).found_existing) continue;
         try all.append(allocator, stmt_id);
         try body_clone.appendSuccessors(store, &work, stmt_id, allocator);
     }

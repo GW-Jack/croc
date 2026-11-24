@@ -1079,6 +1079,9 @@ const IdShape = enum {
     /// An `i128_literal`, which the calls pass through a `ref.local` copy:
     /// the shape LIR lowering gives a loop id.
     copied_i128,
+    /// As `direct`, in a loop on a tail that every path of a switch shares,
+    /// as a loop's break and its normal end share what follows the loop.
+    shared_tail,
 };
 
 /// The provides root `g()` of a promotion test, in the sequential form:
@@ -1185,6 +1188,16 @@ fn promotionProgram(f: *Fixture, background: [3]bool, body: LoopBody, id_shape: 
                 .next = head,
             } }, .test_fixture);
         },
+        .shared_tail => {
+            const which = try f.local(.u64);
+            const shared = try literal(f, id, test_loop_id, .u64, head);
+            head = try literal(f, which, 0, .u64, try f.store.addCFStmt(.{ .switch_stmt = .{
+                .cond = which,
+                .branches = try f.store.addCFSwitchBranches(&.{.{ .value = 0, .body = shared }}),
+                .default_branch = shared,
+                .continuation = shared,
+            } }, .test_fixture));
+        },
     }
     const g = try f.store.addProcSpec(.{
         .name = f.store.freshSyntheticSymbol(),
@@ -1279,6 +1292,38 @@ test "promotion cancels a loop's running set and drains it through run_next!" {
     // 20 arrives first. The body cancels the other two, which haven't begun,
     // and drains: each cancelled report readies the loop, which parks until
     // the last.
+    try std.testing.expectEqual(Status.done, children[1].resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.cancelled, children[0].resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.cancelled, children[2].resumeFromHost(ready, abort));
+    try std.testing.expectEqual(Status.done, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(@as(u64, 20), root);
+    task.free();
+    try f.runtime_env.checkForLeaks();
+}
+
+test "promotion promotes a loop on a tail that paths share once" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const entry = try promotionProgram(&f, .{ false, false, false }, .first, .shared_tail);
+
+    var static_strings = try eval.Interpreter.buildStaticStrings(f.allocator, &f.store);
+    defer static_strings.deinit();
+    var interp = try eval.Interpreter.init(f.allocator, &f.store, &f.layouts, static_strings.view(), f.runtime_env.get_ops());
+    defer interp.deinit();
+
+    // The loop runs as it does off a shared tail: 20 arrives first, and the
+    // other two entries, which haven't begun, are cancelled and drained.
+    var root: u64 = 0;
+    ReadyChildren.len = 0;
+    const task = try startEntry(&interp, entry, &root);
+    const ready = &ReadyChildren.ready;
+    const abort = &ReadyChildren.abort;
+    const Status = builtins.task.Status;
+    try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
+    try std.testing.expectEqual(@as(usize, 3), ReadyChildren.len);
+    const children = ReadyChildren.tasks[0..3].*;
     try std.testing.expectEqual(Status.done, children[1].resumeFromHost(ready, abort));
     try std.testing.expectEqual(Status.pending, task.resumeFromHost(ready, abort));
     try std.testing.expectEqual(Status.cancelled, children[0].resumeFromHost(ready, abort));
