@@ -34196,15 +34196,16 @@ integer literal in the procedure holding the loop, a fresh local per call.
 Monotype mints it as the owning specialization's reserved function id
 shifted left 32 bits, or'd with the loop's index among the plan loops that
 specialization's body lowers, so it is deterministic and unique per source
-loop and owning specialization. Ids stay unique within a procedure after
-inlining: SolvedInline inlines a body only at its single call site, since a
-wrapper can't own a loop and the single-use rules need exactly one call site,
-and the copies of a specialization that lambda-set instances make become
-separate procedures. The id may reach a call through copies of its literal
-local; the LIR checks follow them back to the literal. The Boxy strategy lowers every plan loop
-sequentially; it compiles no `Tasks` program, since the CLI rejects a
-`Tasks` platform under `--specialize=no`, so no Boxy loop's entries can
-suspend.
+loop and owning specialization. Ids stay unique within a procedure because a
+function whose body owns a plan loop, which is one that calls `run_create!`,
+always stays a procedure of its own: neither SpecConstr nor SolvedInline
+inlines it. One call site each isn't enough, since a specialization's copies,
+which SpecConstr makes per call pattern and lambda-set solving per instance,
+keep its ids and can all be called from one procedure. The id may reach a call
+through copies of its literal local; the LIR checks follow them back to the
+literal. The Boxy strategy lowers every plan loop sequentially; it compiles no
+`Tasks` program, since the CLI rejects a `Tasks` platform under
+`--specialize=no`, so no Boxy loop's entries can suspend.
 
 **The library.** Each of these is ordinary Builtin Roc written with a
 concurrent loop, so it gets both forms:

@@ -17002,3 +17002,113 @@ test "running-set helper specializations carry their marks, and run_next! calls 
         try expectRunningSetHelperProcs(&lowered.lowered);
     }
 }
+
+/// Lower `source` under each inline mode and require every procedure to hold
+/// at most one plan loop, so that a copy of a loop-owning body in a caller,
+/// which would repeat the loop's id there, shows up as a second `run_create!`
+/// call.
+fn expectLoopOwnersStayCalls(source: []const u8) TestError!void {
+    const allocator = std.testing.allocator;
+    for ([_]lir.CheckedPipeline.InlineMode{ .procedures, .wrappers }) |inline_mode| {
+        var lowered = try lowerModuleWithOptions(allocator, source, inline_mode, .{ .specialization_strategy = .lss });
+        defer lowered.deinit(allocator);
+        errdefer std.debug.print("plan loops, inline mode {s}:\n{s}\n", .{ @tagName(inline_mode), source });
+        const store = &lowered.lowered.lir_result.store;
+        for (0..store.procSpecCount()) |index| {
+            const proc_id: LIR.LirProcSpecId = @fromBackingInt(@intCast(index));
+            const callees = try collectAssignCallProcs(allocator, &lowered.lowered, proc_id);
+            defer allocator.free(callees);
+            var loops: usize = 0;
+            for (callees) |callee| {
+                if (store.getProcSpec(callee).running_set_helper == .run_create) loops += 1;
+            }
+            try std.testing.expect(loops <= 1);
+        }
+    }
+}
+
+test "a function that owns a plan loop stays a call when its call sites pass plans of different shapes" {
+    try expectLoopOwnersStayCalls(
+        \\sum! : Concurrently(U64) => U64
+        \\sum! = |plan| {
+        \\    var $sum = 0
+        \\    for! x in plan {
+        \\        $sum = $sum + x
+        \\    }
+        \\    $sum
+        \\}
+        \\
+        \\main : U64 => U64
+        \\main = |n| sum!(List.concurrently([|| n])) + sum!(List.concurrently([|| n + 1, || n + 2]))
+    );
+}
+
+test "a function that owns a plan loop stays a call when one call site limits its plan" {
+    try expectLoopOwnersStayCalls(
+        \\sum! : Concurrently(U64) => U64
+        \\sum! = |plan| {
+        \\    var $sum = 0
+        \\    for! x in plan {
+        \\        $sum = $sum + x
+        \\    }
+        \\    $sum
+        \\}
+        \\
+        \\main : U64 => U64
+        \\main = |n| sum!(List.concurrently([|| n])) + sum!(List.concurrently([|| n + 1]).limit(2))
+    );
+}
+
+test "a capturing local function that owns a plan loop stays a call" {
+    try expectLoopOwnersStayCalls(
+        \\outer! : U64 => U64
+        \\outer! = |n| {
+        \\    inner! = |k| {
+        \\        var $sum = 0
+        \\        for! x in List.concurrently([|| k, || n]) {
+        \\            $sum = $sum + x
+        \\        }
+        \\        $sum
+        \\    }
+        \\    inner!(1) + inner!(2)
+        \\}
+        \\
+        \\main : U64 => U64
+        \\main = |n| outer!(n) + outer!(4)
+    );
+}
+
+test "a function that owns a plan loop stays a call inside a caller with several call sites" {
+    try expectLoopOwnersStayCalls(
+        \\sum! : Concurrently(U64) => U64
+        \\sum! = |plan| {
+        \\    var $sum = 0
+        \\    for! x in plan {
+        \\        $sum = $sum + x
+        \\    }
+        \\    $sum
+        \\}
+        \\
+        \\outer! : U64 => U64
+        \\outer! = |n| sum!(List.concurrently([|| n])) + sum!(List.concurrently([|| n + 1]).limit(2))
+        \\
+        \\main : U64 => U64
+        \\main = |n| if n > 3 outer!(n) else outer!(n + 1) + outer!(7)
+    );
+}
+
+test "a lambda that owns a plan loop stays a call in the function it is passed to" {
+    try expectLoopOwnersStayCalls(
+        \\run! : (U64 => U64), U64 => U64
+        \\run! = |f!, n| f!(n) + f!(n + 1)
+        \\
+        \\main : U64 => U64
+        \\main = |n| run!(|k| {
+        \\    var $sum = 0
+        \\    for! x in List.concurrently([|| k, || k + 1]) {
+        \\        $sum = $sum + x
+        \\    }
+        \\    $sum
+        \\}, n) + run!(|k| k * 2, n)
+    );
+}

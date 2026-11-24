@@ -387,7 +387,7 @@ const InlineAnalyzer = struct {
             const callees_start: u32 = @intCast(graph.callees.items.len);
             switch (try self.scanCandidateBody(candidate.body, self.solved.instances.specFnEnv(fn_id), &graph.callees)) {
                 .closed => {},
-                .open => {
+                .open, .owns_plan_loop => {
                     graph.callees.shrinkRetainingCapacity(callees_start);
                     self.decisions[index] = .never;
                     continue;
@@ -413,13 +413,18 @@ const InlineAnalyzer = struct {
         closed,
         /// The body can transfer control out of itself.
         open,
+        /// The body holds a concurrent loop of its own. Specializations of one
+        /// source function keep the loop's id, so two of them inlined into one
+        /// caller would repeat it there (design.md "Plans And Concurrent
+        /// Loops", "Sequential lowering.").
+        owns_plan_loop,
     };
 
     const WalkItem = struct { child: Lifted.ExprChild, loop_depth: usize };
 
     /// Prove that every break and continue in `body`, read under instance
-    /// `env`, is owned by a loop inside it, appending each procedure it calls
-    /// directly to `callees`.
+    /// `env`, is owned by a loop inside it and that it holds no concurrent
+    /// loop, appending each procedure it calls directly to `callees`.
     fn scanCandidateBody(self: *InlineAnalyzer, body: Lifted.ExprId, env: Instances.Env, callees: *std.ArrayList(SpecFnId)) std.mem.Allocator.Error!BodyShape {
         var walk: std.ArrayList(WalkItem) = .empty;
         defer walk.deinit(self.allocator);
@@ -452,6 +457,9 @@ const InlineAnalyzer = struct {
                     => {},
                     .call_proc => |call| {
                         if (Lifted.localDirectCallee(call)) |callee| {
+                            if (self.solved.lifted.getFn(callee).source) |template| {
+                                if (template.running_set_helper == .run_create) return .owns_plan_loop;
+                            }
                             const callee_env = Instances.referenceEnv(self.solved, expr_id, callee, env);
                             try callees.append(self.allocator, self.solved.instances.specFn(callee, callee_env));
                         }

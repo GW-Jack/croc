@@ -10290,7 +10290,8 @@ const Cloner = struct {
                 const source = try self.pass.inlineSourceBody(callable.fn_id) orelse return residualCallableCall(frame, task);
                 if (!source.size.admits()) return residualCallableCall(frame, task);
                 if (try exprContainsReturn(self.pass.allocator, self.pass.program, source.expr) or
-                    try exprContainsFreeLoopControl(self.pass.allocator, self.pass.program, source.expr))
+                    try exprContainsFreeLoopControl(self.pass.allocator, self.pass.program, source.expr) or
+                    try exprOwnsPlanLoop(self.pass.allocator, self.pass.program, source.expr))
                 {
                     return residualCallableCall(frame, task);
                 }
@@ -10463,7 +10464,8 @@ const Cloner = struct {
                 const source = try self.pass.inlineSourceBody(callee) orelse return plainDirectCall(frame, task);
                 if (!source.size.admits()) return plainDirectCall(frame, task);
                 if (try exprContainsReturn(self.pass.allocator, self.pass.program, source.expr) or
-                    try exprContainsFreeLoopControl(self.pass.allocator, self.pass.program, source.expr))
+                    try exprContainsFreeLoopControl(self.pass.allocator, self.pass.program, source.expr) or
+                    try exprOwnsPlanLoop(self.pass.allocator, self.pass.program, source.expr))
                 {
                     return plainDirectCall(frame, task);
                 }
@@ -14969,6 +14971,33 @@ fn exprContainsReturn(allocator: Allocator, program: *const Ast.Program, expr_id
                 .return_ => .found,
                 .let_, .expr, .expect, .dbg, .uninitialized, .crash, .checked_error => .descend,
             };
+        }
+    };
+    return Ast.anyExpr(allocator, program, expr_id, Search{ .program = program });
+}
+
+/// Whether `expr_id` holds a concurrent loop of its own, as a call of
+/// `run_create!`. A function whose body does stays a call: a copy of the body
+/// in a caller would repeat the loop's id there (design.md "Plans And
+/// Concurrent Loops", "Sequential lowering.").
+fn exprOwnsPlanLoop(allocator: Allocator, program: *const Ast.Program, expr_id: Ast.ExprId) Allocator.Error!bool {
+    const Search = struct {
+        program: *const Ast.Program,
+
+        pub fn visitExpr(search: @This(), id: Ast.ExprId, _: *std.ArrayList(Ast.ExprChild)) Allocator.Error!Ast.ExprSearch {
+            return switch (search.program.getExpr(id).data) {
+                .call_proc => |call| {
+                    const callee = Ast.localDirectCallee(call) orelse return .descend;
+                    const template = search.program.getFn(callee).source orelse return .descend;
+                    return if (template.running_set_helper == .run_create) .found else .descend;
+                },
+                .lambda, .def_ref, .fn_def, .comptime_value => .skip,
+                .return_, .local, .unit, .@"unreachable", .int_lit, .frac_f32_lit, .frac_f64_lit, .dec_lit, .str_lit, .bytes_lit, .static_data_candidate, .typed_boundary, .row_widen, .list, .tuple, .record, .record_update, .tag, .nominal, .let_, .fn_ref, .call_value, .low_level, .field_access, .tuple_access, .structural_eq, .structural_hash, .match_, .if_, .uninitialized, .uninitialized_payload, .if_initialized_payload, .try_sequence, .try_record_sequence, .block, .loop_, .break_, .continue_, .join_point, .jump, .crash, .checked_error, .comptime_exhaustiveness_failed, .dbg, .expect_err, .expect, .literal_rejected => .descend,
+            };
+        }
+
+        pub fn visitStmt(_: @This(), _: Ast.StmtId, _: *std.ArrayList(Ast.ExprChild)) Allocator.Error!Ast.ExprSearch {
+            return .descend;
         }
     };
     return Ast.anyExpr(allocator, program, expr_id, Search{ .program = program });
