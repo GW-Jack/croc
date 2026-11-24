@@ -1,19 +1,19 @@
 //! wasm32 host for the `concurrency: Tasks` test platform: the native
-//! host's pausing loop (host.zig) inside the module, driven from
+//! host's loop (host.zig, scheduler.zig) inside the module, driven from
 //! `wasm_main`.
 //!
 //! `wasm_configure(mode, pause)` picks how the next `wasm_main` runs:
-//! - 0: answer every `roc_host_fetch` on the next turn of the loop, waking
-//!   the task, which the program hands back through `roc_task_ready`;
+//! - 0: answer the oldest parked `roc_host_fetch` when no task is ready,
+//!   waking its task, which the program hands back through `roc_task_ready`;
 //! - 1: answer every fetch during the call;
 //! - 2: cancel at pause `pause` before answering, so the program aborts the
-//!   fetch through `roc_task_abort` and hands the task back through
-//!   `roc_task_ready`;
+//!   fetches through `roc_task_abort` and hands the unparked tasks back
+//!   through `roc_task_ready`;
 //! - 3: answer and wake at pause `pause`, then cancel, so the program
-//!   releases the answer.
+//!   releases the answer;
+//! - 4: as 0, but answer the newest parked fetch first.
 //!
-//! A cancel is a request: the loop resumes the task once more, and that
-//! resume reports CANCELLED.
+//! A cancel is a request: a later resume of the task reports CANCELLED.
 //!
 //! `wasm_main` returns the text the native host prints (the result or where
 //! it cancelled, then the fetch and pause counts), copied out of the heap,
@@ -24,12 +24,12 @@
 const std = @import("std");
 const builtins = @import("builtins");
 const host_alloc = @import("host_alloc");
+const scheduler = @import("scheduler.zig");
 
 const shim_symbols = builtins.shim_symbols;
 const RocOps = builtins.host_abi.RocOps;
 const RocStr = builtins.str.RocStr;
 const RocTask = builtins.task.RocTask;
-const TaskStatus = builtins.task.Status;
 
 const env_imports = struct {
     extern "env" fn roc_panic(ptr: [*]const u8, len: usize) noreturn;
@@ -125,65 +125,26 @@ var roc_ops = RocOps{
     .hosted_fns = .{ .count = 0, .fns = undefined }, // hosted functions are reached by symbol
 };
 
-/// `RocPoll` (design.md "Host Contract").
-const poll_ready: u32 = 0;
-const poll_pending: u32 = 1;
+const Mode = enum(u32) { pause_every_fetch = 0, finish_at_once = 1, cancel_at = 2, cancel_woken_at = 3, newest_first = 4 };
 
-const Mode = enum(u32) { pause_every_fetch = 0, finish_at_once = 1, cancel_at = 2, cancel_woken_at = 3 };
-
-/// The fetch the task is parked on, answered on the next turn of the loop.
-const Pending = struct {
-    task: *RocTask,
-    out: *RocStr,
-    url: RocStr,
-};
-
-var mode: Mode = .pause_every_fetch;
-var cancel_pause: u32 = 0;
-var pending: ?Pending = null;
-var fetches: u32 = 0;
-var pauses: u32 = 0;
-
-/// The answer to `fetch!(url)`. It owns `url`.
-fn answer(url: RocStr) RocStr {
-    var buf: [256]u8 = undefined;
-    const text = std.fmt.bufPrint(&buf, "fetched({s})", .{url.asSlice()}) catch "fetched(...)";
-    var owned = url;
-    owned.decref(&roc_ops);
-    return RocStr.fromSlice(text, &roc_ops);
-}
+var config: scheduler.Config = .{};
 
 /// `RocPoll roc_host_fetch(RocTask *task, RocStr *out, RocStr url)`.
 fn hostedFetch(task: *RocTask, out: *RocStr, url: RocStr) callconv(.c) u32 {
-    fetches += 1;
-    if (mode == .finish_at_once) {
-        out.* = answer(url);
-        return poll_ready;
-    }
-    if (pending != null) @panic("a second fetch while one is pending");
-    pending = .{ .task = task, .out = out, .url = url };
-    return poll_pending;
+    return scheduler.fetch(task, out, url);
 }
 
 /// `void roc_task_abort(RocTask *task)`: abandon the fetch the cancelled
 /// task is parked on, releasing its URL.
 fn taskAbort(task: *RocTask) callconv(.c) void {
-    const parked = pending orelse @panic("roc_task_abort with no fetch pending");
-    if (parked.task != task) @panic("roc_task_abort for another task");
-    pending = null;
-    var url = parked.url;
-    url.decref(&roc_ops);
+    scheduler.abort(task);
 }
 
-/// The host's ready queue: the task `roc_task_ready` handed back, which the
-/// loop resumes next. One task, so one slot.
-var ready: ?*RocTask = null;
-
-/// `void roc_task_ready(RocTask *task)`: a wake found the task parked, or a
-/// cancel unparked it, so it may be resumed. Queue it for the loop.
+/// `void roc_task_ready(RocTask *task)`: a wake found the task parked, a
+/// cancel unparked it, or the program started it as a child. Queue it for
+/// the loop.
 fn taskReady(task: *RocTask) callconv(.c) void {
-    if (ready != null) @panic("roc_task_ready while a task is already queued");
-    ready = task;
+    scheduler.readied(task);
 }
 
 comptime {
@@ -193,10 +154,7 @@ comptime {
 }
 
 extern fn roc_main(url: RocStr, result_out: *RocStr) callconv(.c) *RocTask;
-extern fn roc_task_resume(task: *RocTask) callconv(.c) u32;
-extern fn roc_task_wake(task: *RocTask) callconv(.c) void;
 extern fn roc_task_free(task: *RocTask) callconv(.c) void;
-extern fn roc_task_cancel(task: *RocTask) callconv(.c) void;
 
 var report_buf: [512]u8 = undefined;
 var report_len: usize = 0;
@@ -207,55 +165,34 @@ fn report(comptime fmt: []const u8, args: anytype) void {
 
 /// Set how the next `wasm_main` runs; see the module comment.
 export fn wasm_configure(new_mode: u32, pause: u32) void {
-    mode = std.enums.fromInt(Mode, new_mode) orelse @panic("unknown mode");
-    cancel_pause = pause;
+    const mode = std.enums.fromInt(Mode, new_mode) orelse @panic("unknown mode");
+    config = .{
+        .finish_at_once = mode == .finish_at_once,
+        .order = if (mode == .newest_first) .newest_first else .oldest_first,
+        .cancel_at = if (mode == .cancel_at or mode == .cancel_woken_at) pause else null,
+        .cancel_woken = mode == .cancel_woken_at,
+    };
 }
 
 /// Run the app once and return the address of its report.
 export fn wasm_main() [*]const u8 {
-    pending = null;
-    ready = null;
-    fetches = 0;
-    pauses = 0;
+    scheduler.reset(config, &roc_ops);
     // Long enough that the string, and the answer built from it, live on the
     // heap and so count toward the allocation balance.
     const url = RocStr.fromSlice("https://example.com/concurrency/tasks", &roc_ops);
     var result: RocStr = undefined;
     const task = roc_main(url, &result);
-
-    var cancel_requested = false;
-    while (true) {
-        const status = roc_task_resume(task);
-        if (status == @backingInt(TaskStatus.done)) break;
-        if (status == @backingInt(TaskStatus.cancelled) and cancel_requested) {
-            roc_task_free(task);
-            report("cancelled at pause {d}\nfetches: {d}, pauses: {d}\n", .{ pauses, fetches, pauses });
-            return &report_buf;
-        }
-        if (status != @backingInt(TaskStatus.pending)) @panic("unexpected task status");
-        const parked = pending orelse @panic("the task paused with no fetch pending");
-        pauses += 1;
-        const cancelling = (mode == .cancel_at or mode == .cancel_woken_at) and pauses == cancel_pause;
-        if (!cancelling or mode == .cancel_woken_at) {
-            pending = null;
-            parked.out.* = answer(parked.url);
-            roc_task_wake(parked.task);
-            // The task was parked, so the wake handed it back.
-            if (ready != parked.task) @panic("a woken parked task was not handed back");
-            ready = null;
-        }
-        if (cancelling) {
-            // Unwoken, the program aborts the fetch through `taskAbort` and
-            // hands the task back; woken, the wake already did.
-            cancel_requested = true;
-            roc_task_cancel(task);
-            if (mode == .cancel_at) {
-                if (ready != task) @panic("a cancelled parked task was not handed back");
-                ready = null;
-            }
-        }
-    }
+    const outcome = scheduler.run(task) catch |err| @panic(@errorName(err));
     roc_task_free(task);
+    const fetches = scheduler.fetches;
+    const pauses = scheduler.pauses;
+    if (outcome == .cancelled) {
+        report("cancelled at pause {d}\nfetches: {d}, pauses: {d}\n", .{ pauses, fetches, pauses });
+        return &report_buf;
+    }
+    // wasm has no crash exit: a crash reaches `roc_crashed` while the task
+    // runs (design.md "The Task Runtime").
+    if (outcome == .crashed) @panic("the task reported CRASHED");
     report("{s}\nfetches: {d}, pauses: {d}\n", .{ result.asSlice(), fetches, pauses });
     result.decref(&roc_ops);
     return &report_buf;

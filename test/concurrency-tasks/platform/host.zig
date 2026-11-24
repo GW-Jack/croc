@@ -1,29 +1,32 @@
 //! Host for the `concurrency: Tasks` test platform: a pausing host.
 //!
-//! It calls `roc_main`, which returns a task, and drives that task with
-//! `roc_task_resume`. Every `roc_host_fetch` call parks: the host answers it
-//! on the next turn of its loop, writing the result to the call's `out` and
-//! waking the task through the program's `roc_task_wake`, which hands the
-//! parked task back through the host's `roc_task_ready`; the loop resumes
-//! only a task that was handed back. With `--finish-at-once` it answers every call during the
-//! call instead, so the same app runs both ways. With `--cancel-at N` it
-//! cancels the task through the program's `roc_task_cancel` at its Nth pause
-//! instead of answering, so the program aborts the fetch through the host's
-//! `roc_task_abort` and hands the task back through `roc_task_ready`; with
-//! `--cancel-woken-at N` it answers and wakes the task first, so the program
-//! releases the answer. Either way the cancel is a request: the next resume
-//! reports CANCELLED (design.md "The Task Runtime", "Cancellation"). It
-//! prints the result, or where it cancelled, and the number of pauses, and
-//! fails the run unless every
-//! allocation it served was freed. A task that crashes ends with status
-//! CRASHED (design.md "The Task Runtime"): the host prints its message and
-//! fails the run, without the leak check, since a crash leaves what the
-//! crashed frames owned.
+//! It calls `roc_main`, which returns a task, and drives that task, and the
+//! child tasks it starts, with the loop in scheduler.zig: every
+//! `roc_host_fetch` call parks, and the loop answers one when no task is
+//! ready, waking the task through the program's `roc_task_wake`. Arguments:
+//! - `--finish-at-once` answers every call during the call instead, so the
+//!   same app runs both ways;
+//! - `--answer-newest-first` answers the newest parked fetch first;
+//! - `--cancel-at N` cancels the task through the program's
+//!   `roc_task_cancel` at its Nth pause instead of answering, so the program
+//!   aborts the fetches through the host's `roc_task_abort` and hands the
+//!   unparked tasks back through `roc_task_ready`;
+//! - `--cancel-woken-at N` answers and wakes the Nth pause's fetch first, so
+//!   the program releases the answer.
+//!
+//! Either way the cancel is a request: a later resume reports CANCELLED
+//! (design.md "The Task Runtime", "Cancellation"). It prints the result, or
+//! where it cancelled, and the number of pauses, and fails the run unless
+//! every allocation it served was freed. A task that crashes ends with
+//! status CRASHED (design.md "The Task Runtime"): the host prints its
+//! message and fails the run, without the leak check, since a crash leaves
+//! what the crashed frames owned.
 
 const std = @import("std");
 const shim_io = @import("shim_io");
 const builtins = @import("builtins");
 const host_alloc = @import("host_alloc");
+const scheduler = @import("scheduler.zig");
 
 pub const std_options_elf_debug_info_search_paths = shim_io.elfDebugInfoSearchPaths;
 pub const std_options_debug_io = shim_io.io();
@@ -35,11 +38,6 @@ pub const std_options = shim_io.std_options_static_archive;
 const RocOps = builtins.host_abi.RocOps;
 const RocStr = builtins.str.RocStr;
 const RocTask = builtins.task.RocTask;
-const TaskStatus = builtins.task.Status;
-
-/// `RocPoll` (design.md "Host Contract").
-const poll_ready: u32 = 0;
-const poll_pending: u32 = 1;
 
 /// Counts the allocations live in the backing allocator, so the host can
 /// check that the program freed everything it allocated.
@@ -80,66 +78,25 @@ fn getOps() *RocOps {
     return &g_roc_ops;
 }
 
-/// The `fetch!` call the task is parked on, answered on the next turn of the
-/// host's loop.
-const Pending = struct {
-    task: *RocTask,
-    out: *RocStr,
-    url: RocStr,
-};
-
-var g_pending: ?Pending = null;
-var g_finish_at_once = false;
-/// The pause at which the host cancels the task, if any.
-var g_cancel_at: ?u32 = null;
-/// Whether the host answers and wakes the task before cancelling it.
-var g_cancel_woken = false;
-var g_fetches: u32 = 0;
-var g_pauses: u32 = 0;
-/// The host's ready queue: the task `roc_task_ready` handed back, which the
-/// loop resumes next. One task, so one slot.
-var g_ready: ?*RocTask = null;
-
-/// The answer to `fetch!(url)`. It owns `url`.
-fn answer(url: RocStr) RocStr {
-    var buf: [256]u8 = undefined;
-    const text = std.fmt.bufPrint(&buf, "fetched({s})", .{url.asSlice()}) catch "fetched(...)";
-    var owned = url;
-    owned.decref(&g_roc_ops);
-    return RocStr.fromSlice(text, &g_roc_ops);
-}
+var g_config: scheduler.Config = .{};
 
 /// `RocPoll roc_host_fetch(RocTask *task, RocStr *out, RocStr url)`.
 fn hostedFetch(task: *RocTask, out: *RocStr, url: RocStr) callconv(.c) u32 {
-    g_fetches += 1;
-    if (g_finish_at_once) {
-        out.* = answer(url);
-        return poll_ready;
-    }
-    // design.md "Host Contract": the host resumes a task only after a resume
-    // returns, so one task waits on at most one call.
-    std.debug.assert(g_pending == null);
-    g_pending = .{ .task = task, .out = out, .url = url };
-    return poll_pending;
+    return scheduler.fetch(task, out, url);
 }
 
 /// `void roc_task_abort(RocTask *task)`, which every `Tasks` host defines
 /// (design.md "Host Contract"): abandon the fetch the cancelled task is
 /// parked on, releasing its URL.
 fn taskAbort(task: *RocTask) callconv(.c) void {
-    const pending = g_pending orelse @panic("roc_task_abort with no fetch pending");
-    std.debug.assert(pending.task == task);
-    g_pending = null;
-    var url = pending.url;
-    url.decref(&g_roc_ops);
+    scheduler.abort(task);
 }
 
 /// `void roc_task_ready(RocTask *task)`, which every `Tasks` host defines
-/// (design.md "Host Contract"): a wake found the task parked, or a cancel
-/// unparked it, so it may be resumed. Queue it for the loop.
+/// (design.md "Host Contract"): a wake found the task parked, a cancel
+/// unparked it, or the program started it as a child. Queue it for the loop.
 fn taskReady(task: *RocTask) callconv(.c) void {
-    std.debug.assert(g_ready == null);
-    g_ready = task;
+    scheduler.readied(task);
 }
 
 comptime {
@@ -150,10 +107,7 @@ comptime {
 }
 
 extern fn roc_main(url: RocStr, result_out: *RocStr) callconv(.c) *RocTask;
-extern fn roc_task_resume(task: *RocTask) callconv(.c) u32;
-extern fn roc_task_wake(task: *RocTask) callconv(.c) void;
 extern fn roc_task_free(task: *RocTask) callconv(.c) void;
-extern fn roc_task_cancel(task: *RocTask) callconv(.c) void;
 extern fn roc_task_crash_message(task: *RocTask, len: *usize) callconv(.c) [*]const u8;
 
 // OS-specific entry point handling
@@ -166,12 +120,14 @@ fn main(argc: c_int, argv: [*][*:0]u8) callconv(.c) c_int {
     while (i < @as(usize, @intCast(argc))) : (i += 1) {
         const arg = std.mem.span(argv[i]);
         if (std.mem.eql(u8, arg, "--finish-at-once")) {
-            g_finish_at_once = true;
+            g_config.finish_at_once = true;
+        } else if (std.mem.eql(u8, arg, "--answer-newest-first")) {
+            g_config.order = .newest_first;
         } else if (std.mem.eql(u8, arg, "--cancel-at") or std.mem.eql(u8, arg, "--cancel-woken-at")) {
-            g_cancel_woken = std.mem.eql(u8, arg, "--cancel-woken-at");
+            g_config.cancel_woken = std.mem.eql(u8, arg, "--cancel-woken-at");
             i += 1;
             const pause = if (i < @as(usize, @intCast(argc))) std.mem.span(argv[i]) else "";
-            g_cancel_at = std.fmt.parseInt(u32, pause, 10) catch return usage(arg);
+            g_config.cancel_at = std.fmt.parseInt(u32, pause, 10) catch return usage(arg);
         } else {
             return usage(arg);
         }
@@ -184,63 +140,35 @@ fn main(argc: c_int, argv: [*][*:0]u8) callconv(.c) c_int {
 }
 
 fn usage(arg: []const u8) c_int {
-    std.debug.print("Error: bad argument '{s}'\nUsage: <app> [--finish-at-once | --cancel-at N | --cancel-woken-at N]\n", .{arg});
+    std.debug.print("Error: bad argument '{s}'\nUsage: <app> [--finish-at-once | --answer-newest-first | --cancel-at N | --cancel-woken-at N]\n", .{arg});
     return 1;
 }
 
-const HostError = error{ TaskCancelled, TaskCrashed, UnexpectedStatus, NotReady, Leaked };
+const HostError = scheduler.Error || error{ TaskCrashed, Leaked };
 
 fn platformMain() HostError!void {
+    scheduler.reset(g_config, &g_roc_ops);
     // Long enough that the string, and the answer built from it, live on the
     // heap and so count toward the leak check.
     const url = RocStr.fromSlice("https://example.com/concurrency/tasks", &g_roc_ops);
     var result: RocStr = undefined;
     const task = roc_main(url, &result);
-
-    var cancel_requested = false;
-    while (true) {
-        const status = roc_task_resume(task);
-        if (status == @backingInt(TaskStatus.done)) break;
-        if (status == @backingInt(TaskStatus.cancelled)) {
-            if (!cancel_requested) return error.TaskCancelled;
-            roc_task_free(task);
-            std.debug.print("cancelled at pause {d}\nfetches: {d}, pauses: {d}\n", .{ g_pauses, g_fetches, g_pauses });
-            return checkLeaks();
-        }
-        if (status == @backingInt(TaskStatus.crashed)) {
-            var len: usize = 0;
-            const message = roc_task_crash_message(task, &len);
-            std.debug.print("crashed after pause {d}: {s}\nfetches: {d}, pauses: {d}\n", .{ g_pauses, message[0..len], g_fetches, g_pauses });
-            roc_task_free(task);
-            return error.TaskCrashed;
-        }
-        if (status != @backingInt(TaskStatus.pending)) return error.UnexpectedStatus;
-        // The task paused on a fetch: answer it, then resume it.
-        const pending = g_pending orelse return error.UnexpectedStatus;
-        g_pauses += 1;
-        const cancelling = g_cancel_at == g_pauses;
-        if (!cancelling or g_cancel_woken) {
-            g_pending = null;
-            pending.out.* = answer(pending.url);
-            roc_task_wake(pending.task);
-            // The task was parked, so the wake handed it back.
-            if (g_ready != pending.task) return error.NotReady;
-            g_ready = null;
-        }
-        if (cancelling) {
-            // Unwoken, the program aborts the fetch through `taskAbort` and
-            // hands the task back; woken, the wake already did.
-            cancel_requested = true;
-            roc_task_cancel(task);
-            if (!g_cancel_woken) {
-                if (g_ready != task) return error.NotReady;
-                g_ready = null;
-            }
-        }
+    const outcome = try scheduler.run(task);
+    const fetches = scheduler.fetches;
+    const pauses = scheduler.pauses;
+    if (outcome == .crashed) {
+        var len: usize = 0;
+        const message = roc_task_crash_message(task, &len);
+        std.debug.print("crashed after pause {d}: {s}\nfetches: {d}, pauses: {d}\n", .{ pauses, message[0..len], fetches, pauses });
+        roc_task_free(task);
+        return error.TaskCrashed;
     }
     roc_task_free(task);
-
-    std.debug.print("{s}\nfetches: {d}, pauses: {d}\n", .{ result.asSlice(), g_fetches, g_pauses });
+    if (outcome == .cancelled) {
+        std.debug.print("cancelled at pause {d}\nfetches: {d}, pauses: {d}\n", .{ pauses, fetches, pauses });
+        return checkLeaks();
+    }
+    std.debug.print("{s}\nfetches: {d}, pauses: {d}\n", .{ result.asSlice(), fetches, pauses });
     result.decref(&g_roc_ops);
     return checkLeaks();
 }
