@@ -34058,8 +34058,10 @@ blocks, and reports one outside every `for!` body or inside a closure or
 `expect` within one as an error. Checking then binds each `spawn` to the
 innermost enclosing loop that takes the plan protocol in the same function,
 skipping `for`, `while` and stream `for!` loops, and checks `f` against
-`() => a` for that loop's items `a`. A `spawn` with no such loop is a type
-error. A rejected `spawn` crashes if it runs. A spawned entry:
+`() => a` for that loop's items `a`. The running set holds `f`, so a
+generalized `f`, such as a closed lambda, is instantiated there, as one stored
+in a list is. A `spawn` with no such loop is a type error. A rejected `spawn`
+crashes if it runs. A spawned entry:
 - is unshielded and never background;
 - counts against the root limit if the plan has one. A plan whose
   outermost node is not a `Limit`, such as `p.limit(2).shielded()`, spawns

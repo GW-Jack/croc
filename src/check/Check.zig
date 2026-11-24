@@ -37396,7 +37396,11 @@ fn resumeSpawnCheck(self: *Self, task: *ExprTask, state: *SingleChildCheck, env:
         try self.cir.recordSpawnPlanLoop(ModuleEnv.nodeIdxFrom(frame.expr_idx), plan_loop.loop_node);
         const entry_content = try self.types.mkFuncEffectful(&.{}, plan_loop.item_var);
         const entry_var = try self.freshFromContent(entry_content, env, frame.expr_region);
-        const result = try self.unifyOwnedRelation(entry_var, ModuleEnv.varFrom(operand), env, .none, .construction);
+        // The loop's running set holds the entry, so a generalized operand is
+        // instantiated here: unifying the loop's item with its scheme would
+        // generalize the item.
+        const operand_var = try self.storedValueVar(operand, env);
+        const result = try self.unifyOwnedRelation(entry_var, operand_var, env, .none, .construction);
         if (result.isProblem()) try self.markErroneousValueExpr(frame.expr_idx);
     } else {
         _ = try self.problems.appendProblem(.{ .spawn_outside_plan_loop = .{ .region = frame.expr_region } });
