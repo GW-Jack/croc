@@ -38,7 +38,7 @@ NO CHANGE
 		(args
 			(p-assign (ident "x")))
 		(e-call (constraint-fn-var 239)
-			(e-lookup-associated-resolved (source "Bool.not") (builtin) (target-node "19681") (target-def "19681"))
+			(e-lookup-associated-resolved (source "Bool.not") (builtin) (target-node "19686") (target-def "19686"))
 			(e-lookup-local
 				(p-assign (ident "x")))))
 	(e-tag (name "True")))

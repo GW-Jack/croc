@@ -24166,8 +24166,8 @@ whose results hold no function (numbers, strings, byte lists, answers about an
 operand), and the operations later stages build from LIR, which solving never
 sees.
 
-`list_map_extract_unsafe` is the one operation that reads a value its operand
-types do not describe: `List.map`'s buffer is typed by the output item while
+`list_map_extract_unsafe` is the one operation that reads a value its other
+operands' types do not describe: `List.map`'s buffer is typed by the output item while
 its unwritten slots hold input items. Its third operand is the input list the
 buffer was retyped from, whose item type is the extracted item's. The operand
 exists for its type alone (`LowLevel.typeOnlyOperands`): Lambda Solved reads
@@ -24180,6 +24180,18 @@ SpecConstr specializes `List.map` for a known transform by rebuilding the
 transform at each use, each a reference that instantiates the transform's
 binding group on its own. The extracted item would then take a callable set
 nothing produces, which is empty and cannot be called.
+
+`list_map_can_reuse` and `list_map_cast_unsafe` take the output list as a
+type-only operand for the same reason. `List.map` binds an empty list that
+nothing reads and passes it to both. The cast's result has that list's type, so
+every callable set that reaches the returned list's items reaches the operand's
+item type, and the reuse decision compares the input's items with exactly the
+items the in-place loop writes. The transform's result type cannot be what it
+compares: the reference the reuse test holds is an instance of its own that is
+never called, so it lacks the callables that reach the returned items from
+elsewhere, and an item laid out without their captures can be smaller than the
+one written. `list_map_can_reuse` keeps the transform as an operand, which
+relates the transform's parameter to the input's items.
 
 Every lifted function's type is registered before any body is solved.
 Definitions are output in `FnId` order because consumers reach functions only
@@ -25050,7 +25062,8 @@ The property is declared, never inferred. `LowLevel.procedureKeyedByLayout` is
 the explicit allow list of operations whose lowering is layout-only; a new
 operation is not on it until someone adds it after checking its lowering. An
 operation stays off the list when its lowering reads anything but operand and
-result layouts: `list_map_can_reuse` reads its transform's solved function type,
+result layouts: `list_map_can_reuse` takes a transform for its solved function
+type and reads its type-only output list,
 `dict_pseudo_seed` reads the program's seed mode, and operations over fixed
 types gain nothing from the key and are not listed. A template carries its
 operation explicitly: the Builtin low-level transform records the operation

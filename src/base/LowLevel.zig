@@ -117,7 +117,13 @@ pub const LowLevel = enum(u16) {
     /// never shared, so unlike `list_sublist` the result is born unique.
     list_clear,
     list_map_prepare_reuse,
+    /// Whether `List.map` may write its output into the prepared list's
+    /// allocation. Its last operand is `typeOnlyOperands`' output list, whose
+    /// item type is the one the in-place loop writes: the transform's result
+    /// type is that of a reference that may never be called.
     list_map_can_reuse,
+    /// Retypes the prepared list to the output list's type, which its
+    /// type-only second operand has.
     list_map_cast_unsafe,
     /// `list_move_out_unsafe` for a buffer retyped to `List.map`'s output item.
     /// Its third operand is `typeOnlyOperands`' input list, the list the
@@ -969,7 +975,7 @@ pub const LowLevel = enum(u16) {
     /// layouts of its operands and result, so every specialization of its
     /// wrapper whose closed request types commit the same layouts emits the
     /// same procedure. An operation whose lowering reads a solved type (for
-    /// example `list_map_can_reuse`, which inspects its transform's function
+    /// example `list_map_can_reuse`, which relates its transform's function
     /// type) or program-wide lowering state (`dict_pseudo_seed`) is not a
     /// member, and neither is any operation whose meaning depends on anything
     /// but its operands' runtime representation.
@@ -1209,7 +1215,7 @@ pub const LowLevel = enum(u16) {
         // Reads the prepared list's refcount (and slice bit) without
         // changing it. List.map additionally gates this result on item
         // representation compatibility during lowering.
-        .list_map_can_reuse = byType(.none()),
+        .list_map_can_reuse = byType(.none()).typeOnly(1),
         // The owned flag reads the list's count and nothing else; it is
         // the check a versioned loop dispatches on, so a list proven
         // unique makes it a constant.
@@ -1218,7 +1224,7 @@ pub const LowLevel = enum(u16) {
         // Retypes a unique non-slice list to the output element type,
         // keeping the same allocation. Only reachable behind a true
         // `list_map_can_reuse`, so the result's count is 1 on return.
-        .list_map_cast_unsafe = byLayout(.consumesArgsReturningConsumedArgsRetainingArgs(arg_0, 0)).elements(&.{.layout}),
+        .list_map_cast_unsafe = byLayout(.consumesArgsReturningConsumedArgsRetainingArgs(arg_0, 0)).elements(&.{ .layout, .none }).typeOnly(1),
 
         // Moves one element's ownership out of a unique list's buffer.
         // The buffer slot keeps stale bytes until `list_map_write_unsafe`

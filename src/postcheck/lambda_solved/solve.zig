@@ -3441,7 +3441,7 @@ const Solver = struct {
                 try self.unify(expected, args[0]);
             },
             .list_map_can_reuse => {
-                expectLowLevelArity(op, args, 2);
+                expectLowLevelArity(op, args, 3);
                 const transform = try self.functionShape(args[1]);
                 if (transform.args.count() != 1) Common.invariant("list map transform must have one argument");
                 try self.unify(try self.listElem(args[0]), self.program.types.spanItem(transform.args, 0));
@@ -3471,10 +3471,14 @@ const Solver = struct {
                 try self.unify(expected, args[0]);
                 try self.unify(expected, args[1]);
             },
-            // Retyping keeps the input and output callable sets apart: the
-            // items written later flow into the output through
-            // `list_map_write_unsafe`.
-            .list_map_cast_unsafe => expectLowLevelArity(op, args, 1),
+            // Retyping keeps the input and output callable sets apart. The
+            // result has the output list operand's type, the one
+            // `list_map_can_reuse` compares with the input's, so every
+            // callable set that reaches the returned items reaches both.
+            .list_map_cast_unsafe => {
+                expectLowLevelArity(op, args, 2);
+                try self.unify(expected, args[1]);
+            },
             .dict_pseudo_seed => expectLowLevelArity(op, args, 0),
             .hasher_finish => expectLowLevelArity(op, args, 1),
             .crypto_sha256_hash_bytes,
@@ -7133,8 +7137,13 @@ test "lambda solved list map primitives preserve callable element flow" {
         .ret = elements[3],
     } });
     const reuse_result = try program.types.add(.{ .primitive = .u8 });
-    try solver.bindLowLevelTypes(.list_map_can_reuse, reuse_result, &.{ lists[0], transform });
+    try solver.bindLowLevelTypes(.list_map_can_reuse, reuse_result, &.{ lists[0], transform, lists[2] });
     try std.testing.expectEqual(program.types.rootCompressed(callables[0]), program.types.rootCompressed(callables[1]));
+
+    // The retyped buffer has the output list operand's callable set, and not
+    // the input's.
+    try solver.bindLowLevelTypes(.list_map_cast_unsafe, lists[3], &.{ lists[0], lists[2] });
+    try std.testing.expectEqual(program.types.rootCompressed(callables[2]), program.types.rootCompressed(callables[3]));
 
     // A write preserves the buffer's element representation, including the
     // lambda set, both in the stored value and in the returned list handle.

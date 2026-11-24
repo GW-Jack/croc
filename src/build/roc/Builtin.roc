@@ -4701,10 +4701,13 @@ Builtin :: [].{
 		map : List(a), (a -> b) -> List(b)
 		map = |list, transform| {
 			prepared_list = list_map_prepare_reuse(list)
-			match list_map_can_reuse(prepared_list, transform) {
+			# Never read: its type is the returned list's, which the reuse check
+			# compares with the input's and the retyped buffer takes.
+			output = []
+			match list_map_can_reuse(prepared_list, transform, output) {
 				1 => {
 					length = prepared_list.len()
-					var $out = list_map_cast_unsafe(prepared_list)
+					var $out = list_map_cast_unsafe(prepared_list, output)
 					var $index = 0
 					while $index < length {
 						item = list_map_extract_unsafe($out, $index, prepared_list)
@@ -28183,13 +28186,16 @@ list_map_prepare_reuse : List(input) -> List(input)
 # layouts are interchangeable, and at runtime the list is uniquely owned and
 # not a seamless slice. Lowered to a constant 0 when the layouts are not
 # interchangeable, which lets lowering drop the in-place branch entirely.
+# The output list is never evaluated: its type is the returned list's, so its
+# item is the one the in-place loop writes.
 # Note: success is U8 (0 = false, 1 = true) since Bool is not available at top level
-list_map_can_reuse : List(input), (input -> output) -> U8
+list_map_can_reuse : List(input), (input -> output), List(output) -> U8
 
 # Implemented by the compiler. Retypes a unique, non-slice list in place so
 # List.map can overwrite its items without allocating a new list. Must only
-# be called on a list for which list_map_can_reuse returned 1.
-list_map_cast_unsafe : List(input) -> List(output)
+# be called on a list for which list_map_can_reuse returned 1. The output list is
+# never evaluated: the result has its type.
+list_map_cast_unsafe : List(input), List(output) -> List(output)
 
 # Implemented by the compiler. Moves ownership of the item at the given
 # index out of the list's buffer; the slot keeps stale bytes until

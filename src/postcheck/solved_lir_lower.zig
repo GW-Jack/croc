@@ -9233,7 +9233,7 @@ const Lowerer = struct {
         }
         if (op == .list_map_can_reuse) {
             var map_output_elem: ?layout.Idx = null;
-            const interchangeable = try self.listMapLayoutsInterchangeable(args, &map_output_elem);
+            const interchangeable = try self.listMapLayoutsInterchangeable(self.solved.lifted.exprSpan(span), &map_output_elem);
             if (!interchangeable.get(.u32) and !interchangeable.get(.u64)) {
                 // Reuse is statically impossible (or disabled) on every
                 // width, so the runtime uniqueness check never needs to
@@ -10981,7 +10981,7 @@ const Lowerer = struct {
     /// for the width it is building.
     fn listMapLayoutsInterchangeable(self: *Lowerer, args: anytype, output_layout: ?*?layout.Idx) Common.LowerError!layout.WidthValues(bool) {
         const none = layout.WidthValues(bool).both(false, false);
-        if (args.len != 2) Common.invariant("list_map_can_reuse reached LIR lowering with the wrong arity");
+        if (args.len != 3) Common.invariant("list_map_can_reuse reached LIR lowering with the wrong arity");
         if (!self.list_in_place_map) return none;
 
         const list_layout_idx = try self.layoutOfType(try self.lowerExprTy(GuardedList.at(args, 0)));
@@ -10989,13 +10989,11 @@ const Lowerer = struct {
         if (list_layout.tag != .list) return none;
         const in_elem_idx = self.result.layouts.runtimeRepresentationLayoutIdx(list_layout.getIdx());
 
-        const transform = self.resolveRef(self.bodyRef(self.solved.expr_tys.items[@backingInt(GuardedList.at(args, 1))]));
-        const transform_content = self.solved.types.get(transform.ty);
-        if (transform_content != .func) Common.invariant("list_map_can_reuse transform argument is not a function");
-        const out_ret = transform_content.func.ret;
-        const out_elem_idx = self.result.layouts.runtimeRepresentationLayoutIdx(
-            try self.layoutOfType(try self.lowerType(.{ .ty = out_ret, .env = transform.env })),
-        );
+        // The type-only output list's item, not the transform's result: see
+        // design.md "Lambda Solving".
+        const output_list = self.result.layouts.getLayout(try self.layoutOfType(try self.lowerExprTy(GuardedList.at(args, 2))));
+        if (output_list.tag != .list) return none;
+        const out_elem_idx = self.result.layouts.runtimeRepresentationLayoutIdx(output_list.getIdx());
         if (output_layout) |out| out.* = out_elem_idx;
 
         return layout.WidthValues(bool).both(
