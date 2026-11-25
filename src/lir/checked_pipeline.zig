@@ -2177,6 +2177,7 @@ fn generateConsumerLir(prepared: *PreparedSolved, consumer: Consumer) LowerResou
         .completed_scalar_values = target.completed_scalar_values,
         .completed_erased_members = consumer.completed_erased_members,
         .erased_capture_prefix = target.erased_capture_prefix,
+        .erased_classes = target.concurrency_mode != .none,
     });
     if (target.timing) |timing| timing.addSolvedLirParallel(parallel_metrics.?.*);
     lir_gen_timing_scope.end();

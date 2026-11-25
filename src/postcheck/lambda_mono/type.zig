@@ -118,6 +118,10 @@ pub const Content = union(enum) {
     erased_fn: struct {
         source_fn_ty: names.TypeDigest,
         members: Span = .empty(),
+        /// The type's class, or 0 where the platform has no tasks. Equal
+        /// classes have equal members (design.md "Erased Calls That May
+        /// Suspend").
+        class: u64 = 0,
     },
     erased_capture_ptr,
     zst,

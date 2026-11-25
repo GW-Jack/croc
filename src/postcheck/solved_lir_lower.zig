@@ -123,6 +123,9 @@ pub const Options = struct {
     owned_proc_signatures: bool = false,
     /// Non-owning runtime bytes before the entrypoint's typed capture.
     erased_capture_prefix: u32 = 0,
+    /// Give each erased callable type a class, which a platform with tasks
+    /// needs (design.md "Erased Calls That May Suspend").
+    erased_classes: bool = false,
     inline_plan: SolvedInline.Plan = .{},
     /// Reuse checking workers for prepared procedure-body lowering.
     post_check_executor: ?base.post_check_task_executor.Executor = null,
@@ -375,10 +378,13 @@ const FnSpec = struct {
     /// finite proc. The payload records the capture type already resident in
     /// that destination; `null` means an enabled destination with no captures.
     return_reuse: ErasedReturnReuse,
+    /// The class of the erased callable type this specialization is a member
+    /// of, or 0 where it has none (`Type.ErasedFnContent`).
+    erased_class: u64 align(4) = 0,
 };
 
 comptime {
-    std.debug.assert(@sizeOf(FnSpec) == 52);
+    std.debug.assert(@sizeOf(FnSpec) == 60);
 }
 
 const FnSpecContext = struct {
@@ -405,6 +411,7 @@ const FnSpecContext = struct {
                 std.hash.autoHash(&hasher, if (capture_ty) |ty| @backingInt(ty) else std.math.maxInt(u32));
             },
         }
+        std.hash.autoHash(&hasher, spec.erased_class);
         return hasher.final();
     }
 
@@ -415,7 +422,8 @@ const FnSpecContext = struct {
             lhs.abi == rhs.abi and
             std.meta.eql(lhs.captures, rhs.captures) and
             lhs.capture_ty == rhs.capture_ty and
-            std.meta.eql(lhs.return_reuse, rhs.return_reuse);
+            std.meta.eql(lhs.return_reuse, rhs.return_reuse) and
+            lhs.erased_class == rhs.erased_class;
     }
 };
 
@@ -438,7 +446,7 @@ const FnEntry = struct {
 };
 
 comptime {
-    std.debug.assert(@sizeOf(FnEntry) == 556);
+    std.debug.assert(@sizeOf(FnEntry) == 564);
 }
 
 const LoweredFnBody = struct {
@@ -524,6 +532,10 @@ comptime {
 const StaticInitializerRequest = struct {
     static_data: Common.StaticDataId,
     layout_idx: layout.Idx,
+    /// What the slot's type says about the classes of the erased callables
+    /// the value holds (`erasedClassDigest`): each names procedures of its
+    /// own class, so one value is stored once per answer.
+    erased_classes: u64,
 };
 
 const ComptimeValueRequest = struct {
@@ -877,6 +889,7 @@ const Lowerer = struct {
     site_code_keys: bool,
     owned_proc_signatures: bool,
     erased_capture_prefix: u32,
+    erased_classes: bool,
     /// This consumer's explicit share of the producer's roots and requests.
     root_manifest: ?RootManifest,
     /// Drain positions, kept across calls so a second drain resumes.
@@ -1344,6 +1357,7 @@ const Lowerer = struct {
             .site_code_keys = options.site_code_keys,
             .owned_proc_signatures = options.owned_proc_signatures,
             .erased_capture_prefix = options.erased_capture_prefix,
+            .erased_classes = options.erased_classes,
             .root_manifest = options.root_manifest,
             .fn_queue_index = 0,
             .initializer_queue_index = 0,
@@ -3328,6 +3342,7 @@ const Lowerer = struct {
             .ret_layout = ret_layout,
             .erased_capture_arg = if (spec.abi == .erased) .some(arg_locals[lifted_args.len]) else .none,
             .abi = if (spec.abi == .erased) .erased_callable else .roc,
+            .erased_class = @fromBackingInt(spec.erased_class),
             .hosted = .of(try self.hostedProcForSource(source_fn.source)),
             .suspends = suspendsForSource(source_fn.source),
             .running_set_helper = runningSetHelperForSource(source_fn.source),
@@ -3758,6 +3773,7 @@ const Lowerer = struct {
         abi: CaptureAbi,
         captures: CaptureSpanId,
         return_reuse: ErasedReturnReuse,
+        erased_class: u64 = 0,
         spec: FnSpec = undefined,
         fn_id: Type.FnId = undefined,
         symbol: Common.Symbol = undefined,
@@ -3778,6 +3794,9 @@ const Lowerer = struct {
         /// The function type every member is specialized at; null lowers
         /// each member at its own function type.
         solved_fn_ty: ?Ref,
+        /// The class of the erased callable type the set is the members of,
+        /// or 0.
+        erased_class: u64 = 0,
         /// The set's members at their instances, in their lowered order.
         resolved: std.ArrayList(Instances.ResolvedMember) = .empty,
         variants: std.ArrayList(Type.FnVariant) = .empty,
@@ -3915,7 +3934,7 @@ const Lowerer = struct {
                         if (callable_content == .lambda_set) {
                             return .{ .call = .{ .members = .{ .members = callable_content.lambda_set, .env = callable.env, .abi = .finite, .solved_fn_ty = root } } };
                         } else if (callable_content == .erased) {
-                            return .{ .call = .{ .members = .{ .members = callable_content.erased.members, .env = callable.env, .abi = .erased, .solved_fn_ty = self.erasedAbiFn(root) } } };
+                            return .{ .call = .{ .members = .{ .members = callable_content.erased.members, .env = callable.env, .abi = .erased, .solved_fn_ty = self.erasedAbiFn(root), .erased_class = try self.erasedClass(callable) } } };
                         }
                         return Common.invariant("function callable slot was unresolved before direct Lambda Mono");
                     },
@@ -3928,7 +3947,7 @@ const Lowerer = struct {
                     .erased => |erased| {
                         frame.cursor = TypeVarCursor.callable;
                         const abi_fn: ?Ref = if (erased.abi_fn) |abi_fn| .{ .ty = abi_fn, .env = root.env } else null;
-                        return .{ .call = .{ .members = .{ .members = erased.members, .env = root.env, .abi = .erased, .solved_fn_ty = abi_fn } } };
+                        return .{ .call = .{ .members = .{ .members = erased.members, .env = root.env, .abi = .erased, .solved_fn_ty = abi_fn, .erased_class = try self.erasedClass(root) } } };
                     },
                     .lambda_set => |members| {
                         frame.cursor = TypeVarCursor.callable;
@@ -3942,18 +3961,21 @@ const Lowerer = struct {
                 const content = self.solved.types.get(task.root.ty);
                 return try self.finishTypeVar(task, switch (content) {
                     .func => |func| blk: {
-                        const callable_content = self.solved.types.get(self.resolveRef(.{ .ty = func.callable, .env = task.root.env }).ty);
+                        const callable = self.resolveRef(.{ .ty = func.callable, .env = task.root.env });
+                        const callable_content = self.solved.types.get(callable.ty);
                         break :blk if (callable_content == .lambda_set)
                             .{ .callable = members }
                         else
                             .{ .erased_fn = .{
                                 .source_fn_ty = callable_content.erased.source_fn_ty,
                                 .members = members,
+                                .class = try self.erasedClass(callable),
                             } };
                     },
                     .erased => |erased| .{ .erased_fn = .{
                         .source_fn_ty = erased.source_fn_ty,
                         .members = members,
+                        .class = try self.erasedClass(task.root),
                     } },
                     .lambda_set => .{ .callable = members },
                     .link, .unbound, .primitive, .named, .record, .tuple, .tag_union, .list, .box, .zst, .hole, .mono => unreachable, // TypeVarCursor.callable is set only for func, erased, and lambda_set contents
@@ -4158,6 +4180,7 @@ const Lowerer = struct {
                 .captures = task.captures,
                 .capture_ty = .of(if (input) |capture_record| capture_record.ty else null),
                 .return_reuse = task.return_reuse,
+                .erased_class = task.erased_class,
             };
             if (self.worker_callback) {
                 return .{ .ret = .{ .fn_id = self.fn_spec_map.get(task.spec) orelse
@@ -4244,6 +4267,7 @@ const Lowerer = struct {
                 .abi = task.abi,
                 .captures = CaptureSpanId.fromSolved(member.captures, member.captures_env),
                 .return_reuse = .none,
+                .erased_class = task.erased_class,
             } } };
         }
         return .{ .ret = .{ .span = try self.types.addFnVariants(task.variants.items) } };
@@ -5816,18 +5840,37 @@ const Lowerer = struct {
     /// Identity of a specialization procedure, from its lifted source and the
     /// solved function type it was specialized at.
     fn specIdentity(self: *Lowerer, spec: FnSpec) std.mem.Allocator.Error!LIR.ProcIdentity {
-        const renderer = proc_identity.Renderer{
+        const renderer = self.identityRenderer();
+        const return_reuse: []const u8 = switch (spec.return_reuse) {
+            .none => "no-return-reuse",
+            .erased_callable => "erased-return-reuse",
+        };
+        return .{ .bytes = try renderer.specIdentity(spec.source, spec.solved_fn_ty, self.captureSpan(spec.captures), spec.captures.env, @tagName(spec.abi), return_reuse, if (spec.erased_class == 0) null else spec.erased_class) };
+    }
+
+    fn identityRenderer(self: *Lowerer) proc_identity.Renderer {
+        return .{
             .allocator = self.allocator,
             .program = self.solved,
             .names = &self.solved.lifted.names,
             .source_digests = self.source_digests,
             .memo = &self.identity_memo,
+            .erased_members = self.erased_classes,
         };
-        const return_reuse: []const u8 = switch (spec.return_reuse) {
-            .none => "no-return-reuse",
-            .erased_callable => "erased-return-reuse",
-        };
-        return .{ .bytes = try renderer.specIdentity(spec.source, spec.solved_fn_ty, self.captureSpan(spec.captures), spec.captures.env, @tagName(spec.abi), return_reuse) };
+    }
+
+    /// The class of the erased callable type `erased`, or 0 where the
+    /// platform has no tasks: its digest, which names its source function
+    /// type and its members (design.md "Erased Calls That May Suspend").
+    /// `erased` is resolved. Called while types are prepared, never by a
+    /// worker.
+    fn erasedClass(self: *Lowerer, erased: Ref) std.mem.Allocator.Error!u64 {
+        if (!self.erased_classes) return 0;
+        const renderer = self.identityRenderer();
+        const digest = try renderer.typeDigest(erased);
+        const class = std.mem.readInt(u64, digest[0..8], .little);
+        if (class == 0) Common.invariant("an erased callable type's class was the one no type has");
+        return class;
     }
 
     /// The code key of a procedure whose identity names its template by site
@@ -5894,6 +5937,57 @@ const Lowerer = struct {
         }
     }
 
+    /// A digest of the classes of the erased callables a value of type `root`
+    /// holds, or 0 where it holds none or the platform has no tasks. Two
+    /// types of one value with one answer name one set of procedures. An
+    /// erased callable's class covers what its captures hold.
+    fn erasedClassDigest(self: *Lowerer, root: Type.TypeId) std.mem.Allocator.Error!u64 {
+        if (!self.erased_classes) return 0;
+        var visited = collections.DenseMap(Type.TypeId, void).init(self.allocator);
+        defer visited.deinit();
+        var stack = std.ArrayList(Type.TypeId).empty;
+        defer stack.deinit(self.allocator);
+        var hasher = std.hash.Wyhash.init(0);
+        var found = false;
+        try stack.append(self.allocator, root);
+        while (stack.pop()) |ty| {
+            if ((try visited.getOrPut(ty)).found_existing) continue;
+            switch (self.types.get(ty)) {
+                .primitive, .zst, .hole, .erased_capture_ptr => {},
+                .erased_fn => |erased| {
+                    found = true;
+                    std.hash.autoHash(&hasher, erased.class);
+                },
+                .list, .box => |elem| try stack.append(self.allocator, elem),
+                .tuple => |span| try self.appendTypeSpan(&stack, span),
+                .record => |span| {
+                    const fields = self.types.fieldSpan(span);
+                    for (0..fields.len) |index| try stack.append(self.allocator, GuardedList.at(fields, index).ty);
+                },
+                .capture_record => |span| {
+                    const fields = self.types.captureFieldSpan(span);
+                    for (0..fields.len) |index| try stack.append(self.allocator, GuardedList.at(fields, index).ty);
+                },
+                .tag_union => |span| {
+                    const tags = self.types.tagSpan(span);
+                    for (0..tags.len) |index| try self.appendTypeSpan(&stack, GuardedList.at(tags, index).payloads);
+                },
+                .callable => |span| {
+                    const variants = self.types.fnVariantSpan(span);
+                    for (0..variants.len) |index| {
+                        if (GuardedList.at(variants, index).capture_ty.get()) |capture_ty| try stack.append(self.allocator, capture_ty);
+                    }
+                },
+                .named => |named| {
+                    try self.appendTypeSpan(&stack, named.args);
+                    if (named.backing.get()) |backing| try stack.append(self.allocator, backing.ty);
+                },
+            }
+        }
+        if (!found) return 0;
+        return @max(hasher.final(), 1);
+    }
+
     /// Identity of a static-initializer procedure. These procedures exist only
     /// so target static-data materialization can run a value's construction;
     /// they are never emitted by a runtime backend, so their identity names
@@ -5904,6 +5998,10 @@ const Lowerer = struct {
         hasher.update(&try self.result.layouts.contentDigest(request.layout_idx));
         const slot: u32 = @backingInt(request.static_data);
         hasher.update(&[_]u8{ @truncate(slot), @truncate(slot >> 8), @truncate(slot >> 16), @truncate(slot >> 24) });
+        if (request.erased_classes != 0) {
+            hasher.update("erased-classes");
+            hasher.update(&std.mem.toBytes(std.mem.nativeToLittle(u64, request.erased_classes)));
+        }
         return .{ .bytes = hasher.finalResult() };
     }
 
@@ -5916,6 +6014,7 @@ const Lowerer = struct {
         const request = StaticInitializerRequest{
             .static_data = candidate.static_data,
             .layout_idx = layout_idx,
+            .erased_classes = try self.erasedClassDigest(ty),
         };
         if (self.worker_callback) {
             return self.static_initializer_map.get(request) orelse
@@ -8972,6 +9071,7 @@ const Lowerer = struct {
                 .arg_plan = try self.erasedCallArgsPlan(args.ids),
                 .reuse_source = .some(callee),
                 .result_reuse = try self.erasedResultDemand(abi_ret_ty) == .single_slot,
+                .erased_class = @fromBackingInt(self.types.get(callee_ty).erased_fn.class),
             }),
             .next = after_call,
         } }, where.source());
@@ -13735,6 +13835,9 @@ const Lowerer = struct {
 
         const target_content = self.types.get(task.target_ty);
         const source_content = self.types.get(task.source_ty);
+        if (target_content == .erased_fn and source_content == .erased_fn and target_content.erased_fn.class != source_content.erased_fn.class) {
+            Common.invariant("an erased callable crossed a boundary between erased types of different classes");
+        }
         if (target_content == .erased_fn and source_content == .callable) {
             return .{ .tail = .{ .variants = .{ .kind = .callable_to_erased, .target = target, .target_span = target_content.erased_fn.members, .source = source, .source_span = source_content.callable, .next = next } } };
         }
@@ -13756,6 +13859,9 @@ const Lowerer = struct {
             return .{ .tail = .{ .fields = .{ .kind = .tuple, .target = target, .target_span = target_content.tuple, .source = source, .source_span = source_content.tuple, .next = next } } };
         }
         if ((target_content == .list and source_content == .list) or (target_content == .box and source_content == .box)) {
+            if (builtin.mode == .debug and try self.erasedClassDigest(task.target_ty) != try self.erasedClassDigest(task.source_ty)) {
+                Common.invariant("a list or box crossed a boundary between types whose erased callables have different classes");
+            }
             const target_layout = self.result.store.getLocal(target).layout_idx;
             const source_layout = self.result.store.getLocal(source).layout_idx;
             if (!self.layoutsShareRepresentation(target_layout, source_layout) and
@@ -14879,6 +14985,7 @@ const Lowerer = struct {
             .callable => |variants| self.hashVariantShapes(&hasher, variants),
             .erased_fn => |erased| {
                 hasher.update(erased.source_fn_ty.bytes[0..]);
+                std.hash.autoHash(&hasher, erased.class);
                 self.hashVariantShapes(&hasher, erased.members);
             },
             .named => |named| {
@@ -15032,6 +15139,7 @@ const Lowerer = struct {
                     .callable => |variants| if (!try scan.addVariantPairs(items, mode != .value_encoding, variants, rhs.callable)) return .{ .value = false },
                     .erased_fn => |erased| {
                         if (!std.mem.eql(u8, erased.source_fn_ty.bytes[0..], rhs.erased_fn.source_fn_ty.bytes[0..])) return .{ .value = false };
+                        if (erased.class != rhs.erased_fn.class) return .{ .value = false };
                         if (!try scan.addVariantPairs(items, true, erased.members, rhs.erased_fn.members)) return .{ .value = false };
                     },
                     .named => |named| if (!try scan.addNamedPairs(items, named, rhs.named)) return .{ .value = false },

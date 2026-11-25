@@ -1073,7 +1073,7 @@ const Twin = struct {
 const plan_loops = Twin{
     .tasks_path = "test/postcheck/plan_loops_tasks/app.roc",
     .none_path = "test/postcheck/plan_loops_none/app.roc",
-    .cases = &.{ "basic", "limits", "spawn", "background", "break", "return", "try", "nested", "children", "after_break", "supervise", "shared", "cleanups", "cycles" },
+    .cases = &.{ "basic", "limits", "spawn", "background", "break", "return", "try", "nested", "children", "after_break", "supervise", "boxed", "shared", "cleanups", "cycles" },
 };
 
 /// A program whose tasks wait on shared state, so its `None` build runs tasks

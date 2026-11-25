@@ -33809,6 +33809,15 @@ an erased callable the continuation pass makes (a resume entry or a start
 record's procedure) has none either: only the task runtime enters it, and
 the runtime passes it the task.
 
+A value never changes class: Lambda Solved gives a value's type one solved
+callable variable wherever the value flows, and LIR construction asserts that
+no boundary relabels an erased callable, or a list or box that holds one, at
+another class. A compile-time constant is the one value read at several
+types, since each read of it has its own. A slot of static data is therefore
+named by the classes its type holds as well as by its value and layout, so a
+constant that holds an erased callable is stored once per class, each copy
+naming that class's procedure.
+
 A class may suspend when one of its procedures may. Then all its procedures
 may, and every call through the class is a suspension site, recorded on its
 `ErasedCallData`. The fixpoint propagates over classes as it does over direct

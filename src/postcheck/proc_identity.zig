@@ -8,6 +8,9 @@
 //! with their lambda sets. The plain procedure of a layout-keyed Builtin
 //! template is the exception: Direct LIR names it by its argument and result
 //! layouts instead (design.md "Layout-Keyed Builtin Procedures").
+//! In a build with tasks an erased callable type is also told apart by its
+//! members, which decide whether a call through it can suspend (design.md
+//! "Erased Calls That May Suspend").
 //! The outer callable set describes where a function value flows, not the
 //! code of the selected procedure; its source and captures already name that
 //! selection. Nested callable sets still determine dispatch and representation.
@@ -102,12 +105,17 @@ pub const Renderer = struct {
     /// checked source, indexed by `Lifted.FnId`.
     source_digests: []const ?Identity,
     memo: *Memo,
+    /// Whether erased callable types are told apart by their members, as a
+    /// platform with tasks needs (design.md "Erased Calls That May Suspend").
+    erased_members: bool = false,
 
     /// Identity of the specialization of `source` at `solved_fn_ty` with the
     /// given captures, read under `captures_env`, and Lambda Mono ABI
-    /// choices. Two specializations with the same identity are one
-    /// procedure: everything that determines the procedure's code is
-    /// rendered here, so Direct LIR lowers one proc per identity.
+    /// choices, and, for a procedure entered through an erased callable type
+    /// that has a class, that class. Two specializations with the same
+    /// identity are one procedure: everything that determines the
+    /// procedure's code is rendered here, so Direct LIR lowers one proc per
+    /// identity.
     pub fn specIdentity(
         self: *const Renderer,
         source: Lifted.FnId,
@@ -116,12 +124,18 @@ pub const Renderer = struct {
         captures_env: Instances.Env,
         capture_abi: []const u8,
         return_reuse: []const u8,
+        erased_class: ?u64,
     ) Allocator.Error!Identity {
         var hasher = TypeDigestHasher.init();
         writeBytes(&hasher, domain);
         hasher.update(&self.sourceDigest(source));
         writeBytes(&hasher, capture_abi);
         writeBytes(&hasher, return_reuse);
+        if (erased_class) |class| {
+            writeBytes(&hasher, "erased_class");
+            writeU32(&hasher, @truncate(class));
+            writeU32(&hasher, @truncate(class >> 32));
+        }
         const fn_ref = self.renderedRef(solved_fn_ty);
         const signature = switch (self.types().get(fn_ref.ty)) {
             .func => |func| func,
@@ -311,6 +325,9 @@ const Engine = struct {
             .erased => |erased| {
                 try self.putBytes("erased");
                 try self.putBytes(&erased.source_fn_ty.bytes);
+                // Where the members decide whether a call suspends, they are
+                // part of the code of a procedure that makes one.
+                if (renderer.erased_members) try self.putMembers(erased.members, env);
             },
             .func => |func| {
                 try self.putBytes("func");
@@ -489,26 +506,26 @@ test "procedure identity excludes outer callable sets but retains nested callabl
         .source_digests = &.{ @splat(1), @splat(2) },
         .memo = &memo,
     };
-    const identity = try renderer.specIdentity(first_fn, .global(alone), &.{}, .global, "finite", "none");
-    try std.testing.expectEqual(identity, try renderer.specIdentity(first_fn, .global(beside_lambda), &.{}, .global, "finite", "none"));
+    const identity = try renderer.specIdentity(first_fn, .global(alone), &.{}, .global, "finite", "none", null);
+    try std.testing.expectEqual(identity, try renderer.specIdentity(first_fn, .global(beside_lambda), &.{}, .global, "finite", "none", null));
     // Function values still distinguish the members their dispatch can select.
     try std.testing.expect(!std.mem.eql(u8, &try renderer.typeDigest(.global(alone)), &try renderer.typeDigest(.global(beside_lambda))));
     for ([_][2]SolvedType.TypeVarId{ .{ takes_alone, takes_joined }, .{ returns_alone, returns_joined } }) |pair| {
-        const left = try renderer.specIdentity(first_fn, .global(pair[0]), &.{}, .global, "finite", "none");
-        const right = try renderer.specIdentity(first_fn, .global(pair[1]), &.{}, .global, "finite", "none");
+        const left = try renderer.specIdentity(first_fn, .global(pair[0]), &.{}, .global, "finite", "none", null);
+        const right = try renderer.specIdentity(first_fn, .global(pair[1]), &.{}, .global, "finite", "none", null);
         try std.testing.expect(!std.mem.eql(u8, &left, &right));
     }
     var mono = @import("monotype/ast.zig").ProgramBuilder.init(allocator);
     defer mono.deinit();
     const capture_local = try mono.addLocal(first, try mono.types.add(.{ .primitive = .i64 }));
     var capture = SolvedType.Capture{ .local = capture_local, .symbol = first, .binder = .none, .ty = alone };
-    const captures_alone = try renderer.specIdentity(first_fn, .global(alone), &.{capture}, .global, "finite", "none");
+    const captures_alone = try renderer.specIdentity(first_fn, .global(alone), &.{capture}, .global, "finite", "none", null);
     capture.ty = beside_lambda;
-    const captures_joined = try renderer.specIdentity(first_fn, .global(alone), &.{capture}, .global, "finite", "none");
+    const captures_joined = try renderer.specIdentity(first_fn, .global(alone), &.{capture}, .global, "finite", "none", null);
     try std.testing.expect(!std.mem.eql(u8, &captures_alone, &captures_joined));
-    try std.testing.expect(!std.mem.eql(u8, &identity, &try renderer.specIdentity(second_fn, .global(alone), &.{}, .global, "finite", "none")));
-    try std.testing.expect(!std.mem.eql(u8, &identity, &try renderer.specIdentity(first_fn, .global(alone), &.{}, .global, "erased", "none")));
-    try std.testing.expect(!std.mem.eql(u8, &identity, &try renderer.specIdentity(first_fn, .global(alone), &.{}, .global, "finite", "reuse")));
+    try std.testing.expect(!std.mem.eql(u8, &identity, &try renderer.specIdentity(second_fn, .global(alone), &.{}, .global, "finite", "none", null)));
+    try std.testing.expect(!std.mem.eql(u8, &identity, &try renderer.specIdentity(first_fn, .global(alone), &.{}, .global, "erased", "none", null)));
+    try std.testing.expect(!std.mem.eql(u8, &identity, &try renderer.specIdentity(first_fn, .global(alone), &.{}, .global, "finite", "reuse", null)));
 
     // An erased callable's members are whatever closures the program puts
     // in it; a procedure that takes one is the same code whichever they are.
@@ -535,14 +552,38 @@ test "procedure identity excludes outer callable sets but retains nested callabl
         .memo = &memo,
     };
     try std.testing.expectEqual(
-        try erased_renderer.specIdentity(first_fn, .global(takes_boxed_first), &.{}, .global, "finite", "none"),
-        try erased_renderer.specIdentity(first_fn, .global(takes_boxed_both), &.{}, .global, "finite", "none"),
+        try erased_renderer.specIdentity(first_fn, .global(takes_boxed_first), &.{}, .global, "finite", "none", null),
+        try erased_renderer.specIdentity(first_fn, .global(takes_boxed_both), &.{}, .global, "finite", "none", null),
     );
     // The erased function type is still part of the identity.
     try std.testing.expect(!std.mem.eql(
         u8,
-        &try erased_renderer.specIdentity(first_fn, .global(takes_boxed_first), &.{}, .global, "finite", "none"),
-        &try erased_renderer.specIdentity(first_fn, .global(takes_boxed_other), &.{}, .global, "finite", "none"),
+        &try erased_renderer.specIdentity(first_fn, .global(takes_boxed_first), &.{}, .global, "finite", "none", null),
+        &try erased_renderer.specIdentity(first_fn, .global(takes_boxed_other), &.{}, .global, "finite", "none", null),
+    ));
+
+    // Where the platform has tasks, the members decide whether a call
+    // through the type suspends, so they are part of the code, and so is the
+    // class a member is entered through.
+    var member_memo = Memo.init(allocator);
+    defer member_memo.deinit();
+    const member_renderer = Renderer{
+        .allocator = allocator,
+        .program = &program,
+        .names = &name_store,
+        .source_digests = &.{ @splat(1), @splat(2) },
+        .memo = &member_memo,
+        .erased_members = true,
+    };
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &try member_renderer.specIdentity(first_fn, .global(takes_boxed_first), &.{}, .global, "finite", "none", null),
+        &try member_renderer.specIdentity(first_fn, .global(takes_boxed_both), &.{}, .global, "finite", "none", null),
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &try member_renderer.specIdentity(first_fn, .global(alone), &.{}, .global, "erased", "none", 1),
+        &try member_renderer.specIdentity(first_fn, .global(alone), &.{}, .global, "erased", "none", 2),
     ));
 }
 

@@ -24,6 +24,7 @@ main! = |name| {
 		"children" => children!()
 		"after_break" => after_break!()
 		"supervise" => supervise!()
+		"boxed" => boxed!()
 		"supervise_crash" => supervise_crash!()
 		"shared" => shared!()
 		"cleanups" => cleanups!()
@@ -413,4 +414,131 @@ stalled! = || {
 		},
 	)
 	Str.concat(result, order.get!())
+}
+
+# Functions of one erased callable type: the first suspends in a tasks build,
+# and the others can't, whichever of them a call enters. A box may return a
+# box, be held by a record or a constant, or be an entry of a loop.
+Step : { name : Str, run : Box((Str => Str)) }
+
+steps : Str -> List(Step)
+steps = |label| [
+	{ name: "fetch", run: Box.box(|name| Host.fetch!("${label} ${name}")) },
+	{
+		name: "log",
+		run: Box.box(
+			|name| {
+				Host.log!("${label} logs ${name}")
+				"${name} logged by ${label}"
+			},
+		),
+	},
+	{ name: "pure", run: Box.box(|name| "${name} and ${label}") },
+]
+
+# A box that returns a box: both calls suspend, and the second captures what
+# the first fetched.
+fetcher : Str -> Box((Str => Box((Str => Str))))
+fetcher = |prefix| Box.box(
+	|name| {
+		first = Host.fetch!("${prefix} ${name}")
+		Box.box(|suffix| Str.concat(first, Host.fetch!(suffix)))
+	},
+)
+
+constant : Box((Str => Str))
+constant = Box.box(
+	|name| {
+		Host.log!("constant")
+		Host.fetch!(name)
+	},
+)
+
+# A constant read at two types, alone and through `either`: calls through it
+# alone never suspend, and those through the other type may.
+common : Box((Str => Str))
+common = Box.box(
+	|name| {
+		Host.log!("common ${name}")
+		Str.concat(name, " common")
+	},
+)
+
+either : Bool -> Box((Str => Str))
+either = |yes| if (yes) constant else common
+
+# The same inside a list, a record and a recursive type.
+Tree := [Leaf(Box((Str => Str))), Node(List(Tree))]
+
+tree : Tree
+tree = Node([Leaf(common), Node([Leaf(constant), Leaf(common)])])
+
+walk! : Tree, Str => Str
+walk! = |node, name| match node {
+	Leaf(box) => repeat!(box, name, 0)
+	Node(kids) => {
+		var $name = name
+		for kid in kids {
+			$name = walk!(kid, $name)
+		}
+		$name
+	}
+}
+
+compose : Box((Str => Str)), Box((Str => Str)) -> Box((Str => Str))
+compose = |first, second| Box.box(
+	|name| {
+		first! = Box.unbox(first)
+		second! = Box.unbox(second)
+		first!(second!(name))
+	},
+)
+
+# Boxed pure functions of the same shape never suspend.
+pure_box : Box((Str -> Str))
+pure_box = Box.box(|name| "pure ${name}")
+
+call_pure : Box((Str -> Str)), Str -> Str
+call_pure = |box, name| Box.unbox(box)(name)
+
+repeat! : Box((Str => Str)), Str, U64 => Str
+repeat! = |box, name, count| {
+	f! = Box.unbox(box)
+	if (count == 0) f!(name) else repeat!(box, f!(name), count - 1)
+}
+
+boxed! : () => Str
+boxed! = || {
+	var $joined = ""
+	for step in steps("a label too long to be a small string") {
+		f! = Box.unbox(step.run)
+		$joined = Str.concat($joined, f!(step.name))
+	}
+	outer! = Box.unbox(fetcher("a prefix too long to be a small string"))
+	inner! = Box.unbox(outer!("outer"))
+	$joined = Str.concat($joined, inner!("inner"))
+	constant! = Box.unbox(constant)
+	$joined = Str.concat($joined, constant!("c"))
+	$joined = Str.concat($joined, call_pure(pure_box, "p"))
+	$joined = Str.concat($joined, repeat!(constant, "r", 2))
+	common! = Box.unbox(common)
+	$joined = Str.concat($joined, common!("alone"))
+	yes = Str.count_utf8_bytes($joined) > 1
+	for box in [either(!yes), either(yes), common] {
+		$joined = Str.concat($joined, repeat!(box, "e", 1))
+	}
+	$joined = Str.concat($joined, walk!(tree, "t"))
+	$joined = Str.concat($joined, repeat!(compose(common, either(yes)), "m", 1))
+	for! body in List.concurrently(
+		steps("entry").map(
+			|step| || {
+				f! = Box.unbox(step.run)
+				f!(step.name)
+			},
+		),
+	) {
+		Host.log!("got ${body}")
+		$joined = Str.concat($joined, body)
+	}
+	$joined
 }
