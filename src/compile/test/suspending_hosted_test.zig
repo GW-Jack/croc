@@ -1,7 +1,8 @@
 //! A `suspending` hosted declaration reaches the checked artifact's
 //! `HostedProc` (design.md "Suspendable Effects", Explicit Inputs). Only the
 //! marked declaration is suspending; its unmarked sibling is not. A platform
-//! that doesn't declare `concurrency: Tasks` can't have a suspending one.
+//! that doesn't declare `concurrency: Tasks` can't have a suspending one, and
+//! one that does can't hand the host an effectful function value.
 
 const std = @import("std");
 const roc_target = @import("roc_target");
@@ -23,11 +24,21 @@ const host_source =
     \\
 ;
 
+const unmarked_host_source =
+    \\Host := [].{
+    \\    fetch! : Str => Str
+    \\    log! : Str => {}
+    \\}
+    \\
+;
+
 fn mainSource(comptime concurrency_field: []const u8) []const u8 {
     return main_head ++ concurrency_field ++ main_tail;
 }
 
-const main_head =
+const main_head = main_head_open ++ "    }\n";
+
+const main_head_open =
     \\platform ""
     \\    requires {
     \\        main! : Str => Str
@@ -38,7 +49,6 @@ const main_head =
     \\    hosted {
     \\        "roc_host_fetch": Host.fetch!,
     \\        "roc_host_log": Host.log!,
-    \\    }
     \\
 ;
 
@@ -56,10 +66,15 @@ const main_tail =
 
 /// Builds the platform in `dir`, rooted at `main.roc`.
 fn buildPlatform(build_env: *BuildEnv, dir: *std.testing.TmpDir, main_source: []const u8) TestError!void {
+    return buildPlatformWithHost(build_env, dir, main_source, host_source);
+}
+
+/// Builds the platform in `dir` with `host` as its `Host` module.
+fn buildPlatformWithHost(build_env: *BuildEnv, dir: *std.testing.TmpDir, main_source: []const u8, host: []const u8) TestError!void {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    try dir.dir.writeFile(io, .{ .sub_path = "Host.roc", .data = host_source });
+    try dir.dir.writeFile(io, .{ .sub_path = "Host.roc", .data = host });
     try dir.dir.writeFile(io, .{ .sub_path = "main.roc", .data = main_source });
 
     const cwd = try dir.dir.realPathFileAlloc(io, ".", gpa);
@@ -135,5 +150,84 @@ test "a suspending hosted function needs concurrency: Tasks" {
 
         const result = try reportTitles(&build_env, "Invalid Hosted Section");
         try std.testing.expect(result.found);
+    }
+}
+
+const concurrency_fields = .{
+    .{ .field = "", .tasks = false },
+    .{ .field = "    concurrency: None\n", .tasks = false },
+    .{ .field = "    concurrency: Tasks\n", .tasks = true },
+    .{ .field = "    concurrency: ParallelTasks\n", .tasks = true },
+};
+
+test "a hosted function of a platform with tasks takes and returns no effectful function the host could call" {
+    const cases = [_]struct { ty: []const u8, effectful: bool }{
+        .{ .ty = "Box((Str => {})) => {}", .effectful = true },
+        .{ .ty = "{} => Box((Str => Str))", .effectful = true },
+        .{ .ty = "List({ name : Str, run : Box((() => Str)) }) => {}", .effectful = true },
+        .{ .ty = "Handler => {}", .effectful = true },
+        .{ .ty = "Wrap(Box((Str => Str))) => {}", .effectful = true },
+        // The host calls the outer function, so it is handed the inner one.
+        .{ .ty = "Box((Str -> Box((Str => Str)))) => {}", .effectful = true },
+        .{ .ty = "Box((Str -> Str)) => {}", .effectful = false },
+        // The host only holds what is in the box.
+        .{ .ty = "Box({ run : Str => Str }) => Box(Held)", .effectful = false },
+        .{ .ty = "Box(a), Str => Box(a)", .effectful = false },
+    };
+    inline for (concurrency_fields) |mode| {
+        for (cases) |case| {
+            const host = try std.fmt.allocPrint(std.testing.allocator,
+                \\Host := [].{{
+                \\    Handler := {{ run : Box((Str => Str)) }}
+                \\    Held := {{ run : Str => Str }}
+                \\    Wrap(a) := {{ value : a }}
+                \\    fetch! : Str => Str
+                \\    log! : Str => {{}}
+                \\    call! : {s}
+                \\}}
+                \\
+            , .{case.ty});
+            defer std.testing.allocator.free(host);
+            var build_env: BuildEnv = undefined;
+            var tmp_dir = std.testing.tmpDir(.{});
+            defer tmp_dir.cleanup();
+            const main_source = main_head_open ++ "        \"roc_host_call\": Host.call!,\n    }\n" ++ mode.field ++ main_tail;
+            try buildPlatformWithHost(&build_env, &tmp_dir, main_source, host);
+            defer build_env.deinit();
+            errdefer std.debug.print("host signature: {s}, mode: {s}\n", .{ case.ty, mode.field });
+
+            const result = try reportTitles(&build_env, "Host Cannot Run Effectful Function");
+            try std.testing.expectEqual(mode.tasks and case.effectful, result.found);
+            try std.testing.expectEqual(result.found, result.any);
+        }
+    }
+}
+
+test "a provides entry of a platform with tasks hands the host no effectful function it could call" {
+    const cases = [_]struct { ty: []const u8, body: []const u8, effectful: bool }{
+        .{ .ty = "Str => Box((Str => Str))", .body = "|_| Box.box(|name| Host.fetch!(name))", .effectful = true },
+        .{ .ty = "Str, Box((Str => Str)) => Str", .body = "|name, _run| name", .effectful = true },
+        .{ .ty = "Str => Box((Str -> Str))", .body = "|_| Box.box(|name| name)", .effectful = false },
+        .{ .ty = "Str => Str", .body = "|url| Host.fetch!(url)", .effectful = false },
+    };
+    inline for (concurrency_fields) |mode| {
+        for (cases) |case| {
+            const main_source = try std.fmt.allocPrint(
+                std.testing.allocator,
+                "{s}{s}\nimport Host\n\nmain_for_host! : {s}\nmain_for_host! = {s}\n",
+                .{ main_head, mode.field, case.ty, case.body },
+            );
+            defer std.testing.allocator.free(main_source);
+            var build_env: BuildEnv = undefined;
+            var tmp_dir = std.testing.tmpDir(.{});
+            defer tmp_dir.cleanup();
+            try buildPlatformWithHost(&build_env, &tmp_dir, main_source, unmarked_host_source);
+            defer build_env.deinit();
+            errdefer std.debug.print("provides type: {s}, mode: {s}\n", .{ case.ty, mode.field });
+
+            const result = try reportTitles(&build_env, "Host Cannot Run Effectful Function");
+            try std.testing.expectEqual(mode.tasks and case.effectful, result.found);
+            try std.testing.expectEqual(result.found, result.any);
+        }
     }
 }

@@ -114,6 +114,7 @@ pub const Problem = union(enum) {
     unsupported_generated_method: UnsupportedGeneratedMethod,
     associated_item_not_found: AssociatedItemNotFound,
     hosted_unboxed_function: HostedUnboxedFunction,
+    host_effectful_callable: HostEffectfulCallable,
     hosted_function_not_effectful: HostedFunctionNotEffectful,
     hosted_type_variable_not_boxed: HostedTypeVariableNotBoxed,
     host_boundary_open_row: HostBoundaryOpenRow,
@@ -205,6 +206,14 @@ pub const PolymorphicRecursion = struct {
 /// Host-visible functions must be boxed, and `Iter` and `Stream` directly boxed.
 pub const HostedUnboxedFunction = struct {
     region: base.Region,
+    path: ExtraStringIdx,
+};
+
+/// An effectful function value the host could call or supply, in a platform
+/// with tasks: the host holds no task to pass it.
+pub const HostEffectfulCallable = struct {
+    /// The hosted or `provides` declaration whose type holds it
+    name: ExtraStringIdx,
     path: ExtraStringIdx,
 };
 

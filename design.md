@@ -33763,6 +33763,13 @@ Checking makes both inputs exact before anything later reads them:
 - The checker reports a `suspending` hosted procedure of a platform whose
   mode is not `Tasks`. This runs with the platform root's hosted section
   check, after the platform's type modules.
+- The same check reports an effectful function value that the host could call
+  or supply, in a hosted or `provides` signature of a platform with tasks. The
+  host holds no task to pass such a function, and has none of the class its
+  Roc callers agree on (Suspendability). The values are those `host_boundary`
+  finds to be callable by the host: an effectful function that is the
+  immediate payload of a `Box`. The signature itself and the functions inside
+  a `Box` payload the host only holds are unaffected, as are pure functions.
 
 With `concurrency: None` every hosted call completes before it returns, no
 procedure may suspend, and none of the passes below changes anything.

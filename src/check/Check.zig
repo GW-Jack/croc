@@ -19,6 +19,7 @@ const MethodNameId = canonical_names.MethodNameId;
 const canonical_type_keys = @import("canonical_type_keys.zig");
 const checked_reachability = @import("checked_reachability.zig");
 const copy_import = @import("copy_import.zig");
+const host_boundary = @import("host_boundary.zig");
 const requirement_solution = @import("requirement_solution.zig");
 const unifier = @import("unify.zig");
 const VarRegions = @import("var_regions.zig");
@@ -21734,6 +21735,19 @@ fn checkPlatformHostedSection(self: *Self) std.mem.Allocator.Error!void {
         try self.checkHostSymbol(symbol_text, &symbols);
     }
 
+    // The host has no task to pass an effectful function value.
+    if (self.cir.concurrency_mode.hasTasks()) {
+        for (self.cir.provides_entries.items()) |provides_entry| {
+            const def_idx = provides_entry.local_def orelse continue;
+            if (self.erroneous_value_patterns.contains(self.cir.store.getDef(def_idx).pattern)) continue;
+            try self.checkHostEffectfulCallables(self.cir, ModuleEnv.varFrom(def_idx), self.cir.getIdent(provides_entry.ident));
+        }
+        var declared_types = declared.iterator();
+        while (declared_types.next()) |decl| {
+            try self.checkHostEffectfulCallables(decl.key_ptr.module, ModuleEnv.varFrom(decl.key_ptr.def), decl.value_ptr.*);
+        }
+    }
+
     // A suspending hosted function needs a platform that lets tasks pause.
     if (!self.cir.concurrency_mode.hasTasks()) {
         var suspending_it = declared.iterator();
@@ -21869,29 +21883,49 @@ fn checkProvidesEntryHostBoundary(
     try self.replaceExprWithRuntimeError(def.expr, diagnostic);
 }
 
+/// What a host boundary walk over a type of `module` reads from the checker.
+const HostBoundaryContext = struct {
+    check: *Self,
+    module: *const ModuleEnv,
+
+    /// The builtin a nominal type is, as the walk distinguishes them.
+    pub fn builtin(ctx: HostBoundaryContext, nominal: types_mod.NominalType) host_boundary.Builtin {
+        if (!nominal.originIsBuiltin()) return .other;
+        return switch (ctx.check.builtinNominalDeclForBuiltinSourceDecl(nominal.sourceDeclOptional()) orelse return .other) {
+            .box => .box,
+            .list => .list,
+            .dict, .set, .try_type, .fields, .field, .numeral, .num, .concurrently, .shared => .other,
+        };
+    }
+
+    /// The source text of a field name of `module`.
+    pub fn fieldName(ctx: HostBoundaryContext, ident: Ident.Idx) []const u8 {
+        return ctx.module.getIdent(ident);
+    }
+
+    /// Whether the nominal type's declaration has a backing to walk.
+    pub fn hasBacking(ctx: HostBoundaryContext, nominal: types_mod.NominalType) bool {
+        if (ctx.module == ctx.check.cir) return ctx.check.nominalDeclBackingTemplate(nominal) != null;
+        const decl_idx = ctx.module.types.lookupNominalDecl(nominal) orelse return false;
+        return ctx.module.types.getNominalDecl(decl_idx).isValid();
+    }
+};
+
+/// Report an effectful function value the host could call or supply in the
+/// type of `module`'s declaration `name`, where this platform has tasks.
+fn checkHostEffectfulCallables(self: *Self, module: *const ModuleEnv, var_: Var, name: []const u8) std.mem.Allocator.Error!void {
+    if (!self.cir.concurrency_mode.hasTasks()) return;
+    const source: *const types_mod.Store = if (module == self.cir) self.types else &module.types;
+    const violation = try host_boundary.findViolation(self.gpa, source, var_, true, .effectful_callables, HostBoundaryContext{ .check = self, .module = module }) orelse return;
+    defer self.gpa.free(violation.path);
+    _ = try self.problems.appendProblem(.{ .host_effectful_callable = .{
+        .name = try self.problems.putExtraString(name),
+        .path = try self.problems.putExtraString(violation.path),
+    } });
+}
+
 fn checkHostBoundaryType(self: *Self, var_: Var, region: Region) std.mem.Allocator.Error!void {
-    const boundary = @import("host_boundary.zig");
-    const Context = struct {
-        check: *Self,
-
-        pub fn builtin(ctx: @This(), nominal: types_mod.NominalType) boundary.Builtin {
-            if (!nominal.originIsBuiltin()) return .other;
-            return switch (ctx.check.builtinNominalDeclForBuiltinSourceDecl(nominal.sourceDeclOptional()) orelse return .other) {
-                .box => .box,
-                .list => .list,
-                .dict, .set, .try_type, .fields, .field, .numeral, .num, .concurrently, .shared => .other,
-            };
-        }
-
-        pub fn fieldName(ctx: @This(), ident: Ident.Idx) []const u8 {
-            return ctx.check.cir.getIdent(ident);
-        }
-
-        pub fn hasBacking(ctx: @This(), nominal: types_mod.NominalType) bool {
-            return ctx.check.nominalDeclBackingTemplate(nominal) != null;
-        }
-    };
-    if (try boundary.findViolation(self.gpa, self.types, var_, true, Context{ .check = self })) |violation| {
+    if (try host_boundary.findViolation(self.gpa, self.types, var_, true, .unboxed_functions, HostBoundaryContext{ .check = self, .module = self.cir })) |violation| {
         defer self.gpa.free(violation.path);
         _ = try self.problems.appendProblem(.{ .hosted_unboxed_function = .{
             .region = region,

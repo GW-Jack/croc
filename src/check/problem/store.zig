@@ -230,6 +230,7 @@ pub const Store = struct {
                     .capturing_method,
                     .unsupported_generated_method,
                     .hosted_unboxed_function,
+                    .host_effectful_callable,
                     .hosted_function_not_effectful,
                     .hosted_type_variable_not_boxed,
                     .host_boundary_open_row,

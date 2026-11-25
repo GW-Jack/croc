@@ -89,6 +89,7 @@ const AliasNamesNoNominalType = problem_mod.AliasNamesNoNominalType;
 const PlatformDefNotFound = problem_mod.PlatformDefNotFound;
 const PlatformHostedSection = problem_mod.PlatformHostedSection;
 const HostedUnboxedFunction = problem_mod.HostedUnboxedFunction;
+const HostEffectfulCallable = problem_mod.HostEffectfulCallable;
 const PolymorphicRecursion = problem_mod.PolymorphicRecursion;
 const HostedFunctionNotEffectful = problem_mod.HostedFunctionNotEffectful;
 const HostedTypeVariableNotBoxed = problem_mod.HostedTypeVariableNotBoxed;
@@ -1143,6 +1144,9 @@ pub const ReportBuilder = struct {
             },
             .hosted_unboxed_function => |data| {
                 return self.buildHostedUnboxedFunctionReport(data);
+            },
+            .host_effectful_callable => |data| {
+                return self.buildHostEffectfulCallableReport(data);
             },
             .polymorphic_recursion => |data| {
                 return self.buildPolymorphicRecursionReport(data);
@@ -5699,6 +5703,25 @@ pub const ReportBuilder = struct {
             D.bytes("function").withAnnotation(.inline_code),
             D.bytes("value. Make that value the immediate payload of its own Box, or box a record, tuple, list, tag, or user type that holds it. An argument or result of a boxed function does not count, because the host passes and receives those values itself."),
         });
+    }
+
+    fn buildHostEffectfulCallableReport(self: *Self, data: HostEffectfulCallable) Allocator.Error!Report {
+        var report = try Report.init(self.gpa, "Host Cannot Run Effectful Function", "", .runtime_error);
+        errdefer report.deinit();
+        try D.renderSliceInto(&.{
+            D.bytes("The type of"),
+            D.bytes(self.problems.getExtraString(data.name)).withAnnotation(.inline_code),
+            D.bytes("hands an effectful function value between Roc and the host, and this platform runs its Roc code as tasks."),
+        }, self, &report, &report.headline);
+        try D.renderSlice(&.{
+            D.bytes("The function is at"),
+            D.bytes(self.problems.getExtraString(data.path)).withAnnotation(.inline_code),
+            D.bytes(".").withNoPrecedingSpace(),
+            D.bytes("An effectful function may pause its task, and the host has no task to run it in. Make it a pure"),
+            D.bytes("->").withAnnotation(.inline_code),
+            D.bytes("function, or have the host return a value that says which Roc code to run."),
+        }, self, &report);
+        return report;
     }
 
     fn buildHostedFunctionNotEffectfulReport(self: *Self, data: HostedFunctionNotEffectful) Allocator.Error!Report {

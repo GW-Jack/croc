@@ -16,7 +16,15 @@ const TypeView = @import("type_view.zig");
 
 /// Builtin identities whose payload visibility differs from a user nominal.
 pub const Builtin = enum { box, list, other };
-/// A rejected unboxed function and its allocator-owned source-level path.
+/// What no host-visible declaration's type may hold.
+pub const Rule = enum {
+    /// A function the host would receive without a `Box` around it.
+    unboxed_functions,
+    /// An effectful function the host may invoke or supply, where the platform
+    /// has tasks: the host holds no task to pass it.
+    effectful_callables,
+};
+/// A rejected function and its allocator-owned source-level path.
 pub const Violation = struct { path: []u8 };
 const Position = enum {
     /// The root of a host-visible declaration's type.
@@ -59,6 +67,7 @@ pub fn findViolation(
     source: *const types.Store,
     root: types.Var,
     signature: bool,
+    rule: Rule,
     context: anytype,
 ) std.mem.Allocator.Error!?Violation {
     var view = TypeView.init(allocator, source);
@@ -83,15 +92,17 @@ pub fn findViolation(
             .alias => |alias| try append(allocator, &nodes, cursor, view.getAliasBackingVar(alias), key.position, .backing),
             .structure => |flat| switch (flat) {
                 .fn_pure, .fn_effectful, .fn_unbound => |func| {
-                    switch (key.position) {
-                        .value => return .{
-                            .path = try renderPath(allocator, nodes.items, cursor, context),
-                        },
+                    const rejected = switch (key.position) {
+                        .value => rule == .unboxed_functions,
                         // The enclosing Box erases this function, and the host
                         // never calls it, so its signature is Roc's alone.
                         .held => continue,
-                        .signature, .box_payload => {},
-                    }
+                        .signature => false,
+                        .box_payload => rule == .effectful_callables and flat == .fn_effectful,
+                    };
+                    if (rejected) return .{
+                        .path = try renderPath(allocator, nodes.items, cursor, context),
+                    };
                     for (view.sliceVars(func.args), 0..) |arg, index|
                         try append(allocator, &nodes, cursor, arg, .value, .{ .argument = index });
                     try append(allocator, &nodes, cursor, func.ret, .value, .result);

@@ -100,6 +100,7 @@ pub const InvalidNominalDeclRecursion = types.InvalidNominalDeclRecursion;
 pub const PlatformDefNotFound = types.PlatformDefNotFound;
 pub const PlatformHostedSection = types.PlatformHostedSection;
 pub const HostedUnboxedFunction = types.HostedUnboxedFunction;
+pub const HostEffectfulCallable = types.HostEffectfulCallable;
 pub const PolymorphicRecursion = types.PolymorphicRecursion;
 pub const HostedFunctionNotEffectful = types.HostedFunctionNotEffectful;
 pub const HostedTypeVariableNotBoxed = types.HostedTypeVariableNotBoxed;
