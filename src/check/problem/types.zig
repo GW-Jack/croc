@@ -145,6 +145,9 @@ pub const Problem = union(enum) {
     unmatchable_pattern: UnmatchablePattern,
     match_alt_binder_missing: MatchAltBinderMissing,
     discarded_var_update: DiscardedVarUpdate,
+    unshared_state: UnsharedState,
+    lost_update: LostUpdate,
+    pause_before_cleanup: PauseBeforeCleanup,
     comptime_condition: ComptimeCondition,
     generalization_nesting_too_deep: GeneralizationNestingTooDeep,
     derived_parser_error_row: DerivedParserErrorRow,
@@ -1015,6 +1018,34 @@ pub const DiscardedVarUpdate = struct {
     expr_region: base.Region,
     /// The `var` the method was called on.
     var_ident: Ident.Idx,
+};
+
+/// Shared state whose handle is never captured, passed or stored, so no other
+/// task can use it.
+pub const UnsharedState = struct {
+    /// The name the handle is bound to.
+    region: base.Region,
+    name: Ident.Idx,
+};
+
+/// An update that ignores the state and stores a value computed from an earlier
+/// read of it.
+pub const LostUpdate = struct {
+    /// The update.
+    region: base.Region,
+    /// The read.
+    read_region: base.Region,
+    name: Ident.Idx,
+};
+
+/// A call that may pause between an update of shared state and the cleanup that
+/// undoes the update.
+pub const PauseBeforeCleanup = struct {
+    /// The call that may pause.
+    region: base.Region,
+    /// The `finally!` or `on_failure!`.
+    cleanup_region: base.Region,
+    name: Ident.Idx,
 };
 
 // static dispatch //

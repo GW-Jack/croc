@@ -71,6 +71,12 @@ pub const UnmatchablePattern = types.UnmatchablePattern;
 pub const MatchBranchPart = types.MatchBranchPart;
 pub const MatchAltBinderMissing = types.MatchAltBinderMissing;
 pub const DiscardedVarUpdate = types.DiscardedVarUpdate;
+/// Re-export of `types.UnsharedState` problem payload.
+pub const UnsharedState = types.UnsharedState;
+/// Re-export of `types.LostUpdate` problem payload.
+pub const LostUpdate = types.LostUpdate;
+/// Re-export of `types.PauseBeforeCleanup` problem payload.
+pub const PauseBeforeCleanup = types.PauseBeforeCleanup;
 pub const ComptimeCondition = types.ComptimeCondition;
 pub const GeneralizationNestingTooDeep = types.GeneralizationNestingTooDeep;
 

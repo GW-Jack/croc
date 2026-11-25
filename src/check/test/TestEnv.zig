@@ -781,7 +781,7 @@ fn initReportBuilder(self: *TestEnv) Allocator.Error!report_mod.ReportBuilder {
 /// Assert that every type problem is warning-severity and that the rendered
 /// titles match `expected_titles` exactly, in order. Any error-severity
 /// problem (or a count/title mismatch) fails the assertion.
-fn assertOnlyTypeWarnings(self: *TestEnv, expected_titles: []const []const u8) TestEnvError!void {
+pub fn assertOnlyTypeWarnings(self: *TestEnv, expected_titles: []const []const u8) TestEnvError!void {
     var report_builder = try self.initReportBuilder();
     defer report_builder.deinit();
 

@@ -31,6 +31,7 @@ const hoist_roots = @import("can").HoistRoots;
 const output_type_roots = @import("output_type_roots.zig");
 const dispatch_evidence = @import("dispatch_evidence.zig");
 const static_dispatch = @import("static_dispatch_registry.zig");
+const shared_state_warnings = @import("shared_state_warnings.zig");
 
 const CIR = can.CIR;
 const ModuleEnv = can.ModuleEnv;
@@ -1023,6 +1024,9 @@ rejected_value_annotations: collections.DenseMapUnmanaged(CIR.Pattern.Idx, void)
 /// var's solved class erroneous directly would leak the poison into a
 /// shared monomorphic callee's scheme.
 rejected_default_exprs: collections.DenseMapUnmanaged(CIR.Expr.Idx, void) = .empty,
+/// Whether a name or a method call in this module refers to a function of
+/// `Shared`, so the module can have something for `shared_state_warnings`.
+uses_shared_state: bool = false,
 /// Every accepted explicit nominal constructor backing relation, for the
 /// settled-state re-decision in `recheckNominalConstructorBackings`.
 accepted_nominal_constructor_backings: std.ArrayListUnmanaged(AcceptedNominalConstructorBacking) = .empty,
@@ -2039,6 +2043,7 @@ pub const state_inventory = state_discipline.inventory(Self, .{
     .erroneous_causes = .keyed,
     .rejected_value_annotations = .keyed,
     .rejected_default_exprs = .settled,
+    .uses_shared_state = .settled,
     .accepted_nominal_constructor_backings = .settled,
     .hoist_frames = .frame_stack,
     .hoist_expr_candidates = .frame_partitioned,
@@ -8056,7 +8061,7 @@ fn markHoistInvalidatedExprChildren(
 /// Visit the direct children of a statement in the source tree: each child
 /// expression, each pattern it binds, and the pattern a reassignment writes.
 /// A `return`'s lambda encloses the statement, so it is not a child.
-fn visitStatementChildren(self: *const Self, statement: CIR.Statement.Idx, visitor: anytype) Allocator.Error!void {
+pub fn visitStatementChildren(self: *const Self, statement: CIR.Statement.Idx, visitor: anytype) Allocator.Error!void {
     switch (self.cir.store.getStatement(statement)) {
         .s_decl => |decl| {
             try visitor.boundPattern(decl.pattern);
@@ -8100,7 +8105,7 @@ fn visitStatementChildren(self: *const Self, statement: CIR.Statement.Idx, visit
 /// Visit the direct children of an expression in the source tree: each child
 /// expression and each pattern it binds. A `return`'s lambda encloses the
 /// expression, so it is not a child.
-fn visitExprChildren(self: *const Self, expr: CIR.Expr.Idx, visitor: anytype) Allocator.Error!void {
+pub fn visitExprChildren(self: *const Self, expr: CIR.Expr.Idx, visitor: anytype) Allocator.Error!void {
     switch (self.cir.store.getExpr(expr)) {
         .e_str => |str| for (self.cir.store.sliceExpr(str.span)) |child| try visitor.expr(child),
         .e_list => |list| for (self.cir.store.sliceExpr(list.elems)) |child| try visitor.expr(child),
@@ -16090,6 +16095,7 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
     try self.finishDispatchReplayFreezes();
     try self.withdrawUnavailableConditionWarnings();
     try self.withdrawSupersededLiteralDefaultWarnings();
+    if (self.uses_shared_state and self.cir.module_role != .builtin) try shared_state_warnings.report(self.gpa, self);
 
     try self.publishCallableCheckingFacts();
     try self.recordErroneousNodes();
@@ -18596,7 +18602,7 @@ fn appendHoistedDependencyPatternBinders(
 
 /// Push `pattern`'s direct subpatterns onto `pending` so that they pop in
 /// source order, for pre-order walks over a pattern tree.
-fn pushCirSubpatterns(self: *const Self, pending: *std.ArrayList(CIR.Pattern.Idx), pattern: CIR.Pattern.Idx) Allocator.Error!void {
+pub fn pushCirSubpatterns(self: *const Self, pending: *std.ArrayList(CIR.Pattern.Idx), pattern: CIR.Pattern.Idx) Allocator.Error!void {
     try self.pushCirPatternChildren(pending, self.cir.store.getPattern(pattern));
 }
 
@@ -38777,6 +38783,7 @@ fn rejectRunningSetHelperDispatch(
     env: *Env,
     failure_expr: ?CIR.Expr.Idx,
 ) Allocator.Error!bool {
+    if (sharedOperationOfDef(lookup.env, lookup.binding.def_idx) != null) self.uses_shared_state = true;
     if (lookup.env.runningSetHelperForDef(lookup.binding.def_idx) == .none) return false;
     if (self.cir.module_role == .builtin) return false;
     if (self.loop_dispatch_iterables.get(constraint.fn_var) != null) return false;
@@ -62929,6 +62936,62 @@ fn stepDerivedMethodCall(self: *Self, task: *ExprTask, state: *CallCheck, env: *
     return .done;
 }
 
+/// The function of `Shared` that a definition is.
+fn sharedOperationOfDef(env: *const ModuleEnv, def_idx: CIR.Def.Idx) ?shared_state_warnings.Operation {
+    if (env.module_role != .builtin) return null;
+    const pattern = env.store.getPattern(env.store.getDef(def_idx).pattern);
+    if (pattern != .assign) return null;
+    const ident = pattern.assign.ident;
+    const idents = env.idents;
+    if (ident.eql(idents.builtin_shared_new)) return .new;
+    if (ident.eql(idents.builtin_shared_update)) return .update;
+    if (ident.eql(idents.builtin_shared_get)) return .get;
+    if (ident.eql(idents.builtin_shared_modify)) return .modify;
+    if (ident.eql(idents.builtin_shared_finally)) return .finally;
+    if (ident.eql(idents.builtin_shared_on_failure)) return .on_failure;
+    return null;
+}
+
+/// The function of `Shared` that a checked call calls, by its name or as a
+/// method of a value whose type is `Shared`.
+pub fn sharedOperation(self: *Self, call_expr: CIR.Expr.Idx) Allocator.Error!?shared_state_warnings.Operation {
+    const node = self.cir.store.getExpr(call_expr);
+    if (node == .e_call) {
+        const callee = self.cir.store.getExpr(node.e_call.func);
+        if (callee == .e_lookup_external) {
+            const lookup = callee.e_lookup_external;
+            const target = (try self.resolveVarFromExternal(lookup.module_idx, lookup.target_node_idx)) orelse return null;
+            if (target.other_cir.store.nodes.fieldItem(.tag, target.other_cir_node_idx) != .def) return null;
+            return sharedOperationOfDef(target.other_cir, @fromBackingInt(@intCast(@backingInt(target.other_cir_node_idx))));
+        }
+        if (callee == .e_lookup_associated_resolved) {
+            const lookup = callee.e_lookup_associated_resolved;
+            return sharedOperationOfDef(self.moduleEnvForIdentity(self.cir, lookup.module_identity).env, lookup.target_def_idx);
+        }
+        return null;
+    }
+    if (node != .e_dispatch_call) return null;
+    const receiver = self.types.resolveThroughAliases(ModuleEnv.varFrom(node.e_dispatch_call.receiver)).desc.content;
+    const nominal = receiver.unwrapNominalType() orelse return null;
+    if (!self.nominalIsBuiltinDecl(nominal, .shared)) return null;
+    const method = self.lookupStaticDispatchMethodBinding(
+        self.getNominalOriginEnv(nominal),
+        nominal.sourceDeclOptional(),
+        self.cir,
+        node.e_dispatch_call.method_name,
+    ) orelse return null;
+    return sharedOperationOfDef(method.env, method.binding.def_idx);
+}
+
+/// Whether a checked call's function is effectful.
+pub fn callIsEffectful(self: *Self, call_expr: CIR.Expr.Idx) Allocator.Error!bool {
+    const node = self.cir.store.getExpr(call_expr);
+    if (node == .e_call) return self.varIsEffectfulFunction(ModuleEnv.varFrom(node.e_call.func));
+    if (node == .e_dispatch_call) return self.varIsEffectfulFunction(node.e_dispatch_call.constraint_fn_var);
+    if (node == .e_type_dispatch_call) return self.varIsEffectfulFunction(node.e_type_dispatch_call.constraint_fn_var);
+    return false;
+}
+
 /// design.md "Plans And Concurrent Loops", "Sequential lowering.": a name
 /// outside the Builtin module that refers to a Builtin running-set helper, by
 /// calling it or naming it as a value, is reported and becomes erroneous, so it
@@ -62942,6 +63005,7 @@ fn rejectRunningSetHelperUse(
     expr_var: Var,
     region: Region,
 ) Allocator.Error!bool {
+    if (sharedOperationOfDef(target_env, target_def_idx) != null) self.uses_shared_state = true;
     if (target_env.runningSetHelperForDef(target_def_idx) == .none) return false;
     if (self.cir.module_role == .builtin) return false;
     _ = try self.problems.appendProblem(.{ .running_set_helper_use = .{ .region = region } });

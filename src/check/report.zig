@@ -64,6 +64,9 @@ const RedundantPattern = problem_mod.RedundantPattern;
 const UnmatchablePattern = problem_mod.UnmatchablePattern;
 const MatchAltBinderMissing = problem_mod.MatchAltBinderMissing;
 const DiscardedVarUpdate = problem_mod.DiscardedVarUpdate;
+const UnsharedState = problem_mod.UnsharedState;
+const LostUpdate = problem_mod.LostUpdate;
+const PauseBeforeCleanup = problem_mod.PauseBeforeCleanup;
 const ComptimeCondition = problem_mod.ComptimeCondition;
 const GeneralizationNestingTooDeep = problem_mod.GeneralizationNestingTooDeep;
 
@@ -1194,6 +1197,9 @@ pub const ReportBuilder = struct {
             .unmatchable_pattern => |data| return self.buildUnmatchablePatternReport(data),
             .match_alt_binder_missing => |data| return self.buildMatchAltBinderMissingReport(data),
             .discarded_var_update => |data| return self.buildDiscardedVarUpdateReport(data),
+            .unshared_state => |data| return self.buildUnsharedStateReport(data),
+            .lost_update => |data| return self.buildLostUpdateReport(data),
+            .pause_before_cleanup => |data| return self.buildPauseBeforeCleanupReport(data),
             .comptime_condition => |data| return self.buildComptimeConditionReport(data),
             .generalization_nesting_too_deep => |data| return self.buildGeneralizationNestingTooDeepReport(data),
         }
@@ -7026,6 +7032,66 @@ pub const ReportBuilder = struct {
         defer self.gpa.free(reassignment);
         try report.document.addCodeBlock(try report.addOwnedString(reassignment));
 
+        return report;
+    }
+
+    fn buildUnsharedStateReport(self: *Self, data: UnsharedState) Allocator.Error!Report {
+        const name = D.ident(data.name).withAnnotation(.inline_code);
+        var report = try Report.init(self.gpa, "Unshared State", "", .warning);
+        errdefer report.deinit();
+        try D.renderSliceInto(&.{ D.bytes("No other task can use the state of"), name, D.bytes(".").withNoPrecedingSpace() }, self, &report, &report.headline);
+        try self.addSourceRegionOf(&report.document, data.region, .warning_highlight);
+        try report.document.addLineBreak();
+        try D.renderSlice(&.{
+            name,
+            D.bytes("is never captured, passed or stored. State that only one function uses can be a"),
+            D.bytes("var").withAnnotation(.inline_code),
+            D.bytes("instead."),
+        }, self, &report);
+        return report;
+    }
+
+    fn buildLostUpdateReport(self: *Self, data: LostUpdate) Allocator.Error!Report {
+        const name = D.ident(data.name).withAnnotation(.inline_code);
+        var report = try Report.init(self.gpa, "Lost Update", "", .warning);
+        errdefer report.deinit();
+        try D.renderSliceInto(&.{
+            D.bytes("This replaces the state of"),
+            name,
+            D.bytes("with a value computed from an earlier read of it."),
+        }, self, &report, &report.headline);
+        try self.addSourceRegionOf(&report.document, data.region, .warning_highlight);
+        try report.document.addLineBreak();
+        try D.renderSlice(&.{D.bytes("The earlier read is here:")}, self, &report);
+        try report.document.addLineBreak();
+        try self.addSourceRegionOf(&report.document, data.read_region, .dimmed);
+        try report.document.addLineBreak();
+        try D.renderSlice(&.{
+            D.bytes("If another task updates"),
+            name,
+            D.bytes("between the two, this overwrites what it stored. Compute the new state from the function's argument, inside one update."),
+        }, self, &report);
+        return report;
+    }
+
+    fn buildPauseBeforeCleanupReport(self: *Self, data: PauseBeforeCleanup) Allocator.Error!Report {
+        const name = D.ident(data.name).withAnnotation(.inline_code);
+        var report = try Report.init(self.gpa, "Pause Before Cleanup", "", .warning);
+        errdefer report.deinit();
+        try D.renderSliceInto(&.{
+            D.bytes("This may pause between an update of"),
+            name,
+            D.bytes("and its cleanup."),
+        }, self, &report, &report.headline);
+        try self.addSourceRegionOf(&report.document, data.region, .warning_highlight);
+        try report.document.addLineBreak();
+        try D.renderSlice(&.{D.bytes("The cleanup is here:")}, self, &report);
+        try report.document.addLineBreak();
+        try self.addSourceRegionOf(&report.document, data.cleanup_region, .dimmed);
+        try report.document.addLineBreak();
+        try D.renderSlice(&.{
+            D.bytes("A task that is cancelled where it pauses, or that crashes there, ends without the cleanup, so what the update took is never given back. Move the call before the update or inside the function the cleanup is for."),
+        }, self, &report);
         return report;
     }
 

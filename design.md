@@ -34842,6 +34842,29 @@ What is dropped late is a tracked cell that a sweep has yet to find, with its
 state. A crash's frames leak what they hold (Child Tasks, Crashes), so a cell
 they hold is not freed itself, but if it's tracked its state is.
 
+**Warnings.** `shared_state_warnings.zig` reports three uses of shared state. It
+reads the checked module after every solver rule, and only where a name or a
+method call refers to a function of `Shared`. A handle is known by the immutable
+name it is bound to.
+- *Unshared State*: a name bound to the result of `Shared.new!` is used, and only
+  as the handle of a call of a `Shared` function in the lambda that binds it. No
+  other task can use that state, and a `var` is simpler.
+- *Lost Update*: a `modify!` or `update!` whose function is written as a lambda
+  that never uses its argument stores a value computed from an earlier `get!` of
+  the same handle. What another task stored since is overwritten. The value is
+  what `modify!`'s function returns, or the payload of a `Set` in `update!`'s. It
+  is followed through the names that declarations, `var`s and `match` patterns
+  bind, and not into other functions.
+- *Pause Before Cleanup*: control can go from an `update!` of a handle through a
+  call that may pause to a `finally!` or `on_failure!` of it, in one lambda. A
+  task cancelled at the pause ends without the cleanup. Which functions pause is
+  not in their types, so any call of an effectful function counts, as does each
+  iteration of a `for!`. The exceptions are `Shared.new!`, `get!` and `modify!`,
+  and an `update!` of the same handle.
+
+Nothing else reads them, and code that no report names is checked, lowered and
+run as without them.
+
 **Invariants.**
 
 | | Invariant |

@@ -1,5 +1,5 @@
-//! What a type that crosses the host boundary may hold of shared state
-//! (design.md "Shared State"): no handle, wherever it is.
+//! Shared state (design.md "Shared State"): a type that crosses the host
+//! boundary holds no handle, wherever it is, and the three warnings.
 
 const std = @import("std");
 const TestEnv = @import("TestEnv.zig");
@@ -51,4 +51,216 @@ test "no type that crosses the host boundary holds a handle to shared state" {
         errdefer std.debug.print("hosted case: {s}\n", .{hosted});
         if (case.valid) try effect.assertNoErrors() else try effect.assertOneTypeError("Host Boundary Forbids Shared State");
     }
+}
+
+const Warning = enum { unshared, lost, pause };
+
+fn expectWarnings(body: []const u8, expected: []const Warning) TestEnv.TestEnvError!void {
+    const source = try std.mem.concat(std.testing.allocator, u8, &.{
+        \\Sem :: {}.{}
+        \\
+        \\tick! : () => {}
+        \\tick! = || ...
+        \\
+        \\use! : Shared(U64) => {}
+        \\use! = |handle| handle.modify!(|n| n + 1)
+        \\
+        \\main! : Shared(U64) => U64
+        \\main! = |h|
+        \\
+        ,
+        body,
+        "\n",
+    });
+    defer std.testing.allocator.free(source);
+    var env = try TestEnv.init("Test", source);
+    defer env.deinit();
+    errdefer std.debug.print("case:\n{s}\n", .{source});
+    var titles: [4][]const u8 = undefined;
+    for (expected, titles[0..expected.len]) |warning, *title| title.* = switch (warning) {
+        .unshared => "Unshared State",
+        .lost => "Lost Update",
+        .pause => "Pause Before Cleanup",
+    };
+    try env.assertOnlyTypeWarnings(titles[0..expected.len]);
+}
+
+test "state that only one function uses is warned about" {
+    try expectWarnings(
+        \\{
+        \\    seen = Shared.new!(0)
+        \\    seen.modify!(|n| n + 1)
+        \\    if h.get!() > 3 { Shared.modify!(seen, |n| n + 1) }
+        \\    seen.get!()
+        \\}
+    , &.{.unshared});
+    // Passed, captured, stored, returned as a part, and renamed.
+    for ([_][]const u8{
+        \\{
+        \\    seen = Shared.new!(0)
+        \\    use!(seen)
+        \\    seen.get!()
+        \\}
+        ,
+        \\{
+        \\    seen = Shared.new!(0)
+        \\    run! = || seen.get!()
+        \\    run!()
+        \\}
+        ,
+        \\{
+        \\    seen = Shared.new!(0)
+        \\    parts = [seen]
+        \\    parts.len()
+        \\}
+        ,
+        \\{
+        \\    seen = Shared.new!(0)
+        \\    same = seen
+        \\    same.get!()
+        \\}
+        ,
+        \\{
+        \\    seen = Shared.new!(0)
+        \\    Concurrent.both!(|| seen.get!(), || seen.get!()).0
+        \\}
+        ,
+    }) |body| try expectWarnings(body, &.{});
+}
+
+test "an update that stores a value from an earlier read is warned about" {
+    for ([_][]const u8{
+        \\{
+        \\    n = h.get!()
+        \\    h.modify!(|_| n - 1)
+        \\    n
+        \\}
+        ,
+        \\{
+        \\    less = Shared.get!(h) - 1
+        \\    (smaller, _) = (less - 1, 0)
+        \\    Shared.modify!(h, |_state| smaller)
+        \\    smaller
+        \\}
+        ,
+        \\{
+        \\    n = h.get!()
+        \\    h.update!(|_| if n > 3 { Set(n - 1, n) } else { Keep(0) })
+        \\}
+        ,
+    }) |body| try expectWarnings(body, &.{.lost});
+    for ([_][]const u8{
+        // It uses the state.
+        \\{
+        \\    n = h.get!()
+        \\    h.modify!(|m| m + n)
+        \\    n
+        \\}
+        ,
+        // What it stores is not from the read.
+        \\{
+        \\    n = h.get!()
+        \\    if n > 3 { h.modify!(|_| 0) }
+        \\    n
+        \\}
+        ,
+        // Only its answer is.
+        \\{
+        \\    n = h.get!()
+        \\    h.update!(|_| Set(0, n))
+        \\}
+        ,
+        // The read is of other state.
+        \\{
+        \\    other = Shared.new!(3)
+        \\    use!(other)
+        \\    n = other.get!()
+        \\    h.modify!(|_| n)
+        \\    n
+        \\}
+        ,
+    }) |body| try expectWarnings(body, &.{});
+}
+
+test "a call that may pause between an update and its cleanup is warned about" {
+    for ([_][]const u8{
+        \\{
+        \\    h.modify!(|n| n)
+        \\    h.update!(|n| if n == 0 { Wait } else { Set(n - 1, {}) })
+        \\    tick!()
+        \\    h.finally!(|n| n + 1, || 3)
+        \\}
+        ,
+        \\{
+        \\    h.update!(|n| if n == 0 { Wait } else { Set(n - 1, {}) })
+        \\    if h.get!() > 3 { tick!() }
+        \\    h.on_failure!(|n| n + 1, || 3)
+        \\}
+        ,
+        \\{
+        \\    h.update!(|n| if n == 0 { Wait } else { Set(n - 1, {}) })
+        \\    if h.get!() > 3 { {} } else { tick!() }
+        \\    h.on_failure!(|n| n + 1, || 3)
+        \\}
+        ,
+        \\match h.update!(|n| if n == 0 { Keep(Full) } else { Set(n - 1, Took) }) {
+        \\    Full => 0
+        \\    Took => {
+        \\        tick!()
+        \\        h.finally!(|n| n + 1, || 3)
+        \\    }
+        \\}
+        ,
+    }) |body| try expectWarnings(body, &.{.pause});
+    for ([_][]const u8{
+        // Nothing pauses between.
+        \\{
+        \\    tick!()
+        \\    h.update!(|n| if n == 0 { Wait } else { Set(n - 1, {}) })
+        \\    _ = h.get!()
+        \\    h.finally!(|n| n + 1, || {
+        \\        tick!()
+        \\        3
+        \\    })
+        \\}
+        ,
+        // The pause is on a path that never reaches the cleanup.
+        \\match h.update!(|n| if n == 0 { Keep(Full) } else { Set(n - 1, Took) }) {
+        \\    Full => {
+        \\        tick!()
+        \\        0
+        \\    }
+        \\    Took => h.finally!(|n| n + 1, || 3)
+        \\}
+        ,
+        \\{
+        \\    match h.update!(|n| if n == 0 { Keep(Full) } else { Set(n - 1, Took) }) {
+        \\        Full => {
+        \\            tick!()
+        \\            return 0
+        \\        }
+        \\        Took => {}
+        \\    }
+        \\    h.finally!(|n| n + 1, || 3)
+        \\}
+        ,
+        // The update is undone before.
+        \\{
+        \\    h.update!(|n| if n == 0 { Wait } else { Set(n - 1, {}) })
+        \\    _ = h.finally!(|n| n + 1, || 3)
+        \\    tick!()
+        \\    h.finally!(|n| n + 1, || 3)
+        \\}
+        ,
+        // The call is in another function.
+        \\{
+        \\    h.update!(|n| if n == 0 { Wait } else { Set(n - 1, {}) })
+        \\    run! = || tick!()
+        \\    h.finally!(|n| n + 1, || {
+        \\        run!()
+        \\        3
+        \\    })
+        \\}
+        ,
+    }) |body| try expectWarnings(body, &.{});
 }
