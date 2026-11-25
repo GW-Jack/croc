@@ -658,6 +658,7 @@ test "the running-set operations run each entry as a child task and move its res
     var buffer: [8]u8 = undefined;
     var owner = bareTask(&slot, &buffer);
     owner.ops = f.runtime_env.get_ops();
+    owner.root = &owner;
     owner.ready_fn = &ReadyChildren.ready;
     owner.abort_fn = &ReadyChildren.abort;
     ReadyChildren.len = 0;
@@ -717,6 +718,7 @@ test "a running set of heap results drops one through the interpreter and releas
     var buffer: [8]u8 = undefined;
     var owner = bareTask(&slot, &buffer);
     owner.ops = f.runtime_env.get_ops();
+    owner.root = &owner;
     owner.ready_fn = &ReadyChildren.ready;
     owner.abort_fn = &ReadyChildren.abort;
 

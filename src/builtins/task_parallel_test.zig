@@ -159,7 +159,7 @@ fn worker(seed: u64) void {
     while (!root_ended.load(.acquire)) {
         const pick = random.random().int(usize);
         if (random.random().uintLessThan(u8, 3) == 0) _ = finishOperation(pick);
-        if (random.random().uintLessThan(u8, 8) == 0) raiseGate();
+        if (!shape.closed and random.random().uintLessThan(u8, 8) == 0) raiseGate();
         const task = ready.take(pick) orelse {
             idle = if (finishOperation(pick)) 0 else idle + 1;
             if (idle == stalled_spins) {
@@ -263,7 +263,12 @@ const Loop = struct {
 };
 
 /// What each round's tree may do.
-const Shape = struct { crashes: bool, exits: bool };
+const Shape = struct {
+    crashes: bool,
+    exits: bool,
+    /// Whether `gate` never goes up, so that every wait on it is a deadlock.
+    closed: bool = false,
+};
 var shape: Shape = undefined;
 
 /// The loops of a round, which its records point at.
@@ -401,19 +406,21 @@ fn runTree(seed: u64, round_shape: Shape, cancel: bool) RunError!void {
     const loop = newLoop(prng.random().int(u64), 3);
     var root: u64 = 0;
     root_task = RocTask.createParallel(ops, startRecord(ops, &loopCall, std.mem.asBytes(&loop)), @ptrCast(&root), buffers);
+    // `raiseGate` is outside the tree, which has not stalled when its tasks wait.
+    if (!round_shape.closed) root_task.busy += 1;
     ready.push(root_task);
 
     var workers: [worker_count]std.Thread = undefined;
     for (&workers, 0..) |*thread, index| thread.* = try std.Thread.spawn(.{}, worker, .{seed *% 31 +% index});
     for (workers) |thread| thread.join();
 
-    if (!cancel and !round_shape.crashes) try std.testing.expectEqual(Status.done, root_status);
+    if (!cancel and !round_shape.crashes and !round_shape.closed) try std.testing.expectEqual(Status.done, root_status);
     if (root_status == .crashed) {
         var len: usize = undefined;
         const message = task_mod.host_calls.crashMessage(root_task, &len);
-        try std.testing.expectEqualStrings("a leaf crashed", message[0..len]);
+        try std.testing.expectEqualStrings(if (round_shape.closed) task_mod.deadlock else "a leaf crashed", message[0..len]);
     }
-    if (!round_shape.crashes) try std.testing.expect(root_status != .crashed);
+    if (!round_shape.crashes and !round_shape.closed) try std.testing.expect(root_status != .crashed);
     if (root_status == .done) try std.testing.expectEqual(@as(u64, 1), root);
     root_task.free();
     // Every child ended before the root, so nothing is ready or running.
@@ -451,4 +458,16 @@ test "a root cancelled while its tree runs on several threads ends after every t
         if (root_status == .cancelled) cancelled += 1;
     }
     try std.testing.expect(cancelled > 0);
+}
+
+test "a tree whose tasks all wait on several threads crashes, and one whose tasks don't wait ends" {
+    if (!crash_exit.available()) return error.SkipZigTest;
+    var crashed: usize = 0;
+    var done: usize = 0;
+    for (0..rounds) |round| {
+        try runTree(round, .{ .crashes = false, .exits = round % 2 == 0, .closed = true }, false);
+        if (root_status == .crashed) crashed += 1;
+        if (root_status == .done) done += 1;
+    }
+    try std.testing.expect(crashed > 0 and done > 0);
 }

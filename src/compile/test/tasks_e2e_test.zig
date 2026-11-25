@@ -1609,6 +1609,12 @@ fn cleanupsAfterCrash(comptime R: type, program: R.Program) E2eError!void {
         defer got.deinit();
         try std.testing.expectEqualStrings(want, got.result);
     }
+    // A deadlock is a crash where a task waits ("Deadlocks.").
+    for ([_]task_test_host.Mode{ .ready, .pause }) |mode| {
+        const got = try queueCase(R, program, "stalled", mode, null, false);
+        defer got.deinit();
+        try std.testing.expectEqualStrings("a/bodyb/bodyb a ", got.result);
+    }
 }
 
 fn cleanupsAfterCrashInterpreter(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {

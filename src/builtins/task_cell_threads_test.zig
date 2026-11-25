@@ -267,6 +267,8 @@ fn runRound(seed: u64) (std.Thread.SpawnError || error{ TestUnexpectedResult, Te
             .amount = random.intRangeAtMost(i64, -2, 2),
         };
         runner.task = RocTask.createParallel(&test_host.ops, allocCallable(&test_host.ops, &scriptCall, *Runner, runner), @ptrCast(&runner.root), buffers);
+        // Its cells are other roots' too, so its tree has not stalled when they wait.
+        runner.task.busy += 1;
         readyTask(runner.task);
     }
     try runReady(seed, seed % 2 == 0);

@@ -211,12 +211,19 @@ const buffers = task_mod.BufferLayout{
     .result_buffer_alignment = 8,
 };
 
+/// The tests' tasks share cells though each is a root, where a program's cells
+/// are its one tree's. So a tree whose tasks all wait has not stalled.
+fn sharesCells(root: *RocTask) void {
+    root.busy += 1;
+}
+
 fn begin(ops: *RocOps, runners: []Runner) void {
     Host.reset();
     for (runners, 0..) |*runner, index| {
         runner.index = index;
         const start = allocCallable(ops, &scriptCall, *Runner, runner);
         runner.task = RocTask.create(ops, start, @ptrCast(&runner.root), buffers);
+        sharesCells(runner.task);
     }
 }
 
@@ -405,6 +412,7 @@ test "an update of one cell probes no other cell's waiters" {
         const give = [_]Step{.{ .cell = cell, .amount = 1 }};
         var giver = [_]Runner{.{ .steps = &give }};
         giver[0].task = RocTask.create(env.getOps(), allocCallable(env.getOps(), &scriptCall, *Runner, &giver[0]), @ptrCast(&giver[0].root), buffers);
+        sharesCells(giver[0].task);
         Host.resumeRunner(&giver[0]);
         try testing.expectEqual(index + 1, Host.probes);
         Host.drain(&runners);
@@ -531,6 +539,113 @@ test "a push outside any task drops its cleanup" {
     task_mod.cleanupPush(env.getOps(), allocCallable(env.getOps(), &cleanupCall, *const Step, &step));
     try testing.expectEqual(@as(usize, 0), env.getAllocationCount());
     task_mod.cleanupPop();
+}
+
+/// A root whose loop runs `entries` as its children, at most `limit` at once.
+const Tree = struct {
+    entries: []Runner,
+    limit: u32,
+    group: ?*task_mod.Group = null,
+
+    fn run(self: *Tree, ops: *RocOps) Runner {
+        Host.reset();
+        var runner: Runner = .{ .steps = &.{} };
+        runner.task = RocTask.create(ops, allocCallable(ops, &treeCall, *Tree, self), @ptrCast(&runner.root), buffers);
+        Host.resumeRunner(&runner);
+        while (Host.head < Host.len) {
+            const task = Host.queue[Host.head];
+            Host.head += 1;
+            if (task == runner.task) Host.resumeRunner(&runner) else _ = task.resumeFromHost(&Host.readyTask, &Host.abortTask);
+        }
+        return runner;
+    }
+};
+
+fn treeCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {
+    const tree: *Tree = @as(*align(1) const *Tree, @ptrCast(capture.?)).*;
+    const task: *RocTask = @as(*const *RocTask, @ptrCast(@alignCast(args.?))).*;
+    if (tree.group == null) {
+        var starts: [4][*]u8 = undefined;
+        for (tree.entries, starts[0..tree.entries.len]) |*runner, *start| start.* = allocCallable(ops, &scriptCall, *Runner, runner);
+        const marks: [4]task_mod.EntryMarks = @splat(.{ .limit_path = &.{0}, .shielded = false, .background = false });
+        tree.group = task_mod.groupCreate(task, .{
+            .starts = starts[0..tree.entries.len],
+            .marks = marks[0..tree.entries.len],
+            .limits = &.{tree.limit},
+            .root_limit = 0,
+            .slot_size = 8,
+            .slot_alignment = 8,
+            .result_drop = null,
+            .result_drop_context = null,
+        });
+    }
+    while (true) switch (task_mod.groupNext(tree.group.?)) {
+        .arrived => {},
+        .crashed => unreachable, // rationale: the group isn't supervised
+        .ended => {
+            task_mod.groupFree(tree.group.?);
+            @as(*align(1) u64, @ptrCast(ret.?)).* = 1;
+            return;
+        },
+        .pending => {
+            const size = erased_callable.payloadSize(@sizeOf(*Tree));
+            const built = allocCallable(ops, &treeCall, *Tree, tree);
+            const moved = task.allocRecord(size);
+            @memcpy(moved[0..size], built[0..size]);
+            utils.freeDataPtrC(built, erased_callable.payload_alignment, erased_callable.allocation_has_refcounted_children, ops);
+            task.pushRecord(moved, null);
+            task.setPending();
+            return;
+        },
+    };
+}
+
+test "a task whose update no task can let go on crashes where it waits" {
+    if (comptime !crash_exit.native) return error.SkipZigTest;
+    var env = utils.TestEnv.init(testing.allocator);
+    defer env.deinit();
+    var cell: Cell = .{};
+    const steps = [_]Step{.{ .cell = &cell, .threshold = 1 }};
+    var runner: Runner = .{ .steps = &steps };
+    Host.reset();
+    runner.task = RocTask.create(env.getOps(), allocCallable(env.getOps(), &scriptCall, *Runner, &runner), @ptrCast(&runner.root), buffers);
+    Host.resumeRunner(&runner);
+    try testing.expectEqual(@as(?Status, .crashed), runner.ended);
+    try testing.expectEqualStrings(task_mod.deadlock, Host.message[0..Host.message_len]);
+    try testing.expectEqual(@as(usize, 0), Host.len);
+    try testing.expect(!task_mod.anyWaiter());
+}
+
+test "when no task of a tree can run, the waiter that began to wait last crashes, and of two that began together the newer task" {
+    if (comptime !crash_exit.native) return error.SkipZigTest;
+    var env = utils.TestEnv.init(testing.allocator);
+    defer env.deinit();
+    var first: Cell = .{};
+    var never: Cell = .{};
+    var logged: Cell = .{};
+    const wait_a = [_]Step{ .{ .cell = &logged, .log = 'a', .cleanup = .push }, .{ .cell = &never, .threshold = 1 } };
+    const wait_b = [_]Step{ .{ .cell = &logged, .log = 'b', .cleanup = .push }, .{ .cell = &never, .threshold = 1 } };
+    const twice = [_]Step{ .{ .cell = &logged, .log = 'a', .cleanup = .push }, .{ .cell = &first, .threshold = 1 }, .{ .cell = &never, .threshold = 1 } };
+    const give = [_]Step{.{ .cell = &first, .amount = 1 }};
+    {
+        var entries = [_]Runner{ .{ .steps = &wait_a }, .{ .steps = &wait_b } };
+        var tree: Tree = .{ .entries = &entries, .limit = 2 };
+        const root = tree.run(env.getOps());
+        try testing.expectEqual(@as(?Status, .crashed), root.ended);
+        try testing.expectEqualStrings(task_mod.deadlock, Host.message[0..Host.message_len]);
+        // The one that crashed ran its cleanup first; the other was cancelled.
+        try expectLog("ba");
+    }
+    {
+        // The first entry waits a second time once the fourth started, which the
+        // third's end made room for.
+        var entries = [_]Runner{ .{ .steps = &twice }, .{ .steps = &wait_b }, .{ .steps = &give }, .{ .steps = &.{} } };
+        var tree: Tree = .{ .entries = &entries, .limit = 3 };
+        const root = tree.run(env.getOps());
+        try testing.expectEqual(@as(?Status, .crashed), root.ended);
+        try expectLog("ab");
+    }
+    try testing.expect(!task_mod.anyWaiter());
 }
 
 test "in random runs, no task is left parked whose update would go on, whatever order tasks run and end in" {

@@ -34709,6 +34709,30 @@ thread-local. A crash on a thread one of whose waiters is being probed returns
 to the probe. Any other takes the waiters of that thread's runs off their lists
 before it calls the host, since the host may go on to run the program again.
 
+**Deadlocks.** A type that holds a handle never crosses the host boundary, so a
+cell is used by the tasks of one root's tree and nothing else. The tree is
+*stalled* when none of its tasks can run unless another does first: none is
+queued, running or paused on a hosted operation. Then at least one waits on a
+cell, since a task paused at a loop's next has an entry that has not reported,
+and no update will ever let it go on. The runtime crashes the waiter that began
+to wait last, with `deadlock: no task can ever change the shared state this task
+waits for`. When a wait began is counted by the tasks the tree had started, and of
+two that began at the same count the task started later is the later. So the
+choice depends only on the schedule.
+The crash readies other tasks, as any does, so one crash per stall is enough.
+
+The root counts the tasks of its tree that are not parked on a group or a cell.
+A park there takes the task off the count before it sets the parked bit, and what
+clears the bit puts it back. Only a running task, or the host's cancel with the
+tree locked, clears one. So when a park or a report finds the count at
+zero with the tree locked, nothing is about to clear another, and the tree
+stalled. The waiter is readied as if by a wake, and its update runs again. If it
+would still wait, it crashes there, on its own task and in its own code. A waiter
+whose own park finds the stall goes on without parking. A hosted operation's pause
+leaves the count alone, so a program that shares no state pays for it only at a
+loop's next. In a `None` program the scheduler finds a stall itself, when it has no
+task to resume.
+
 **Cleanups.** `h.finally!(cleanup, body)` runs `body`, then applies `cleanup` to
 the state however `body` ended: it returned, its task was cancelled, or it
 crashed. `on_failure!` applies it only on a cancel or a crash. A cleanup is

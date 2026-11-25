@@ -294,7 +294,7 @@ test "runs on several threads, some of which crash, go as each goes alone" {
                 try testing.expectEqual(@as(isize, 0), run.live);
                 try testing.expectEqual(@as(u64, 7), run.result);
                 ended += 1;
-            } else if (std.mem.eql(u8, run.message[0..run.message_len], Scheduler.deadlock)) {
+            } else if (std.mem.eql(u8, run.message[0..run.message_len], task_mod.deadlock)) {
                 deadlocked += 1;
             } else {
                 try testing.expectEqualStrings("an update crashed", run.message[0..run.message_len]);

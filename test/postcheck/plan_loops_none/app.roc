@@ -28,6 +28,7 @@ main! = |name| {
 		"shared" => shared!()
 		"cleanups" => cleanups!()
 		"cleanups_crash" => cleanups_crash!()
+		"stalled" => stalled!()
 		_ => "unknown"
 	}
 	Host.log!("end ${name}")
@@ -349,6 +350,36 @@ cleanups_crash! = || {
 					},
 				),
 			)
+		},
+	)
+	Str.concat(result, order.get!())
+}
+
+# Entries that wait for state no task is left to store: the one that began to wait
+# last crashes, and the supervisor's next attempt finds the state it needs.
+stalled! : () => Str
+stalled! = || {
+	order = Shared.new!("")
+	tries : Shared(U64)
+	tries = Shared.new!(0)
+	result = Concurrent.supervise!(
+		{ max_restarts: 1 },
+		|| {
+			opened = Shared.new!(tries.update!(|n| Set(n + 1, n)))
+			pass! : Str -> (() => Str)
+			pass! = |name| || order.on_failure!(
+				|text| "${text}${name} ",
+				|| {
+					body = Host.fetch!(name)
+					opened.update!(|n| if (n == 0) Wait else Keep({}))
+					body
+				},
+			)
+			var $joined = ""
+			for! body in List.concurrently([pass!("a"), pass!("b")]) {
+				$joined = Str.concat($joined, body)
+			}
+			$joined
 		},
 	)
 	Str.concat(result, order.get!())

@@ -346,6 +346,11 @@ pub const RocTask = extern struct {
     newer_waiter: ?*RocTask,
     /// Whether the task was readied by a wake its update has not yet answered.
     carries_wake: bool,
+    /// Whether the task was readied because its tree stalled, so that its update
+    /// crashes if it would still wait (design.md "Shared State", "Deadlocks.").
+    stalled: bool,
+    /// How many tasks its tree had started when the task began to wait.
+    waited_since: u32,
     /// The lock the task's running update holds in a `ParallelTasks` program,
     /// until it settles, parks or crashes.
     locked_cells: ?*CellWaiters,
@@ -370,6 +375,15 @@ pub const RocTask = extern struct {
     /// Whether one of the task's resumes is running, in a `ParallelTasks`
     /// program while the monitors are on (P1).
     resume_claimed: bool,
+    /// The root of the task's tree, which may be the task.
+    root: *RocTask,
+    /// How many tasks of a root's tree are not parked on a group or a cell:
+    /// when there are none, the tree stalled. The root itself counts.
+    busy: u32,
+    /// How many tasks a root's tree has started, and which of them this is; the
+    /// root is 0.
+    tasks_started: u32,
+    task_number: u32,
     /// The lock of the task's tree, in a `ParallelTasks` program: the root's
     /// `tree_lock`. Null in a `Tasks` program, whose resumes never overlap.
     tree: ?*u32,
@@ -433,6 +447,8 @@ pub const RocTask = extern struct {
             .older_waiter = null,
             .newer_waiter = null,
             .carries_wake = false,
+            .stalled = false,
+            .waited_since = 0,
             .locked_cells = null,
             .passed_wake = .{},
             .probing = false,
@@ -442,6 +458,10 @@ pub const RocTask = extern struct {
             .finishing = false,
             .crashing = false,
             .resume_claimed = false,
+            .root = undefined,
+            .busy = 1,
+            .tasks_started = 0,
+            .task_number = 0,
             .tree = null,
             .tree_lock = 0,
             .cleanups = undefined,
@@ -467,6 +487,7 @@ pub const RocTask = extern struct {
             allocBuffer(ops, buffers.hosted_slot_size, buffers.hosted_slot_alignment),
             allocBuffer(ops, buffers.result_buffer_size, buffers.result_buffer_alignment),
         );
+        task.root = task;
         task.push(.{ .record = start, .slot_drop = null, .from_task = false });
         forgetFreed(task);
         return task;
@@ -625,7 +646,7 @@ pub const RocTask = extern struct {
             const readied = if (self.finishing or self.cancel_requested or self.crashing)
                 seen & wake_parked == 0
             else if (!self.waitsOnOperation())
-                seen & wake_parked == 0 and seen != 0
+                seen & wake_parked == 0 and (seen != 0 or self.stalled)
             else
                 seen == 1;
             if (!readied) {
@@ -786,11 +807,24 @@ pub const RocTask = extern struct {
     /// with no wait left, when the source has something for the task.
     fn parkOnWait(self: *RocTask) bool {
         const word = self.waitWord();
+        const hosted = self.waitsOnOperation();
+        // Before the parked bit is set, after which a wake counts it again.
+        if (!hosted) _ = @atomicRmw(u32, &self.root.busy, .Sub, 1, .monotonic);
         const seen = @cmpxchgStrong(u32, word, 0, wake_parked, .acq_rel, .acquire) orelse {
+            const stalled = if (hosted) null else self.stalledWaiter();
+            if (stalled == self) {
+                self.addBusy();
+                self.endWait();
+                self.unlockTree();
+                return false;
+            }
+            var calls: HostCalls = .{};
+            if (stalled) |waiter| _ = waiter.unpark(&calls);
             self.unlockTree();
+            calls.make();
             return true;
         };
-        const hosted = self.waitsOnOperation();
+        if (!hosted) self.addBusy();
         self.endWait();
         self.unlockTree();
         if (hosted) {
@@ -887,8 +921,47 @@ pub const RocTask = extern struct {
     /// task that isn't parked, and the result is false. The tree is locked.
     fn unpark(self: *RocTask, calls: *HostCalls) bool {
         if (@cmpxchgStrong(u32, self.waitWord(), wake_parked, 0, .acq_rel, .monotonic) != null) return false;
-        calls.add(self, self.waitsOnOperation());
+        const operation = self.waitsOnOperation();
+        if (!operation) self.addBusy();
+        calls.add(self, operation);
         return true;
+    }
+
+    /// The task, parked on a group or a cell until here, can run again.
+    fn addBusy(self: *RocTask) void {
+        _ = @atomicRmw(u32, &self.root.busy, .Add, 1, .monotonic);
+    }
+
+    /// If the task's tree stalled, because none of its tasks can run unless one
+    /// that waits on a cell does, the waiter that began to wait last, which the
+    /// caller readies to crash (design.md "Shared State", "Deadlocks."). The
+    /// tree is locked, and no task of it but the calling one runs, so nothing
+    /// wakes a waiter meanwhile. A `None` program's scheduler finds out itself.
+    fn stalledWaiter(self: *RocTask) ?*RocTask {
+        const root = self.root;
+        if (self.scheduler != null or @atomicLoad(u32, &root.busy, .monotonic) != 0) return null;
+        var latest: ?*RocTask = null;
+        var task = root;
+        while (true) {
+            if (task.waits_on_cell) {
+                const later = if (latest) |other|
+                    task.waited_since > other.waited_since or (task.waited_since == other.waited_since and task.task_number > other.task_number)
+                else
+                    true;
+                if (later) latest = task;
+            }
+            var place = task.firstEntry();
+            while (place == null) {
+                const group = task.group orelse {
+                    const waiter = latest orelse utils.builtinInvariant(self.ops, "no task of a tree can run, and none waits on shared state");
+                    waiter.stalled = true;
+                    return waiter;
+                };
+                place = group.entryFrom(task.entry_index + 1);
+                task = group.owner;
+            }
+            task = place.?;
+        }
     }
 
     /// The first running entry of the task's open groups.
@@ -1054,6 +1127,7 @@ pub const RocTask = extern struct {
         self.older_waiter = null;
         self.newer_waiter = null;
         self.carries_wake = false;
+        self.stalled = false;
         erased_callable.decref(self.waiting_probe, self.ops);
     }
 
@@ -1286,8 +1360,14 @@ pub fn cellLock(cell: *anyopaque) void {
 /// The lock is held from before the update took the state until the task runs
 /// no more code, so no store comes between that the task would miss.
 pub fn cellWait(task: *RocTask, cell: *anyopaque, probe: [*]u8) void {
+    const first = task.waited_cell == null;
     if (task.waited_cell) |waited| {
         std.debug.assert(waited == cell); // rationale: a readied waiter's code goes on with the update that waited
+        if (task.stalled) {
+            erased_callable.decref(probe, task.ops);
+            crashRunning(deadlock);
+            task.ops.crash(deadlock);
+        }
         if (!task.carries_wake) utils.builtinInvariant(task.ops, "a task waiting on shared state ran again without a wake");
         erased_callable.decref(task.waiting_probe, task.ops);
         task.waiting_probe = probe;
@@ -1303,6 +1383,7 @@ pub fn cellWait(task: *RocTask, cell: *anyopaque, probe: [*]u8) void {
     }
     task.lockTree();
     task.waits_on_cell = true;
+    if (first) task.waited_since = task.root.tasks_started;
     task.unlockTree();
 }
 
@@ -1353,7 +1434,10 @@ fn probeFrom(cell: *anyopaque, first: ?*RocTask, calls: *HostCalls) void {
         if (!waiter.probe()) continue;
         waiter.carries_wake = true;
         const seen = @atomicRmw(u32, &waiter.cell_word, .Xchg, 1, .acq_rel);
-        if (seen & wake_parked != 0) calls.add(waiter, false);
+        if (seen & wake_parked != 0) {
+            waiter.addBusy();
+            calls.add(waiter, false);
+        }
         return;
     }
 }
@@ -1639,6 +1723,10 @@ pub const Group = struct {
         }
         const child = RocTask.create(owner.ops, entry.start.?, entry.slot, owner.bufferLayout());
         entry.start = null;
+        child.root = owner.root;
+        owner.root.tasks_started += 1;
+        child.task_number = owner.root.tasks_started;
+        child.addBusy();
         child.tree = owner.tree;
         child.ready_fn = owner.ready_fn;
         child.abort_fn = owner.abort_fn;
@@ -1729,6 +1817,7 @@ pub const Group = struct {
         while (@cmpxchgWeak(u32, &self.word, seen, (seen & ~wake_parked) + 1, .release, .monotonic)) |actual| seen = actual;
         var parked = seen & wake_parked != 0;
         if (parked) {
+            owner.addBusy();
             calls.add(owner, false);
         } else if (owner.crashing) {
             // Parked elsewhere, on its hosted operation or on another of
@@ -1738,6 +1827,8 @@ pub const Group = struct {
         // Its code won't run again, so its entries are cancelled here too.
         const ends_here = if (owner.tree == null) !was_crashing else parked;
         if (owner.crashing and !owner.finishing and ends_here) owner.cancelGroups(&calls);
+        _ = @atomicRmw(u32, &child.root.busy, .Sub, 1, .monotonic);
+        if (child.stalledWaiter()) |waiter| _ = waiter.unpark(&calls);
         // Once the tree is unlocked, the owner may take this report, close
         // the group and end.
         child.unlockTree();
@@ -2175,6 +2266,10 @@ const TaskHeap = struct {
 var innermost_run: ?*Scheduler = null;
 var runs_lock: SpinLock = .{};
 
+/// The message of the crash when no task can run that could change the state a
+/// task waits for.
+pub const deadlock = "deadlock: no task can ever change the shared state this task waits for";
+
 /// One run of a `None` program that can wait on shared state (design.md
 /// "Shared State", "Programs without tasks."): the host of its tasks, from
 /// `task_run`'s call of the root until it ends. Runs on several threads may
@@ -2191,9 +2286,6 @@ pub const Scheduler = struct {
     /// The tasks to resume: those readied, and of each group whose owner is
     /// waiting at its loop's next, the first entry that has not begun.
     readied: TaskHeap,
-
-    /// The message of the crash when no task can run.
-    pub const deadlock = "deadlock: no task can ever change the shared state this task waits for";
 
     /// `task_run`: run the root whose start record is `start`, with every task
     /// it makes, until it ends. Returns the address of its result, which
