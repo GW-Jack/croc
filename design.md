@@ -35930,6 +35930,45 @@ crosses a wasm frame but a crash's: wasm has no crash exit, so `roc_crashed` thr
 error ends the run, and the module's instance is never entered again. Nothing
 here needs threads, JavaScript promise integration or a transformed module.
 
+**WASI hosts.** On WASI 0.3 the component model is the scheduler's event loop, and
+a hosted operation is a subtask or a stream operation. test/wasi-tasks-platform is
+the reference, a wasm host whose component exports `wasi:cli/run`. Its host and the
+Roc code are one core module, and nothing outside that module knows of Roc tasks.
+
+- *One component task runs one root and every child under it.* A Roc task is not a
+  component task, so starting one costs no call out of the module. `run` is lifted
+  with a callback, so a paused program holds no native stack. It drains a first-in,
+  first-out queue of ready tasks by resuming each, then returns `WAIT` on the
+  program's one waitable set. `roc_task_ready` only appends to the queue, so Roc
+  code never runs inside a hosted call (P1) and runs on one thread (P10).
+- *A `suspending` hosted function* starts its import with an async lowering. If the
+  import returned at once, the function returns `ROC_READY`. Otherwise it joins the
+  subtask to the set, records which task waits on it and returns `ROC_PENDING`. The
+  callback's event for that subtask drops it and wakes the task (P3).
+- *`roc_task_abort`* takes the subtask out of the set, cancels it, which blocks until
+  it resolves, drops it and forgets the task, so that no event is left for it (P4). `run` is an async
+  function, so it may block, and no callback runs while it does. WASI 0.3's own
+  operations resolve promptly. An import that may take long to cancel needs
+  `subtask.cancel`'s async form, which WASI 0.3.0 leaves out: the host would keep
+  the subtask in the set, with no task to wake, until its event.
+- *Output* is one stream for the whole program, which the host writes a line at a
+  time in the order the lines were printed. A task that prints waits until its
+  line is written, so a reader that is slower than the program holds the program
+  back. The host owns a line's bytes, so a line already begun when its task is
+  aborted is still written whole, and one not begun is dropped.
+- *The end.* Once the root reports its status no task waits on anything, so no
+  subtask is left. The host waits until every line begun is written, closes the
+  stream, and returns `run`'s result (or, for `CANCELLED`, calls `task.cancel`) and
+  `EXIT`. A component
+  that is called again while a program runs starts the next only after it, by
+  backpressure.
+- *Cancellation* of the component task is an event of the callback's, which calls
+  `roc_task_cancel` on the root.
+- *A crash* writes its message to the error stream and blocks until it is out, then
+  traps. wasm has no crash exit, so the instance is never entered again.
+
+Nothing here needs a stackful lift, threads or shared memory.
+
 ### The Task Runtime
 
 **The wake word.** The pending flag is what compiled code tests, and

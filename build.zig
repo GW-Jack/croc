@@ -1601,6 +1601,7 @@ const TestPlatformSteps = struct {
     wasm32: *Step,
     wasm32v1: *Step,
     browser: *Step,
+    wasi: *Step,
     /// For each of `all_test_platform_dirs`, the step producing that
     /// platform's host for the `roc` under test's own Roc target (and its
     /// `v1` twin), or null when `-Dplatform` filtered the platform out.
@@ -1827,6 +1828,15 @@ fn setupTestPlatforms(
         .dest_paths = &.{"test/browser-tasks-platform/platform/targets/wasm32/host.wasm"},
     });
     prepared_hosts_step.dependOn(browser_host_step);
+    // The WASI 0.3 reference host.
+    const wasi_host_step = buildAndCopyWasmHostObject(b, wasm_target, optimize, strip, omit_frame_pointer, .{
+        .name = "host",
+        .root_source_file = "test/wasi-tasks-platform/platform/host.zig",
+        .imports = test_host_imports,
+        .bundle_compiler_rt = true,
+        .dest_paths = &.{"test/wasi-tasks-platform/platform/targets/wasm32/host.wasm"},
+    });
+    prepared_hosts_step.dependOn(wasi_host_step);
     const host_alloc_imports: []const std.Build.Module.Import = &.{
         .{ .name = "host_alloc", .module = roc_modules.host_alloc },
     };
@@ -1882,7 +1892,7 @@ fn setupTestPlatforms(
 
     b.getInstallStep().dependOn(prepared_hosts_step);
 
-    return .{ .wasm32 = wasm_host_step, .wasm32v1 = wasm_v1_host_step, .browser = browser_host_step, .native = native_hosts };
+    return .{ .wasm32 = wasm_host_step, .wasm32v1 = wasm_v1_host_step, .browser = browser_host_step, .wasi = wasi_host_step, .native = native_hosts };
 }
 
 /// Makes `roc_cache_dir` the whole environment of a cached `roc build` step.
@@ -4274,6 +4284,13 @@ pub fn build(b: *std.Build) void {
         _ = browser_app_sources.addCopyFile(test_fixtures.output(test_platform_hosts.browser, "test/browser-tasks-platform/platform/targets/wasm32/host.wasm"), "platform/targets/wasm32/host.wasm");
         browser_app_sources.step.dependOn(test_platform_hosts.browser);
 
+        const wasi_app_sources = b.addWriteFiles();
+        _ = wasi_app_sources.addCopyDirectory(b.path("test/wasi-tasks-platform"), ".", .{
+            .include_extensions = &.{".roc"},
+        });
+        _ = wasi_app_sources.addCopyFile(test_fixtures.output(test_platform_hosts.wasi, "test/wasi-tasks-platform/platform/targets/wasm32/host.wasm"), "platform/targets/wasm32/host.wasm");
+        wasi_app_sources.step.dependOn(test_platform_hosts.wasi);
+
         const build_wasm_provided_callable_app = addWasmStaticLibAppBuild(b, roc_exe, build_roc_step, build_test_hosts_step, provided_callable_app_sources, "app.roc", &.{}, "app.wasm", "wasm32");
         build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_provided_callable_app.run.step);
 
@@ -4372,6 +4389,33 @@ pub fn build(b: *std.Build) void {
                     run_browser_test.addFileArg(built.output);
                 }
                 run_test_wasm_static_lib_step.dependOn(&run_browser_test.step);
+            }
+
+            // The WASI 0.3 reference host, on the test's own stand-in for a
+            // component runtime, and on wasmtime when its path and that of jco,
+            // which makes the component, are given.
+            const wasmtime = b.option([]const u8, "wasmtime", "Path to wasmtime, for run-test-wasi-tasks");
+            const jco = b.option([]const u8, "jco", "Path to jco, for run-test-wasi-tasks");
+            const run_test_wasi_tasks_step = b.step("run-test-wasi-tasks", "Run the WASI 0.3 reference host's components on wasmtime (needs -Dwasmtime and -Djco)");
+            if (wasmtime == null or jco == null) {
+                run_test_wasi_tasks_step.dependOn(&b.addFail("run-test-wasi-tasks needs -Dwasmtime=PATH and -Djco=PATH").step);
+            }
+            for ([_][]const u8{ "dev", "speed" }) |opt| {
+                const run_module_test = b.addSystemCommand(&.{"node"});
+                run_module_test.addFileArg(b.path("test/wasi-tasks-platform/module.test.mjs"));
+                run_module_test.addFileInput(b.path("test/wasi-tasks-platform/component.mjs"));
+                const run_component_test = b.addSystemCommand(&.{"node"});
+                run_component_test.addFileArg(b.path("test/wasi-tasks-platform/wasmtime.test.mjs"));
+                run_component_test.addArgs(&.{ wasmtime orelse "", jco orelse "" });
+                run_component_test.addFileArg(b.path("test/wasi-tasks-platform/platform/world.wit"));
+                run_component_test.addFileArg(b.path("test/wasi-tasks-platform/canceller.wat"));
+                for ([_][]const u8{ "app", "app_queue", "app_crash", "app_forever" }) |app| {
+                    const built = addWasmStaticLibAppBuild(b, roc_exe, build_roc_step, build_test_hosts_step, wasi_app_sources, b.fmt("{s}.roc", .{app}), &.{ b.fmt("--opt={s}", .{opt}), "--specialize=yes" }, b.fmt("{s}.wasm", .{app}), "wasm32");
+                    run_module_test.addFileArg(built.output);
+                    run_component_test.addFileArg(built.output);
+                }
+                run_test_wasm_static_lib_step.dependOn(&run_module_test.step);
+                if (wasmtime != null and jco != null) run_test_wasi_tasks_step.dependOn(&run_component_test.step);
             }
         }
         run_wasm_test.step.dependOn(build_test_wasm_static_lib_runner_step);

@@ -1,0 +1,38 @@
+// The component the WASI reference host's core module becomes (design.md "Host
+// Contract", "WASI hosts."): the interfaces of WASI 0.3.0 the host uses, with
+// only the functions it uses.
+package roc:tasks@0.1.0;
+
+world app {
+  import wasi:clocks/monotonic-clock@0.3.0;
+  import wasi:cli/stdout@0.3.0;
+  import wasi:cli/stderr@0.3.0;
+  export wasi:cli/run@0.3.0;
+}
+
+package wasi:clocks@0.3.0 {
+  interface types {
+    type duration = u64;
+  }
+  interface monotonic-clock {
+    use types.{duration};
+    wait-for: async func(how-long: duration);
+  }
+}
+
+package wasi:cli@0.3.0 {
+  interface types {
+    enum error-code { io, illegal-byte-sequence, pipe }
+  }
+  interface stdout {
+    use types.{error-code};
+    write-via-stream: func(data: stream<u8>) -> future<result<_, error-code>>;
+  }
+  interface stderr {
+    use types.{error-code};
+    write-via-stream: func(data: stream<u8>) -> future<result<_, error-code>>;
+  }
+  interface run {
+    run: async func() -> result;
+  }
+}
