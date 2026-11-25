@@ -26,8 +26,6 @@ main! = |name| {
 		"supervise" => supervise!()
 		"supervise_crash" => supervise_crash!()
 		"shared" => shared!()
-		"shared_wait" => shared_wait!()
-		"shared_wait_body" => shared_wait_body!()
 		_ => "unknown"
 	}
 	Host.log!("end ${name}")
@@ -294,65 +292,4 @@ shared! = || {
 	}
 	Host.log!("logged ${log.get!().len().to_str()}")
 	Str.concat($joined, Str.join_with(log.get!(), ";"))
-}
-
-# Entries that wait for each other: a queue of one item between two that put
-# and two that take. A `None` build can't run this case until it has a
-# scheduler of its own.
-shared_wait! : () => Str
-shared_wait! = || {
-	queue = Shared.new!([])
-	put! : Str -> (() => Str)
-	put! = |name| || {
-		body = Host.fetch!(name)
-		for part in ["one", "two", "three"] {
-			item = "${body}, part ${part}, too long to be small"
-			queue.update!(|items| if (items.is_empty()) Set(items.append(item), {}) else Wait)
-			Host.log!("put ${item}")
-		}
-		body
-	}
-	take! : Str -> (() => Str)
-	take! = |name| || {
-		var $taken = name
-		var $left = 3
-		while $left > 0 {
-			item = queue.update!(
-				|items| match items {
-					[first, .. as rest] => Set(rest, first)
-					[] => Wait
-				},
-			)
-			Host.log!("${name} took ${item}")
-			$taken = Str.concat($taken, item)
-			$left = $left - 1
-		}
-		$taken
-	}
-	var $joined = ""
-	for! body in List.concurrently([take!("x"), put!("a"), take!("y"), put!("b")]) {
-		Host.log!("got ${body}")
-		$joined = Str.concat($joined, body)
-	}
-	$joined
-}
-
-# The body waits for what its entries do, which can't suspend: the second does it
-# while the first one's body waits.
-shared_wait_body! : () => Str
-shared_wait_body! = || {
-	done = Shared.new!(0)
-	work! : Str -> (() => Str)
-	work! = |name| || {
-		done.modify!(|n| n + 1)
-		Host.log!("did ${name}")
-		name
-	}
-	var $joined = ""
-	for! body in List.concurrently([work!("a"), work!("b"), work!("c")]) {
-		so_far = done.update!(|n| if (n >= 2) Keep(n) else Wait)
-		Host.log!("got ${body} at ${so_far.to_str()}")
-		$joined = Str.concat($joined, body)
-	}
-	$joined
 }

@@ -2099,6 +2099,16 @@ pub fn taskMode(self: *const Self) ?TaskMode {
     return null;
 }
 
+/// Whether the program runs tasks itself, as one without tasks whose updates
+/// can wait does (design.md "Shared State"). `taskMode` is null then: the
+/// program defines no task calls.
+pub fn runsTasks(self: *const Self) bool {
+    for (self.getCFStmts()) |stmt| {
+        if (stmt == .assign_low_level and stmt.assign_low_level.op == .task_run) return true;
+    }
+    return false;
+}
+
 /// Returns the stored statement for the given id.
 pub fn getCFStmt(self: *const Self, id: CFStmtId) CFStmt {
     self.verifyCFStmtId(id);

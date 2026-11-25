@@ -1063,14 +1063,29 @@ test "a pausing call may return a tag union, on LLVM" {
 // finishes every hosted call in place and resumes the ready task first in the
 // task tree, as a `None` build of the same program gives without tasks.
 
-const plan_loop_tasks_path = "test/postcheck/plan_loops_tasks/app.roc";
-const plan_loop_none_path = "test/postcheck/plan_loops_none/app.roc";
-const plan_loop_cases = [_][]const u8{
-    "basic", "limits", "spawn", "background", "break", "return", "try", "nested", "children", "after_break", "supervise", "shared",
+/// One program on two platforms that differ only in declaring tasks.
+const Twin = struct {
+    tasks_path: []const u8,
+    none_path: []const u8,
+    cases: []const []const u8,
 };
-/// The cases that wait on shared state, which run only under the queue
-/// schedule.
-const waiting_cases = [_][]const u8{ "shared_wait", "shared_wait_body" };
+
+const plan_loops = Twin{
+    .tasks_path = "test/postcheck/plan_loops_tasks/app.roc",
+    .none_path = "test/postcheck/plan_loops_none/app.roc",
+    .cases = &.{ "basic", "limits", "spawn", "background", "break", "return", "try", "nested", "children", "after_break", "supervise", "shared" },
+};
+
+/// A program whose tasks wait on shared state, so its `None` build runs tasks
+/// too (design.md "Shared State", "Programs without tasks.").
+const shared_waits = Twin{
+    .tasks_path = "test/postcheck/shared_waits_tasks/app.roc",
+    .none_path = "test/postcheck/shared_waits_none/app.roc",
+    .cases = &.{ "queue", "body", "body_first", "nested", "cancelled", "oldest" },
+};
+
+/// The program the inspection functions run. Tests run one at a time.
+var twin: Twin = plan_loops;
 
 /// What a run of one case gave: its result, and the hosted calls it made.
 const CaseOutcome = struct {
@@ -1104,12 +1119,12 @@ const CaseOutcome = struct {
 
 /// The outcomes of the `None` build, which `recordNoneOutcomes` fills and the
 /// Tasks runs compare with. Tests run one at a time.
-var none_outcomes: ?[plan_loop_cases.len]CaseOutcome = null;
+var none_outcomes: std.ArrayList(CaseOutcome) = .empty;
 
 fn freeNoneOutcomes() void {
-    const outcomes = none_outcomes orelse return;
-    for (outcomes) |outcome| outcome.deinit();
-    none_outcomes = null;
+    for (none_outcomes.items) |outcome| outcome.deinit();
+    none_outcomes.deinit(std.testing.allocator);
+    none_outcomes = .empty;
 }
 
 /// The host of the `None` build on the interpreter: the same calls, all
@@ -1163,15 +1178,14 @@ fn recordNoneOutcomes(lowered: *const lir.CheckedPipeline.LoweredProgram) harnes
 }
 
 fn recordNone(lowered: *const lir.CheckedPipeline.LoweredProgram) E2eError!void {
-    var outcomes: [plan_loop_cases.len]CaseOutcome = undefined;
-    for (plan_loop_cases, 0..) |name, index| {
-        outcomes[index] = noneCase(lowered, name) catch |err| {
+    for (twin.cases) |name| {
+        const outcome = noneCase(lowered, name) catch |err| {
             std.log.err("the None build's case {s} failed: {s}", .{ name, @errorName(err) });
-            for (outcomes[0..index]) |outcome| outcome.deinit();
             return err;
         };
+        errdefer outcome.deinit();
+        try none_outcomes.append(std.testing.allocator, outcome);
     }
-    none_outcomes = outcomes;
 }
 
 fn noneCase(lowered: *const lir.CheckedPipeline.LoweredProgram, name: []const u8) E2eError!CaseOutcome {
@@ -1215,8 +1229,7 @@ fn noneCase(lowered: *const lir.CheckedPipeline.LoweredProgram, name: []const u8
 /// Run each case of the Tasks build under the coroutine schedule and compare
 /// it with the `None` build's outcome.
 fn compareCoroutineRuns(comptime R: type, program: R.Program) E2eError!void {
-    const want_all = none_outcomes orelse return error.TestUnexpectedResult;
-    for (plan_loop_cases, want_all) |name, want| {
+    for (twin.cases, none_outcomes.items) |name, want| {
         const got = coroutineCase(R, program, name) catch |err| {
             std.log.err("the Tasks build's case {s} failed: {s}", .{ name, @errorName(err) });
             return err;
@@ -1281,9 +1294,9 @@ const plan_loop_options: harness.LirLoweringOptions = .{ .specialization_strateg
 /// declaring tasks and marking `fetch!` suspending.
 fn expectTwinApps() E2eError!void {
     const gpa = std.testing.allocator;
-    const tasks_app = try readFixture(gpa, plan_loop_tasks_path);
+    const tasks_app = try readFixture(gpa, twin.tasks_path);
     defer gpa.free(tasks_app);
-    const none_app = try readFixture(gpa, plan_loop_none_path);
+    const none_app = try readFixture(gpa, twin.none_path);
     defer gpa.free(none_app);
     try std.testing.expectEqualStrings(tasks_app, none_app);
 }
@@ -1292,27 +1305,33 @@ fn readFixture(gpa: std.mem.Allocator, path: []const u8) E2eError![]u8 {
     return CoreCtx.os(gpa, gpa, std.testing.io).readFile(path, gpa) catch return error.TestUnexpectedResult;
 }
 
-fn checkSequentialEquivalence(inspect: harness.LoweredInspectFn) E2eError!void {
+fn checkSequentialEquivalence(program: Twin, inspect: harness.LoweredInspectFn) E2eError!void {
+    twin = program;
     try expectTwinApps();
     defer freeNoneOutcomes();
-    harness.runAppPathLoweredInspection(plan_loop_none_path, plan_loop_options, recordNoneOutcomes) catch return error.TestUnexpectedResult;
-    harness.runAppPathLoweredInspection(plan_loop_tasks_path, plan_loop_options, inspect) catch return error.TestUnexpectedResult;
+    harness.runAppPathLoweredInspection(twin.none_path, plan_loop_options, recordNoneOutcomes) catch return error.TestUnexpectedResult;
+    harness.runAppPathLoweredInspection(twin.tasks_path, plan_loop_options, inspect) catch return error.TestUnexpectedResult;
 }
 
 test "concurrent loops run on child tasks as a None build runs them, on the interpreter" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    try checkSequentialEquivalence(compareInterpreter);
+    try checkSequentialEquivalence(plan_loops, compareInterpreter);
 }
 
 test "concurrent loops run on child tasks as a None build runs them, on the dev backend" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
-    try checkSequentialEquivalence(compareDev);
+    try checkSequentialEquivalence(plan_loops, compareDev);
 }
 
 test "concurrent loops run on child tasks as a None build runs them, on LLVM" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    try checkSequentialEquivalence(compareLlvm);
+    try checkSequentialEquivalence(plan_loops, compareLlvm);
+}
+
+test "tasks that wait on shared state run in a None build as on a host with tasks, on the interpreter" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    try checkSequentialEquivalence(shared_waits, compareInterpreter);
 }
 
 // The queue schedule: every backend runs the same program through the same
@@ -1351,7 +1370,7 @@ fn recordQueueRuns(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.L
 }
 
 fn recordQueue(lowered: *const lir.CheckedPipeline.LoweredProgram) E2eError!void {
-    for (plan_loop_cases ++ waiting_cases) |name| {
+    for (twin.cases) |name| {
         for ([_]task_test_host.Mode{ .ready, .pause }) |mode| {
             const resumes = try recordQueueRun(lowered, name, mode, null);
             var cancel_after: u32 = 0;
@@ -1483,26 +1502,27 @@ fn compareQueueRunWasm(program: *const WasmProgram, want: QueueRun) E2eError!voi
     try expectQueueOutcome(want, got);
 }
 
-fn checkQueueRuns(options: harness.LirLoweringOptions, inspect: harness.LoweredInspectFn) E2eError!void {
+fn checkQueueRuns(program: Twin, options: harness.LirLoweringOptions, inspect: harness.LoweredInspectFn) E2eError!void {
+    twin = program;
     defer freeQueueRuns();
-    harness.runAppPathLoweredInspection(plan_loop_tasks_path, plan_loop_options, recordQueueRuns) catch return error.TestUnexpectedResult;
-    harness.runAppPathLoweredInspection(plan_loop_tasks_path, options, inspect) catch return error.TestUnexpectedResult;
+    harness.runAppPathLoweredInspection(twin.tasks_path, plan_loop_options, recordQueueRuns) catch return error.TestUnexpectedResult;
+    harness.runAppPathLoweredInspection(twin.tasks_path, options, inspect) catch return error.TestUnexpectedResult;
 }
 
 test "concurrent loops take the interpreter's steps under a queue, cancelled after any resume, on the dev backend" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
-    try checkQueueRuns(plan_loop_options, compareQueueDev);
+    for ([_]Twin{ plan_loops, shared_waits }) |program| try checkQueueRuns(program, plan_loop_options, compareQueueDev);
 }
 
 test "concurrent loops take the interpreter's steps under a queue, cancelled after any resume, on LLVM" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    try checkQueueRuns(plan_loop_options, compareQueueLlvm);
+    for ([_]Twin{ plan_loops, shared_waits }) |program| try checkQueueRuns(program, plan_loop_options, compareQueueLlvm);
 }
 
 test "concurrent loops take the interpreter's steps under a queue, cancelled after any resume, on the wasm backend" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    try checkQueueRuns(.{ .specialization_strategy = .lss, .target_usize = .u32 }, compareQueueWasm);
+    for ([_]Twin{ plan_loops, shared_waits }) |program| try checkQueueRuns(program, .{ .specialization_strategy = .lss, .target_usize = .u32 }, compareQueueWasm);
 }
 
 // Supervision (design.md "Plans And Concurrent Loops", "Supervision."): every
@@ -1561,16 +1581,16 @@ fn superviseCrashLlvm(lowered: *const lir.CheckedPipeline.LoweredProgram) harnes
 
 test "supervise! restarts a crashing function up to its limit and then crashes with its message, on the interpreter" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(plan_loop_tasks_path, plan_loop_options, superviseCrashInterpreter);
+    try harness.runAppPathLoweredInspection(plan_loops.tasks_path, plan_loop_options, superviseCrashInterpreter);
 }
 
 test "supervise! restarts a crashing function up to its limit and then crashes with its message, on the dev backend" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(plan_loop_tasks_path, plan_loop_options, superviseCrashDev);
+    try harness.runAppPathLoweredInspection(plan_loops.tasks_path, plan_loop_options, superviseCrashDev);
 }
 
 test "supervise! restarts a crashing function up to its limit and then crashes with its message, on LLVM" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(plan_loop_tasks_path, plan_loop_options, superviseCrashLlvm);
+    try harness.runAppPathLoweredInspection(plan_loops.tasks_path, plan_loop_options, superviseCrashLlvm);
 }

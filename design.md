@@ -34294,7 +34294,8 @@ for may be an update by an entry that the sequential form would run only after
 the body goes on. A procedure *may wait* when it calls a `cell_wait!`
 specialization or a procedure that may wait; `SuspensionMarks.mayWait` finds
 them. A suspending hosted call is no wait: it finishes whatever other tasks do,
-and the entries run after it. A `None` build has no `suspending` procedure, so all its
+and the entries run after it. In a `None` build only a wait on shared
+state suspends (Shared State, Programs without tasks), so without one all its
 loops are sequential.
 
 *Sequential form.* No task and no runtime call. The operations are ordinary
@@ -34660,14 +34661,53 @@ record, whose captures are visible to other threads, and a value stored in a
 cell or loaded from one is linked to the cell (Thread-Confined Reference Counts). A probe
 is made visible where `cell_wait` takes it, since any thread's crash may run it.
 
-**Programs without tasks.** A program none of whose updates can reach `Wait`
-runs as Plans And Concurrent Loops says, on one stack. A `None` program that
-can wait is compiled as a `Tasks` program whose hosted calls never
-pause and that carries its own scheduler, which resumes the ready task that
-comes first in the task tree, an entry that has not begun counting only when
-its loop asks for it or nothing else can run. When nothing can run, the
-program crashes with `deadlock: no task can ever change the shared state this
-task waits for`.
+**Programs without tasks.** In a `None` program under `.lss`, only a
+`cell_wait!` specialization is a seed of the suspension marks, so a program none
+of whose updates can reach `Wait` has no procedure that may suspend and runs as
+Plans And Concurrent Loops says, on one stack. Otherwise the continuation pass
+treats the program as it does a `Tasks` program, with three differences:
+- hosted calls never pause, since a `None` platform declares none `suspending`;
+- `run_supervised!` keeps its body, which runs its function once, since a crash
+  ends the program;
+- a root that may suspend keeps the signature it has without tasks. Its entry
+  packs the start record, calls `task_run`, moves the result out of the address
+  that returns and calls `task_run_end`. A root that can't suspend is not
+  changed.
+
+`task_run(start, buffer size, buffer alignment, result size, result alignment)
+-> address` makes a root task and is its host until it ends. It resumes the
+ready task that comes first in the task tree, where an entry that has not begun
+is ready only while its owner waits at its loop's next, or when no other task
+can run (Sequential equivalence). When no task can run, the program crashes with
+`deadlock: no task can ever change the shared state this task waits for`.
+`task_run_end(address, result size, result alignment)` frees the result's memory.
+
+The scheduler keeps its ready tasks in a heap in tree order, linked through the
+tasks. A task is in it once, from its ready until its resume. Of a running set's
+entries that have not begun, the first is put in when the owner starts to wait
+at the set's next, and the one after it when that one begins, so a set of many
+entries costs no more than it runs. One that comes out when its owner waits
+elsewhere is dropped, and put in again at the next wait. Only when the heap is
+empty does the scheduler walk the tree, for the first entry that has not begun.
+
+A host may call into a `None` program on several threads at once, and one run may
+be inside another's, since a hosted call can call back into the program. Each run
+has its own tasks and scheduler, and a wake reaches the scheduler of the task it
+wakes. The inner run can't resume the outer's tasks, so it deadlocks where only
+they could change the state it waits for. A cell is used by one
+thread at a time, but the table of waiters is the process's, so a lock guards the
+links of each of its lists. It is held while they are read or changed, and never
+while a probe runs.
+
+A crash in a task of a `None` program is not caught: the program crashes through
+the host's `roc_crashed`, as it does without tasks. A probe's crash is still its
+answer. So where the program holds a `task_run`, its crashes go through the
+`task_crash` builtin, as where it creates a task. No pointer to the running task
+is kept, since runs on several threads would share it. Instead each run keeps its
+thread's id, which the builtins read from the operating system, with no
+thread-local. A crash on a thread one of whose waiters is being probed returns
+to the probe. Any other takes the waiters of that thread's runs off their lists
+before it calls the host, since the host may go on to run the program again.
 
 **Cleanups.** `h.finally!(cleanup, body)` runs `body`, then applies `cleanup` to
 the state however `body` ended: it returned, its task was cancelled, or it
@@ -34692,10 +34732,10 @@ descendants are gone.
 | V10 | A probe answers as the update would, and an update puts back on `Keep` and `Wait` the state it was given |
 
 **What is built.** `new!`, `update!`, `get!` and `modify!` on every backend and
-both strategies, with poison, and waiting in `Tasks` and `ParallelTasks`
-programs. A `Wait` in a `None` program crashes with the deadlock message.
-Schedulers for `None` programs, cleanups, holder sets and the update and probe
-forms come in that order.
+both strategies, with poison, and waiting under `.lss` in programs of every
+mode. Under `.boxy`, where only `None` programs compile, a `Wait` crashes with
+the deadlock message. Cleanups, holder sets and the update and probe forms come
+in that order.
 
 ### Host Contract
 

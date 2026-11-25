@@ -226,7 +226,7 @@ pub fn pausingProgram(f: *Fixture, hosted_ret: layout.Idx, add: bool) TaskOpsTes
     }, .none);
     try lir.SuspensionMarks.run(allocator, &f.store, .none);
     var roots = [_]LIR.LirProcSpecId{g};
-    try lir.ContinuationPass.run(allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true} });
+    try lir.ContinuationPass.run(allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .mode = .tasks });
     return roots[0];
 }
 
@@ -272,7 +272,7 @@ pub fn pausingTwiceProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
     }, .none);
     try lir.SuspensionMarks.run(allocator, &f.store, .none);
     var roots = [_]LIR.LirProcSpecId{g};
-    try lir.ContinuationPass.run(allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true} });
+    try lir.ContinuationPass.run(allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .mode = .tasks });
     return roots[0];
 }
 
@@ -327,7 +327,7 @@ pub fn pausingNestedProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
     }, .none);
     try lir.SuspensionMarks.run(allocator, &f.store, .none);
     var roots = [_]LIR.LirProcSpecId{g};
-    try lir.ContinuationPass.run(allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true} });
+    try lir.ContinuationPass.run(allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .mode = .tasks });
     return roots[0];
 }
 
@@ -826,7 +826,7 @@ fn parkingProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
 
     try lir.SuspensionMarks.run(f.allocator, &f.store, .none);
     var roots = [_]LIR.LirProcSpecId{g};
-    try lir.ContinuationPass.run(f.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true} });
+    try lir.ContinuationPass.run(f.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .mode = .tasks });
     try indexJoinPoints(f);
     return roots[0];
 }
@@ -1196,7 +1196,7 @@ pub fn promotionProgram(f: *Fixture, background: [3]bool, body: LoopBody, releas
 
     try lir.SuspensionMarks.run(f.allocator, &f.store, .none);
     var roots = [_]LIR.LirProcSpecId{g};
-    try lir.ContinuationPass.run(f.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true} });
+    try lir.ContinuationPass.run(f.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .mode = .tasks });
     try indexJoinPoints(f);
     return roots[0];
 }

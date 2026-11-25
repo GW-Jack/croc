@@ -191,6 +191,7 @@ pub const llvm_private_runtime_set = c_memory_set ++ c_math_set ++ [_][:0]const 
     "roc_task_crash_exits",
     "roc_task_setjmp",
     "roc_task_longjmp",
+    "roc_task_thread_id",
 };
 
 /// Export the six fixed host callbacks using canonical names. Callback types

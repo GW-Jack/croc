@@ -699,6 +699,16 @@ pub const LowLevel = enum(u16) {
     /// `task_create` in a `ParallelTasks` program: the new task, a root, has
     /// its tree's lock (design.md "Parallel Resumes").
     task_create_parallel,
+    /// (start, result_buffer_size, result_buffer_alignment, result_size,
+    /// result_alignment) -> Ptr(T): run a root whose list holds the start
+    /// record, which it takes, with every task it makes, until it ends, in a
+    /// program without tasks (design.md "Shared State"). The address is of the
+    /// root's result, which the caller moves out. Each size and alignment is a
+    /// `U64`.
+    task_run,
+    /// (result, result_size, result_alignment) -> {}: free the memory of a
+    /// `task_run`'s result.
+    task_run_end,
 
     // Running-set operations of a task-form concurrent loop (design.md
     // "Records And The Task", "Child Tasks"), made only by the continuation
@@ -1394,6 +1404,9 @@ pub const LowLevel = enum(u16) {
         .task_result_buffer = byType(.none()),
         .task_create = byType(.{ .may_retain_or_release = true, .consume_args = arg_0, .args_host_visible = arg_0 }),
         .task_create_parallel = byType(.{ .may_retain_or_release = true, .consume_args = arg_0, .args_host_visible = arg_0 }),
+
+        .task_run = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_0 }),
+        .task_run_end = byType(.none()),
 
         // Starting entries makes child tasks; ending, cancelling and
         // freeing a set drop start records and results nobody took.

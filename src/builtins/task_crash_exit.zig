@@ -36,6 +36,7 @@ const linked_routines = struct {
     extern fn roc_task_crash_exits() callconv(.c) bool;
     extern fn roc_task_setjmp(buf: *Buffer) callconv(.c) c_int;
     extern fn roc_task_longjmp(buf: *Buffer) callconv(.c) noreturn;
+    extern fn roc_task_thread_id() callconv(.c) u64;
 };
 
 /// Whether this program's target can take a crash exit. Without one, a
@@ -61,7 +62,32 @@ pub fn jump(buf: *Buffer) noreturn {
     sljmp.naked.longjmp(@ptrCast(buf), 1);
 }
 
-/// The definitions of the three routines the linked builtins call, for the
+/// A number that tells the calling thread from the process's other threads, on
+/// a target with crash exits; elsewhere a crash ends the process, and it is 0.
+/// No thread-local holds it: a host's threads may have none.
+pub fn threadId() u64 {
+    if (comptime linked) return linked_routines.roc_task_thread_id();
+    return nativeThreadId();
+}
+
+fn nativeThreadId() u64 {
+    if (comptime !native) return 0;
+    if (comptime builtin.os.tag == .linux) return @intCast(std.os.linux.gettid());
+    if (comptime builtin.os.tag == .windows) return std.os.windows.GetCurrentThreadId();
+    if (comptime !builtin.os.tag.isDarwin()) @compileError("a target with crash exits needs a thread id");
+    // The kernel sets the register, or the segment's first word, to the
+    // thread's own structure.
+    if (comptime builtin.cpu.arch == .aarch64) {
+        return asm ("mrs %[id], tpidrro_el0"
+            : [id] "=r" (-> u64),
+        ) & ~@as(u64, 7);
+    }
+    return asm ("movq %%gs:0, %[id]"
+        : [id] "=r" (-> u64),
+    );
+}
+
+/// The definitions of the four routines the linked builtins call, for the
 /// target this file is compiled for: the private runtime exports them into
 /// an LLVM object, and the compiler's relocatable loader binds an object it
 /// loads into its own process to them (`resolveLinked`).
@@ -78,6 +104,10 @@ pub const linked_definitions = struct {
         return 0;
     }
 
+    pub fn threadIdOf() callconv(.c) u64 {
+        return nativeThreadId();
+    }
+
     pub fn longjmp(buf: *Buffer) callconv(.c) noreturn {
         if (comptime !native) unreachable; // callers check roc_task_crash_exits first
         sljmp.naked.longjmp(@ptrCast(buf), 1);
@@ -85,10 +115,11 @@ pub const linked_definitions = struct {
 };
 
 /// The address of the linked routine `name` names, if it is one of the
-/// three.
+/// four.
 pub fn resolveLinked(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "roc_task_crash_exits")) return @intFromPtr(&linked_definitions.crashExits);
     if (std.mem.eql(u8, name, "roc_task_setjmp")) return @intFromPtr(linked_definitions.setjmp);
     if (std.mem.eql(u8, name, "roc_task_longjmp")) return @intFromPtr(&linked_definitions.longjmp);
+    if (std.mem.eql(u8, name, "roc_task_thread_id")) return @intFromPtr(&linked_definitions.threadIdOf);
     return null;
 }

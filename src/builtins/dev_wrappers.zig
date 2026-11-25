@@ -1428,6 +1428,17 @@ pub fn roc_builtins_task_create_parallel(start: [*]u8, root_result: [*]u8, hoste
     });
 }
 
+/// `task_run` (design.md "Shared State"): run a root whose list holds `start`,
+/// which it takes, until it ends, and return the address of its result.
+pub fn roc_builtins_task_run(start: [*]u8, result_buffer_size: u64, result_buffer_alignment: u64, result_size: u64, result_alignment: u64) callconv(.c) [*]u8 {
+    return task.Scheduler.run(in_process_host.ops(), start, @intCast(result_buffer_size), @intCast(result_buffer_alignment), @intCast(result_size), @intCast(result_alignment));
+}
+
+/// `task_run_end`: free the memory of a `task_run`'s result.
+pub fn roc_builtins_task_run_end(result: [*]u8, result_size: u64, result_alignment: u64) callconv(.c) void {
+    task.Scheduler.runEnd(in_process_host.ops(), result, @intCast(result_size), @intCast(result_alignment));
+}
+
 /// Where `suspend_save` packs its record: `payload_size` bytes with one
 /// reference, from the task's record cache when it has one of that size
 /// (design.md "The Task Runtime", "Record cache").

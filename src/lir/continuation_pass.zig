@@ -64,7 +64,8 @@ const SiteKind = union(enum) {
 
 /// The program's roots, parallel to `program.Result.root_procs`. The pass
 /// replaces each `provides` root that may suspend with its task entry
-/// (design.md "Records And The Task").
+/// (design.md "Records And The Task"), or in a program without tasks with an
+/// entry that runs it ("Shared State", "Programs without tasks.").
 pub const Roots = struct {
     procs: []ProcId,
     /// Whether each root is a platform `provides` entry. Only those may
@@ -117,7 +118,8 @@ const ProcPlan = struct {
 /// its task argument, make the continuation and resume entry of each of its
 /// sites that is not a tail site, add the pending edges, and give
 /// `suspending` hosted procedures the host's shape. Each `provides` root that may suspend is started as a task:
-/// its place in `roots` goes to an entry that creates the task.
+/// its place in `roots` goes to an entry that creates the task, or in a program
+/// without tasks runs it.
 pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots: Roots) Allocator.Error!void {
     // A promoted loop's `group_next` is a park site, so promotion comes
     // before any procedure's sites are found.
@@ -263,11 +265,11 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
         const may_suspend = store.getProcSpecImmediate(root.*).suspends != .never;
         if (may_suspend and !provided) invariant("a root that is not a provides entry may suspend", .{});
         if (!provided or !(may_suspend or roots.mode.hasTasks())) continue;
-        const create_op: LIR.LowLevel = switch (roots.mode) {
-            .none, .tasks => .task_create,
-            .parallel_tasks => .task_create_parallel,
+        root.* = switch (roots.mode) {
+            .none => try runRoot(allocator, store, layouts, root.*, buffers),
+            .tasks => try startRoot(allocator, store, layouts, root.*, .task_create, may_suspend, buffers),
+            .parallel_tasks => try startRoot(allocator, store, layouts, root.*, .task_create_parallel, may_suspend, buffers),
         };
-        root.* = try startRoot(allocator, store, layouts, root.*, create_op, may_suspend, buffers);
     }
 
     try SuspensionMarks.run(allocator, store, roots.mode);
@@ -431,16 +433,74 @@ fn startRoot(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roo
 
     const ret = try store.addCFStmt(.{ .ret = .{ .value = task } }, origin);
     var head = try store.addLowLevelStmt(task, create_op, &.{ record, result_out, size_locals[0], size_locals[1], size_locals[2], size_locals[3] }, ret, origin);
+    head = try sizeLiterals(store, &size_locals, &sizes, head, origin);
+    head = try packStart(allocator, store, layouts, &frame, start, entry_args[0..explicit.len], record, head, origin);
+    std.mem.sort(LocalId, frame.items, {}, localLessThan);
+    const spec = store.getProcSpecPtr(entry);
+    spec.args = try store.addLocalSpan(entry_args);
+    spec.frame_locals = try store.addLocalSpan(frame.items);
+    spec.body = .some(head);
+    return entry;
+}
+
+/// `locals = sizes` before `next`.
+fn sizeLiterals(store: *LirStore, locals: []const LocalId, sizes: []const u64, next: CFStmtId, origin: LIR.StmtOrigin) Allocator.Error!CFStmtId {
+    var head = next;
     var index = sizes.len;
     while (index > 0) {
         index -= 1;
         head = try store.addCFStmt(.{ .assign_literal = .{
-            .target = size_locals[index],
+            .target = locals[index],
             .value = .{ .i64_literal = .{ .value = @intCast(sizes[index]), .layout_idx = .u64 } },
             .next = head,
         } }, origin);
     }
-    head = try packStart(allocator, store, layouts, &frame, start, entry_args[0..explicit.len], record, head, origin);
+    return head;
+}
+
+/// Run the root `root`, which may suspend, as a task in a program without
+/// tasks (design.md "Shared State", "Programs without tasks."). Its entry has
+/// the arguments and the result the root has for its callers: it packs the
+/// start record, runs the task it starts until it ends, and returns the result.
+/// Returns the entry, which takes the root's place.
+fn runRoot(allocator: Allocator, store: *LirStore, layouts: *layout.Store, root: ProcId, buffers: Buffers) Allocator.Error!ProcId {
+    const source = store.getProcSpecImmediate(root).*;
+    const origin = store.stmtOrigin(source.body.get().?);
+    const root_args = try copyLocals(allocator, store, source.args);
+    defer allocator.free(root_args);
+    // The root takes the task last; the host passes the others.
+    const explicit = root_args[0 .. root_args.len - 1];
+    const arg_layouts = try allocator.alloc(layout.Idx, explicit.len);
+    defer allocator.free(arg_layouts);
+    for (explicit, arg_layouts) |arg, *arg_layout| arg_layout.* = store.getLocal(arg).layout_idx;
+    const start = try buildStart(allocator, store, layouts, root, arg_layouts, true, .none);
+
+    const entry = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .identity = source.identity.derived("run-entry", &.{}),
+        .args = .empty(),
+        .ret_layout = source.ret_layout,
+    }, store.procLoc(root));
+    try nameDerived(allocator, store, entry, root, "entry", null);
+    var frame = std.ArrayList(LocalId).empty;
+    defer frame.deinit(allocator);
+    const entry_args = try allocator.alloc(LocalId, explicit.len);
+    defer allocator.free(entry_args);
+    for (arg_layouts, entry_args) |arg_layout, *arg| arg.* = try freshLocal(store, &frame, allocator, arg_layout);
+    const record = try freshLocal(store, &frame, allocator, try layouts.insertErasedCallable());
+    const slot = try freshLocal(store, &frame, allocator, try layouts.insertPtr(source.ret_layout));
+    const value = try freshLocal(store, &frame, allocator, source.ret_layout);
+    const result = layouts.layoutSizeAlign(layouts.getLayout(source.ret_layout));
+    const sizes = [_]u64{ buffers.result_buffer_size, buffers.result_buffer_alignment, result.size, result.alignment.toByteUnits() };
+    var size_locals: [sizes.len]LocalId = undefined;
+    for (&size_locals) |*size_local| size_local.* = try freshLocal(store, &frame, allocator, .u64);
+
+    var head = try store.addCFStmt(.{ .ret = .{ .value = value } }, origin);
+    head = try store.addLowLevelStmt(try freshLocal(store, &frame, allocator, .zst), .task_run_end, &.{ slot, size_locals[2], size_locals[3] }, head, origin);
+    head = try store.addTaskResultLoad(value, slot, start.proc, head, origin);
+    head = try store.addLowLevelStmt(slot, .task_run, &.{ record, size_locals[0], size_locals[1], size_locals[2], size_locals[3] }, head, origin);
+    head = try sizeLiterals(store, &size_locals, &sizes, head, origin);
+    head = try packStart(allocator, store, layouts, &frame, start, entry_args, record, head, origin);
     std.mem.sort(LocalId, frame.items, {}, localLessThan);
     const spec = store.getProcSpecPtr(entry);
     spec.args = try store.addLocalSpan(entry_args);
@@ -1829,19 +1889,15 @@ test "a provides root that may suspend is started as a task by an entry that tak
     defer f.deinit();
     const y = try f.local();
     const t = try f.local();
-    // f(y) = t = seed(); ret t, a provides root beside one that never suspends
+    // f(y) = t = seed(); ret t
     const ret = try f.stmt(.{ .ret = .{ .value = t } });
     const site = try f.callSeed(t, ret);
     const p = try f.addProc(&.{y}, &.{ y, t }, site);
-    const z = try f.local();
-    const quiet = try f.addProc(&.{z}, &.{z}, try f.stmt(.{ .ret = .{ .value = z } }));
     const count = f.store.procSpecCount();
-    var roots = [_]ProcId{ p, quiet };
+    var roots = [_]ProcId{p};
 
-    try run(testing.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{ true, true } });
+    try run(testing.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .mode = .tasks });
 
-    // The root that never suspends keeps its place.
-    try testing.expectEqual(quiet, roots[1]);
     const start: ProcId = @fromBackingInt(@intCast(count));
     const entry: ProcId = @fromBackingInt(@intCast(count + 1));
     try testing.expectEqual(entry, roots[0]);
@@ -1888,6 +1944,66 @@ test "a provides root that may suspend is started as a task by an entry that tak
     defer testing.allocator.free(call_args);
     try testing.expectEqualSlices(LocalId, &.{ field.target, start_args[0] }, call_args);
     try testing.expectEqual(call.target, f.at(call.next).ret.value);
+}
+
+test "in a program without tasks a root that may suspend is run by an entry with its own signature" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const y = try f.local();
+    const t = try f.local();
+    // f(y) = t = seed(); ret t, a provides root beside one that never suspends
+    const ret = try f.stmt(.{ .ret = .{ .value = t } });
+    const site = try f.callSeed(t, ret);
+    const p = try f.addProc(&.{y}, &.{ y, t }, site);
+    const z = try f.local();
+    const quiet = try f.addProc(&.{z}, &.{z}, try f.stmt(.{ .ret = .{ .value = z } }));
+    const count = f.store.procSpecCount();
+    var roots = [_]ProcId{ p, quiet };
+    try testing.expect(!f.store.runsTasks());
+
+    try run(testing.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{ true, true } });
+
+    // The root that never suspends keeps its place.
+    try testing.expectEqual(quiet, roots[1]);
+    const start: ProcId = @fromBackingInt(@intCast(count));
+    const entry: ProcId = @fromBackingInt(@intCast(count + 1));
+    try testing.expectEqual(entry, roots[0]);
+    try testing.expect(f.store.runsTasks());
+    try testing.expectEqual(@as(?TaskMode, null), f.store.taskMode());
+
+    // E(y') = cap = {y'}; rec = <S cap>; sizes; slot = task_run(rec, sizes);
+    // value = load slot; task_run_end(slot, sizes); ret value
+    const entry_args = try f.locals(f.spec(entry).args);
+    defer testing.allocator.free(entry_args);
+    try testing.expectEqual(@as(usize, 1), entry_args.len);
+    try testing.expectEqual(layout.Idx.u64, f.store.getLocal(entry_args[0]).layout_idx);
+    try testing.expectEqual(layout.Idx.u64, f.spec(entry).ret_layout);
+    try testing.expectEqual(LIR.Suspends.never, f.spec(entry).suspends);
+    const capture = f.at(f.spec(entry).body.get().?).assign_struct;
+    const pack = f.at(capture.next).assign_packed_erased_fn;
+    try testing.expectEqual(start, f.store.stmtRow(pack.data).proc);
+    var cursor = pack.next;
+    var sizes: [4]i64 = undefined;
+    for (&sizes) |*size| {
+        const literal = f.at(cursor).assign_literal;
+        size.* = literal.value.i64_literal.value;
+        cursor = literal.next;
+    }
+    // The result buffer and the root's result each fit a U64.
+    try testing.expectEqualSlices(i64, &.{ 8, 8, 8, 8 }, &sizes);
+    const task_run = f.at(cursor).assign_low_level;
+    try testing.expectEqual(LIR.LowLevel.task_run, task_run.op);
+    const run_args = try f.locals(task_run.args);
+    defer testing.allocator.free(run_args);
+    try testing.expectEqual(pack.target, run_args[0]);
+    const load = f.at(task_run.next).assign_low_level;
+    try testing.expectEqual(LIR.LowLevel.ptr_load, load.op);
+    const run_end = f.at(load.next).assign_low_level;
+    try testing.expectEqual(LIR.LowLevel.task_run_end, run_end.op);
+    const end_args = try f.locals(run_end.args);
+    defer testing.allocator.free(end_args);
+    try testing.expectEqualSlices(LocalId, &.{ task_run.target, run_args[3], run_args[4] }, end_args);
+    try testing.expectEqual(load.target, f.at(run_end.next).ret.value);
 }
 
 test "the mode picks the operation that creates a root's task" {

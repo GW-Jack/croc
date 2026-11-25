@@ -5,9 +5,10 @@
 //! helpers, its sequential form. A loop whose `run_next!` specialization may
 //! suspend, or whose procedure may wait on shared state, is task-form: this
 //! rewrites each of its helper calls in place to running-set operations, which
-//! name the set by the loop's id. In a `Tasks` build it also replaces the body of
-//! each `run_supervised!` specialization with its restart loop ("Supervision."),
-//! and those of the `cell_wait!` and `cell_settle!` specializations with their
+//! name the set by the loop's id. In a build with tasks it also replaces the body
+//! of each `run_supervised!` specialization with its restart loop
+//! ("Supervision."). In one with tasks or whose updates can wait, it replaces
+//! those of the `cell_wait!` and `cell_settle!` specializations with their
 //! operations ("Shared State", "Waiting."). The continuation pass runs this
 //! before it finds any sites, since a promoted `group_next` is a park site, and
 //! afterwards gives every operation its task.
@@ -46,8 +47,9 @@ const Loop = struct {
 };
 
 /// Promote every task-form loop in the program (design.md "Promotion"), and
-/// in a `Tasks` build every `run_supervised!`, `cell_wait!` and
-/// `cell_settle!` specialization ("Supervision."; "Shared State", "Waiting.").
+/// in a build with tasks every `run_supervised!` specialization, and where
+/// updates can wait every `cell_wait!` and `cell_settle!` one ("Supervision.";
+/// "Shared State", "Waiting.").
 pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, mode: base.ConcurrencyMode) Allocator.Error!void {
     var loops = collections.DenseMapUnmanaged(ProcId, Loop).empty;
     defer loops.deinit(allocator);
@@ -56,21 +58,23 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, mode:
 
     // Start procedures are added below; none of them calls a helper.
     const proc_count = store.procSpecCount();
-    var waits = if (mode.hasTasks()) try SuspensionMarks.mayWait(allocator, store) else try std.bit_set.DynamicBitSetUnmanaged.initEmpty(allocator, proc_count);
-    defer waits.deinit(allocator);
+    // Nothing waits in a program without tasks whose updates can't.
+    const waits = mode.hasTasks() or holdsWait(store);
+    var may_wait = if (waits) try SuspensionMarks.mayWait(allocator, store) else try std.bit_set.DynamicBitSetUnmanaged.initEmpty(allocator, proc_count);
+    defer may_wait.deinit(allocator);
     for (0..proc_count) |index| {
         const proc_id: ProcId = @fromBackingInt(@intCast(index));
         const proc = store.getProcSpecImmediate(proc_id);
         if (proc.running_set_helper != .run_next or proc.suspends == .never) continue;
         try loops.put(allocator, proc_id, try describe(allocator, store, layouts, &starts, proc_id));
     }
-    if (mode.hasTasks()) {
+    if (waits) {
         for (0..proc_count) |index| {
             const proc_id: ProcId = @fromBackingInt(@intCast(index));
             const proc = store.getProcSpecImmediate(proc_id);
             if (proc.body.get() == null) continue;
             switch (proc.running_set_helper) {
-                .run_supervised => try promoteSupervised(allocator, store, layouts, &starts, proc_id),
+                .run_supervised => if (mode.hasTasks()) try promoteSupervised(allocator, store, layouts, &starts, proc_id),
                 .cell_lock => if (mode == .parallel_tasks) try promoteCell(allocator, store, proc_id, .cell_lock),
                 .cell_wait => try promoteCell(allocator, store, proc_id, .cell_wait),
                 .cell_settle => try promoteCell(allocator, store, proc_id, .cell_settle),
@@ -78,8 +82,17 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, mode:
             }
         }
     }
-    if (loops.count() == 0 and waits.count() == 0) return;
-    for (0..proc_count) |index| try promoteIn(allocator, store, layouts, &loops, &starts, waits.isSet(index), @fromBackingInt(@intCast(index)));
+    if (loops.count() == 0 and may_wait.count() == 0) return;
+    for (0..proc_count) |index| try promoteIn(allocator, store, layouts, &loops, &starts, may_wait.isSet(index), @fromBackingInt(@intCast(index)));
+}
+
+/// Whether this compilation holds the body of a `cell_wait!` specialization.
+fn holdsWait(store: *const LirStore) bool {
+    for (0..store.procSpecCount()) |index| {
+        const proc = store.getProcSpecImmediate(@fromBackingInt(@intCast(index)));
+        if (proc.running_set_helper == .cell_wait and proc.body.get() != null) return true;
+    }
+    return false;
 }
 
 /// The helpers a task-form `run_next!` calls: exactly one specialization

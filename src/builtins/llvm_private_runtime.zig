@@ -33,6 +33,7 @@ comptime {
     @export(&crash_exit.crashExits, .{ .name = "roc_task_crash_exits", .visibility = .hidden });
     @export(crash_exit.setjmp, .{ .name = "roc_task_setjmp", .visibility = .hidden });
     @export(&crash_exit.longjmp, .{ .name = "roc_task_longjmp", .visibility = .hidden });
+    @export(&crash_exit.threadIdOf, .{ .name = "roc_task_thread_id", .visibility = .hidden });
 }
 
 /// Darwin targets lower a zero fill of unknown length to `bzero`, which

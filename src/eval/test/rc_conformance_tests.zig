@@ -1270,6 +1270,7 @@ const exemptions = [_]Exemption{
     .{ .op = .list_reverse, .reason = "no producer: List.rev is written in Roc over list_get_unsafe" },
     .{ .op = .task_create, .reason = "only the continuation pass emits it, for a provides root of a platform that declares `concurrency: Tasks`, which this sweep's platform-free sources cannot declare; the task-ops LIR tests and the tasks end-to-end leak checks pin that it takes its start record" },
     .{ .op = .task_create_parallel, .reason = "task_create, for a platform that declares `concurrency: ParallelTasks`" },
+    .{ .op = .task_run, .reason = "only the continuation pass emits it, for a provides root of a program without tasks whose updates can wait, which this sweep's sources, each a pure expression, cannot hold; the task-ops LIR and backend leak checks pin that it takes its start record" },
     .{ .op = .group_init, .reason = running_set_reason },
     .{ .op = .group_push, .reason = running_set_reason },
     .{ .op = .group_start, .reason = running_set_reason },

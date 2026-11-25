@@ -61,6 +61,7 @@ test "builtins tests" {
     std.testing.refAllDecls(@import("task_group_threads_test.zig"));
     std.testing.refAllDecls(@import("task_parallel_test.zig"));
     std.testing.refAllDecls(@import("task_cell_threads_test.zig"));
+    std.testing.refAllDecls(@import("task_scheduler_test.zig"));
     std.testing.refAllDecls(@import("in_process_host.zig"));
     std.testing.refAllDecls(@import("shim_symbols.zig"));
     std.testing.refAllDecls(@import("list.zig"));

@@ -46,9 +46,9 @@ const Walk = struct {
 /// Commit `suspends` on every procedure with a body and `suspension_site` on
 /// every direct call.
 ///
-/// `mode` is the platform's: in a build with tasks every `run_supervised`
-/// and `cell_wait` specialization is a seed (design.md "Plans And Concurrent
-/// Loops", "Supervision."; "Shared State", "Waiting.").
+/// `mode` is the platform's: every `cell_wait` specialization is a seed, and in
+/// a build with tasks every `run_supervised` one (design.md "Shared State",
+/// "Waiting."; "Plans And Concurrent Loops", "Supervision.").
 pub fn run(allocator: Allocator, store: *LirStore, mode: ConcurrencyMode) Allocator.Error!void {
     if (!anySeed(store, mode)) {
         // Nothing can suspend: commit `never` without walking. A Debug
@@ -76,10 +76,8 @@ pub fn run(allocator: Allocator, store: *LirStore, mode: ConcurrencyMode) Alloca
     var walk = try walkBodies(allocator, store);
     defer walk.deinit(allocator);
     const calls = &walk.calls;
-    if (mode.hasTasks()) {
-        for (0..store.procSpecCount()) |index| {
-            if (seeds(store.getProcSpecImmediate(@fromBackingInt(@as(u32, @intCast(index)))))) walk.parks.set(index);
-        }
+    for (0..store.procSpecCount()) |index| {
+        if (seeds(store.getProcSpecImmediate(@fromBackingInt(@as(u32, @intCast(index)))), mode)) walk.parks.set(index);
     }
     var may = try maySuspend(allocator, store, calls.items, &walk.parks);
     defer may.deinit(allocator);
@@ -99,21 +97,22 @@ pub fn run(allocator: Allocator, store: *LirStore, mode: ConcurrencyMode) Alloca
     if (builtin.mode == .debug) try verify(allocator, store, calls.items, &walk.parks);
 }
 
-/// Whether a procedure is a `run_supervised` or `cell_wait` specialization
-/// this compilation has the body of; a cached one's producer committed its
-/// mark.
-fn seeds(proc: *const LIR.LirProcSpec) bool {
-    if (proc.running_set_helper != .run_supervised and proc.running_set_helper != .cell_wait) return false;
-    return proc.body.get() != null;
+/// Whether a procedure is a `cell_wait` specialization, or in a build with
+/// tasks a `run_supervised` one, that this compilation has the body of; a
+/// cached one's producer committed its mark.
+fn seeds(proc: *const LIR.LirProcSpec, mode: ConcurrencyMode) bool {
+    if (proc.body.get() == null) return false;
+    if (proc.running_set_helper == .cell_wait) return true;
+    return mode.hasTasks() and proc.running_set_helper == .run_supervised;
 }
 
-/// Whether any body-less procedure is marked as one that may suspend, or a
-/// build with tasks holds a seed's body.
+/// Whether any body-less procedure is marked as one that may suspend, or this
+/// compilation holds a seed's body.
 fn anySeed(store: *const LirStore, mode: ConcurrencyMode) bool {
     for (0..store.procSpecCount()) |index| {
         const proc = store.getProcSpecImmediate(@fromBackingInt(@as(u32, @intCast(index))));
         if (proc.body.get() == null and proc.suspends == .may) return true;
-        if (mode.hasTasks() and seeds(proc)) return true;
+        if (seeds(proc, mode)) return true;
     }
     return false;
 }
@@ -389,7 +388,7 @@ test "a running set's next makes its procedure suspend, and its callers" {
     try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(leaf.proc).suspends);
 }
 
-test "a wait on shared state makes its helper suspend, and the helper's callers, only in a build with tasks" {
+test "a wait on shared state makes its helper suspend, and the helper's callers, in every mode" {
     const a = testing.allocator;
     for ([_]ConcurrencyMode{ .none, .tasks, .parallel_tasks }) |mode| {
         var store = LirStore.init(a);
@@ -403,10 +402,9 @@ test "a wait on shared state makes its helper suspend, and the helper's callers,
 
         try run(a, &store, mode);
 
-        const expected: LIR.Suspends = if (mode.hasTasks()) .may else .never;
-        try testing.expectEqual(expected, store.getProcSpecImmediate(helper.proc).suspends);
-        try testing.expectEqual(expected, store.getProcSpecImmediate(caller.proc).suspends);
-        try testing.expectEqual(mode.hasTasks(), isSite(&store, caller.call.?));
+        try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(helper.proc).suspends);
+        try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(caller.proc).suspends);
+        try testing.expect(isSite(&store, caller.call.?));
         try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(settle.proc).suspends);
         try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(settling.proc).suspends);
     }

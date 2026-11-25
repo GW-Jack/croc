@@ -6689,6 +6689,29 @@ pub const Interpreter = struct {
                 break :blk try self.pointerValue(ll.ret_layout, @intFromPtr(task));
             },
 
+            .task_run => blk: {
+                const start = self.readBoxedDataPointer(args[0]) orelse
+                    return self.invariantFailedError("LIR/interpreter invariant violated: task_run had no start record", .{});
+                const result = builtins.task.Scheduler.run(
+                    self.roc_env.currentRocOps(),
+                    start,
+                    @intCast(args[1].read(u64)),
+                    @intCast(args[2].read(u64)),
+                    @intCast(args[3].read(u64)),
+                    @intCast(args[4].read(u64)),
+                );
+                break :blk try self.pointerValue(ll.ret_layout, @intFromPtr(result));
+            },
+            .task_run_end => blk: {
+                builtins.task.Scheduler.runEnd(
+                    self.roc_env.currentRocOps(),
+                    @ptrFromInt(self.readPointerInt(args[0])),
+                    @intCast(args[1].read(u64)),
+                    @intCast(args[2].read(u64)),
+                );
+                break :blk Value.zst;
+            },
+
             // ── Running sets ──
             .group_init => blk: {
                 const result_layout = ll.group_result orelse

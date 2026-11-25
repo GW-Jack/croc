@@ -174,6 +174,10 @@ pub const ThreadSlotFn = *const fn () callconv(.c) *?*RocTask;
 /// pointer per process is enough.
 var running_serial: ?*RocTask = null;
 
+/// `Scheduler.crashed`, from a `None` program's first run that can wait on; a
+/// program that has none doesn't link it.
+var run_crashed: ?*const fn () void = null;
+
 /// The host's thread slots, from the first resume of a `ParallelTasks`
 /// program on; null in every other program.
 var thread_slot: ?ThreadSlotFn = null;
@@ -186,10 +190,14 @@ fn runningSlot() *?*RocTask {
 
 /// Take the crash exit of the running task, if there is one and the target
 /// has crash exits: keep `msg` in the task and jump back to its resume.
-/// Returns otherwise, and the caller hands the crash to the host.
+/// Returns otherwise, and the caller hands the crash to the host. A `None`
+/// program's tasks have no crash exit, only its probes do.
 pub fn crashRunning(msg: []const u8) void {
     const slot = runningSlot();
-    const task = slot.* orelse return;
+    const task = slot.* orelse {
+        const crashed_in_run = @atomicLoad(?*const fn () void, &run_crashed, .monotonic) orelse return;
+        return crashed_in_run();
+    };
     if (!crash_exit.available()) return;
     // A crash while copying the message must reach the host, not loop.
     slot.* = null;
@@ -365,6 +373,12 @@ pub const RocTask = extern struct {
     /// (`HostCalls`), and whether this one's operation is abandoned first.
     host_next: ?*RocTask,
     host_abort: bool,
+    /// The run that resumes the task, in a `None` program; null in a program
+    /// whose host does.
+    scheduler: ?*Scheduler,
+    /// The task's place in the heap that holds it (`TaskHeap`).
+    heap_child: ?*RocTask,
+    heap_sibling: ?*RocTask,
 
     /// A task with no records, which has not run.
     pub fn initial(ops: *RocOps, root_result: [*]u8, buffers: BufferLayout, hosted_slot: [*]u8, result_buffer: [*]u8) RocTask {
@@ -419,6 +433,9 @@ pub const RocTask = extern struct {
             .tree_lock = 0,
             .host_next = null,
             .host_abort = false,
+            .scheduler = null,
+            .heap_child = null,
+            .heap_sibling = null,
         };
     }
 
@@ -611,13 +628,15 @@ pub const RocTask = extern struct {
         self.unlockTree();
         if (ending) return self.finish(completed);
         self.pending = 0;
-        const exits = crash_exit.available();
+        const exits = self.scheduler == null and crash_exit.available();
         while (self.len > 0) {
             self.len -= 1;
             const entry = self.entries[self.len];
             const base = self.len;
-            // Set on every target: a settled update finds its task there.
-            runningSlot().* = self;
+            // Set on every target: a settled update finds its task there. A
+            // `None` program's runs may overlap on several threads, so they
+            // keep no running task for the process.
+            if (self.scheduler == null) runningSlot().* = self;
             if (exits) {
                 // Kept in the task, since a crash exit restores no local.
                 self.running_record = entry.record;
@@ -625,7 +644,7 @@ pub const RocTask = extern struct {
                 if (crash_exit.save(&self.crash_jmp) != 0) return self.crashed();
             }
             self.call(entry.record, if (base == 0) self.root_result else self.result_buffer);
-            runningSlot().* = null;
+            if (self.scheduler == null) runningSlot().* = null;
             std.mem.reverse(Entry, self.entries[base..self.len]);
             self.releaseRecord(entry.record, entry.from_task);
             if (self.pending != 0) switch (self.park()) {
@@ -821,7 +840,7 @@ pub const RocTask = extern struct {
     /// monitors are on (P1, P10), or in a `ParallelTasks` program the task's
     /// own (P1).
     fn claimResume(self: *RocTask) void {
-        if (!monitors) return;
+        if (!monitors or self.scheduler != null) return;
         if (self.tree != null) return self.claimParallelResume();
         const holder = @cmpxchgStrong(?*RocTask, &resuming, null, self, .acquire, .monotonic) orelse return;
         if (holder == self) hostViolation(self.ops, "a task was resumed inside its own resume, from a hosted call (P1)");
@@ -896,6 +915,12 @@ pub const RocTask = extern struct {
         return self.end(if (self.crashing) .crashed else .cancelled);
     }
 
+    /// The task, if it waits on a cell: an update it runs is then the one that
+    /// waited, run again.
+    fn retriedWaiter(self: *RocTask) ?*RocTask {
+        return if (self.waited_cell == null) null else self;
+    }
+
     /// Take the task off the waiters of the cell it waits on, if it waits,
     /// because it ended or its update answered without a `Wait`. If it
     /// carried a wake it did not pass on, the waiters after it are probed.
@@ -913,15 +938,16 @@ pub const RocTask = extern struct {
     fn leaveLocked(self: *RocTask, calls: *HostCalls) void {
         const cell = self.waited_cell.?;
         const carried = self.carries_wake;
-        const next = self.newer_waiter;
+        const next = cellWaiters(cell).after(cell, self);
         self.removeWaiter();
         if (carried) probeFrom(cell, next, calls);
     }
 
     fn removeWaiter(self: *RocTask) void {
         const waiters = cellWaiters(self.waited_cell.?);
-        if (self.older_waiter) |older| older.newer_waiter = self.newer_waiter else waiters.oldest = self.newer_waiter;
-        if (self.newer_waiter) |newer| newer.older_waiter = self.older_waiter else waiters.newest = self.older_waiter;
+        waiters.list.lock();
+        waiters.unlink(self);
+        waiters.list.unlock();
         self.waited_cell = null;
         self.older_waiter = null;
         self.newer_waiter = null;
@@ -935,10 +961,12 @@ pub const RocTask = extern struct {
     /// mean that it would, so that the update itself crashes.
     noinline fn probe(self: *RocTask) bool {
         // Kept in the task, since a crash exit restores no local.
-        self.probe_outer = runningSlot().*;
+        if (self.scheduler == null) {
+            self.probe_outer = runningSlot().*;
+            runningSlot().* = self;
+        }
         self.probe_goes_on = true;
         self.probing = true;
-        runningSlot().* = self;
         if (!crash_exit.available() or crash_exit.save(&self.crash_jmp) == 0) {
             var answer: u8 = undefined;
             var out_desc: ?*const anyopaque = null;
@@ -953,7 +981,7 @@ pub const RocTask = extern struct {
             self.probe_goes_on = answer != 0;
         }
         self.probing = false;
-        runningSlot().* = self.probe_outer;
+        if (self.scheduler == null) runningSlot().* = self.probe_outer;
         return self.probe_goes_on;
     }
 
@@ -1041,6 +1069,19 @@ pub const RocTask = extern struct {
     }
 };
 
+/// A lock a short piece of the runtime's own code holds.
+const SpinLock = struct {
+    word: u32 = 0,
+
+    fn lock(self: *SpinLock) void {
+        while (@cmpxchgWeak(u32, &self.word, 0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *SpinLock) void {
+        @atomicStore(u32, &self.word, 0, .release);
+    }
+};
+
 /// The tasks waiting on the cells that share one entry of `cell_waiters`,
 /// oldest first.
 const CellWaiters = struct {
@@ -1048,8 +1089,42 @@ const CellWaiters = struct {
     /// an update holds it from taking its cell's state until it settled or
     /// waits, so it covers the cells' payloads and this list.
     locked: u32 = 0,
+    /// The lock of the list's links, which cells of a `None` program's runs on
+    /// several threads share.
+    list: SpinLock = .{},
     oldest: ?*RocTask = null,
     newest: ?*RocTask = null,
+
+    /// The oldest waiter of `cell` that is newer than `last`, or its oldest. A
+    /// waiter of `cell` stays in the list while the caller may use the cell.
+    fn after(self: *CellWaiters, cell: *anyopaque, last: ?*RocTask) ?*RocTask {
+        self.list.lock();
+        defer self.list.unlock();
+        var next = if (last) |task| task.newer_waiter else self.oldest;
+        while (next) |waiter| : (next = waiter.newer_waiter) {
+            if (waiter.waited_cell.? == cell) return waiter;
+        }
+        return null;
+    }
+
+    /// Whether no task waits on a cell that shares the entry.
+    fn empty(self: *const CellWaiters) bool {
+        return @atomicLoad(?*RocTask, &self.oldest, .monotonic) == null;
+    }
+
+    /// Put `task` last. The list is locked.
+    fn link(self: *CellWaiters, task: *RocTask) void {
+        task.older_waiter = self.newest;
+        task.newer_waiter = null;
+        if (self.newest) |newest| newest.newer_waiter = task else @atomicStore(?*RocTask, &self.oldest, task, .monotonic);
+        self.newest = task;
+    }
+
+    /// Take `task` off. The list is locked.
+    fn unlink(self: *CellWaiters, task: *RocTask) void {
+        if (task.older_waiter) |older| older.newer_waiter = task.newer_waiter else @atomicStore(?*RocTask, &self.oldest, task.newer_waiter, .monotonic);
+        if (task.newer_waiter) |newer| newer.older_waiter = task.older_waiter else self.newest = task.older_waiter;
+    }
 
     fn lock(self: *CellWaiters) void {
         while (@cmpxchgWeak(u32, &self.locked, 0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
@@ -1100,15 +1175,14 @@ pub fn cellWait(task: *RocTask, cell: *anyopaque, probe: [*]u8) void {
         erased_callable.decref(task.waiting_probe, task.ops);
         task.waiting_probe = probe;
         task.carries_wake = false;
-        probeFrom(cell, task.newer_waiter, &task.passed_wake);
+        probeFrom(cell, cellWaiters(cell).after(cell, task), &task.passed_wake);
     } else {
         const waiters = cellWaiters(cell);
         task.waited_cell = cell;
         task.waiting_probe = probe;
-        task.older_waiter = waiters.newest;
-        task.newer_waiter = null;
-        if (waiters.newest) |newest| newest.newer_waiter = task else waiters.oldest = task;
-        waiters.newest = task;
+        waiters.list.lock();
+        waiters.link(task);
+        waiters.list.unlock();
     }
     task.lockTree();
     task.waits_on_cell = true;
@@ -1121,12 +1195,13 @@ pub fn cellSettle(cell: *anyopaque, stored: bool) void {
     const waiters = cellWaiters(cell);
     const running = runningSlot().*;
     var calls: HostCalls = .{};
-    if (waiters.oldest) |_| {
-        if (running) |task| if (task.waited_cell != null) {
+    if (!waiters.empty()) {
+        const retried = if (running) |task| task.retriedWaiter() else Scheduler.retriedWaiter(cell);
+        if (retried) |task| {
             std.debug.assert(task.waited_cell.? == cell); // rationale: a readied waiter's code goes on with the update that waited
             if (stored) task.removeWaiter() else task.leaveLocked(&calls);
-        };
-        if (stored) probeFrom(cell, waiters.oldest, &calls);
+        }
+        if (stored) probeFrom(cell, waiters.after(cell, null), &calls);
     }
     waiters.unlockUpdate(running);
     calls.make();
@@ -1139,8 +1214,7 @@ pub fn cellSettle(cell: *anyopaque, stored: bool) void {
 /// The cell's waiters are locked.
 fn probeFrom(cell: *anyopaque, first: ?*RocTask, calls: *HostCalls) void {
     var next = first;
-    while (next) |waiter| : (next = waiter.newer_waiter) {
-        if (waiter.waited_cell.? != cell) continue;
+    while (next) |waiter| : (next = cellWaiters(cell).after(cell, waiter)) {
         if (waiter.carries_wake) return;
         // A task that runs no more of its code leaves the cell when it ends.
         if (@atomicLoad(bool, &waiter.cancel_requested, .monotonic) or @atomicLoad(bool, &waiter.crashing, .monotonic)) continue;
@@ -1164,6 +1238,12 @@ fn probeEveryCell(parallel: bool) void {
         if (parallel) waiters.unlock();
         calls.make();
     }
+}
+
+/// Whether any task waits on a cell, when no thread runs a task. For tests.
+pub fn anyWaiter() bool {
+    for (&cell_waiters) |*waiters| if (!waiters.empty()) return true;
+    return false;
 }
 
 fn oldestOf(waiters: *const CellWaiters, cell: *anyopaque) ?*RocTask {
@@ -1196,6 +1276,11 @@ const HostCalls = extern struct {
         while (next) |task| {
             // Once it is readied, another thread may resume the task.
             next = task.host_next;
+            if (task.scheduler) |scheduler| {
+                std.debug.assert(!task.host_abort); // rationale: a `None` program's hosted calls never pause
+                scheduler.ready(task);
+                continue;
+            }
             if (task.host_abort) {
                 callHost(task.abort_fn.?, task);
                 if (monitors) @atomicStore(bool, &task.aborted, true, .monotonic);
@@ -1334,6 +1419,9 @@ pub const Group = struct {
     /// Entries that aren't background and are unstarted or running: the
     /// ones that keep the loop going.
     foreground_left: u32,
+    /// The running entries that have not begun and that the scheduler has not
+    /// taken, in a `None` program (`Scheduler`).
+    unbegun: TaskHeap,
     /// Whether only background entries were left and `groupNext` cancelled
     /// them: what arrives after is dropped, and the loop ends.
     ending: bool,
@@ -1411,7 +1499,7 @@ pub const Group = struct {
     /// `roc_task_ready`. The tree is locked.
     fn start(self: *Group, index: u32, calls: *HostCalls) void {
         const owner = self.owner;
-        if (owner.ready_fn == null) utils.builtinInvariant(owner.ops, "a task started children without the host's roc_task_ready; its resume came from no host");
+        if (owner.ready_fn == null and owner.scheduler == null) utils.builtinInvariant(owner.ops, "a task started children without the host's roc_task_ready; its resume came from no host");
         const entry = &self.entries[index];
         for (self.path(entry)) |limit| {
             self.limits[limit].running += 1;
@@ -1422,6 +1510,7 @@ pub const Group = struct {
         child.tree = owner.tree;
         child.ready_fn = owner.ready_fn;
         child.abort_fn = owner.abort_fn;
+        child.scheduler = owner.scheduler;
         child.group = self;
         child.entry_index = index;
         child.tree_index = entry.tree_index;
@@ -1577,6 +1666,8 @@ pub const Group = struct {
             }
         }
         self.first_unstarted = self.len;
+        // Every entry that has not begun was cancelled, so it may end now.
+        if (self.owner.scheduler) |scheduler| scheduler.readied.takeAll(&self.unbegun);
     }
 
     /// Ready the tasks a cancel reached and release the start records it
@@ -1684,6 +1775,7 @@ pub fn groupInit(
         .live = 0,
         .unstarted = 0,
         .foreground_left = 0,
+        .unbegun = .{},
         .ending = false,
         .supervised = supervised,
         .crash_message = undefined,
@@ -1816,12 +1908,12 @@ pub fn groupFree(group: *Group) void {
     group.close();
 }
 
-/// Whether a host under the coroutine schedule may resume `task` next, as far
-/// as beginning it goes. A task that has begun, or that a cancel asked to
+/// Whether `task` may be resumed next under the coroutine schedule, as far as
+/// beginning it goes. A task that has begun, or that a cancel asked to
 /// end, always may. An entry that has not begun may only while its owner is
 /// parked on the group that holds it, waiting at its loop's next; otherwise
-/// another task must run first, if one can. For a test host (design.md
-/// "Sequential equivalence"); not part of the host ABI.
+/// another task must run first, if one can. For `Scheduler` and a test host
+/// (design.md "Sequential equivalence"); not part of the host ABI.
 pub fn coroutineMayBegin(task: *const RocTask) bool {
     if (task.started or task.cancel_requested) return true;
     const group = task.group orelse return true;
@@ -1830,8 +1922,9 @@ pub fn coroutineMayBegin(task: *const RocTask) bool {
 
 /// Where `a` comes in the task tree against `b`, which shares its root: an
 /// ancestor before its descendants, and siblings in the order their entries
-/// were made. For a test host that resumes the ready task first in the tree
-/// (design.md "Sequential equivalence"); not part of the host ABI.
+/// were made. For `Scheduler`, and a test host that resumes the ready task
+/// first in the tree (design.md "Sequential equivalence"); not part of the host
+/// ABI.
 pub fn treeOrder(a: *const RocTask, b: *const RocTask) std.math.Order {
     var x = a;
     var y = b;
@@ -1863,6 +1956,227 @@ fn treeDepth(task: *const RocTask) u32 {
     while (current.group) |group| : (current = group.owner) depth += 1;
     return depth;
 }
+
+/// Tasks of one run, linked through them, so that the one first in the task
+/// tree is the cheapest to find: a pairing heap. A task is in at most one.
+const TaskHeap = struct {
+    first: ?*RocTask = null,
+
+    fn add(self: *TaskHeap, task: *RocTask) void {
+        std.debug.assert(task.heap_child == null and task.heap_sibling == null); // rationale: `takeFirst` clears both
+        self.first = merge(self.first, task);
+    }
+
+    /// Move every task of `other` here.
+    fn takeAll(self: *TaskHeap, other: *TaskHeap) void {
+        self.first = merge(self.first, other.first);
+        other.first = null;
+    }
+
+    fn takeFirst(self: *TaskHeap) ?*RocTask {
+        const taken = self.first orelse return null;
+        // Merge the children in pairs, then each pair into the rest.
+        var pairs: ?*RocTask = null;
+        var next = taken.heap_child;
+        while (next) |left| {
+            const right = left.heap_sibling;
+            left.heap_sibling = null;
+            next = if (right) |one| one.heap_sibling else null;
+            if (right) |one| one.heap_sibling = null;
+            const pair = merge(left, right).?;
+            pair.heap_sibling = pairs;
+            pairs = pair;
+        }
+        var rest: ?*RocTask = null;
+        while (pairs) |pair| {
+            pairs = pair.heap_sibling;
+            pair.heap_sibling = null;
+            rest = merge(rest, pair);
+        }
+        self.first = rest;
+        taken.heap_child = null;
+        return taken;
+    }
+
+    /// The heap of two heaps' tasks; neither root has a sibling.
+    fn merge(a: ?*RocTask, b: ?*RocTask) ?*RocTask {
+        const x = a orelse return b;
+        const y = b orelse return a;
+        const first, const other = if (treeOrder(x, y) == .lt) .{ x, y } else .{ y, x };
+        other.heap_sibling = first.heap_child;
+        first.heap_child = other;
+        return first;
+    }
+};
+
+/// One run of a `None` program that can wait on shared state (design.md
+/// "Shared State", "Programs without tasks."): the host of its tasks, from
+/// `task_run`'s call of the root until it ends. Runs on several threads may
+/// overlap, and one may be inside another's hosted call; each has its own
+/// tasks.
+pub const Scheduler = struct {
+    /// The thread the run is on (`crash_exit.threadId`).
+    thread: u64,
+    root: *RocTask,
+    /// The task whose resume is running.
+    running: ?*RocTask,
+    /// The tasks to resume: those readied, and of each group whose owner is
+    /// waiting at its loop's next, the first entry that has not begun.
+    readied: TaskHeap,
+
+    /// The message of the crash when no task can run.
+    pub const deadlock = "deadlock: no task can ever change the shared state this task waits for";
+
+    /// `task_run`: run the root whose start record is `start`, with every task
+    /// it makes, until it ends. Returns the address of its result, which
+    /// `runEnd` frees once the caller has moved it out.
+    pub fn run(ops: *RocOps, start: [*]u8, buffer_size: usize, buffer_alignment: usize, result_size: usize, result_alignment: usize) [*]u8 {
+        @atomicStore(?*const fn () void, &run_crashed, &crashed, .monotonic);
+        const result = allocBuffer(ops, result_size, result_alignment);
+        var self = Scheduler{ .thread = crash_exit.threadId(), .root = undefined, .running = null, .readied = .{} };
+        self.root = RocTask.create(ops, start, result, .{
+            .hosted_slot_size = 0,
+            .hosted_slot_alignment = 1,
+            .result_buffer_size = buffer_size,
+            .result_buffer_alignment = buffer_alignment,
+        });
+        self.root.scheduler = &self;
+        self.readied.add(self.root);
+        while (true) {
+            const task = self.next() orelse ops.crash(deadlock);
+            // The entry after it is the next one its owner asked for.
+            if (!task.started) if (task.group) |group| self.offer(group);
+            self.running = task;
+            const status = task.resumeTask();
+            self.running = null;
+            if (status == .pending) {
+                if (task.wait) |group| self.offer(group);
+            } else if (task == self.root) break;
+        }
+        self.root.release();
+        return result;
+    }
+
+    /// `task_run_end`.
+    pub fn runEnd(ops: *RocOps, result: [*]u8, result_size: usize, result_alignment: usize) void {
+        freeBuffer(ops, result, result_size, result_alignment);
+    }
+
+    /// `task` may be resumed: it is new, or was parked and now has something.
+    fn ready(self: *Scheduler, task: *RocTask) void {
+        if (coroutineMayBegin(task)) return self.readied.add(task);
+        task.group.?.unbegun.add(task);
+    }
+
+    /// Ready the first entry of `group` that has not begun, if its owner waits
+    /// at its loop's next.
+    fn offer(self: *Scheduler, group: *Group) void {
+        const first = group.unbegun.takeFirst() orelse return;
+        if (group.owner.wait != group) return group.unbegun.add(first);
+        self.readied.add(first);
+    }
+
+    /// The next task to resume, or null when none can run.
+    fn next(self: *Scheduler) ?*RocTask {
+        while (self.readied.takeFirst()) |task| {
+            if (coroutineMayBegin(task)) return task;
+            // Its owner is waiting elsewhere by now.
+            task.group.?.unbegun.add(task);
+        }
+        const group = self.firstUnbegun() orelse return null;
+        return group.unbegun.takeFirst();
+    }
+
+    /// The group whose entry is the first in the tree that has not begun.
+    fn firstUnbegun(self: *Scheduler) ?*Group {
+        // In tree order: a task, then its open groups' entries, outermost
+        // group first, each with its own descendants.
+        var task = self.root;
+        while (true) {
+            if (!task.started) return task.group;
+            var place = outermostEntry(task);
+            while (place == null) {
+                const group = task.group orelse return null;
+                place = entryAfter(group, task.entry_index + 1);
+                task = group.owner;
+            }
+            task = place.?;
+        }
+    }
+
+    /// The first running entry of the task's open groups.
+    fn outermostEntry(task: *RocTask) ?*RocTask {
+        return entryAfter(outermostGroup(task.open_groups, null) orelse return null, 0);
+    }
+
+    /// The group of the list that starts at `innermost` just inside of
+    /// `outer`, or its outermost.
+    fn outermostGroup(innermost: ?*Group, outer: ?*Group) ?*Group {
+        var group = innermost;
+        while (group) |open| : (group = open.outer) {
+            if (open.outer == outer) return open;
+        }
+        return null;
+    }
+
+    /// The first running entry of `group` from `index` on, or of the groups
+    /// inside it that its owner opened after it.
+    fn entryAfter(group: *Group, index: usize) ?*RocTask {
+        var current = group;
+        var from = index;
+        while (true) {
+            for (current.entries[from..current.len]) |*entry| {
+                if (entry.child) |child| return child;
+            }
+            current = outermostGroup(current.owner.open_groups, current) orelse return null;
+            from = 0;
+        }
+    }
+
+    /// The running task of the calling thread's run, if it waits on `cell`: an
+    /// update it runs is then the one that waited, run again.
+    fn retriedWaiter(cell: *anyopaque) ?*RocTask {
+        const waiters = cellWaiters(cell);
+        var next_waiter = waiters.after(cell, null);
+        while (next_waiter) |waiter| : (next_waiter = waiters.after(cell, waiter)) {
+            const scheduler = waiter.scheduler orelse continue;
+            if (scheduler.running == waiter) return waiter;
+        }
+        return null;
+    }
+
+    /// A crash with no running task. If the calling thread is running a probe
+    /// of one of its runs' waiters, that is the probe's answer. Otherwise its
+    /// runs are over, and the crash is the host's.
+    fn crashed() void {
+        const thread = crash_exit.threadId();
+        for (&cell_waiters) |*waiters| {
+            if (waiters.empty()) continue;
+            waiters.list.lock();
+            const probing = waiterOn(waiters.oldest, thread, true);
+            waiters.list.unlock();
+            if (probing) |task| if (crash_exit.available()) crash_exit.jump(&task.crash_jmp);
+        }
+        for (&cell_waiters) |*waiters| {
+            if (waiters.empty()) continue;
+            waiters.list.lock();
+            while (waiterOn(waiters.oldest, thread, false)) |task| waiters.unlink(task);
+            waiters.list.unlock();
+        }
+    }
+
+    /// The first waiter from `first` on of a run on `thread`, one whose probe
+    /// is running when `probing` holds. Another thread's are only looked at for
+    /// their run, which the list's lock keeps from ending.
+    fn waiterOn(first: ?*RocTask, thread: u64, probing: bool) ?*RocTask {
+        var next_waiter = first;
+        while (next_waiter) |waiter| : (next_waiter = waiter.newer_waiter) {
+            const scheduler = waiter.scheduler orelse continue;
+            if (scheduler.thread == thread and (!probing or waiter.probing)) return waiter;
+        }
+        return null;
+    }
+};
 
 /// A buffer no result is ever written to has no allocation.
 var empty_buffer: [1]u8 align(16) = .{0};
