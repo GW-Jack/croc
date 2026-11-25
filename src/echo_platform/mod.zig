@@ -199,14 +199,23 @@ fn handleStdoutError(err: std.Io.File.Writer.Error) noreturn {
 /// Create a minimal RocOps struct for default_app execution.
 pub fn makeDefaultRocOps(env: *EchoEnv, hosted_fns: []host_abi.HostedFn) host_abi.RocOps {
     const fns = struct {
-        const size_prefix = @sizeOf(usize);
+        /// The alignment of a block's allocation, whose prefix holds a length.
+        fn blockAlignment(alignment: usize) std.mem.Alignment {
+            return .fromByteUnits(@max(alignment, @alignOf(usize)));
+        }
+
+        /// How many bytes before a block hold its length: at least a length's,
+        /// and a multiple of the block's alignment, so the block has it too.
+        fn prefixSize(alignment: usize) usize {
+            return @max(alignment, @sizeOf(usize));
+        }
 
         /// Allocate with a size prefix so realloc/dealloc can recover the old length.
         fn rocAlloc(_: *host_abi.RocOps, length: usize, alignment: usize) callconv(.c) *anyopaque {
             const alloc = if (comptime is_wasm) std.heap.wasm_allocator else std.heap.smp_allocator;
+            const size_prefix = prefixSize(alignment);
             const total = length + size_prefix;
-            const align_enum = std.mem.Alignment.fromByteUnits(@max(alignment, @alignOf(usize)));
-            const raw = alloc.rawAlloc(total, align_enum, @returnAddress()) orelse {
+            const raw = alloc.rawAlloc(total, blockAlignment(alignment), @returnAddress()) orelse {
                 if (comptime is_wasm) @trap() else {
                     std.debug.print("roc_alloc failed: OOM\n", .{});
                     std.process.exit(1);
@@ -222,15 +231,16 @@ pub fn makeDefaultRocOps(env: *EchoEnv, hosted_fns: []host_abi.HostedFn) host_ab
             const alloc = if (comptime is_wasm) std.heap.wasm_allocator else std.heap.smp_allocator;
             // Recover the length rocAlloc stored in the prefix, then free the whole block.
             const user_ptr: [*]u8 = @ptrCast(ptr);
+            const size_prefix = prefixSize(alignment);
             const raw = user_ptr - size_prefix;
             const length = @as(*const usize, @ptrCast(@alignCast(raw))).*;
-            const align_enum = std.mem.Alignment.fromByteUnits(@max(alignment, @alignOf(usize)));
-            alloc.rawFree(raw[0 .. length + size_prefix], align_enum, @returnAddress());
+            alloc.rawFree(raw[0 .. length + size_prefix], blockAlignment(alignment), @returnAddress());
         }
 
         fn rocRealloc(_: *host_abi.RocOps, ptr: *anyopaque, new_length: usize, alignment: usize) callconv(.c) *anyopaque {
             const alloc = if (comptime is_wasm) std.heap.wasm_allocator else std.heap.smp_allocator;
-            const align_enum = std.mem.Alignment.fromByteUnits(@max(alignment, @alignOf(usize)));
+            const align_enum = blockAlignment(alignment);
+            const size_prefix = prefixSize(alignment);
 
             // Read old size from prefix
             const old_ptr: [*]u8 = @ptrCast(ptr);
@@ -343,6 +353,23 @@ fn sanitizeUtf8(input: []const u8, allocator: std.mem.Allocator) std.mem.Allocat
 }
 
 const testing = std.testing;
+
+test "makeDefaultRocOps: blocks have the alignment they were asked for" {
+    var hosted_fns = [_]host_abi.HostedFn{};
+    var env = EchoEnv{ .std_io = testing.io };
+    var ops = makeDefaultRocOps(&env, &hosted_fns);
+    for ([_]usize{ 1, 2, 4, 8, 16, 32, 64 }) |alignment| {
+        for ([_]usize{ 1, 24, 1008 }) |length| {
+            const block: [*]u8 = @ptrCast(ops.roc_alloc(&ops, length, alignment));
+            try testing.expect(std.mem.isAligned(@intFromPtr(block), alignment));
+            @memset(block[0..length], 0xa5);
+            const grown: [*]u8 = @ptrCast(ops.roc_realloc(&ops, block, length * 2, alignment));
+            try testing.expect(std.mem.isAligned(@intFromPtr(grown), alignment));
+            for (grown[0..length]) |byte| try testing.expectEqual(@as(u8, 0xa5), byte);
+            ops.roc_dealloc(&ops, grown, alignment);
+        }
+    }
+}
 const test_allocator = std.testing.allocator;
 
 test "sanitizeUtf8: valid ASCII passes through unchanged" {
