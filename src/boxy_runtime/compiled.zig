@@ -254,6 +254,16 @@ pub fn storeSlot(desc: *const TypeDesc, slot: *const usize, value: [*]const u8, 
     dst.* = slot.*;
 }
 
+/// Move the payload of the shared cell `cell` holds to `dst`, then put the
+/// value at `value`, which is borrowed, in its place.
+pub fn exchangeCell(desc: *const TypeDesc, cell: *const usize, value: [*]u8, dst: [*]u8, ops: *RocOps) void {
+    if (desc.size == 0) return;
+    const data: [*]u8 = @ptrFromInt(cell.*);
+    walk.incref(desc, value, 1, ops);
+    walk.copyBytes(dst, data, desc.size);
+    walk.copyBytes(data, value, desc.size);
+}
+
 // Representation adaptation.
 
 /// One value of an adaptation: the source bytes rebuilt at `dst` by `plan`.

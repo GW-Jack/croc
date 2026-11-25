@@ -106,7 +106,7 @@ Names := [].{
 		(e-lambda
 			(args
 				(p-assign (ident "n")))
-			(e-dispatch-call (method "plus") (constraint-fn-var 270)
+			(e-dispatch-call (method "plus") (constraint-fn-var 276)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "n"))))
@@ -118,13 +118,13 @@ Names := [].{
 				(ty-lookup (name "U64") (builtin)))))
 	(d-let
 		(p-assign (ident "Names.call"))
-		(e-call (constraint-fn-var 274)
+		(e-call (constraint-fn-var 280)
 			(e-lookup-local
 				(p-assign (ident "Names.spawn")))
 			(e-num (value "1"))))
 	(d-let
 		(p-assign (ident "Names.piped"))
-		(e-call (constraint-fn-var 277)
+		(e-call (constraint-fn-var 283)
 			(e-lookup-local
 				(p-assign (ident "Names.spawn")))
 			(e-num (value "3"))))
@@ -135,7 +135,7 @@ Names := [].{
 				(p-assign (ident "f"))
 				(e-lookup-local
 					(p-assign (ident "Names.spawn"))))
-			(e-call (constraint-fn-var 280)
+			(e-call (constraint-fn-var 286)
 				(e-lookup-local
 					(p-assign (ident "f")))
 				(e-num (value "4")))))

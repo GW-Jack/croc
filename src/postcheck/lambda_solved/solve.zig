@@ -3382,6 +3382,17 @@ const Solver = struct {
                 try self.unify(expected, try self.boxElem(args[0]));
                 try self.markErasedCallablesReachedByType(expected);
             },
+            .cell_new => {
+                expectLowLevelArity(op, args, 1);
+                try self.unify(args[0], try self.boxElem(expected));
+                try self.markErasedCallablesReachedByType(args[0]);
+            },
+            .cell_exchange => {
+                expectLowLevelArity(op, args, 2);
+                try self.unify(args[1], try self.boxElem(args[0]));
+                try self.unify(expected, try self.boxElem(args[0]));
+                try self.markErasedCallablesReachedByType(expected);
+            },
             .list_get_unsafe => {
                 expectLowLevelArity(op, args, 2);
                 try self.unify(expected, try self.listElem(args[0]));

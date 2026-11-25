@@ -145,7 +145,7 @@ main = "${y}"
 				(p-assign (ident "thing"))
 				(p-assign (ident "f")))
 			(e-block
-				(e-call (constraint-fn-var 272)
+				(e-call (constraint-fn-var 278)
 					(e-lookup-local
 						(p-assign (ident "f")))
 					(e-lookup-local
@@ -160,7 +160,7 @@ main = "${y}"
 				(ty-rigid-var-lookup (ty-rigid-var (name "b"))))))
 	(d-let
 		(p-assign (ident "y"))
-		(e-call (constraint-fn-var 281)
+		(e-call (constraint-fn-var 287)
 			(e-lookup-local
 				(p-assign (ident "call")))
 			(e-num (value "5"))
@@ -168,7 +168,7 @@ main = "${y}"
 				(args
 					(p-assign (ident "i")))
 				(e-block
-					(e-dispatch-call (method "plus") (constraint-fn-var 279)
+					(e-dispatch-call (method "plus") (constraint-fn-var 285)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "i"))))

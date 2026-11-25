@@ -1627,6 +1627,11 @@ pub const DynOp = union(enum) {
     /// box `slot`; the target is the filled slot. `slot` and `value` are
     /// consumed.
     slot_store: struct { slot: LocalId, value: LocalId, desc: LocalId },
+    /// Put `value`, which `desc` describes, in the shared cell `cell` and
+    /// move the cell's old payload into the target, which owns it (design.md
+    /// "Shared State"). `cell` and `value` are borrowed; the cell takes a
+    /// reference to `value` of its own.
+    cell_exchange: struct { cell: LocalId, value: LocalId, desc: LocalId },
     /// Structural equality (target: `Bool`) honoring nominal overrides.
     eq: struct { lhs: LocalId, rhs: LocalId, desc: LocalId },
     /// Structural hashing of `value` into `hasher` (target: the hasher's

@@ -158,7 +158,7 @@ NO CHANGE
 			(args
 				(p-assign (ident "lines"))
 				(p-assign (ident "functions")))
-			(e-dispatch-call (method "join_map") (constraint-fn-var 296)
+			(e-dispatch-call (method "join_map") (constraint-fn-var 302)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "lines"))))
@@ -169,7 +169,7 @@ NO CHANGE
 						(e-lambda
 							(args
 								(p-assign (ident "line")))
-							(e-dispatch-call (method "join_map") (constraint-fn-var 294)
+							(e-dispatch-call (method "join_map") (constraint-fn-var 300)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "functions"))))
@@ -180,7 +180,7 @@ NO CHANGE
 										(e-lambda
 											(args
 												(p-assign (ident "f")))
-											(e-call (constraint-fn-var 293)
+											(e-call (constraint-fn-var 299)
 												(e-lookup-local
 													(p-assign (ident "f")))
 												(e-lookup-local
@@ -209,7 +209,7 @@ NO CHANGE
 				(ty-apply (name "List") (builtin)
 					(ty-lookup (name "Str") (builtin))))))
 	(s-expect
-		(e-call (constraint-fn-var 367)
+		(e-call (constraint-fn-var 373)
 			(e-lookup-external
 				(builtin))
 			(e-runtime-error (tag "erroneous_value_expr"))

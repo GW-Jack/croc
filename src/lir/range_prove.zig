@@ -8158,6 +8158,8 @@ const Pass = struct {
             .group_spawn,
             .group_cancel,
             .group_free,
+            .cell_new,
+            .cell_exchange,
             .compare,
             .crash,
             => try self.bindFresh(s.target),

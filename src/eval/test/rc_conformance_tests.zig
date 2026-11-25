@@ -1263,6 +1263,8 @@ const cases = [_]Case{
 /// whose platform this sweep's sources cannot declare.
 const exemptions = [_]Exemption{
     .{ .op = .box_unbox, .reason = "allocation-consuming compiled variant is pinned by focused LIR and runtime-helper tests" },
+    .{ .op = .cell_new, .reason = "no LIR producer: lowering replaces it with box_box, or with a boxy box construction" },
+    .{ .op = .cell_exchange, .reason = "no LIR producer: lowering replaces it with a payload pointer's load and store, or with a boxy cell exchange" },
     .{ .op = .erased_capture_load, .reason = "ARC normalizes the consuming capture load into erased_capture_load_borrowed plus explicit RC statements, which the erased-call alloc-count tests and the certifier pin" },
     .{ .op = .list_prefetched, .reason = "no LIR producer: lowering splits List.prefetched into an alias of its list and list_prefetch" },
     .{ .op = .list_reverse, .reason = "no producer: List.rev is written in Roc over list_get_unsafe" },

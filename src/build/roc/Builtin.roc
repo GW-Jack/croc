@@ -4080,6 +4080,46 @@ Builtin :: [].{
 		supervise! = |{ max_restarts }, f| Concurrently.run_supervised!(max_restarts, f)
 	}
 
+	## A handle to state that tasks share. It can be captured, passed and stored
+	## like any value, and only effectful functions can use the state it names. Each
+	## [Shared.new!] makes different state, and copying a handle doesn't copy it.
+	Shared(state) :: [Cell(Box([Held(state), Moved]))].{
+
+		## Makes shared state that starts as `state`, and returns a handle to it.
+		new! : state => Shared(state)
+		new! = |state| Cell(cell_new!(Held(state)))
+
+		## Runs the function on the state, as if no other task ran meanwhile. `Set`
+		## replaces the state, `Keep` leaves it as it was, and each returns the
+		## answer it carries.
+		##
+		## If the function crashes, so does every later use of this state.
+		update! : Shared(state), (state -> [Set(state, answer), Keep(answer)]) => answer
+		update! = |Cell(cell), transform|
+			match cell_exchange!(cell, Moved) {
+				Moved => crash "this shared state was poisoned when an update crashed"
+				Held(state) => match transform(state) {
+					Set(changed, answer) => {
+						_ = cell_exchange!(cell, Held(changed))
+						answer
+					}
+					Keep(answer) => {
+						_ = cell_exchange!(cell, Held(state))
+						answer
+					}
+				}
+			}
+
+		## Returns the state. Another task can change it at once, so to act on the
+		## state, decide inside an [Shared.update!].
+		get! : Shared(state) => state
+		get! = |shared| Shared.update!(shared, |state| Keep(state))
+
+		## Replaces the state with what the function returns for it.
+		modify! : Shared(state), (state -> state) => {}
+		modify! = |shared, transform| Shared.update!(shared, |state| Set(transform(state), {}))
+	}
+
 	## A type has a default sort order when its module provides
 	## `order_relative_to : item, item -> [Before, Same, After]`.
 	## These tags say which argument comes first; they deliberately do not tie
@@ -28276,6 +28316,13 @@ append_utf8_code_point = |out, code_point|
 		b3 = 128 + code_point.bitwise_and(63)
 		u8_append(u8_append(u8_append(u8_append(out, b0.to_u8_wrap()), b1.to_u8_wrap()), b2.to_u8_wrap()), b3.to_u8_wrap())
 	}
+
+# Implemented by the compiler: a new cell of shared state
+cell_new! : item => Box(item)
+
+# Implemented by the compiler: puts the item in the cell and returns the one
+# that was there
+cell_exchange! : Box(item), item => item
 
 # Implemented by the compiler, does not perform bounds checks
 list_get_unsafe : List(item), U64 -> item

@@ -45,7 +45,7 @@ pub fn ownership(op: DynOp) Ownership {
         .box_payload_addr => |payload| .{ .borrow_component = payload.box },
         .tag_payload_addr => |payload| .{ .borrow_component = payload.base },
         .view => |view| .{ .borrow_component = view.owner orelse view.address },
-        .tag_discriminant, .eq, .hash, .inspect, .adapt => .borrow_operands,
+        .tag_discriminant, .cell_exchange, .eq, .hash, .inspect, .adapt => .borrow_operands,
         .record, .record_update, .tag, .list, .box, .slot_alloc, .slot_store, .closure => .construct,
         .call_erased => .call_erased,
     };
@@ -118,6 +118,11 @@ pub const Operands = struct {
                 result.single(store_.slot);
                 result.single(store_.value);
                 result.single(store_.desc);
+            },
+            .cell_exchange => |exchange| {
+                result.single(exchange.cell);
+                result.single(exchange.value);
+                result.single(exchange.desc);
             },
             .record_update => |update| {
                 result.single(update.base);
@@ -212,7 +217,7 @@ pub fn constructedValues(store: *const LirStore, allocator: std.mem.Allocator, o
             try out.append(allocator, closure.capture);
             if (closure.reuse) |reuse| try out.append(allocator, reuse);
         },
-        .frame_alloc, .table_entry, .copy, .field_addr, .list_item_addr, .box_payload_addr, .tag_discriminant, .tag_payload_addr, .eq, .hash, .inspect, .call_erased, .view, .adapt => unreachable, // only construct operations consume value operands
+        .frame_alloc, .table_entry, .copy, .field_addr, .list_item_addr, .box_payload_addr, .tag_discriminant, .tag_payload_addr, .cell_exchange, .eq, .hash, .inspect, .call_erased, .view, .adapt => unreachable, // only construct operations consume value operands
     }
 }
 
@@ -272,6 +277,7 @@ pub fn remapOperands(store: *LirStore, op: DynOp, context: anytype, comptime map
         .record => |record| .{ .record = .{ .desc = try Remap.one(context, record.desc), .fields = try Remap.span(store, context, record.fields) } },
         .slot_alloc => |slot| .{ .slot_alloc = .{ .desc = try Remap.one(context, slot.desc) } },
         .slot_store => |slot| .{ .slot_store = .{ .slot = try Remap.one(context, slot.slot), .value = try Remap.one(context, slot.value), .desc = try Remap.one(context, slot.desc) } },
+        .cell_exchange => |exchange| .{ .cell_exchange = .{ .cell = try Remap.one(context, exchange.cell), .value = try Remap.one(context, exchange.value), .desc = try Remap.one(context, exchange.desc) } },
         .record_update => |update| .{ .record_update = .{
             .base = try Remap.one(context, update.base),
             .base_desc = try Remap.one(context, update.base_desc),

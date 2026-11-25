@@ -731,6 +731,15 @@ pub const LowLevel = enum(u16) {
     /// (id, task) -> {}: free a set that has ended.
     group_free,
 
+    // Shared-state operations (design.md "Shared State"), which only Builtin
+    // makes. Lowering to LIR replaces each with box and pointer operations.
+    /// (T) -> Box(T): a new cell holding the payload it takes. Every call
+    /// makes a different cell, so this is never constant data.
+    cell_new,
+    /// (Box(T), T) -> T: store the payload it takes in the cell, which it
+    /// borrows, and return the one that was there, owned.
+    cell_exchange,
+
     /// Index into `builtins.simd.Op`. The SIMD entries are intentionally one
     /// contiguous, order-pinned block so the interpreter and compile-time
     /// evaluator share the semantic oracle's operation vocabulary without a
@@ -1377,6 +1386,9 @@ pub const LowLevel = enum(u16) {
         .group_spawn = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_1, .args_spawned = arg_1 }),
         .group_cancel = byType(.{ .may_retain_or_release = true }),
         .group_free = byType(.{ .may_retain_or_release = true }),
+
+        .cell_new = byLayout(.allocatesRetainingArgs(arg_0)).elements(&.{.layout}),
+        .cell_exchange = byLayout(.consumesArgsRetainingArgs(arg_1, 0)).elements(&.{ .layout, .layout }),
 
         .str_is_eq = byType(.none()),
         .str_is_eq_static_small = byType(.none()),

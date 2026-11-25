@@ -134,7 +134,7 @@ NO CHANGE
 					(e-num (value "0")))
 				(s-for
 					(p-assign (ident "x"))
-					(e-call (constraint-fn-var 281)
+					(e-call (constraint-fn-var 287)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local
@@ -142,7 +142,7 @@ NO CHANGE
 					(e-block
 						(s-reassign
 							(p-var-assign (ident "$sum"))
-							(e-dispatch-call (method "plus") (constraint-fn-var 318)
+							(e-dispatch-call (method "plus") (constraint-fn-var 324)
 								(receiver
 									(e-lookup-local
 										(p-var-assign (ident "$sum"))))

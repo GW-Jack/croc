@@ -6732,6 +6732,7 @@ pub const Interpreter = struct {
                 val.write(u32, status);
                 break :blk val;
             },
+            .cell_new, .cell_exchange => unreachable, // lowering to LIR replaces a cell operation with box and pointer operations
             .group_arrival => try self.pointerValue(ll.ret_layout, @intFromPtr(builtins.task.groupArrival(self.openGroup(args[0], args[1])))),
             .group_spawn => blk: {
                 const start = self.readBoxedDataPointer(args[1]) orelse
@@ -8989,6 +8990,14 @@ pub const Interpreter = struct {
                 };
                 const dst = try self.targetStorage(frame, target);
                 @as(*align(1) usize, @ptrCast(dst)).* = word;
+                try self.finishResultStorage(frame, stmt_id, target, dst);
+            },
+            .cell_exchange => |exchange| {
+                const payload = try self.descAt(frame, exchange.desc);
+                const cell: *const usize = @ptrCast(@alignCast(try self.localBytes(frame, exchange.cell)));
+                const value = try self.localBytes(frame, exchange.value);
+                const dst = try self.targetStorage(frame, target);
+                boxy.compiled.exchangeCell(payload, cell, value, dst, &self.roc_ops);
                 try self.finishResultStorage(frame, stmt_id, target, dst);
             },
             .slot_store => |s| {

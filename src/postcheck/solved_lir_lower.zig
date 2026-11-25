@@ -2605,7 +2605,16 @@ const Lowerer = struct {
                 .fn_ref => |ref| for (view.captureOperandSpan(ref.captures)) |capture| {
                     try self.add(.{ .expr = capture.value });
                 },
-                .low_level => |call| try self.addExprs(call.args),
+                .low_level => |call| {
+                    try self.addExprs(call.args);
+                    if (call.op == .cell_exchange) {
+                        const cell = GuardedList.at(view.exprSpan(call.args), 0);
+                        const cell_layout = l.result.layouts.getLayout(try l.layoutOfType(try l.lowerExprTy(cell)));
+                        if (cell_layout.tag != .box) Common.invariant("a shared cell's layout was not a box");
+                        // The body's address of the cell's payload.
+                        _ = try l.result.layouts.insertPtr(cell_layout.getIdx());
+                    }
+                },
                 .field_access => |field| try self.add(.{ .expr = field.receiver }),
                 .tuple_access => |access| try self.add(.{ .expr = access.tuple }),
                 .structural_eq => |eq| {
@@ -9197,14 +9206,23 @@ const Lowerer = struct {
                 .next = next,
             } }, where.source()) };
         }
-        if (op == .box_box or op == .box_unbox) {
+        if (op == .cell_exchange) {
+            if (args.len != 2) Common.invariant("cell_exchange reached LIR lowering with the wrong arity");
+            const lowered = try self.lowerExprsToTemps(args);
+            defer lowered.deinit(self.allocator);
+            const exchange = try self.assignCellExchange(where, target, lowered.ids[0], lowered.ids[1], next);
+            return .{ .tail = try self.operandChain(where, lowered, null, null, exchange) };
+        }
+        // A new cell is a new box. Only `box_box` may become static data, so
+        // the two are one operation from here on.
+        if (op == .box_box or op == .box_unbox or op == .cell_new) {
             if (args.len != 1) Common.invariant("Box low-level operation reached LIR lowering with the wrong arity");
             const arg = GuardedList.at(args, 0);
             const source_ty = try self.lowerExprTy(arg);
             const source = try self.addTemp(source_ty);
             const source_layout = self.result.store.getLocal(source).layout_idx;
             const saved_return_target = self.current_return_target;
-            if (saved_return_target == target and op == .box_box) {
+            if (saved_return_target == target and op != .box_unbox) {
                 self.current_return_target = source;
             }
             const assign = self.assignBoxBoundary(where, target, source, source_layout, next) catch |err| {
@@ -9281,6 +9299,28 @@ const Lowerer = struct {
             .next = next,
         } }, where.source());
         return .{ .tail = try self.operandChain(where, lowered, null, null, current) };
+    }
+
+    /// `target = cell_exchange(cell, payload)`: move the cell's payload out
+    /// through its address, then move the new one in (design.md "Shared
+    /// State").
+    fn assignCellExchange(self: *Lowerer, where: LowerSite, target: LIR.LocalId, cell: LIR.LocalId, payload: LIR.LocalId, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+        const cell_layout = self.result.layouts.getLayout(self.result.store.getLocal(cell).layout_idx);
+        if (cell_layout.tag != .box) Common.invariant("a shared cell's layout was not a box");
+        const payload_layout = cell_layout.getIdx();
+        const address = try self.addLocalForLayout(self.result.layouts.getPtr(payload_layout) orelse
+            Common.invariant("a shared cell's payload pointer layout was not prepared"));
+        const old = try self.addLocalForLayout(payload_layout);
+        const new = try self.addLocalForLayout(payload_layout);
+        var current = try self.maybeAssignDirectLayoutBoundary(where, target, old, next) orelse
+            Common.invariant("a shared cell's payload had no direct boundary to its state's layout");
+        // The store addresses the cell itself, so it keeps the cell alive for
+        // the load before it.
+        current = try self.result.store.addLowLevelStmt(try self.addLocalForLayout(.zst), .ptr_store, &.{ cell, new }, current, where.source());
+        current = try self.result.store.addLowLevelStmt(old, .ptr_load, &.{address}, current, where.source());
+        current = try self.result.store.addLowLevelStmt(address, .ptr_cast, &.{cell}, current, where.source());
+        return try self.maybeAssignDirectLayoutBoundary(where, new, payload, current) orelse
+            Common.invariant("a shared cell's state had no direct boundary to its payload's layout");
     }
 
     fn fieldAccessStep(

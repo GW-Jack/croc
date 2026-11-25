@@ -245,6 +245,8 @@ fn replaceProvidedByCompilerLowLevels(env: *ModuleEnv) (Allocator.Error || error
         .{ "Builtin.Str.join_with", .str_join_with },
         .{ "Builtin.Box.box", .box_box },
         .{ "Builtin.Box.unbox", .box_unbox },
+        .{ "cell_new!", .cell_new },
+        .{ "cell_exchange!", .cell_exchange },
         .{ "Builtin.List.len", .list_len },
         .{ "Builtin.List.capacity", .list_capacity },
         .{ "u8_list_len", .list_len },

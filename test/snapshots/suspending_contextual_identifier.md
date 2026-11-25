@@ -77,7 +77,7 @@ NO CHANGE
 			(e-block
 				(s-let
 					(p-assign (ident "suspending_count"))
-					(e-dispatch-call (method "plus") (constraint-fn-var 260)
+					(e-dispatch-call (method "plus") (constraint-fn-var 266)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "x"))))

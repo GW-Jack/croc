@@ -485,7 +485,7 @@ const Pass = struct {
                 var op = self.store.stmtRow(dyn.data);
                 switch (op) {
                     .closure => |*closure| closure.proc = self.remapProc(closure.proc),
-                    .frame_alloc, .table_entry, .copy, .field_addr, .list_item_addr, .box_payload_addr, .tag_discriminant, .tag_payload_addr, .record, .record_update, .tag, .list, .box, .slot_alloc, .slot_store, .eq, .hash, .inspect, .call_erased, .view, .adapt => {},
+                    .frame_alloc, .table_entry, .copy, .field_addr, .list_item_addr, .box_payload_addr, .tag_discriminant, .tag_payload_addr, .record, .record_update, .tag, .list, .box, .slot_alloc, .slot_store, .cell_exchange, .eq, .hash, .inspect, .call_erased, .view, .adapt => {},
                 }
                 if (op == .closure) dyn.data = try self.store.addStmtRow(LIR.DynOp, op);
             },
@@ -903,7 +903,7 @@ fn stmtRefs(store: *const LirStore, stmt: LIR.CFStmt) StmtRefs {
         .suspend_save => |save| return .{ .procs = .{ store.stmtRow(save.data).proc, null } },
         .dyn => |dyn| return switch (store.stmtRow(dyn.data)) {
             .closure => |closure| .{ .procs = .{ closure.proc, null } },
-            .frame_alloc, .table_entry, .copy, .field_addr, .list_item_addr, .box_payload_addr, .tag_discriminant, .tag_payload_addr, .record, .record_update, .tag, .list, .box, .slot_alloc, .slot_store, .eq, .hash, .inspect, .call_erased, .view, .adapt => .{},
+            .frame_alloc, .table_entry, .copy, .field_addr, .list_item_addr, .box_payload_addr, .tag_discriminant, .tag_payload_addr, .record, .record_update, .tag, .list, .box, .slot_alloc, .slot_store, .cell_exchange, .eq, .hash, .inspect, .call_erased, .view, .adapt => .{},
         },
         .assign_literal => |literal| {
             var refs: StmtRefs = .{};

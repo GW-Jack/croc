@@ -67,7 +67,7 @@ NO CHANGE
 			(p-assign (ident "#interp_1"))
 			(e-lookup-local
 				(p-assign (ident "world"))))
-		(e-interpolation (constraint-fn-var 264) (dispatcher-var 20)
+		(e-interpolation (constraint-fn-var 270) (dispatcher-var 20)
 			(first
 				(e-literal (string "")))
 			(parts

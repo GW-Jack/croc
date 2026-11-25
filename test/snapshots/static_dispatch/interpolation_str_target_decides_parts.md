@@ -133,7 +133,7 @@ NO CHANGE
 							(field (name "age")
 								(e-typed-int (value "36") (type "U64"))))))
 				(s-expr
-					(e-call (constraint-fn-var 336)
+					(e-call (constraint-fn-var 342)
 						(e-lookup-local
 							(p-assign (ident "echo!")))
 						(e-block

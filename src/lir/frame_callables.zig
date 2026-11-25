@@ -435,6 +435,7 @@ pub fn classifyUse(store: *const LirStore, stmt_id: CFStmtId, local: LocalId) Us
             .box,
             .slot_alloc,
             .slot_store,
+            .cell_exchange,
             .eq,
             .hash,
             .inspect,

@@ -14035,6 +14035,7 @@ fn freshBuiltinTypeInstance(self: *Self, builtin_type: Var, env: *Env, new_regio
 const BuiltinNominalDecl = union(enum) {
     list,
     concurrently,
+    shared,
     box,
     dict,
     set,
@@ -14093,6 +14094,7 @@ fn builtinNominalIdent(self: *const Self, decl: BuiltinNominalDecl) Ident.Idx {
     return switch (decl) {
         .list => self.cir.idents.builtin_list,
         .concurrently => self.cir.idents.builtin_concurrently,
+        .shared => self.cir.idents.builtin_shared,
         .box => self.cir.idents.builtin_box,
         .dict => self.cir.idents.builtin_dict,
         .set => self.cir.idents.builtin_set,
@@ -14108,6 +14110,7 @@ fn builtinNominalLabel(decl: BuiltinNominalDecl) []const u8 {
     return switch (decl) {
         .list => "List",
         .concurrently => "Concurrently",
+        .shared => "Shared",
         .box => "Box",
         .dict => "Dict",
         .set => "Set",
@@ -14160,6 +14163,7 @@ fn sourceDeclForBuiltinNominal(self: *const Self, decl: BuiltinNominalDecl) u32 
         const stmt_idx = switch (decl) {
             .list => indices.list_type,
             .concurrently => indices.concurrently_type,
+            .shared => indices.shared_type,
             .box => indices.box_type,
             .dict => indices.dict_type,
             .set => indices.set_type,
@@ -14458,6 +14462,7 @@ fn builtinNominalDeclForIdentInEnv(source_env: *const ModuleEnv, type_ident: Ide
     const common = source_env.idents;
     if (type_ident.eql(common.list) or type_ident.eql(common.builtin_list)) return .list;
     if (type_ident.eql(common.builtin_concurrently)) return .concurrently;
+    if (type_ident.eql(common.builtin_shared)) return .shared;
     if (type_ident.eql(common.box) or type_ident.eql(common.builtin_box)) return .box;
     if (type_ident.eql(common.dict) or type_ident.eql(common.builtin_dict)) return .dict;
     if (type_ident.eql(common.set) or type_ident.eql(common.builtin_set)) return .set;
@@ -14491,6 +14496,7 @@ fn builtinNominalDeclForBuiltinSourceDecl(self: *const Self, source_decl: ?u32) 
     const indices = self.builtin_ctx.builtin_indices orelse return null;
     if (raw_decl == @backingInt(indices.list_type)) return .list;
     if (raw_decl == @backingInt(indices.concurrently_type)) return .concurrently;
+    if (raw_decl == @backingInt(indices.shared_type)) return .shared;
     if (raw_decl == @backingInt(indices.box_type)) return .box;
     if (raw_decl == @backingInt(indices.dict_type)) return .dict;
     if (raw_decl == @backingInt(indices.set_type)) return .set;
@@ -14517,7 +14523,7 @@ fn builtinNominalDeclForBuiltinSourceDecl(self: *const Self, source_decl: ?u32) 
 fn builtinNumKindFromBuiltinSourceDecl(self: *const Self, source_decl: ?u32) ?CIR.NumKind {
     return switch (self.builtinNominalDeclForBuiltinSourceDecl(source_decl) orelse return null) {
         .num => |num_kind| num_kind,
-        .list, .concurrently, .box, .dict, .set, .try_type, .fields, .field, .numeral => null,
+        .list, .concurrently, .shared, .box, .dict, .set, .try_type, .fields, .field, .numeral => null,
     };
 }
 
@@ -17169,7 +17175,7 @@ fn storedNominalBacking(self: *const Self, nominal: types_mod.NominalType) Store
         if (nominal.ident.ident_idx.eql(self.cir.idents.builtin_encoding_parse_tag_union_spec)) return .intrinsic_callable;
         if (self.builtinNominalDeclForBuiltinSourceDecl(nominal.sourceDeclOptional())) |builtin_decl| switch (builtin_decl) {
             .list, .box, .dict, .set, .fields, .field, .num => return .args_only,
-            .try_type, .numeral, .concurrently => {},
+            .try_type, .numeral, .concurrently, .shared => {},
         };
     }
     const template = self.nominalDeclBackingTemplate(nominal) orelse return .invalid;
@@ -21867,7 +21873,7 @@ fn checkHostBoundaryType(self: *Self, var_: Var, region: Region) std.mem.Allocat
             return switch (ctx.check.builtinNominalDeclForBuiltinSourceDecl(nominal.sourceDeclOptional()) orelse return .other) {
                 .box => .box,
                 .list => .list,
-                .dict, .set, .try_type, .fields, .field, .numeral, .num, .concurrently => .other,
+                .dict, .set, .try_type, .fields, .field, .numeral, .num, .concurrently, .shared => .other,
             };
         }
 
@@ -21893,6 +21899,11 @@ fn checkHostBoundaryType(self: *Self, var_: Var, region: Region) std.mem.Allocat
     }
     if (try self.varViolatesHostBoundaryRule(.no_optional_fields, var_)) {
         _ = try self.problems.appendProblem(.{ .host_boundary_optional_field = .{
+            .region = region,
+        } });
+    }
+    if (try self.varViolatesHostBoundaryRule(.no_shared_handles, var_)) {
+        _ = try self.problems.appendProblem(.{ .host_boundary_shared_handle = .{
             .region = region,
         } });
     }
@@ -57642,6 +57653,9 @@ fn hostedWalkVisit(
 const HostBoundaryRule = enum {
     closed_rows,
     no_optional_fields,
+    /// Shared state belongs to tasks, so no handle to it crosses to the host
+    /// (design.md "Shared State").
+    no_shared_handles,
 };
 
 fn varViolatesHostBoundaryRule(self: *Self, rule: HostBoundaryRule, var_: Var) std.mem.Allocator.Error!bool {
@@ -57713,7 +57727,7 @@ const HostBoundaryScan = struct {
                             try scan.addRecordFields(items, record.fields);
                             try items.add(switch (scan.rule) {
                                 .closed_rows => .{ .record_ext_open = record.ext },
-                                .no_optional_fields => .{ .var_ = record.ext },
+                                .no_optional_fields, .no_shared_handles => .{ .var_ = record.ext },
                             });
                         },
                         .tuple => |tuple| try addVars(items, self.types.sliceVars(tuple.elems)),
@@ -57721,7 +57735,7 @@ const HostBoundaryScan = struct {
                             try scan.addTags(items, tag_union.tags);
                             try items.add(switch (scan.rule) {
                                 .closed_rows => .{ .tag_ext_open = tag_union.ext },
-                                .no_optional_fields => .{ .var_ = tag_union.ext },
+                                .no_optional_fields, .no_shared_handles => .{ .var_ = tag_union.ext },
                             });
                         },
                         .fn_pure, .fn_effectful, .fn_unbound => |func| {
@@ -57729,6 +57743,7 @@ const HostBoundaryScan = struct {
                             try items.add(.{ .var_ = func.ret });
                         },
                         .nominal_type => |nominal| {
+                            if (scan.rule == .no_shared_handles and self.nominalIsBuiltinDecl(nominal, .shared)) return .{ .value = true };
                             try addVars(items, self.types.sliceNominalArgs(nominal));
                             // The declaration's backing template covers the structural rows;
                             // its formals are rigid leaves (never open rows) standing for the

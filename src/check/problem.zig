@@ -99,6 +99,8 @@ pub const HostedFunctionNotEffectful = types.HostedFunctionNotEffectful;
 pub const HostedTypeVariableNotBoxed = types.HostedTypeVariableNotBoxed;
 pub const HostBoundaryOpenRow = types.HostBoundaryOpenRow;
 pub const HostBoundaryOptionalField = types.HostBoundaryOptionalField;
+/// Public `HostBoundarySharedHandle` re-export.
+pub const HostBoundarySharedHandle = types.HostBoundarySharedHandle;
 pub const PolymorphicProvidedFunction = types.PolymorphicProvidedFunction;
 pub const AnnotationOnlyValue = types.AnnotationOnlyValue;
 /// Public `AnnotationOnlyValueUse` re-export.

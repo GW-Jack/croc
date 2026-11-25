@@ -650,6 +650,8 @@ pub fn lowLevelAccess(op: LowLevel) OpAccess {
         .group_spawn,
         .group_cancel,
         .group_free,
+        .cell_new,
+        .cell_exchange,
         .crash,
         => .{},
     };

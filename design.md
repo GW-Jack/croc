@@ -33680,8 +33680,8 @@ result is ready, the Roc code that made the call pauses, and the host resumes
 it once the result has been written. This section is the compiler side of
 that. It covers a root that pauses at its hosted calls and resumes where it
 paused, and the plans and concurrent loops that run work as child tasks
-(Plans And Concurrent Loops, Child Tasks). Shared state builds on it and is
-specified separately when it is implemented.
+(Plans And Concurrent Loops, Child Tasks), and the state tasks share (Shared
+State).
 
 A task pauses only at a *suspension site*, a call the compiler knows may
 return before its result is ready. Pausing saves, in a heap *record*, the
@@ -34492,6 +34492,128 @@ under nesting and recursion.
 
 On a target without a crash exit (The Task Runtime), wasm included, a crash ends
 the process, in a supervised function too.
+
+### Shared State
+
+`Shared(s)` is a handle to a *cell* of state that tasks use while they run:
+
+```text
+Shared.new!        : s => Shared(s)
+Shared.update!     : Shared(s), (s -> [Set(s, r), Keep(r), Wait]) => r
+Shared.get!        : Shared(s) => s
+Shared.modify!     : Shared(s), (s -> s) => {}
+Shared.finally!    : Shared(s), (s -> s), (() => a) => a
+Shared.on_failure! : Shared(s), (s -> s), (() => a) => a
+```
+
+A handle is an ordinary value. It has no pure function, no equality, no
+hashing and no order, and inspecting one shows only that it's opaque, so pure
+code can hold a handle and do nothing with it. A type that crosses the host
+boundary and holds one is an error. `s` may be any type, functions and handles
+included.
+
+**An update.** `h.update!(f)` runs the pure function `f` on the state, as if no
+other task ran meanwhile:
+- `Set(new, r)` stores `new`, then wakes waiters, and returns `r`;
+- `Keep(r)` leaves the state as it was and returns `r`;
+- `Wait` leaves the state as it was and pauses the task. The update runs again
+  after another task's update stores to the cell.
+
+`get!` is an update that keeps and returns the state, and `modify!` one that
+sets it. `f` is pure, so it can't suspend, perform an effect or use a handle.
+While `f` runs the cell is empty: the state was moved out of it. So a state
+nothing else holds changes in place.
+
+**Poison.** An update or a cleanup that crashes leaves its cell empty, which
+is what poisons it. Every later update of the cell crashes, and every task
+waiting on it is readied so that it crashes too. Nothing can test for
+poison or clear it. So `[Held(s), Moved]` is the whole of a cell's state, and
+an update that finds it `Moved` crashes with `shared state was poisoned when
+an update crashed`.
+
+**The cell.** `Shared(s)` is an opaque Builtin nominal over
+`Box([Held(s), Moved])`, so its layout, reference counts and drops are those
+of a `Box`, and a cell is freed, with its state, when its last handle goes.
+Two low-level operations reach it. Nothing else reads a cell's payload, so no
+pass may treat a cell as the immutable box its layout resembles:
+- `cell_new(payload) -> Box(payload)` makes a cell. Unlike `box_box` it's
+  never evaluated at compile time, promoted to static data or shared, since
+  every cell is different state;
+- `cell_exchange(cell, payload) -> payload` borrows the cell, stores the
+  payload it consumes, and returns, owned, the one that was there.
+
+Both are effectful: their Builtin declarations have `=>` types, and no pass
+drops, duplicates or reorders one. LIR lowering emits `cell_new` as
+`box_box`, which nothing after it makes constant data, and `cell_exchange` as a
+`ptr_load` of the cell's address and a `ptr_store` to the cell, so ARC sees an
+ordinary move out of and into memory, and backends need nothing new. The store
+borrows the cell rather than its address, which keeps the cell alive for the
+load before it. Under Boxy, where a payload's type can be open, the
+two are the dynamic operations `box` and `cell_exchange`.
+
+`update!` is ordinary Builtin Roc over them:
+
+```text
+update! = |cell, f| match take!(cell) {
+    Moved => crash "..."
+    Held(state) => match f(state) {
+        Set(new, r) => { put!(cell, new); r }
+        Keep(r) => { put!(cell, state); r }
+        Wait => { put!(cell, state); wait!(cell, f); update!(cell, f) }
+    }
+}
+```
+
+Where `f` is inlined, a path that ends in `Set` no longer uses `state`, so
+ARC moves it into `new` and a unique state changes in place. Where `f` is
+called, `state` is live across the call and a `Set` copies it. Making the
+first case independent of inlining is the update form below.
+
+**Waiting.** A `Wait` parks the task at a suspension site on the cell. Waiters
+are kept oldest first. After a `Set` the runtime *probes* them in that order:
+it calls each waiter's function on the new state to learn whether it
+would answer `Wait`, and readies the first that would not. The readied
+waiter carries the wake. If it ends without storing (it answers `Keep` or
+`Wait`, crashes or is cancelled), the runtime probes on from it, so no wake
+is lost. A waiter readied again keeps its place. A probe that crashes counts as
+one that would not wait. Cancelling a parked waiter takes it off the list.
+
+**Programs without tasks.** A program none of whose updates can reach `Wait`
+runs as Plans And Concurrent Loops says, on one stack. A `None` program that
+can wait is compiled as a `Tasks` program whose hosted calls never
+pause and that carries its own scheduler, which resumes the ready task that
+comes first in the task tree, an entry that has not begun counting only when
+its loop asks for it or nothing else can run. When nothing can run, the
+program crashes with `deadlock: no task can ever change the shared state this
+task waits for`.
+
+**Cleanups.** `h.finally!(cleanup, body)` runs `body`, then applies `cleanup` to
+the state however `body` ended: it returned, its task was cancelled, or it
+crashed. `on_failure!` applies it only on a cancel or a crash. A cleanup is
+pure and cannot wait, so a task that runs no more of its own code can still
+run one. A task's pending cleanups run innermost first, after its
+descendants are gone.
+
+**Invariants.**
+
+| | Invariant |
+|---|---|
+| V1 | Shared state is reached only through `Shared`'s functions, all effectful |
+| V2 | An update sees one state, and its `Set` is stored whole; one that crashes stores nothing and poisons the cell |
+| V3 | Update and cleanup functions contain no suspension site, and `Wait` pauses only after its update put the state back |
+| V4 | An update holds one cell's lock, runs only pure code while it does, and releases it before any suspension |
+| V5 | A `finally!` cleanup runs exactly once on every exit, an `on_failure!` cleanup exactly once on a cancel or a crash and never on a return |
+| V6 | After a crash poisons a cell, every update of it crashes, and so does every task waiting on it |
+| V7 | A waiter whose function would not wait is never left parked |
+| V8 | A `None` build is one schedule of the `Tasks` build |
+| V9 | Every cell is freed: with its last handle, or when no running task can reach it |
+| V10 | A probe answers as the update would, and an update puts back on `Keep` and `Wait` the state it was given |
+
+**What is built.** `new!`, `update!`, `get!` and `modify!` on every backend and
+both strategies, with poison, in `None` and `Tasks` programs. An update's
+function answers `Set` or `Keep`: its type has no `Wait` until waiting is
+built. Waiting, cleanups, holder sets, cells in `ParallelTasks` programs and the
+update and probe forms come in that order.
 
 ### Host Contract
 

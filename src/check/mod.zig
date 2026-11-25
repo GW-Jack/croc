@@ -230,6 +230,7 @@ test "check tests" {
     std.testing.refAllDecls(@import("test/frame_owned_judgment_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12887_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12953_test.zig"));
+    std.testing.refAllDecls(@import("test/shared_state_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12951_test.zig"));
     std.testing.refAllDecls(@import("test/copied_dispatch_requirement_test.zig"));
     std.testing.refAllDecls(@import("test/uncommitted_record_tail_test.zig"));

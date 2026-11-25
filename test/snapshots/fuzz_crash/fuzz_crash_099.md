@@ -193,9 +193,9 @@ main! = |_args| {
 				(p-assign (ident "_args")))
 			(e-block
 				(s-dbg
-					(e-dispatch-call (method "insert") (constraint-fn-var 307)
+					(e-dispatch-call (method "insert") (constraint-fn-var 313)
 						(receiver
-							(e-call (constraint-fn-var 303)
+							(e-call (constraint-fn-var 309)
 								(e-lookup-external
 									(builtin))))
 						(args
@@ -234,7 +234,7 @@ main! = |_args| {
 										(capture (ident "b")))
 									(e-lambda
 										(args)
-										(e-dispatch-call (method "plus") (constraint-fn-var 362)
+										(e-dispatch-call (method "plus") (constraint-fn-var 368)
 											(receiver
 												(e-lookup-local
 													(p-assign (ident "a"))))

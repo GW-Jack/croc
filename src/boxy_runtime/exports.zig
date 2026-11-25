@@ -182,6 +182,11 @@ pub fn roc_desc_slot_store(desc: *const TypeDesc, slot: *const usize, value: ?[*
     compiled.storeSlot(desc, slot, valuePtr(value), dst);
 }
 
+/// The C-ABI form of `compiled.exchangeCell`.
+pub fn roc_desc_cell_exchange(desc: *const TypeDesc, cell: *const usize, value: ?[*]u8, dst: ?[*]u8) callconv(.c) void {
+    compiled.exchangeCell(desc, cell, valuePtr(value), valuePtr(dst), ops());
+}
+
 /// The C-ABI form of `compiled.listOp`.
 pub fn roc_desc_list_op(request: *const compiled.ListOpRequest) callconv(.c) void {
     compiled.listOp(request, ops());

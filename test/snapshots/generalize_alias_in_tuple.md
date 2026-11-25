@@ -120,15 +120,15 @@ main = {
 					(p-assign (ident "t"))))
 			(e-tuple
 				(elems
-					(e-call (constraint-fn-var 262)
+					(e-call (constraint-fn-var 268)
 						(e-lookup-local
 							(p-assign (ident "a")))
 						(e-runtime-error (tag "erroneous_value_expr")))
-					(e-call (constraint-fn-var 263)
+					(e-call (constraint-fn-var 269)
 						(e-lookup-local
 							(p-assign (ident "a")))
 						(e-runtime-error (tag "erroneous_value_expr")))
-					(e-call (constraint-fn-var 264)
+					(e-call (constraint-fn-var 270)
 						(e-lookup-local
 							(p-assign (ident "b")))
 						(e-num (value "2"))))))))

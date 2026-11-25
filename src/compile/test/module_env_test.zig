@@ -226,7 +226,7 @@ test "ModuleEnv.Serialized roundtrip" {
     // Builtin.Num.Range, range_exclusive_to, range_inclusive_to
     // Count reflects the merged builtin set, including structural parser/encoder
     // method identifiers, Builtin.Json.Encoding's parse/encode helpers, and Crypto.
-    try testing.expectEqual(@as(u32, 125), original.common.idents.interner.entry_count);
+    try testing.expectEqual(@as(u32, 126), original.common.idents.interner.entry_count);
     try testing.expectEqualStrings("hello", original.getIdent(hello_idx));
     try testing.expectEqualStrings("world", original.getIdent(world_idx));
 
@@ -237,7 +237,7 @@ test "ModuleEnv.Serialized roundtrip" {
     // First verify that the CommonEnv data was preserved after deserialization
     // Should have same identifiers as original, including the builtin structural method identifiers.
     // (Note: "Try" is now shared with well-known identifiers, reducing total by 1)
-    try testing.expectEqual(@as(u32, 125), env.common.idents.interner.entry_count);
+    try testing.expectEqual(@as(u32, 126), env.common.idents.interner.entry_count);
 
     try testing.expectEqual(@as(usize, 1), env.common.exposed_items.count());
     try testing.expectEqual(@as(?u32, 42), env.common.exposed_items.getValueNodeIndexById(gpa, @as(u32, @bitCast(hello_idx))));

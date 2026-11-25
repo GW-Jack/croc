@@ -91,6 +91,7 @@ const HostedFunctionNotEffectful = problem_mod.HostedFunctionNotEffectful;
 const HostedTypeVariableNotBoxed = problem_mod.HostedTypeVariableNotBoxed;
 const HostBoundaryOpenRow = problem_mod.HostBoundaryOpenRow;
 const HostBoundaryOptionalField = problem_mod.HostBoundaryOptionalField;
+const HostBoundarySharedHandle = problem_mod.HostBoundarySharedHandle;
 const AnnotationOnlyValue = problem_mod.AnnotationOnlyValue;
 const AnnotationOnlyValueUse = problem_mod.AnnotationOnlyValueUse;
 const HostedWhereRequirement = problem_mod.HostedWhereRequirement;
@@ -1154,6 +1155,9 @@ pub const ReportBuilder = struct {
             },
             .host_boundary_optional_field => |data| {
                 return self.buildHostBoundaryOptionalFieldReport(data);
+            },
+            .host_boundary_shared_handle => |data| {
+                return self.buildHostBoundarySharedHandleReport(data);
             },
             .polymorphic_provided_function => |data| {
                 return self.buildPolymorphicProvidedFunctionReport(data);
@@ -5743,6 +5747,16 @@ pub const ReportBuilder = struct {
             D.bytes("Replace each"),
             D.bytes("?:").withAnnotation(.inline_code),
             D.bytes("field with a required field whose value explicitly represents absence before it crosses the host boundary."),
+        });
+    }
+
+    fn buildHostBoundarySharedHandleReport(self: *Self, data: HostBoundarySharedHandle) Allocator.Error!Report {
+        return self.buildHighlightedRegionReport("Host Boundary Forbids Shared State", "Host-bound types cannot contain a handle to shared state.", .runtime_error, data.region, &.{
+            D.bytes("Only tasks can use a"),
+            D.bytes("Shared").withAnnotation(.inline_code),
+            D.bytes("handle. Pass the host the state that"),
+            D.bytes("get!").withAnnotation(.inline_code),
+            D.bytes("returns instead."),
         });
     }
 

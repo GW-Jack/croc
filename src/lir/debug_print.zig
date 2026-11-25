@@ -495,7 +495,7 @@ const Printer = struct {
                 .local => {},
             },
             .tag_payload_addr => |payload| try writer.print(" #{d}", .{payload.payload_index}),
-            .frame_alloc, .copy, .list_item_addr, .box_payload_addr, .tag_discriminant, .record, .record_update, .list, .box, .slot_alloc, .slot_store, .eq, .hash, .inspect, .view, .adapt => {},
+            .frame_alloc, .copy, .list_item_addr, .box_payload_addr, .tag_discriminant, .record, .record_update, .list, .box, .slot_alloc, .slot_store, .cell_exchange, .eq, .hash, .inspect, .view, .adapt => {},
         }
         const operands = DynOps.Operands.of(op);
         for (operands.singles[0..operands.single_count]) |local| try writer.print(" l{d}", .{@backingInt(local)});
