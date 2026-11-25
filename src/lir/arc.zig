@@ -6945,22 +6945,23 @@ const Inserter = struct {
         const switch_stmt = self.store.getCFStmtImmediate(refinement).switch_stmt;
         const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
         const outcomes = self.solution.sigTable().outcomesOf(sig);
+        // An arm no outcome reaches restores nothing, so it must not use the
+        // argument's place either.
         var has_restored_outcome = false;
         for (0..GuardedList.borrowLen(branches)) |index| {
             const branch = GuardedList.at(branches, index);
-            const mask = arc_sig.outcomeMaskForValue(outcomes, branch.value) orelse continue;
+            const mask = arc_sig.outcomeMaskForValue(outcomes, branch.value) orelse 0;
             if ((mask & bit) != 0) {
                 has_restored_outcome = true;
             } else if (try self.ownershipPlaceUsedInPath(branch.body, local)) {
                 return null;
             }
         }
-        if (arc_sig.defaultOutcomeMask(outcomes, branches)) |mask| {
-            if ((mask & bit) != 0) {
-                has_restored_outcome = true;
-            } else if (try self.ownershipPlaceUsedInPath(switch_stmt.default_branch, local)) {
-                return null;
-            }
+        const default_mask = arc_sig.defaultOutcomeMask(outcomes, branches) orelse 0;
+        if ((default_mask & bit) != 0) {
+            has_restored_outcome = true;
+        } else if (try self.ownershipPlaceUsedInPath(switch_stmt.default_branch, local)) {
+            return null;
         }
         if (!has_restored_outcome) return null;
         return .{
@@ -17801,6 +17802,57 @@ test "RC outcome restitution refuses transfer when success still uses the old in
     try testing.expectEqual(base_proc_count, f.store.procSpecCount());
     try testing.expectEqual(@as(usize, 1), f.countRc(input, .incref));
     try testing.expectEqual(@as(u64, 0), try f.uniqueArgsInProc(callee.proc, callee.changed));
+}
+
+test "RC outcome restitution refuses transfer when an arm no outcome reaches still uses the old input" {
+    // The callee returns only discriminants 0 and 1. The caller also reads
+    // `input` on an arm for discriminant 2: an explicit one, then the default
+    // one left over once every returned discriminant is named.
+    for ([_]bool{ true, false }) |explicit_arm| {
+        var f = try ArcTest.init(testing.allocator);
+        defer f.deinit();
+        const outcome_layout = try f.layouts.putTagUnion(&[_]layout_mod.Idx{
+            try f.layouts.ensureZstLayout(),
+            f.list_i64,
+            try f.layouts.ensureZstLayout(),
+        });
+        const callee = try addOutcomeMutationCallee(&f, f.list_i64, outcome_layout);
+
+        const input = try f.local(f.list_i64);
+        const choose = try f.local(.i64);
+        const call_result = try f.local(outcome_layout);
+        const discriminant = try f.local(.u8);
+        const done = try f.local(.i64);
+        const success = try f.assignI64(done, 1, try f.ret(done));
+        const failure = try f.expectStmt(input, try f.assignI64(done, 0, try f.ret(done)));
+        const unreached = try f.expectStmt(input, try f.assignI64(done, 2, try f.ret(done)));
+        const refine = try f.store.addCFStmt(.{ .switch_stmt = .{
+            .cond = discriminant,
+            .branches = try f.store.addCFSwitchBranches(&[_]LIR.CFSwitchBranch{
+                .{ .value = 1, .body = success },
+                if (explicit_arm) .{ .value = 2, .body = unreached } else .{ .value = 0, .body = failure },
+            }),
+            .default_branch = if (explicit_arm) failure else unreached,
+            .default_is_cold = false,
+            .continuation = null,
+        } }, .test_fixture);
+        const read_discriminant = try f.assignDiscriminant(discriminant, call_result, refine);
+        const call = try f.store.addCFStmt(.{ .assign_call = .{
+            .target = call_result,
+            .proc = callee.proc,
+            .args = try f.span(&.{ input, choose }),
+            .next = read_discriminant,
+        } }, .test_fixture);
+        const choose_assign = try f.assignI64(choose, 1, call);
+        const caller_body = try f.assignList(input, &.{}, choose_assign);
+        _ = try f.addProc(&.{}, caller_body, .i64);
+
+        const base_proc_count = f.store.procSpecCount();
+        _ = try insert(&f.store, &f.layouts, .{ .specialize = true });
+
+        try testing.expectEqual(base_proc_count, f.store.procSpecCount());
+        try testing.expectEqual(@as(usize, 1), f.countRc(input, .incref));
+    }
 }
 
 test "RC unrefined outcome uses the unconditional base ownership schedule" {

@@ -28022,7 +28022,8 @@ statement `match` over a call result declares its merge join before switching.
 Each explicit switch arm is
 matched by its integer value; the default arm denotes exactly the signature's
 outcome rows not named by explicit arms. For an argument position, an arm may
-restore the unit only when every outcome reaching that arm carries the bit.
+restore the unit only when every outcome reaching that arm carries the bit,
+and an arm no outcome reaches restores nothing.
 The caller proves that no occurrence of the argument's ownership place exists
 between the call and refinement or on an arm where the bit is absent. Uses
 after a shared continuation therefore reject the transfer unless every outcome
