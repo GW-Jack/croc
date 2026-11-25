@@ -25,8 +25,10 @@ reader: *FuzzReader,
 module: *TypedCodeGenerator,
 app_output: std.ArrayList(u8),
 platform_output: std.ArrayList(u8),
+host_output: std.ArrayList(u8),
 app_file_name: ?[]u8,
 platform_file_name: ?[]u8,
+host_file_name: ?[]u8,
 target: roc_target.RocTarget,
 symbols: Symbols,
 
@@ -45,8 +47,10 @@ pub fn init(allocator: std.mem.Allocator, reader: *FuzzReader, module: *TypedCod
         .module = module,
         .app_output = .empty,
         .platform_output = .empty,
+        .host_output = .empty,
         .app_file_name = null,
         .platform_file_name = null,
+        .host_file_name = null,
         .target = .wasm32,
         .symbols = undefined,
     };
@@ -55,8 +59,10 @@ pub fn init(allocator: std.mem.Allocator, reader: *FuzzReader, module: *TypedCod
 pub fn deinit(self: *Self) void {
     self.app_output.deinit(self.allocator);
     self.platform_output.deinit(self.allocator);
+    self.host_output.deinit(self.allocator);
     if (self.app_file_name) |name| self.allocator.free(name);
     if (self.platform_file_name) |name| self.allocator.free(name);
+    if (self.host_file_name) |name| self.allocator.free(name);
 }
 
 pub fn getAppOutput(self: *const Self) []const u8 {
@@ -75,6 +81,16 @@ pub fn getPlatformFileName(self: *const Self) []const u8 {
     return self.platform_file_name orelse @panic("build fuzzer platform file name requested before generation");
 }
 
+/// The source of the module that declares the program's hosted function.
+pub fn getHostOutput(self: *const Self) []const u8 {
+    return self.host_output.items;
+}
+
+/// The file name of `getHostOutput`, or null when the program has no host.
+pub fn getHostFileName(self: *const Self) ?[]const u8 {
+    return self.host_file_name;
+}
+
 pub fn getTarget(self: *const Self) roc_target.RocTarget {
     return self.target;
 }
@@ -86,12 +102,13 @@ pub fn chooseTarget(reader: *FuzzReader) roc_target.RocTarget {
 pub fn generate(self: *Self, target: roc_target.RocTarget) std.mem.Allocator.Error!void {
     self.app_output.clearRetainingCapacity();
     self.platform_output.clearRetainingCapacity();
+    self.host_output.clearRetainingCapacity();
 
     self.target = target;
     self.symbols = .{
         .app_file = self.module.freshSymbol(.app_file),
         .platform_file = self.module.freshSymbol(.platform_file),
-        .platform_alias = self.module.freshSymbol(.package),
+        .platform_alias = if (self.module.getHost()) |host| host.platform_alias else self.module.freshSymbol(.package),
         .app_entry = self.module.freshSymbol(.function),
         .platform_entry = self.module.freshSymbol(.function),
     };
@@ -99,13 +116,19 @@ pub fn generate(self: *Self, target: roc_target.RocTarget) std.mem.Allocator.Err
     try self.setFileNames();
     try self.writeApp();
     try self.writePlatform();
+    if (self.module.getHost()) |host| try self.writeHost(host);
 }
 
 fn setFileNames(self: *Self) std.mem.Allocator.Error!void {
     if (self.app_file_name) |name| self.allocator.free(name);
     if (self.platform_file_name) |name| self.allocator.free(name);
+    if (self.host_file_name) |name| self.allocator.free(name);
+    self.host_file_name = null;
     self.app_file_name = try std.fmt.allocPrint(self.allocator, "{c}{d}.roc", .{ TypedCodeGenerator.symbolPrefix(self.symbols.app_file.kind), self.symbols.app_file.id });
     self.platform_file_name = try std.fmt.allocPrint(self.allocator, "{c}{d}.roc", .{ TypedCodeGenerator.symbolPrefix(self.symbols.platform_file.kind), self.symbols.platform_file.id });
+    if (self.module.getHost()) |host| {
+        self.host_file_name = try std.fmt.allocPrint(self.allocator, "{c}{d}.roc", .{ TypedCodeGenerator.symbolPrefix(host.module.kind), host.module.id });
+    }
 }
 
 fn writeApp(self: *Self) std.mem.Allocator.Error!void {
@@ -125,6 +148,14 @@ fn writeApp(self: *Self) std.mem.Allocator.Error!void {
     try self.writeAppText("! : {} => I32\n");
     try self.writeAppSymbol(self.symbols.app_entry);
     try self.writeAppText("! = |{}| {\n");
+    // A score's expression reaches few effectful methods, which hold the
+    // program's concurrent loops and hosted calls.
+    for (0..self.reader.intRangeAtMost(u8, 0, 4)) |_| {
+        const method = self.chooseEffectfulMethod() orelse break;
+        try self.writeAppText("    _ = ");
+        try self.writeCall(method, self.reader.intRangeAtMost(u8, 0, 2));
+        try self.writeAppText("\n");
+    }
     try self.writeAppText("    ");
     try self.writeAppSymbol(score);
     try self.writeAppText(" : U64\n    ");
@@ -139,21 +170,43 @@ fn writeApp(self: *Self) std.mem.Allocator.Error!void {
 fn writePlatform(self: *Self) std.mem.Allocator.Error!void {
     try self.writePlatformText("platform \"\"\n    requires {} { ");
     try self.writePlatformSymbol(self.symbols.app_entry);
-    try self.writePlatformText("! : {} => I32 }\n    exposes []\n    packages {}\n    provides { \"main\": ");
+    try self.writePlatformText("! : {} => I32 }\n    exposes [");
+    if (self.module.getHost()) |host| try self.writePlatformSymbol(host.module);
+    try self.writePlatformText("]\n    packages {}\n    provides { \"main\": ");
     try self.writePlatformSymbol(self.symbols.platform_entry);
-    try self.writePlatformText("! }\n    targets: {\n        inputs_dir: \"targets/\",\n");
+    try self.writePlatformText("! }\n");
+    if (self.module.getHost()) |host| {
+        try self.writePlatformText("    hosted { \"roc_fuzz_host\": ");
+        try self.writePlatformSymbol(host.module);
+        try self.writePlatformText(".");
+        try self.writePlatformSymbol(host.function);
+        try self.writePlatformText("! }\n    concurrency: Tasks\n");
+    }
+    try self.writePlatformText("    targets: {\n        inputs_dir: \"targets/\",\n");
     for (build_targets) |target| {
         try self.writePlatformText("        ");
         try self.writePlatformText(@tagName(target));
         try self.writePlatformText(": { inputs: [app], output: Archive },\n");
     }
     try self.writePlatformText("    }\n\n");
+    if (self.module.getHost()) |host| {
+        try self.writePlatformText("import ");
+        try self.writePlatformSymbol(host.module);
+        try self.writePlatformText("\n\n");
+    }
     try self.writePlatformSymbol(self.symbols.platform_entry);
     try self.writePlatformText("! : {} => I32\n");
     try self.writePlatformSymbol(self.symbols.platform_entry);
     try self.writePlatformText("! = ");
     try self.writePlatformSymbol(self.symbols.app_entry);
     try self.writePlatformText("!\n");
+}
+
+fn writeHost(self: *Self, host: TypedCodeGenerator.Host) std.mem.Allocator.Error!void {
+    try TypedCodeGenerator.writeSymbolTo(&self.host_output, self.allocator, host.module);
+    try self.host_output.appendSlice(self.allocator, " := [].{\n    suspending ");
+    try TypedCodeGenerator.writeSymbolTo(&self.host_output, self.allocator, host.function);
+    try self.host_output.appendSlice(self.allocator, "! : U64 => U64\n}\n");
 }
 
 fn writeExpr(self: *Self, typ: Type, depth: u8) std.mem.Allocator.Error!void {
@@ -268,6 +321,11 @@ fn writeExpr(self: *Self, typ: Type, depth: u8) std.mem.Allocator.Error!void {
 
 fn writeMethodCall(self: *Self, result_type: Type, depth: u8) std.mem.Allocator.Error!bool {
     const method = self.chooseMethod(result_type) orelse return false;
+    try self.writeCall(method, depth);
+    return true;
+}
+
+fn writeCall(self: *Self, method: Method, depth: u8) std.mem.Allocator.Error!void {
     try self.writeAppSymbol(self.module.getRootSymbols().typ);
     try self.writeAppText(".");
     try self.writeAppSymbol(method.symbol);
@@ -278,7 +336,21 @@ fn writeMethodCall(self: *Self, result_type: Type, depth: u8) std.mem.Allocator.
         try self.writeExpr(method.param_types[index], depth);
     }
     try self.writeAppText(")");
-    return true;
+}
+
+fn chooseEffectfulMethod(self: *Self) ?Method {
+    const methods = self.module.getMethods();
+    var count: usize = 0;
+    for (methods) |method| count += @intFromBool(method.effectful);
+    if (count == 0) return null;
+
+    var selected = self.reader.intRangeLessThan(usize, 0, count);
+    for (methods) |method| {
+        if (!method.effectful) continue;
+        if (selected == 0) return method;
+        selected -= 1;
+    }
+    unreachable;
 }
 
 fn chooseMethod(self: *Self, result_type: Type) ?Method {

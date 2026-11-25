@@ -46,6 +46,9 @@ pub fn run(buf: [*]u8, len: isize, debug: bool, mode: Mode) void {
         .well_typed => {},
         .type_errors => module_generator.allowTypeErrors(reader.intRangeAtMost(u8, 1, 3)),
     }
+    // Lower as an optimized build does, or as the interpreter's does.
+    const optimized = reader.boolean();
+    if (reader.boolean()) module_generator.useHost();
     module_generator.generateModules() catch |err| switch (err) {
         error.OutOfMemory => @panic("OOM during shared typed module generation"),
     };
@@ -57,16 +60,21 @@ pub fn run(buf: [*]u8, len: isize, debug: bool, mode: Mode) void {
     };
 
     const module_count = module_generator.moduleCount();
-    var generated_files_buf: [TypedCodeGenerator.max_modules + 2]FuzzHarness.GeneratedFile = undefined;
+    var generated_files_buf: [TypedCodeGenerator.max_modules + 3]FuzzHarness.GeneratedFile = undefined;
     for (0..module_count) |index| {
         generated_files_buf[index] = .{ .name = module_generator.moduleFileName(index), .source = module_generator.moduleOutput(index) };
     }
     const app_index = module_count;
     generated_files_buf[app_index] = .{ .name = wrapper_generator.getAppFileName(), .source = wrapper_generator.getAppOutput() };
     generated_files_buf[app_index + 1] = .{ .name = wrapper_generator.getPlatformFileName(), .source = wrapper_generator.getPlatformOutput() };
-    const generated_files = generated_files_buf[0 .. module_count + 2];
+    var file_count = module_count + 2;
+    if (wrapper_generator.getHostFileName()) |name| {
+        generated_files_buf[file_count] = .{ .name = name, .source = wrapper_generator.getHostOutput() };
+        file_count += 1;
+    }
+    const generated_files = generated_files_buf[0..file_count];
     if (debug) {
-        std.debug.print("Input length: {d}, bytes consumed: {d}, target: {s}\n", .{ input.len, reader.position, @tagName(selected_target) });
+        std.debug.print("Input length: {d}, bytes consumed: {d}, target: {s}, optimized: {}\n", .{ input.len, reader.position, @tagName(selected_target), optimized });
         FuzzHarness.printGeneratedFiles(generated_files);
     }
 
@@ -152,7 +160,13 @@ pub fn run(buf: [*]u8, len: isize, debug: bool, mode: Mode) void {
         .{ .requests = lir_roots },
         .{
             .target_usize = targetUsize(selected_target),
-            .list_in_place_map = false,
+            .inline_mode = if (optimized) .wrappers else .none,
+            .specialize_arc_modes = optimized,
+            .prove_uniqueness = optimized,
+            .immortal_string_literals = optimized,
+            .consume_dead_boxes = optimized,
+            .list_in_place_map = optimized,
+            .thread_confined_rc = optimized,
         },
     ) catch |err| switch (err) {
         error.OutOfMemory => @panic("OOM during generated app checked-to-LIR lowering"),

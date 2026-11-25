@@ -64,6 +64,10 @@ current_imports: u8,
 cycle_imports: [max_modules]u8,
 /// The current module's root symbols.
 symbols: RootSymbols,
+/// Whether the next generated program has a `Host`.
+use_host: bool,
+/// The `Host` of the generated program.
+host: ?Host,
 /// The current module's top-level values visible to its methods and to its
 /// later top-level values.
 module_values: ExprContext,
@@ -116,6 +120,15 @@ pub const RootSymbols = struct {
     /// The single-tag nominal tag union type nested in the module's type.
     wrapper: Symbol,
     wrapper_tag: Symbol,
+};
+
+/// A `suspending` hosted function `U64 => U64` of a module the platform
+/// exposes, which effectful code may call.
+pub const Host = struct {
+    /// The app's alias for the platform.
+    platform_alias: Symbol,
+    module: Symbol,
+    function: Symbol,
 };
 
 pub const Type = enum {
@@ -202,6 +215,8 @@ pub fn init(allocator: std.mem.Allocator, reader: *FuzzReader) Self {
         .current_imports = 0,
         .cycle_imports = @splat(0),
         .symbols = undefined,
+        .use_host = false,
+        .host = null,
         .module_values = emptyContext(),
         .next_id = 0,
         .methods = undefined,
@@ -306,6 +321,17 @@ pub fn allowTypeErrors(self: *Self, budget: u8) void {
     self.type_error_budget = @min(budget, max_type_errors);
 }
 
+/// Give the next generated program a platform with a `suspending` hosted
+/// function, whose `Host` the program's wrapper declares.
+pub fn useHost(self: *Self) void {
+    self.use_host = true;
+}
+
+/// The generated program's `Host`, if it has one.
+pub fn getHost(self: *const Self) ?Host {
+    return self.host;
+}
+
 /// The deliberately rejected constructs of the last generated program.
 pub fn typeErrorSites(self: *const Self) []const TypeErrorSite {
     return self.type_error_sites[0..self.type_errors_written];
@@ -320,6 +346,12 @@ pub fn generateModules(self: *Self) std.mem.Allocator.Error!void {
     const field1 = self.fresh(.field);
     const field2 = self.fresh(.field);
     const field3 = self.fresh(.field);
+
+    self.host = if (self.use_host) .{
+        .platform_alias = self.fresh(.package),
+        .module = self.fresh(.type),
+        .function = self.fresh(.function),
+    } else null;
 
     self.module_count = self.reader.intRangeAtMost(u8, 1, max_modules);
     for (0..self.module_count) |index| {
@@ -398,6 +430,14 @@ fn writeImports(self: *Self) std.mem.Allocator.Error!void {
     self.current_imports = imports;
 
     var wrote_import = false;
+    if (self.host) |host| {
+        try self.write("import ");
+        try self.writeSymbol(host.platform_alias);
+        try self.write(".");
+        try self.writeSymbol(host.module);
+        try self.write("\n");
+        wrote_import = true;
+    }
     for (0..index) |earlier| {
         if (imports & moduleBit(earlier) == 0) continue;
         try self.writeImport(earlier);
@@ -598,6 +638,10 @@ fn writeExpr(self: *Self, expected: Type, context: ExprContext, depth: u8, visib
     const typ = self.chooseWrittenType(expected);
     if (depth == 0) {
         try self.writeLeafExpr(typ, context, visible_methods);
+        return;
+    }
+    if (context.effectful and typ != .optional_record and self.reader.intRangeAtMost(u8, 0, 7) == 7) {
+        try self.writePlanLoopExpr(typ, context, depth - 1, visible_methods);
         return;
     }
 
@@ -886,6 +930,10 @@ fn writeStrExpr(self: *Self, context: ExprContext, depth: u8, visible_methods: u
 }
 
 fn writeU64Expr(self: *Self, context: ExprContext, depth: u8, visible_methods: usize) std.mem.Allocator.Error!void {
+    if (context.effectful and self.host != null and self.reader.intRangeAtMost(u8, 0, 3) == 3) {
+        try self.writeHostCall(self.host.?, context, depth - 1, visible_methods);
+        return;
+    }
     switch (self.reader.intRangeAtMost(u8, 0, 14)) {
         0 => if (self.contextSymbol(.u64, context)) |arg| try self.writeSymbol(arg) else try self.writeU64Literal(),
         1 => if (!try self.writeMethodCall(.u64, context, depth - 1, visible_methods)) try self.writeU64Literal(),
@@ -1155,6 +1203,114 @@ fn writeIfExpr(self: *Self, result_type: Type, context: ExprContext, depth: u8, 
     try self.writeParenthesizedExpr(result_type, context, depth, visible_methods);
     try self.write(" else ");
     try self.writeParenthesizedExpr(result_type, context, depth, visible_methods);
+}
+
+/// A call of the platform's hosted function.
+fn writeHostCall(self: *Self, host: Host, context: ExprContext, depth: u8, visible_methods: usize) std.mem.Allocator.Error!void {
+    try self.writeSymbol(host.module);
+    try self.write(".");
+    try self.writeSymbol(host.function);
+    try self.write("!(");
+    try self.writeExpr(.u64, context, depth, visible_methods);
+    try self.write(")");
+}
+
+/// A block that runs a concurrent loop over a plan and is a variable of
+/// type `result_type` the loop's body sets. No type reaches an entry's body
+/// or the variable from outside, and a record is written with its optional
+/// field only where a type says the field is optional, so neither is an
+/// `.optional_record`.
+fn writePlanLoopExpr(self: *Self, result_type: Type, context: ExprContext, depth: u8, visible_methods: usize) std.mem.Allocator.Error!void {
+    const chosen_type = self.chooseType();
+    const item_type: Type = if (chosen_type == .optional_record) .record else chosen_type;
+    const result = self.fresh(.value);
+    const spawns = self.fresh(.value);
+    const plan = self.fresh(.value);
+    const item = self.fresh(.value);
+
+    try self.write("{\n");
+    try self.writeVariableStatement(result);
+    try self.writeExpr(result_type, context, depth, visible_methods);
+    try self.write("\n");
+    try self.writeVariableStatement(spawns);
+    try self.write("0.U64\n");
+    try self.writeSymbol(plan);
+    try self.write(" : Concurrently(");
+    try self.writeType(item_type);
+    try self.write(")\n");
+    try self.writeSymbol(plan);
+    try self.write(" = ");
+    try self.writePlan(item_type, context, depth, visible_methods);
+    try self.write("\nfor! ");
+    try self.writeSymbol(item);
+    try self.write(" in ");
+    try self.writeSymbol(plan);
+    try self.write(" {\n");
+
+    const body = extendContext(context, item, item_type);
+    if (self.reader.boolean()) {
+        try self.write("if ");
+        try self.writeParenthesizedExpr(.bool, body, depth, visible_methods);
+        try self.write(" {\nbreak\n}\n");
+    }
+    if (self.reader.boolean()) {
+        // Once, so the loop ends.
+        try self.write("if $");
+        try self.writeSymbol(spawns);
+        try self.write(" == 0 {\n$");
+        try self.writeSymbol(spawns);
+        try self.write(" = 1\nspawn ");
+        try self.writeEntry(item_type, body, depth, visible_methods);
+        try self.write("\n}\n");
+    }
+    try self.write("$");
+    try self.writeSymbol(result);
+    try self.write(" = ");
+    try self.writeExpr(result_type, body, depth, visible_methods);
+    try self.write("\n}\n$");
+    try self.writeSymbol(result);
+    try self.write("\n}");
+}
+
+/// The start of a statement that makes the variable `symbol`.
+fn writeVariableStatement(self: *Self, symbol: Symbol) std.mem.Allocator.Error!void {
+    try self.write("var $");
+    try self.writeSymbol(symbol);
+    try self.write(" = ");
+}
+
+/// A `Concurrently(item_type)`: entries, with limits, and other plans after
+/// them.
+fn writePlan(self: *Self, item_type: Type, context: ExprContext, depth: u8, visible_methods: usize) std.mem.Allocator.Error!void {
+    const part_count = self.reader.intRangeAtMost(u8, 1, 2);
+    for (0..part_count) |part| {
+        if (part > 0) try self.write(".concat(");
+        try self.write("List.concurrently([");
+        const entry_count = self.reader.intRangeAtMost(u8, 0, 3);
+        for (0..entry_count) |index| {
+            if (index > 0) try self.write(", ");
+            try self.writeEntry(item_type, context, depth, visible_methods);
+        }
+        try self.write("])");
+        switch (self.reader.intRangeAtMost(u8, 0, 3)) {
+            0 => {},
+            1 => {
+                try self.write(".limit(");
+                try self.write(if (self.reader.boolean()) "1" else "2");
+                try self.write(")");
+            },
+            2 => try self.write(".background()"),
+            3 => try self.write(".shielded()"),
+            else => unreachable,
+        }
+        if (part > 0) try self.write(")");
+    }
+}
+
+/// One entry of a plan: a function of no arguments that returns `item_type`.
+fn writeEntry(self: *Self, item_type: Type, context: ExprContext, depth: u8, visible_methods: usize) std.mem.Allocator.Error!void {
+    try self.write("|| ");
+    try self.writeParenthesizedExpr(item_type, context, depth, visible_methods);
 }
 
 fn writeParenthesizedExpr(self: *Self, typ: Type, context: ExprContext, depth: u8, visible_methods: usize) std.mem.Allocator.Error!void {
