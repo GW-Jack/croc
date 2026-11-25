@@ -4015,11 +4015,15 @@ Builtin :: [].{
 		run_supervised! : U64, (() => item) => item
 		run_supervised! = |_max_restarts, f| Concurrently.run_entry!(f)
 
-		# `Shared.update!`'s helpers. In a `Tasks` build the compiler replaces
-		# their bodies: the first pauses the task until a wake, when the probe
-		# would no longer answer 0, and the second wakes the waiters an update
-		# gave reason to. Where nothing can pause, an update that waits can never
-		# go on, and there are no waiters.
+		# `Shared`'s helpers. In a build with tasks the compiler replaces their
+		# bodies. The first, where tasks run on several threads, keeps every other
+		# update of the cell out until one of the others is called; the second
+		# pauses the task until a wake, when the probe would no longer answer 0;
+		# the third wakes the waiters an update gave reason to. Where nothing can
+		# pause, an update that waits can never go on, and there are no waiters.
+		cell_lock! : Box(item) => {}
+		cell_lock! = |_cell| {}
+
 		cell_wait! : Box(item), Box(() => U8) => {}
 		cell_wait! = |_cell, _probe| {
 			crash "deadlock: no task can ever change the shared state this task waits for"
@@ -4139,6 +4143,7 @@ Builtin :: [].{
 		get! = |Cell(cell)| {
 			state = cell_take!(cell)
 			_ = cell_exchange!(cell, Held(state))
+			Concurrently.cell_settle!(cell, False)
 			state
 		}
 
@@ -28354,15 +28359,17 @@ cell_new! : item => Box(item)
 # that was there
 cell_exchange! : Box(item), item => item
 
-# A shared cell's state, moved out of it
+# A shared cell's state, moved out of it for an update
 cell_take! : Box([Held(state), Moved]) => state
-cell_take! = |cell|
+cell_take! = |cell| {
+	Concurrently.cell_lock!(cell)
 	match cell_exchange!(cell, Moved) {
 		Held(state) => state
 		Moved => {
 			crash "this shared state was poisoned when an update crashed"
 		}
 	}
+}
 
 # Whether a waiting update would go on now: 0 when it would answer `Wait`, and
 # 1 when it would answer anything else or crash because the cell is poisoned.

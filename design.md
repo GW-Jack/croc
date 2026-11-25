@@ -34564,7 +34564,7 @@ two are the dynamic operations `box` and `cell_exchange`.
 
 ```text
 update! = |Cell(cell), f| {
-    state = take!(cell)            # cell_exchange(cell, Moved), or the poison crash
+    state = take!(cell)            # cell_lock!, then cell_exchange(cell, Moved) or the poison crash
     match f(state) {
         Set(new, r) => { cell_exchange!(cell, Held(new)); cell_settle!(cell, True); r }
         Keep(r) => { cell_exchange!(cell, Held(state)); cell_settle!(cell, False); r }
@@ -34577,8 +34577,8 @@ update! = |Cell(cell), f| {
 }
 ```
 
-`get!` and `modify!` are written the same way without a `Wait`, so a call of
-either is never a suspension site.
+`get!` and `modify!` are written the same way without a `Wait`, `get!` putting
+the state back as a `Keep` does, so a call of either is never a suspension site.
 
 Where `f` is inlined, a path that ends in `Set` no longer uses `state`, so
 ARC moves it into `new` and a unique state changes in place. Where `f` is
@@ -34618,17 +34618,47 @@ address holds them, so a cell that no task waits on has no room for waiters and
 `cell_settle` on it reads one word. A task waits on at most one cell, so its
 place in the table is in the task. A waiter's probe holds its cell.
 
-Two Builtin helpers, marked as the running-set helpers are, stand for the
+Three Builtin helpers, marked as the running-set helpers are, stand for the
 runtime:
+- `cell_lock!(cell)` in Builtin does nothing;
 - `cell_wait!(cell, probe)` in Builtin crashes with the deadlock message;
 - `cell_settle!(cell, stored)` in Builtin does nothing.
 
-In a build with tasks the continuation pass replaces their bodies with the
-low-level operations `cell_wait(cell, probe, task) -> status` and
-`cell_settle(cell, stored)`. `cell_wait` is a park site beside `group_next`: it
+In a build with tasks the continuation pass replaces the bodies of the last two
+with the low-level operations `cell_wait(cell, probe, task) -> status` and
+`cell_settle(cell, stored)`, and in a `ParallelTasks` build the first one's
+with `cell_lock(cell)`. `cell_wait` is a park site beside `group_next`: it
 always returns the pending status, its resume entry calls its continuation with
 no second run, and the code after it never reads the status. A `cell_wait!`
 specialization is a seed of the suspension marks.
+
+**Updates on several threads.** In a `ParallelTasks` program a lock makes
+updates of one cell happen one after another. `take!` calls `cell_lock!`
+before it moves the state out. The lock is released by `cell_settle!`, after
+its probes; by the task's park, for an update that waits; or by the task's
+crash exit, for one that crashes. So:
+- a cell's payload and its waiters are touched only under its lock, a probe's
+  exchanges included, and the lock orders what one thread wrote to the state
+  before what the next one reads;
+- no store comes between an update's `Wait` and its place among the waiters;
+- a probe's waiter runs no code meanwhile, since it holds the lock until it
+  starts to park, and is woken only by a probe. So the crash exit that the probe
+  uses is free, whichever thread runs it. A cancelled waiter's resume can
+  overlap the probe, but it only releases the task's records and then takes the
+  lock to leave the cell.
+
+A lock is one word beside a list of waiters, so cells whose waiters are in one
+list share a lock. This can't deadlock: an update's function can't reach a
+cell, so no update holds two locks. The holder runs the update's function, a
+probe's and drops of values, so it may call the host to allocate, to free and
+for `dbg`. The host's task functions are called only after the lock is
+released. Where both are held, a cell's lock is taken before its tree's. A wait
+for a lock spins, since a holder never suspends.
+
+Counts need nothing new. A handle reaches another task only through a start
+record, whose captures are visible to other threads, and a value stored in a
+cell or loaded from one is linked to the cell (Thread-Confined Reference Counts). A probe
+is made visible where `cell_wait` takes it, since any thread's crash may run it.
 
 **Programs without tasks.** A program none of whose updates can reach `Wait`
 runs as Plans And Concurrent Loops says, on one stack. A `None` program that
@@ -34662,10 +34692,10 @@ descendants are gone.
 | V10 | A probe answers as the update would, and an update puts back on `Keep` and `Wait` the state it was given |
 
 **What is built.** `new!`, `update!`, `get!` and `modify!` on every backend and
-both strategies, with poison, in `None` and `Tasks` programs, and waiting in
-`Tasks` programs. A `Wait` in a `None` program crashes with the deadlock message.
-Schedulers for `None` programs, cleanups, holder sets, cells in `ParallelTasks`
-programs and the update and probe forms come in that order.
+both strategies, with poison, and waiting in `Tasks` and `ParallelTasks`
+programs. A `Wait` in a `None` program crashes with the deadlock message.
+Schedulers for `None` programs, cleanups, holder sets and the update and probe
+forms come in that order.
 
 ### Host Contract
 

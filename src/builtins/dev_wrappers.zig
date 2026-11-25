@@ -1593,6 +1593,12 @@ pub fn roc_builtins_group_free(loop_id: u64, owner: *task.RocTask) callconv(.c) 
     task.groupFree(task.openGroup(owner, loop_id));
 }
 
+/// An update is about to take the state of `cell`, in a `ParallelTasks`
+/// program (design.md "Shared State", "Updates on several threads.").
+pub fn roc_builtins_cell_lock(cell: *anyopaque) callconv(.c) void {
+    task.cellLock(cell);
+}
+
 /// `Wait`: the running `task`'s update of `cell` pauses it (design.md "Shared
 /// State", "Waiting."). Takes `probe`. Returns the park status, pending.
 pub fn roc_builtins_cell_wait(cell: *anyopaque, probe: [*]u8, owner: *task.RocTask) callconv(.c) u32 {

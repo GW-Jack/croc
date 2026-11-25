@@ -126,7 +126,8 @@ pub const MAGIC: u32 = 0x52494c52; // "RLIR" in little-endian bytes.
 ///      (`args_stored_into`).
 /// v92: the running-set helpers and the operations include `cell_wait` and
 ///      `cell_settle`.
-pub const FORMAT_VERSION: u32 = 92;
+/// v93: `cell_lock` joins them.
+pub const FORMAT_VERSION: u32 = 93;
 const StaticDataImage = @import("lir_image_static_data.zig").Schema(@This());
 
 /// Public `ImageError` declaration.

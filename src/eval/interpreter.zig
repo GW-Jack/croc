@@ -6732,6 +6732,10 @@ pub const Interpreter = struct {
                 val.write(u32, status);
                 break :blk val;
             },
+            .cell_lock => blk: {
+                builtins.task.cellLock(@ptrFromInt(self.readPointerInt(args[0])));
+                break :blk Value.zst;
+            },
             .cell_wait => blk: {
                 const probe = self.readBoxedDataPointer(args[1]) orelse
                     return self.invariantFailedError("LIR/interpreter invariant violated: cell_wait had no probe", .{});

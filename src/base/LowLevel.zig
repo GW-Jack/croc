@@ -740,9 +740,12 @@ pub const LowLevel = enum(u16) {
     /// borrows, and return the one that was there, owned.
     cell_exchange,
 
-    // A `Tasks` program's waiting operations (design.md "Shared State",
-    // "Waiting."), which only the continuation pass makes, from the bodies of
-    // Builtin's two helpers. The pass appends the task to `cell_wait`.
+    // Operations on cells in a program with tasks (design.md "Shared State"),
+    // which only the continuation pass makes, from the bodies of Builtin's
+    // three helpers. The pass appends the task to `cell_wait`.
+    /// (cell) -> {}: an update is about to take the state of the cell, which it
+    /// borrows; in a `ParallelTasks` program.
+    cell_lock,
     /// (cell, probe, task) -> U32: the task's update of the cell, which it
     /// borrows, answered `Wait`; takes the probe. Always the pending status.
     cell_wait,
@@ -1406,7 +1409,9 @@ pub const LowLevel = enum(u16) {
         .cell_new = byLayout(.allocatesRetainingArgs(arg_0)).elements(&.{.layout}),
         .cell_exchange = byLayout(.consumesArgsRetainingArgs(arg_1, 0)).elements(&.{ .layout, .layout }),
         // Either may run waiters' probes and drop one.
-        .cell_wait = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_1 }),
+        .cell_lock = byType(.none()),
+        // Any task's store may run the probe.
+        .cell_wait = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_1, .args_spawned = arg_1 }),
         .cell_settle = byType(.{ .may_allocate = true, .may_retain_or_release = true }),
 
         .str_is_eq = byType(.none()),

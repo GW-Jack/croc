@@ -454,7 +454,8 @@ pub const Constants = struct {
     /// 214: Builtin has `Shared` and its cell operations.
     /// 215: recorded running-set helpers include `cell_wait!` and
     /// `cell_settle!`, whose operations join the low-level ones.
-    pub const CACHE_VERSION = 215;
+    /// 216: `cell_lock!` and its operation join them.
+    pub const CACHE_VERSION = 216;
 };
 
 /// Configuration for the Roc cache system.

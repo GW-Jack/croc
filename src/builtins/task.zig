@@ -331,6 +331,12 @@ pub const RocTask = extern struct {
     newer_waiter: ?*RocTask,
     /// Whether the task was readied by a wake its update has not yet answered.
     carries_wake: bool,
+    /// The lock the task's running update holds in a `ParallelTasks` program,
+    /// until it settles, parks or crashes.
+    locked_cells: ?*CellWaiters,
+    /// The waiter a waiting update passed its wake on to, which the task's
+    /// park tells the host of.
+    passed_wake: HostCalls,
     /// Whether the task's probe is running, in another task's resume, and the
     /// task that was running there.
     probing: bool,
@@ -400,6 +406,8 @@ pub const RocTask = extern struct {
             .older_waiter = null,
             .newer_waiter = null,
             .carries_wake = false,
+            .locked_cells = null,
+            .passed_wake = .{},
             .probing = false,
             .probe_goes_on = false,
             .probe_outer = null,
@@ -671,9 +679,10 @@ pub const RocTask = extern struct {
     /// leaked. The task's children are cancelled, and it ends `crashed`
     /// once they have reported.
     fn crashed(self: *RocTask) Status {
+        self.endUpdate();
         self.releaseRecord(self.running_record, self.running_from_task);
         // The crash may have been an update's, which poisons its cell.
-        probeEveryCell();
+        probeEveryCell(self.tree != null);
         return self.finish(false);
     }
 
@@ -699,7 +708,11 @@ pub const RocTask = extern struct {
     /// A cancel or an entry's crash marks the task and unparks it under the
     /// tree's lock, so either it finds the task parked here, or this finds
     /// the mark.
+    ///
+    /// An update that waits keeps its cell's lock until here, so that a probe
+    /// of the task, on another thread, finds its crash exit free.
     fn park(self: *RocTask) Park {
+        self.endUpdate();
         self.releaseParallelResume();
         self.lockTree();
         if (self.cancel_requested or self.crashing) {
@@ -712,6 +725,19 @@ pub const RocTask = extern struct {
         if (self.parkOnWait()) return .parked;
         self.claimParallelResume();
         return .ready;
+    }
+
+    /// The task runs no more of its code, for now or for good, so an update it
+    /// was running releases its lock, and then tells the host of the wake it
+    /// passed on.
+    fn endUpdate(self: *RocTask) void {
+        if (self.locked_cells) |cells| {
+            self.locked_cells = null;
+            cells.unlock();
+        }
+        const calls = self.passed_wake;
+        self.passed_wake = .{};
+        calls.make();
     }
 
     /// Park on the wait source with the tree locked, and unlock it. False,
@@ -779,7 +805,7 @@ pub const RocTask = extern struct {
     /// abort counts its completion without readying; the finishing resume
     /// releases it.
     fn requestCancel(self: *RocTask, calls: *HostCalls) void {
-        self.cancel_requested = true;
+        @atomicStore(bool, &self.cancel_requested, true, .monotonic);
         if (self.started) self.unpark(calls);
     }
 
@@ -875,10 +901,21 @@ pub const RocTask = extern struct {
     /// carried a wake it did not pass on, the waiters after it are probed.
     fn leaveCell(self: *RocTask) void {
         const cell = self.waited_cell orelse return;
+        var calls: HostCalls = .{};
+        const waiters = cellWaiters(cell);
+        if (self.tree != null) waiters.lock();
+        self.leaveLocked(&calls);
+        if (self.tree != null) waiters.unlock();
+        calls.make();
+    }
+
+    /// `leaveCell` with the cell's waiters locked.
+    fn leaveLocked(self: *RocTask, calls: *HostCalls) void {
+        const cell = self.waited_cell.?;
         const carried = self.carries_wake;
         const next = self.newer_waiter;
         self.removeWaiter();
-        if (carried) probeFrom(cell, next);
+        if (carried) probeFrom(cell, next, calls);
     }
 
     fn removeWaiter(self: *RocTask) void {
@@ -930,7 +967,7 @@ pub const RocTask = extern struct {
         @memcpy(copy[0..message.len], message);
         self.crash_message = copy;
         self.crash_message_len = message.len;
-        self.crashing = true;
+        @atomicStore(bool, &self.crashing, true, .monotonic);
     }
 
     /// The task reached its terminal `status`. A child reports to its group
@@ -1007,8 +1044,27 @@ pub const RocTask = extern struct {
 /// The tasks waiting on the cells that share one entry of `cell_waiters`,
 /// oldest first.
 const CellWaiters = struct {
+    /// The lock of the cells in a `ParallelTasks` program, 0 free and 1 held:
+    /// an update holds it from taking its cell's state until it settled or
+    /// waits, so it covers the cells' payloads and this list.
+    locked: u32 = 0,
     oldest: ?*RocTask = null,
     newest: ?*RocTask = null,
+
+    fn lock(self: *CellWaiters) void {
+        while (@cmpxchgWeak(u32, &self.locked, 0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *CellWaiters) void {
+        @atomicStore(u32, &self.locked, 0, .release);
+    }
+
+    /// Release the lock the running update took, if its program takes one.
+    fn unlockUpdate(self: *CellWaiters, running: ?*RocTask) void {
+        if (running) |task| task.locked_cells = null;
+        // A `ParallelTasks` update holds it, so nothing else changes it here.
+        if (@atomicLoad(u32, &self.locked, .monotonic) != 0) self.unlock();
+    }
 };
 
 /// Every waiting task, by the address of the cell it waits on. Cells that
@@ -1021,72 +1077,92 @@ fn cellWaiters(cell: *anyopaque) *CellWaiters {
     return &cell_waiters[@as(u8, @truncate(address ^ (address >> 8) ^ (address >> 16)))];
 }
 
+/// `cell_lock`, in a `ParallelTasks` program: an update of `cell` is about to
+/// take its state. Cells that share the lock exclude each other too, which
+/// can't deadlock: an update's function can't use another cell.
+pub fn cellLock(cell: *anyopaque) void {
+    const waiters = cellWaiters(cell);
+    waiters.lock();
+    if (runningSlot().*) |task| task.locked_cells = waiters;
+}
+
 /// `cell_wait`: the running `task`'s update of `cell` answered `Wait`, so the
 /// task pauses until a wake. It takes `probe`, a boxed erased callable. A task
 /// whose retried update waits again keeps its place, and passes on the wake
 /// it carried.
+///
+/// The lock is held from before the update took the state until the task runs
+/// no more code, so no store comes between that the task would miss.
 pub fn cellWait(task: *RocTask, cell: *anyopaque, probe: [*]u8) void {
-    task.waits_on_cell = true;
     if (task.waited_cell) |waited| {
         std.debug.assert(waited == cell); // rationale: a readied waiter's code goes on with the update that waited
+        if (!task.carries_wake) utils.builtinInvariant(task.ops, "a task waiting on shared state ran again without a wake");
         erased_callable.decref(task.waiting_probe, task.ops);
         task.waiting_probe = probe;
-        if (!task.carries_wake) utils.builtinInvariant(task.ops, "a task waiting on shared state ran again without a wake");
         task.carries_wake = false;
-        return probeFrom(cell, task.newer_waiter);
+        probeFrom(cell, task.newer_waiter, &task.passed_wake);
+    } else {
+        const waiters = cellWaiters(cell);
+        task.waited_cell = cell;
+        task.waiting_probe = probe;
+        task.older_waiter = waiters.newest;
+        task.newer_waiter = null;
+        if (waiters.newest) |newest| newest.newer_waiter = task else waiters.oldest = task;
+        waiters.newest = task;
     }
-    const waiters = cellWaiters(cell);
-    task.waited_cell = cell;
-    task.waiting_probe = probe;
-    task.older_waiter = waiters.newest;
-    task.newer_waiter = null;
-    if (waiters.newest) |newest| newest.newer_waiter = task else waiters.oldest = task;
-    waiters.newest = task;
+    task.lockTree();
+    task.waits_on_cell = true;
+    task.unlockTree();
 }
 
 /// `cell_settle`: an update of `cell` by the running code answered without a
 /// `Wait`, and `stored` a new state or put back the one it was given.
 pub fn cellSettle(cell: *anyopaque, stored: bool) void {
     const waiters = cellWaiters(cell);
-    if (waiters.oldest == null) return;
     const running = runningSlot().*;
-    if (running) |task| if (task.waited_cell != null) {
-        std.debug.assert(task.waited_cell.? == cell); // rationale: a readied waiter's code goes on with the update that waited
-        if (!stored) return task.leaveCell();
-        task.removeWaiter();
-    };
-    if (stored) probeFrom(cell, waiters.oldest);
+    var calls: HostCalls = .{};
+    if (waiters.oldest) |_| {
+        if (running) |task| if (task.waited_cell != null) {
+            std.debug.assert(task.waited_cell.? == cell); // rationale: a readied waiter's code goes on with the update that waited
+            if (stored) task.removeWaiter() else task.leaveLocked(&calls);
+        };
+        if (stored) probeFrom(cell, waiters.oldest, &calls);
+    }
+    waiters.unlockUpdate(running);
+    calls.make();
 }
 
 /// Probe the waiters of `cell` from `first` on and wake the first that would
 /// not wait, stopping at one that already carries a wake: whichever of them
 /// ends without a store probes on from its successor, so no wake is lost. A
 /// poisoned cell's waiters all go on, each when the one before it crashed.
-fn probeFrom(cell: *anyopaque, first: ?*RocTask) void {
-    var calls: HostCalls = .{};
+/// The cell's waiters are locked.
+fn probeFrom(cell: *anyopaque, first: ?*RocTask, calls: *HostCalls) void {
     var next = first;
-    while (next) |waiter| {
-        next = waiter.newer_waiter;
+    while (next) |waiter| : (next = waiter.newer_waiter) {
         if (waiter.waited_cell.? != cell) continue;
-        if (waiter.carries_wake) break;
+        if (waiter.carries_wake) return;
         // A task that runs no more of its code leaves the cell when it ends.
-        if (waiter.cancel_requested or waiter.crashing) continue;
+        if (@atomicLoad(bool, &waiter.cancel_requested, .monotonic) or @atomicLoad(bool, &waiter.crashing, .monotonic)) continue;
         if (!waiter.probe()) continue;
         waiter.carries_wake = true;
         const seen = @atomicRmw(u32, &waiter.cell_word, .Xchg, 1, .acq_rel);
         if (seen & wake_parked != 0) calls.add(waiter, false);
-        break;
+        return;
     }
-    calls.make();
 }
 
 /// Probe the oldest waiter of every cell, which finds each poisoned one.
-fn probeEveryCell() void {
+fn probeEveryCell(parallel: bool) void {
     for (&cell_waiters) |*waiters| {
+        var calls: HostCalls = .{};
+        if (parallel) waiters.lock();
         var next = waiters.oldest;
         while (next) |waiter| : (next = waiter.newer_waiter) {
-            if (oldestOf(waiters, waiter.waited_cell.?) == waiter) probeFrom(waiter.waited_cell.?, waiter);
+            if (oldestOf(waiters, waiter.waited_cell.?) == waiter) probeFrom(waiter.waited_cell.?, waiter, &calls);
         }
+        if (parallel) waiters.unlock();
+        calls.make();
     }
 }
 
@@ -1102,7 +1178,7 @@ fn oldestOf(waiters: *const CellWaiters, cell: *anyopaque) ?*RocTask {
 /// a task whose operation is abandoned, that are due once the tree is
 /// unlocked, in order. Each task in the list is new or was unparked by what
 /// added it, so until its ready nothing else resumes, readies or frees it.
-const HostCalls = struct {
+const HostCalls = extern struct {
     first: ?*RocTask = null,
     last: ?*RocTask = null,
 

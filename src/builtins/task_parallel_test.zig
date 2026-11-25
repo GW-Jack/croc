@@ -1,7 +1,8 @@
 //! A threaded test of parallel resumes (design.md "Parallel Resumes"): a
 //! `ParallelTasks` host whose workers resume ready tasks and finish hosted
-//! operations at the same time, so reports, wakes, cancels and crashes of one
-//! tree race each other, parks and the owner's own code. `zig build
+//! operations at the same time, and update a shared cell that entries wait on.
+//! So reports, wakes, probes, cancels and crashes of one tree race each other,
+//! parks and the owner's own code. `zig build
 //! run-test-builtins-tsan` runs this file under ThreadSanitizer.
 //!
 //! Each round builds one tree of loops from a seed. The properties:
@@ -17,6 +18,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const crash_exit = @import("task_crash_exit.zig");
+const dev_wrappers = @import("dev_wrappers.zig");
 const erased_callable = @import("erased_callable.zig");
 const task_mod = @import("task.zig");
 const utils = @import("utils.zig");
@@ -157,6 +159,7 @@ fn worker(seed: u64) void {
     while (!root_ended.load(.acquire)) {
         const pick = random.random().int(usize);
         if (random.random().uintLessThan(u8, 3) == 0) _ = finishOperation(pick);
+        if (random.random().uintLessThan(u8, 8) == 0) raiseGate();
         const task = ready.take(pick) orelse {
             idle = if (finishOperation(pick)) 0 else idle + 1;
             if (idle == stalled_spins) {
@@ -189,10 +192,28 @@ fn resumeRoot() void {
     root_ended.store(true, .release);
 }
 
-/// A leaf entry: pause `pauses` times, then return `result`, or crash.
-const Leaf = extern struct { pauses: u32, crashes: bool, result: u64 };
+/// A shared cell, whose value only goes up, with no synchronization but its
+/// lock.
+var gate: u64 = 0;
 
-fn leafCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {
+/// An update of `gate` by no task, as from a Roc function a host calls.
+fn raiseGate() void {
+    dev_wrappers.roc_builtins_cell_lock(&gate);
+    gate += 1;
+    dev_wrappers.roc_builtins_cell_settle(&gate, true);
+}
+
+/// Whether an update that waits until `gate` is at least `until` would go on.
+fn gateProbe(_: *RocOps, ret: ?[*]u8, _: ?[*]const u8, capture: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {
+    ret.?[0] = @intFromBool(gate >= @as(*align(1) const u64, @ptrCast(capture.?)).*);
+}
+
+/// A leaf entry: pause `pauses` times, wait on `gate` `waits` times, then
+/// return `result`, or crash. While it waits, `until` is the value it waits
+/// for.
+const Leaf = extern struct { pauses: u32, waits: u32, crashes: bool, until: u64, result: u64 };
+
+fn leafCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?[*]u8, out_desc: *?*const anyopaque) callconv(.c) void {
     const leaf = @as(*align(1) const Leaf, @ptrCast(capture.?)).*;
     const task: *RocTask = @as(*const *RocTask, @ptrCast(@alignCast(args.?))).*;
     if (leaf.pauses > 0) {
@@ -201,6 +222,22 @@ fn leafCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?
         task.pushRecord(record(task, &leafCall, std.mem.asBytes(&next)), null);
         task.setPending();
         operations.push(task);
+        return;
+    }
+    if (leaf.waits > 0) {
+        var next = leaf;
+        dev_wrappers.roc_builtins_cell_lock(&gate);
+        if (next.until == 0) next.until = gate + 1;
+        if (gate >= next.until) {
+            dev_wrappers.roc_builtins_cell_settle(&gate, false);
+            next.waits -= 1;
+            next.until = 0;
+            return leafCall(ops, ret, args, std.mem.asBytes(&next), null, out_desc);
+        }
+        const probe = startRecord(ops, &gateProbe, std.mem.asBytes(&next.until));
+        std.debug.assert(dev_wrappers.roc_builtins_cell_wait(&gate, probe, task) == 2); // rationale: the park status is fixed
+        task.pushRecord(record(task, &leafCall, std.mem.asBytes(&next)), null);
+        task.setPending();
         return;
     }
     if (leaf.crashes) ops.crash("a leaf crashed");
@@ -262,6 +299,8 @@ fn entryStart(loop: *Loop, ops: *RocOps, index: u32) [*]u8 {
     }
     const leaf: Leaf = .{
         .pauses = random.uintLessThan(u32, 4),
+        .waits = random.uintLessThan(u32, 3),
+        .until = 0,
         .crashes = shape.crashes and random.uintLessThan(u8, 12) == 0,
         .result = 1,
     };

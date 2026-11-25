@@ -652,6 +652,7 @@ pub fn lowLevelAccess(op: LowLevel) OpAccess {
         .group_free,
         .cell_new,
         .cell_exchange,
+        .cell_lock,
         .cell_wait,
         .cell_settle,
         .crash,

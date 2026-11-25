@@ -71,6 +71,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, mode:
             if (proc.body.get() == null) continue;
             switch (proc.running_set_helper) {
                 .run_supervised => try promoteSupervised(allocator, store, layouts, &starts, proc_id),
+                .cell_lock => if (mode == .parallel_tasks) try promoteCell(allocator, store, proc_id, .cell_lock),
                 .cell_wait => try promoteCell(allocator, store, proc_id, .cell_wait),
                 .cell_settle => try promoteCell(allocator, store, proc_id, .cell_settle),
                 .none, .run_create, .run_next, .run_spawn, .run_cancel, .run_entry, .run_arrived, .run_ended => {},
@@ -97,7 +98,7 @@ fn describe(allocator: Allocator, store: *LirStore, layouts: *layout.Store, star
             .run_entry => &entry,
             .run_arrived => &arrived,
             .run_ended => &ended,
-            .none, .run_create, .run_next, .run_spawn, .run_cancel, .run_supervised, .cell_wait, .cell_settle => continue,
+            .none, .run_create, .run_next, .run_spawn, .run_cancel, .run_supervised, .cell_lock, .cell_wait, .cell_settle => continue,
         };
         if (slot.*) |seen| {
             if (seen != callee) invariant("a run_next! specialization calls two specializations of one running-set helper", .{});
@@ -472,14 +473,14 @@ fn promoteSupervised(allocator: Allocator, store: *LirStore, layouts: *layout.St
     proc.frame_locals = try store.addLocalSpan(b.frame.items);
 }
 
-/// Replace the body of one `cell_wait!(cell, probe)` or
+/// Replace the body of one `cell_lock!(cell)`, `cell_wait!(cell, probe)` or
 /// `cell_settle!(cell, stored)` specialization with `op` on its arguments
-/// (design.md "Shared State", "Waiting."). Before, the one crashed and the
-/// other did nothing.
+/// (design.md "Shared State", "Waiting."). Before, the second crashed and the
+/// others did nothing.
 fn promoteCell(allocator: Allocator, store: *LirStore, proc_id: ProcId, op: LIR.LowLevel) Allocator.Error!void {
     const args = try ContinuationPass.copyLocals(allocator, store, store.getProcSpecImmediate(proc_id).args);
     defer allocator.free(args);
-    if (args.len != 2) invariant("a shared-state helper does not take its cell and one more argument", .{});
+    if (args.len != @as(usize, if (op == .cell_lock) 1 else 2)) invariant("a shared-state helper does not take what its operation does", .{});
     const origin = store.stmtOrigin(store.getProcSpecImmediate(proc_id).body.get().?);
     const unit = try store.addLocal(.{ .layout_idx = store.getProcSpecImmediate(proc_id).ret_layout });
     const result = try store.addLocal(.{ .layout_idx = if (op == .cell_wait) .u32 else .zst });
@@ -528,7 +529,7 @@ fn promoteIn(allocator: Allocator, store: *LirStore, layouts: *layout.Store, loo
             try ids.define(allocator, stmt.assign_ref.target, .{ .copy = stmt.assign_ref.op.source });
         } else if (stmt == .assign_call) switch (store.getProcSpecImmediate(stmt.assign_call.proc).running_set_helper) {
             .run_create, .run_next, .run_spawn, .run_cancel => try calls.append(allocator, stmt_id),
-            .none, .run_entry, .run_arrived, .run_ended, .run_supervised, .cell_wait, .cell_settle => {},
+            .none, .run_entry, .run_arrived, .run_ended, .run_supervised, .cell_lock, .cell_wait, .cell_settle => {},
         };
     }
 
@@ -577,7 +578,7 @@ fn promoteIn(allocator: Allocator, store: *LirStore, layouts: *layout.Store, loo
             },
             .run_spawn => try promoter.promoteSpawn(stmt_id, loop),
             .run_cancel => try promoter.promoteCancel(stmt_id),
-            .none, .run_entry, .run_arrived, .run_ended, .run_supervised, .cell_wait, .cell_settle => unreachable, // `calls` holds only these four helpers' calls.
+            .none, .run_entry, .run_arrived, .run_ended, .run_supervised, .cell_lock, .cell_wait, .cell_settle => unreachable, // `calls` holds only these four helpers' calls.
         }
     }
     var task_form_ids = task_form.keyIterator();
