@@ -1182,11 +1182,13 @@ fn createUnsupportedConcurrencyLoweringReport(allocator: Allocator, info: anytyp
 
     try report.document.addText("For now, a platform with ");
     try report.document.addAnnotated("concurrency: Tasks", .emphasized);
+    try report.document.addText(" or ");
+    try report.document.addAnnotated("concurrency: ParallelTasks", .emphasized);
     try report.document.addText(" needs lambda-set specialization (");
     try report.document.addAnnotated("--specialize=yes", .emphasized);
-    try report.document.addText("), with any ");
+    try report.document.addText("), and ParallelTasks an ");
     try report.document.addAnnotated("--opt", .emphasized);
-    try report.document.addText(" and target.");
+    try report.document.addText(" other than interpreter.");
 
     return report;
 }

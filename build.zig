@@ -295,7 +295,7 @@ comptime {
 }
 
 /// Test platform directories that need host libraries built
-const all_test_platform_dirs = [_][]const u8{ "str", "int", "fx", "fx-open", "dylib", "archive", "alloc-count", "box-model-uniqueness", "concurrency-tasks", "tasks-platform" };
+const all_test_platform_dirs = [_][]const u8{ "str", "int", "fx", "fx-open", "dylib", "archive", "alloc-count", "box-model-uniqueness", "concurrency-tasks", "tasks-platform", "parallel-tasks-platform" };
 
 fn mustUseLlvm(target: ResolvedTarget) bool {
     return target.result.os.tag == .macos and target.result.cpu.arch == .x86_64;
@@ -363,15 +363,16 @@ fn testPlatformUsesStackHandler(platform_dir: []const u8) bool {
 }
 
 /// The reference `Tasks` platform runs its blocking operations on a worker
-/// pool (design.md "The Reference Platform").
+/// pool, and the reference `ParallelTasks` platform its tasks (design.md
+/// "The Reference Platform").
 fn testPlatformUsesThreads(platform_dir: []const u8) bool {
-    return std.mem.eql(u8, platform_dir, "tasks-platform");
+    return std.mem.eql(u8, platform_dir, "tasks-platform") or std.mem.eql(u8, platform_dir, "parallel-tasks-platform");
 }
 
-/// The reference `Tasks` platform declares no Windows targets: its host
-/// links libc for threads, `malloc`, `poll` and `pipe`.
+/// Neither reference platform declares Windows targets: their hosts link
+/// libc for threads, `malloc` and `poll`.
 fn testPlatformHasWindowsHost(platform_dir: []const u8) bool {
-    return !std.mem.eql(u8, platform_dir, "tasks-platform");
+    return !testPlatformUsesThreads(platform_dir);
 }
 
 fn testPlatformRequiresSectionDceHost(platform_dir: []const u8) bool {
@@ -1736,7 +1737,7 @@ fn setupTestPlatforms(
             // Allocation-sensitive test platforms declare fx's musl runtime
             // objects as link inputs; copy them alongside their host library
             // rather than committing more copies of the same binaries.
-            if ((std.mem.eql(u8, platform_dir, "alloc-count") or std.mem.eql(u8, platform_dir, "box-model-uniqueness") or std.mem.eql(u8, platform_dir, "concurrency-tasks") or std.mem.eql(u8, platform_dir, "tasks-platform")) and std.mem.endsWith(u8, cross_target.name, "musl")) {
+            if ((std.mem.eql(u8, platform_dir, "alloc-count") or std.mem.eql(u8, platform_dir, "box-model-uniqueness") or std.mem.eql(u8, platform_dir, "concurrency-tasks") or testPlatformUsesThreads(platform_dir)) and std.mem.endsWith(u8, cross_target.name, "musl")) {
                 const copy_musl_runtime = b.addWriteFiles();
                 test_fixtures.copy(
                     copy_musl_runtime,

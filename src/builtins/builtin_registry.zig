@@ -137,9 +137,11 @@ pub const BuiltinFn = enum {
     native_callable_caller_cell,
     erased_callable_free,
     task_create,
+    task_create_parallel,
     task_alloc_record,
     task_push_record,
     task_resume,
+    task_resume_parallel,
     task_wake,
     task_free,
     task_crash_message,
@@ -339,9 +341,11 @@ pub const BuiltinFn = enum {
             .erased_callable_incref_single_thread,
             .erased_callable_repack,
             .task_create,
+            .task_create_parallel,
             .task_alloc_record,
             .task_push_record,
             .task_resume,
+            .task_resume_parallel,
             .task_wake,
             .task_free,
             .task_crash_message,
@@ -594,32 +598,72 @@ fn exportTaskHostCalls() void {
 
 /// Whether `f` is the builtin a `ProgramTaskCall` calls.
 fn isProgramTaskCallBuiltin(f: BuiltinFn) bool {
-    for (program_task_calls) |call| {
-        if (call.builtin == f) return true;
+    for (std.enums.values(TaskMode)) |mode| {
+        for (mode.programTaskCalls()) |call| {
+            if (call.builtin == f) return true;
+        }
     }
     return false;
 }
 
+/// The concurrency mode of a program that creates a task (design.md
+/// "Explicit Inputs").
+pub const TaskMode = enum {
+    tasks,
+    parallel_tasks,
+
+    /// The task calls a program of this mode defines, in the same order in
+    /// both modes.
+    pub fn programTaskCalls(self: TaskMode) *const [program_task_call_count]ProgramTaskCall {
+        return switch (self) {
+            .tasks => &tasks_program_calls,
+            .parallel_tasks => &parallel_program_calls,
+        };
+    }
+
+    /// The host functions they pass, which a host of this mode defines, in
+    /// `TaskHostFn` order.
+    pub fn hostFns(self: TaskMode) []const TaskHostFn {
+        return switch (self) {
+            .tasks => &.{ .ready, .abort },
+            .parallel_tasks => &.{ .ready, .abort, .thread_slot },
+        };
+    }
+};
+
 /// A host function a `ProgramTaskCall` passes to its builtin. Only the host
-/// of a `Tasks` platform defines these.
+/// of a platform with a task mode defines these (`TaskMode.hostFns`).
 pub const TaskHostFn = enum {
     /// `roc_task_ready`: resume the task once.
     ready,
     /// `roc_task_abort`: abandon the task's operation.
     abort,
+    /// `roc_task_thread_slot`: where the calling thread's running task is
+    /// kept, in a `ParallelTasks` program.
+    thread_slot,
 
     pub fn symbol(self: TaskHostFn) [:0]const u8 {
         return switch (self) {
             .ready => shim_symbols.roc_task_ready,
             .abort => shim_symbols.roc_task_abort,
+            .thread_slot => shim_symbols.roc_task_thread_slot,
+        };
+    }
+
+    /// Whether the function takes a task and returns nothing; otherwise it
+    /// takes nothing and returns a pointer.
+    pub fn takesTask(self: TaskHostFn) bool {
+        return switch (self) {
+            .ready, .abort => true,
+            .thread_slot => false,
         };
     }
 };
 
-/// Every `TaskHostFn`, in declaration order.
-pub const task_host_fns = std.enums.values(TaskHostFn);
+/// The number of `TaskHostFn`s.
+pub const task_host_fn_count = std.enums.values(TaskHostFn).len;
 
-/// A task call a `Tasks` program defines over a builtin (design.md
+/// A task call a program that creates a task defines over a builtin (design.md
 /// "Backends"): `name(task)` is `builtin(task, host_fns...)`, with the
 /// addresses of the host's functions. The builtins never link a host symbol
 /// themselves; the program that needs the host's functions does.
@@ -632,22 +676,35 @@ pub const ProgramTaskCall = struct {
     returns_status: bool = false,
 };
 
-/// Every `ProgramTaskCall`: `roc_task_resume` hands the runtime the host's
+/// A `Tasks` program's calls: `roc_task_resume` hands the runtime the host's
 /// `roc_task_ready` and `roc_task_abort`, which it stores on the task for
 /// its children (design.md "Child Tasks"); `roc_task_wake` tells the host a
 /// woken parked task is ready through `roc_task_ready`; `roc_task_cancel`
 /// abandons a parked task's operation through `roc_task_abort` and readies
 /// it through `roc_task_ready`.
-pub const program_task_calls = [_]ProgramTaskCall{
+const tasks_program_calls = [program_task_call_count]ProgramTaskCall{
     .{ .name = shim_symbols.roc_task_resume, .builtin = .task_resume, .host_fns = &.{ .ready, .abort }, .returns_status = true },
     .{ .name = shim_symbols.roc_task_wake, .builtin = .task_wake, .host_fns = &.{.ready} },
     .{ .name = shim_symbols.roc_task_cancel, .builtin = .task_cancel, .host_fns = &.{ .abort, .ready } },
 };
 
+/// A `ParallelTasks` program's calls: `roc_task_resume` also hands the
+/// runtime the host's `roc_task_thread_slot` (design.md "Parallel Resumes").
+const parallel_program_calls = [program_task_call_count]ProgramTaskCall{
+    .{ .name = shim_symbols.roc_task_resume, .builtin = .task_resume_parallel, .host_fns = &.{ .ready, .abort, .thread_slot }, .returns_status = true },
+    tasks_program_calls[1],
+    tasks_program_calls[2],
+};
+
+/// How many `ProgramTaskCall`s a program of either mode defines.
+pub const program_task_call_count = 3;
+
 /// The most host functions one `ProgramTaskCall` passes.
 pub const max_program_task_call_host_fns = blk: {
     var max: usize = 0;
-    for (program_task_calls) |call| max = @max(max, call.host_fns.len);
+    for (std.enums.values(TaskMode)) |mode| {
+        for (mode.programTaskCalls()) |call| max = @max(max, call.host_fns.len);
+    }
     break :blk max;
 };
 

@@ -392,6 +392,8 @@ const WasmRun = struct {
     trace_steps: bool = false,
     ready_tasks: std.ArrayList(u32) = .empty,
     numbers: task_test_host.TaskNumbers(u32) = .{},
+    /// Where the module keeps its running task, in a `ParallelTasks` program.
+    thread_slot: u32 = 0,
     /// The first error a hosted call hit, which it cannot return.
     failure: ?E2eError = null,
 
@@ -404,7 +406,12 @@ const WasmRun = struct {
             .{ .name = "roc_host_log", .params = &task_params, .results = &.{}, .callback = log, .context = self },
             .{ .name = builtins.shim_symbols.roc_task_abort, .params = &task_params, .results = &.{}, .callback = abort, .context = self },
             .{ .name = builtins.shim_symbols.roc_task_ready, .params = &task_params, .results = &.{}, .callback = ready, .context = self },
+            .{ .name = builtins.shim_symbols.roc_task_thread_slot, .params = &.{}, .results = &.{.I32}, .callback = threadSlot, .context = self },
         }) catch return error.TestUnexpectedResult;
+        // The host's own word, not one of the program's allocations.
+        self.thread_slot = self.session.alloc(4, 4);
+        self.session.free();
+        self.writeWord(self.thread_slot, 0);
     }
 
     fn deinit(self: *WasmRun) void {
@@ -538,6 +545,12 @@ const WasmRun = struct {
         self.aborts += 1;
         self.decrefStrValue(pending.url);
         if (self.trace_steps) try self.noteStep("task {d} aborted", .{try self.numbers.of(std.testing.allocator, task)});
+    }
+
+    /// `void **roc_task_thread_slot(void)`, of a `ParallelTasks` program.
+    fn threadSlot(context: ?*anyopaque, _: *wasm_runner.ModuleInstance, _: [*]const wasm_runner.Val, results: [*]wasm_runner.Val) error{}!void {
+        const self: *WasmRun = @ptrCast(@alignCast(context));
+        results[0] = .{ .I32 = @bitCast(self.thread_slot) };
     }
 
     /// `void roc_task_ready(RocTask *task)`: a woken task was parked, or a
@@ -932,6 +945,32 @@ test "a Tasks program compiled by the dev backend pauses and cancels as it does 
 
 test "a Tasks program compiled by the wasm backend pauses and cancels as it does on the interpreter, with no leaks" {
     try harness.runAppPathLoweredInspection(app_path, .{ .specialization_strategy = .lss, .target_usize = .u32 }, runAllWasm);
+}
+
+/// The same program on a `ParallelTasks` platform, resumed by a host with one
+/// thread, which runs as it does on a `Tasks` platform: each backend makes its
+/// root with `task_create_parallel` and passes the resume the host's
+/// `roc_task_thread_slot` (design.md "Parallel Resumes").
+const parallel_app_path = "test/postcheck/suspension_parallel/app.roc";
+
+test "a ParallelTasks program on one thread runs as a Tasks program does, on the interpreter's runtime" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    try harness.runAppPathLoweredInspection(parallel_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, runAll);
+}
+
+test "a ParallelTasks program on one thread runs as a Tasks program does, on LLVM" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    try harness.runAppPathLoweredInspection(parallel_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, runAllLlvm);
+}
+
+test "a ParallelTasks program on one thread runs as a Tasks program does, on the dev backend" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
+    try harness.runAppPathLoweredInspection(parallel_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, runAllDev);
+}
+
+test "a ParallelTasks program on one thread runs as a Tasks program does, on wasm" {
+    try harness.runAppPathLoweredInspection(parallel_app_path, .{ .specialization_strategy = .lss, .target_usize = .u32 }, runAllWasm);
 }
 
 test "a crash inside a Tasks program ends its task with CRASHED and its message, before, between and after its pauses" {

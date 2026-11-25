@@ -58,7 +58,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, mode:
         if (proc.running_set_helper != .run_next or proc.suspends == .never) continue;
         try loops.put(allocator, proc_id, try describe(allocator, store, layouts, &starts, proc_id));
     }
-    if (mode == .tasks) {
+    if (mode.hasTasks()) {
         for (0..proc_count) |index| {
             const proc_id: ProcId = @fromBackingInt(@intCast(index));
             const proc = store.getProcSpecImmediate(proc_id);

@@ -21723,7 +21723,7 @@ fn checkPlatformHostedSection(self: *Self) std.mem.Allocator.Error!void {
     }
 
     // A suspending hosted function needs a platform that lets tasks pause.
-    if (self.cir.concurrency_mode != .tasks) {
+    if (!self.cir.concurrency_mode.hasTasks()) {
         var suspending_it = declared.iterator();
         while (suspending_it.next()) |decl| {
             const def = decl.key_ptr.module.store.getDef(decl.key_ptr.def);

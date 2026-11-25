@@ -65,10 +65,14 @@ test "a platform without the field has mode None" {
     try std.testing.expect(!outcome.unknown_mode and !outcome.not_implemented);
 }
 
-test "Tasks and None are recorded" {
+test "every mode is recorded" {
     const tasks = try canonicalizePlatform(std.testing.allocator, "    concurrency: Tasks");
     try std.testing.expectEqual(base.ConcurrencyMode.tasks, tasks.mode);
     try std.testing.expect(!tasks.unknown_mode and !tasks.not_implemented);
+
+    const parallel = try canonicalizePlatform(std.testing.allocator, "    concurrency: ParallelTasks");
+    try std.testing.expectEqual(base.ConcurrencyMode.parallel_tasks, parallel.mode);
+    try std.testing.expect(!parallel.unknown_mode and !parallel.not_implemented);
 
     const none = try canonicalizePlatform(std.testing.allocator, "    concurrency: None");
     try std.testing.expectEqual(base.ConcurrencyMode.none, none.mode);
@@ -78,12 +82,5 @@ test "Tasks and None are recorded" {
 test "an unknown mode is reported and recorded as None" {
     const outcome = try canonicalizePlatform(std.testing.allocator, "    concurrency: Async");
     try std.testing.expect(outcome.unknown_mode);
-    try std.testing.expectEqual(base.ConcurrencyMode.none, outcome.mode);
-}
-
-test "ParallelTasks is reported as not implemented and recorded as None" {
-    const outcome = try canonicalizePlatform(std.testing.allocator, "    concurrency: ParallelTasks");
-    try std.testing.expect(outcome.not_implemented);
-    try std.testing.expect(!outcome.unknown_mode);
     try std.testing.expectEqual(base.ConcurrencyMode.none, outcome.mode);
 }

@@ -1,6 +1,6 @@
 # META
 ~~~ini
-description=ParallelTasks is reported as not yet implemented
+description=ParallelTasks is recorded on the platform header
 type=file
 ~~~
 # SOURCE
@@ -15,26 +15,9 @@ platform "test-platform"
 helper = 1
 ~~~
 # EXPECTED
-NOT IMPLEMENTED - platform_concurrency_parallel_tasks.md:6:15:6:28
+NIL
 # PROBLEMS
-~~~clojure
-(reports
-	(report
-		(severity fatal)
-		(title "Not Implemented")
-		(region (start 6 15) (end 6 28))
-		(headline
-			(reflow "This feature is not yet implemented: ")
-			(annotation-start emphasis)
-			(text "the ParallelTasks concurrency mode")
-			(annotation-end)
-			(reflow "."))
-		(document
-			(source-region (file "platform_concurrency_parallel_tasks.md") (start 6 15) (end 6 28) (annotation error) (line-text "\tconcurrency: ParallelTasks"))
-			(line-break)
-			(reflow "This error doesn't have a proper diagnostic report yet. Let us know if you want to help improve Roc's error messages!")
-			(line-break))))
-~~~
+NIL
 # TOKENS
 ~~~zig
 KwPlatform,StringStart,StringPart,StringEnd,

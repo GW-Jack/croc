@@ -13836,6 +13836,7 @@ test "RC atomicity: a value loaded from the host keeps atomic counts" {
 test "RC atomicity: the start record a task operation takes is named host-visible" {
     const taking = [_]struct { op: LIR.LowLevel, arg: u6 }{
         .{ .op = .task_create, .arg = 0 },
+        .{ .op = .task_create_parallel, .arg = 0 },
         .{ .op = .group_push, .arg = 1 },
         .{ .op = .group_spawn, .arg = 1 },
     };

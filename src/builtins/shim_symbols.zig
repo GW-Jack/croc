@@ -33,6 +33,13 @@ pub const roc_task_resume = "roc_task_resume";
 /// The registry builtin `task_resume`, which the shims export so a shim
 /// build's platform shim module can define `roc_task_resume` over it.
 pub const roc_builtins_task_resume = "roc_builtins_task_resume";
+/// The registry builtin `task_resume_parallel`, which the shims export so a
+/// shim build's platform shim module can define `roc_task_resume` over it in
+/// a `ParallelTasks` program.
+pub const roc_builtins_task_resume_parallel = "roc_builtins_task_resume_parallel";
+/// The `ParallelTasks` host's: where the calling thread's running task is
+/// kept (design.md "Parallel Resumes").
+pub const roc_task_thread_slot = "roc_task_thread_slot";
 /// Tells a task the host wrote its pending hosted result; a `Tasks` program
 /// defines it (design.md "Host Contract").
 pub const roc_task_wake = "roc_task_wake";

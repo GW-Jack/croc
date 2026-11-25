@@ -378,7 +378,15 @@ pub const CancelAfter = struct { resumes: u32, cancel: CancelFn };
 /// Resume with the test host's `roc_task_ready` and `roc_task_abort`, as a
 /// program's `roc_task_resume` does, for a run whose program defines none.
 pub fn nativeResume(task: *RocTask) callconv(.c) u32 {
+    if (task.tree != null) return builtins.dev_wrappers.roc_builtins_task_resume_parallel(task, &readyTask, &abortPending, &threadSlot);
     return builtins.dev_wrappers.roc_builtins_task_resume(task, &readyTask, &abortPending);
+}
+
+threadlocal var thread_task: ?*RocTask = null;
+
+/// `void **roc_task_thread_slot(void)` of a `ParallelTasks` program.
+fn threadSlot() callconv(.c) *?*RocTask {
+    return &thread_task;
 }
 
 /// Cancel with the test host's `roc_task_abort` and `roc_task_ready`, as a
@@ -398,15 +406,15 @@ var c_abi_host: ?*TestHost = null;
 /// The first error a C-ABI hosted call hit, which it cannot return.
 pub var c_abi_failure: ?eval.Interpreter.Error = null;
 
-/// Bind the fixture's hosted symbols, and the host's `roc_task_ready` and
-/// `roc_task_abort`, for
-/// an object compiled code is loaded from, to the C-ABI functions that reach
+/// Bind the fixture's hosted symbols, and the host's `roc_task_ready`,
+/// `roc_task_abort` and `roc_task_thread_slot`, for an object compiled code is loaded from, to the C-ABI functions that reach
 /// the entered host.
 pub fn resolveCAbiSymbol(_: ?*anyopaque, name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "roc_host_fetch")) return @intFromPtr(&cAbiFetch);
     if (std.mem.eql(u8, name, "roc_host_log")) return @intFromPtr(&cAbiLog);
     if (std.mem.eql(u8, name, builtins.shim_symbols.roc_task_ready)) return @intFromPtr(&readyTask);
     if (std.mem.eql(u8, name, builtins.shim_symbols.roc_task_abort)) return @intFromPtr(&abortPending);
+    if (std.mem.eql(u8, name, builtins.shim_symbols.roc_task_thread_slot)) return @intFromPtr(&threadSlot);
     return null;
 }
 

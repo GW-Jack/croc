@@ -641,6 +641,7 @@ pub fn lowLevelAccess(op: LowLevel) OpAccess {
         .task_hosted_slot,
         .task_result_buffer,
         .task_create,
+        .task_create_parallel,
         .group_init,
         .group_push,
         .group_start,

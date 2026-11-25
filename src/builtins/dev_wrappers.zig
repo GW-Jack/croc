@@ -1417,6 +1417,17 @@ pub fn roc_builtins_task_create(start: [*]u8, root_result: [*]u8, hosted_slot_si
     });
 }
 
+/// `task_create_parallel`: `roc_builtins_task_create` in a `ParallelTasks`
+/// program (design.md "Parallel Resumes").
+pub fn roc_builtins_task_create_parallel(start: [*]u8, root_result: [*]u8, hosted_slot_size: u64, hosted_slot_alignment: u64, result_buffer_size: u64, result_buffer_alignment: u64) callconv(.c) *task.RocTask {
+    return task.RocTask.createParallel(in_process_host.ops(), start, root_result, .{
+        .hosted_slot_size = @intCast(hosted_slot_size),
+        .hosted_slot_alignment = @intCast(hosted_slot_alignment),
+        .result_buffer_size = @intCast(result_buffer_size),
+        .result_buffer_alignment = @intCast(result_buffer_alignment),
+    });
+}
+
 /// Where `suspend_save` packs its record: `payload_size` bytes with one
 /// reference, from the task's record cache when it has one of that size
 /// (design.md "The Task Runtime", "Record cache").
@@ -1437,6 +1448,12 @@ pub fn roc_builtins_task_push_record(roc_task: *task.RocTask, record: [*]u8, slo
 /// `RocTaskStatus`.
 pub fn roc_builtins_task_resume(roc_task: *task.RocTask, ready: task.ReadyFn, abort: task.AbortFn) callconv(.c) u32 {
     return @backingInt(roc_task.resumeFromHost(ready, abort));
+}
+
+/// `roc_task_resume`'s body in a `ParallelTasks` program, with the host's
+/// `roc_task_thread_slot` as `thread_slot` (design.md "Parallel Resumes").
+pub fn roc_builtins_task_resume_parallel(roc_task: *task.RocTask, ready: task.ReadyFn, abort: task.AbortFn, thread_slot: task.ThreadSlotFn) callconv(.c) u32 {
+    return @backingInt(roc_task.resumeParallelFromHost(ready, abort, thread_slot));
 }
 
 /// `roc_task_wake`'s body, with the host's `roc_task_ready` as `ready`: a

@@ -450,7 +450,8 @@ pub const Constants = struct {
     /// 211: module environments record the Builtin running-set helper
     /// definitions, each `spawn`'s plan loop, and plan loops' dispatch.
     /// 212: recorded running-set helpers include `run_supervised!`.
-    pub const CACHE_VERSION = 212;
+    /// 213: `task_create_parallel` joins the low-level operations.
+    pub const CACHE_VERSION = 213;
 };
 
 /// Configuration for the Roc cache system.

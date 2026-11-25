@@ -383,6 +383,15 @@ pub const RocTask = extern struct {
         return task;
     }
 
+    /// `create` for the root of a `ParallelTasks` program: the root has its
+    /// tree's lock from the start, since its tree may be touched by two
+    /// threads from its first resume on (design.md "Parallel Resumes").
+    pub fn createParallel(ops: *RocOps, start: [*]u8, root_result: [*]u8, buffers: BufferLayout) *RocTask {
+        const task = create(ops, start, root_result, buffers);
+        task.tree = &task.tree_lock;
+        return task;
+    }
+
     /// `task_ready`: whether the pending flag is clear.
     pub fn ready(self: *const RocTask) bool {
         return self.pending == 0;
@@ -471,12 +480,11 @@ pub const RocTask = extern struct {
 
     /// `roc_task_resume` of a `ParallelTasks` program
     /// (`roc_builtins_task_resume_parallel`), whose resumes of different
-    /// tasks may overlap: the root's first resume, before which it has no
-    /// children, gives its tree a lock (design.md "Parallel Resumes").
+    /// tasks may overlap (design.md "Parallel Resumes").
     pub fn resumeParallelFromHost(self: *RocTask, ready_fn: ReadyFn, abort_fn: AbortFn, thread_slot_fn: ThreadSlotFn) Status {
         if (!self.resumable()) return self.status;
         @atomicStore(?ThreadSlotFn, &thread_slot, thread_slot_fn, .monotonic);
-        if (self.tree == null) self.tree = &self.tree_lock;
+        std.debug.assert(self.tree != null); // rationale: a `ParallelTasks` root is made by `createParallel`, and a child copies its parent's tree
         self.keepHostFns(ready_fn, abort_fn);
         return self.resumeChecked();
     }

@@ -13,6 +13,15 @@ pub const ConcurrencyMode = enum(u8) {
     /// Like `tasks`, with tasks running on several threads at once.
     parallel_tasks,
 
+    /// Whether a `suspending` hosted call may pause its task, so `provides`
+    /// entries return tasks.
+    pub fn hasTasks(self: ConcurrencyMode) bool {
+        return switch (self) {
+            .none => false,
+            .tasks, .parallel_tasks => true,
+        };
+    }
+
     /// The mode a header's mode name denotes, or null for an unknown name.
     pub fn fromHeaderName(name: []const u8) ?ConcurrencyMode {
         if (std.mem.eql(u8, name, "None")) return .none;

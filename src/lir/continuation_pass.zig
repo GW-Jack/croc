@@ -23,6 +23,7 @@ const SuspensionMarks = @import("suspension_marks.zig");
 const RunningSetPromotion = @import("running_set_promotion.zig");
 const invariant = @import("base").invariant;
 const ConcurrencyMode = @import("base").ConcurrencyMode;
+const TaskMode = @import("builtins").builtin_registry.TaskMode;
 
 const LIR = core.LIR;
 const LirStore = core.LirStore;
@@ -135,7 +136,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
         errdefer sites.deinit();
         try plans.append(allocator, .{ .proc = proc_id, .sites = sites, .task = undefined });
     }
-    if (plans.items.len == 0 and roots.mode != .tasks) return;
+    if (plans.items.len == 0 and !roots.mode.hasTasks()) return;
 
     // The task: a hidden argument after the explicit ones, passed on at
     // every site to a procedure. A hosted site takes it in the host's
@@ -252,8 +253,12 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
     for (roots.procs, roots.provided) |*root, provided| {
         const may_suspend = store.getProcSpecImmediate(root.*).suspends != .never;
         if (may_suspend and !provided) invariant("a root that is not a provides entry may suspend", .{});
-        if (!provided or !(may_suspend or roots.mode == .tasks)) continue;
-        root.* = try startRoot(allocator, store, layouts, root.*, may_suspend, buffers);
+        if (!provided or !(may_suspend or roots.mode.hasTasks())) continue;
+        const create_op: LIR.LowLevel = switch (roots.mode) {
+            .none, .tasks => .task_create,
+            .parallel_tasks => .task_create_parallel,
+        };
+        root.* = try startRoot(allocator, store, layouts, root.*, create_op, may_suspend, buffers);
     }
 
     try SuspensionMarks.run(allocator, store, roots.mode);
@@ -378,8 +383,9 @@ pub fn packStart(allocator: Allocator, store: *LirStore, layouts: *const layout.
 /// takes the root's explicit arguments as its capture. Its task entry
 /// `E(args..., result_out)` takes the root's place: it packs the start
 /// record and returns the task it creates, whose root result goes to
-/// `result_out` (design.md "Host Contract"). Returns `E`.
-fn startRoot(allocator: Allocator, store: *LirStore, layouts: *layout.Store, root: ProcId, may_suspend: bool, buffers: Buffers) Allocator.Error!ProcId {
+/// `result_out` (design.md "Host Contract"). `create_op` is the mode's
+/// operation that creates it. Returns `E`.
+fn startRoot(allocator: Allocator, store: *LirStore, layouts: *layout.Store, root: ProcId, create_op: LIR.LowLevel, may_suspend: bool, buffers: Buffers) Allocator.Error!ProcId {
     const source = store.getProcSpecImmediate(root).*;
     const origin = store.stmtOrigin(source.body.get().?);
     const root_args = try copyLocals(allocator, store, source.args);
@@ -413,7 +419,7 @@ fn startRoot(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roo
     for (&size_locals) |*size_local| size_local.* = try freshLocal(store, &frame, allocator, .u64);
 
     const ret = try store.addCFStmt(.{ .ret = .{ .value = task } }, origin);
-    var head = try store.addLowLevelStmt(task, .task_create, &.{ record, result_out, size_locals[0], size_locals[1], size_locals[2], size_locals[3] }, ret, origin);
+    var head = try store.addLowLevelStmt(task, create_op, &.{ record, result_out, size_locals[0], size_locals[1], size_locals[2], size_locals[3] }, ret, origin);
     var index = sizes.len;
     while (index > 0) {
         index -= 1;
@@ -1859,6 +1865,24 @@ test "a provides root that may suspend is started as a task by an entry that tak
     defer testing.allocator.free(call_args);
     try testing.expectEqualSlices(LocalId, &.{ field.target, start_args[0] }, call_args);
     try testing.expectEqual(call.target, f.at(call.next).ret.value);
+}
+
+test "the mode picks the operation that creates a root's task" {
+    for ([_]ConcurrencyMode{ .tasks, .parallel_tasks }, [_]LIR.LowLevel{ .task_create, .task_create_parallel }) |mode, create_op| {
+        var f = try Fixture.init();
+        defer f.deinit();
+        const z = try f.local();
+        const quiet = try f.addProc(&.{z}, &.{z}, try f.stmt(.{ .ret = .{ .value = z } }));
+        var roots = [_]ProcId{quiet};
+        try testing.expectEqual(@as(?TaskMode, null), f.store.taskMode());
+        try run(testing.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .mode = mode });
+        var creates: usize = 0;
+        for (f.store.getCFStmts()) |stmt| {
+            if (stmt == .assign_low_level and stmt.assign_low_level.op == create_op) creates += 1;
+        }
+        try testing.expectEqual(@as(usize, 1), creates);
+        try testing.expectEqual(@as(?TaskMode, if (mode == .tasks) .tasks else .parallel_tasks), f.store.taskMode());
+    }
 }
 
 test "in a Tasks build a provides root that never suspends is still started as a task" {

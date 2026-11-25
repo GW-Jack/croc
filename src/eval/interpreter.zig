@@ -6676,10 +6676,11 @@ pub const Interpreter = struct {
             // The task keeps the caller's operations, not this interpreter's
             // forwarding ones: the host frees the task after its last record,
             // which may hold the last reference to this interpreter, is gone.
-            .task_create => blk: {
+            .task_create, .task_create_parallel => blk: {
                 const start = self.readBoxedDataPointer(args[0]) orelse
                     return self.invariantFailedError("LIR/interpreter invariant violated: task_create had no start record", .{});
-                const task = RocTask.create(self.roc_env.currentRocOps(), start, @ptrFromInt(self.readPointerInt(args[1])), .{
+                const create: *const @TypeOf(RocTask.create) = if (ll.op == .task_create) &RocTask.create else &RocTask.createParallel;
+                const task = create(self.roc_env.currentRocOps(), start, @ptrFromInt(self.readPointerInt(args[1])), .{
                     .hosted_slot_size = @intCast(args[2].read(u64)),
                     .hosted_slot_alignment = @intCast(args[3].read(u64)),
                     .result_buffer_size = @intCast(args[4].read(u64)),

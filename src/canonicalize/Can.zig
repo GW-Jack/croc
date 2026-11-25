@@ -6340,9 +6340,9 @@ fn checkRocVersionPin(self: *Self, roc_version: ?AST.RecordField.Idx) std.mem.Al
     } });
 }
 
-/// Record the platform header's `concurrency` mode. A mode that doesn't exist,
-/// or one not implemented yet, is reported and leaves the mode `none`, so no
-/// later stage sees a mode it would have to guess about.
+/// Record the platform header's `concurrency` mode. A mode that doesn't exist
+/// is reported and leaves the mode `none`, so no later stage sees a mode it
+/// would have to guess about.
 fn setPlatformConcurrencyMode(self: *Self, mode_token: ?AST.Token.Idx) std.mem.Allocator.Error!void {
     const token = mode_token orelse return;
     const name = self.parse_ir.resolve(token);
@@ -6354,13 +6354,7 @@ fn setPlatformConcurrencyMode(self: *Self, mode_token: ?AST.Token.Idx) std.mem.A
         } });
         return;
     };
-    switch (mode) {
-        .none, .tasks => self.env.concurrency_mode = mode,
-        .parallel_tasks => try self.env.pushDiagnostic(.{ .not_implemented = .{
-            .feature = try self.env.insertString("the ParallelTasks concurrency mode"),
-            .region = region,
-        } }),
-    }
+    self.env.concurrency_mode = mode;
 }
 
 fn createExposedScope(

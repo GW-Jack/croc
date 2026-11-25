@@ -361,6 +361,12 @@ fn parallelSlot() callconv(.c) *?*RocTask {
     return &parallel_running;
 }
 
+/// `task`, a root no resume has run yet, as `createParallel` makes one.
+fn parallelRoot(task: *RocTask) *RocTask {
+    task.tree = &task.tree_lock;
+    return task;
+}
+
 fn resumeParallel(task: *RocTask) Status {
     return task.resumeParallelFromHost(&ready, &abort, &parallelSlot);
 }
@@ -380,9 +386,9 @@ test "parallel resumes of two tasks may overlap, and a second resume of one is c
     reset();
     var root_a: [8]u8 = @splat(0);
     var root_b: [8]u8 = @splat(0);
-    const held = chainTask(&h.ops, &.{}, &root_a, 1);
+    const held = parallelRoot(chainTask(&h.ops, &.{}, &root_a, 1));
     @as(*align(1) Step, @ptrCast(erased_callable.capturePtr(held.entries[0].record))).hook = .hold_for_overlap;
-    const other = chainTask(&h.ops, &.{}, &root_b, 2);
+    const other = parallelRoot(chainTask(&h.ops, &.{}, &root_b, 2));
 
     const thread = try std.Thread.spawn(.{}, runHeldParallel, .{held});
     while (!overlap_running.load(.acquire)) std.atomic.spinLoopHint();
@@ -405,7 +411,7 @@ test "a parallel host that resumes a task inside one of its hosted calls is caug
     defer h.deinit();
     reset();
     var root: [8]u8 = @splat(0);
-    const task = chainTask(&h.ops, &.{.resume_own_task}, &root, 7);
+    const task = parallelRoot(chainTask(&h.ops, &.{.resume_own_task}, &root, 7));
 
     try std.testing.expectEqual(Status.pending, resumeParallel(task));
     try expectCaught(hook_message, "P1");

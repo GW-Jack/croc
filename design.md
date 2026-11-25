@@ -33674,7 +33674,7 @@ interpreter and LirImage follow the output without knowing about suspension.
   sees it, and it reaches LIR as the body-less hosted procedure's own
   `suspends = may` mark (below), set when LIR construction makes it. Only
   effectful (`=>`) hosted declarations may carry it. A `suspending`
-  declaration in a program whose platform is not `concurrency: Tasks` is a
+  declaration in a program whose platform has `concurrency: None` is a
   checking error. Both words are recognized only where they have this
   meaning, so neither becomes a reserved word.
 - **Where the parser accepts them.** `concurrency: <UpperIdent>` is an
@@ -33696,10 +33696,8 @@ interpreter and LirImage follow the output without knowing about suspension.
 Checking makes both inputs exact before anything later reads them:
 
 - A mode other than the three is an unknown-mode error, reported by
-  canonicalization at the mode token. `ParallelTasks` is reported there too,
-  as not yet implemented, until shared counts exist; neither error leaves
-  a mode for later stages to guess at, and the platform's recorded mode is
-  `None` after either.
+  canonicalization at the mode token. The error leaves no mode for later
+  stages to guess at: the platform's recorded mode is `None` after it.
 - Canonicalization reports `suspending` on an annotation that has a
   definition (`suspending_not_hosted`) and on one not written as a `=>`
   function type (`suspending_not_effectful`). The second rule is about the
@@ -34491,15 +34489,18 @@ platform defines:
 - wake calls `roc_task_ready`;
 - cancel calls `roc_task_abort` and `roc_task_ready`.
 
-The builtins never refer to a host symbol. So a `Tasks` program defines
-these three calls itself (its program task calls), each a call to its
-registry builtin with the host's functions. A program of another mode
-neither defines them nor refers to the host's two (Backends).
+The builtins never refer to a host symbol. So a program of a mode with tasks
+defines these three calls itself (its program task calls), each a call to its
+registry builtin with the host's functions. A `ParallelTasks` program's resume
+also passes the host's `roc_task_thread_slot` (Parallel Resumes). A `None`
+program neither defines the calls nor refers to the host's functions
+(Backends).
 
 These symbols join the fixed runtime set, and the glue templates of a
 `Tasks` platform declare all of them with `RocTask`, `RocPoll` and
-`RocTaskStatus`. `roc_task_ready` and `roc_task_abort` are the host's; a
-`Tasks` platform's host must define both.
+`RocTaskStatus`. `roc_task_ready` and `roc_task_abort` are the host's; the
+host of a mode with tasks must define both, and a `ParallelTasks` host
+`roc_task_thread_slot`.
 
 A host keeps these obligations. Breaking one is undefined behavior, like a
 `roc_alloc` that returns null; the conformance harness (The Task Runtime)
@@ -34947,9 +34948,9 @@ a `Tasks` program there is none, and the running task is the builtins global.
 **The tree's lock.** One lock guards the state that tasks of one tree touch
 in each other: each group's entries, limits, counts and reports; and each
 task's wait source, its marks (`started`, `cancel_requested`, `crashing`,
-`finishing`) and its crash message. The root holds the lock's word. Its first
-resume, before which the tree has one task, points the root at it, and a
-child copies its parent's pointer. Roots share nothing, so a server whose
+`finishing`) and its crash message. The root holds the lock's word, and is
+created pointing at it (`task_create_parallel`); a child copies its parent's
+pointer. Roots share nothing, so a server whose
 requests are roots has one lock for each request. The pointer is null in a
 `Tasks` program, which takes no lock.
 
@@ -35113,28 +35114,35 @@ byte:
 - **Program task calls.** `roc_task_resume(task)` calls the registry builtin
   `roc_builtins_task_resume(task, ready, abort)` with the host's
   `roc_task_ready` and `roc_task_abort`, which the runtime stores on the
-  task (Child Tasks). `roc_task_wake(task)` calls the registry builtin
+  task (Child Tasks). In a `ParallelTasks` program it calls
+  `roc_builtins_task_resume_parallel`, which also takes the host's
+  `roc_task_thread_slot`. `roc_task_wake(task)` calls the registry builtin
   `roc_builtins_task_wake(task, ready)` with the host's `roc_task_ready`
   as `ready` (`RocTask.wake`), and `roc_task_cancel(task)` calls
   `roc_builtins_task_cancel(task, abort, ready)` with the host's
   `roc_task_abort` and `roc_task_ready` (`RocTask.cancel`), all
-  `callconv(.c)`. One table, `builtin_registry.program_task_calls`, lists
-  them with the host functions each passes (`TaskHostFn`), and every
-  backend defines each the same way, where the program's own symbols live:
+  `callconv(.c)`. One table per mode, `TaskMode.programTaskCalls`, lists
+  them with the host functions each passes (`TaskHostFn`). A program's mode
+  is read from the operation that creates its roots (`LirStore.taskMode`):
+  the continuation pass emits `task_create`, or `task_create_parallel` in a
+  `ParallelTasks` build, which every backend lowers the same way to its own
+  builtin. Every backend defines each the same way, where the program's own symbols live:
   - LLVM, in the program's module, beside the host's calls;
   - the dev backend's object file (`roc build --opt=dev`), beside its
     entrypoint wrappers, in the same frame they get. The builtins object it
     links defines the host's calls in every payload;
-  - wasm, in the final module, which imports `roc_task_ready` and
-    `roc_task_abort` from `env` like hosted functions, puts them in the
+  - wasm, in the final module, which imports `roc_task_ready`,
+    `roc_task_abort` and, for `ParallelTasks`, `roc_task_thread_slot` from
+    `env` like hosted functions, puts them in the
     table, and exports `roc_task_wake` and `roc_task_cancel`;
   - a shim build (the interpreter's, or the dev backend's run image), in the
     generated platform shim module, which the CLI generates knowing whether
-    the program creates a task (`LirStore.createsTask`). The shim archive
+    the program's task mode (`LirStore.taskMode`). The shim archive
     defines the builtins. Both shims export `roc_builtins_task_resume`,
+    `roc_builtins_task_resume_parallel`,
     `roc_builtins_task_wake` and `roc_builtins_task_cancel` beside the
     host's calls, from the copy of the builtins that runs the records; the
-    interpreter shim's bundled builtins object leaves all five out (One
+    interpreter shim's bundled builtins object leaves all six out (One
     runtime per process).
 
   The CLI's `Tasks` fixture host cancels through `roc_task_cancel` at a
@@ -35180,7 +35188,8 @@ relocatable object that the platform's `host.wasm` links against:
   (`roc_task_free` and `roc_task_crash_message` from the merged builtins,
   and the program's `roc_task_resume`, `roc_task_wake` and
   `roc_task_cancel`), and its allowed imports
-  add `roc_task_ready` and `roc_task_abort`, which the host defines;
+  add the host functions of the program's mode (`TaskMode.hostFns`), which
+  the host defines;
 - in a relocatable object, each program task call is a global symbol under
   its own name, and it names its host function's table slot by a
   `table_index_rel_sleb` relocation against the import's symbol, as any
@@ -35204,7 +35213,9 @@ Until the rest exists:
   combination. Discovery reads the mode from the platform header, and the
   CLI checks it against the selected target, so `roc run`, `roc build` and
   `roc test` report it before checking starts;
-- checking reports `concurrency: ParallelTasks` as not yet implemented;
+- the CLI reports `concurrency: ParallelTasks` on the interpreter the same
+  way. One interpreter's state is not safe to use on two threads, so it
+  cannot run two resumes at once (Parallel Resumes);
 - the continuation pass stops with a not-yet-implemented panic, in every
   build mode, when an erased-callable procedure other than a resume entry or
   start record may suspend: its erased callers have no task to pass it. An
@@ -35283,6 +35294,21 @@ terminal status:
 - the host never cancels the root, so `CANCELLED` is unreachable.
 
 The host links libc on every target, for threads and a thread-safe `malloc`.
+
+**The `ParallelTasks` reference.** `test/parallel-tasks-platform/` is the same
+for `ParallelTasks`: four workers take ready tasks off one queue and resume
+them, so resumes overlap, and a timer thread wakes sleeping tasks. Its host
+keeps the thread slot in a thread-local. `Meet.all! : U64 => Bool` is an
+ordinary hosted call that blocks its thread until as many calls as it names
+are inside it, so a program that meets four entries passes only when four
+threads run Roc code at the same moment. The tests run on the dev backend and
+LLVM:
+- entries that copy and drop shared strings on four threads at once, whose
+  counts must be atomic where they are shared and whose allocations must all
+  be released;
+- an early exit while other entries run or sleep;
+- an entry that crashes while three others run, and a supervised one that
+  does, where the crash must reach its own task.
 
 **Measuring records.** A pause at depth *d* allocates *d* records with
 `roc_alloc`, and the resume releases them with `roc_dealloc`. Records are

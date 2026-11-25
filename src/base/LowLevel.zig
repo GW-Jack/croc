@@ -696,6 +696,9 @@ pub const LowLevel = enum(u16) {
     /// list holds the start record, which it takes, and whose root result
     /// goes to `root_result`. Each size and alignment is a `U64`.
     task_create,
+    /// `task_create` in a `ParallelTasks` program: the new task, a root, has
+    /// its tree's lock (design.md "Parallel Resumes").
+    task_create_parallel,
 
     // Running-set operations of a task-form concurrent loop (design.md
     // "Records And The Task", "Child Tasks"), made only by the continuation
@@ -1349,6 +1352,7 @@ pub const LowLevel = enum(u16) {
         .task_hosted_slot = byType(.none()),
         .task_result_buffer = byType(.none()),
         .task_create = byType(.{ .may_retain_or_release = true, .consume_args = arg_0, .args_host_visible = arg_0 }),
+        .task_create_parallel = byType(.{ .may_retain_or_release = true, .consume_args = arg_0, .args_host_visible = arg_0 }),
 
         // Starting entries makes child tasks; ending, cancelling and
         // freeing a set drop start records and results nobody took.

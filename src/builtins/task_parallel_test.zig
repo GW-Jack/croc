@@ -361,7 +361,7 @@ fn runTree(seed: u64, round_shape: Shape, cancel: bool) RunError!void {
     const ops = &test_host.ops;
     const loop = newLoop(prng.random().int(u64), 3);
     var root: u64 = 0;
-    root_task = RocTask.create(ops, startRecord(ops, &loopCall, std.mem.asBytes(&loop)), @ptrCast(&root), buffers);
+    root_task = RocTask.createParallel(ops, startRecord(ops, &loopCall, std.mem.asBytes(&loop)), @ptrCast(&root), buffers);
     ready.push(root_task);
 
     var workers: [worker_count]std.Thread = undefined;

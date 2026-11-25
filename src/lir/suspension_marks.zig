@@ -45,7 +45,7 @@ const Walk = struct {
 /// Commit `suspends` on every procedure with a body and `suspension_site` on
 /// every direct call.
 ///
-/// `mode` is the platform's: in a `Tasks` build every `run_supervised`
+/// `mode` is the platform's: in a build with tasks every `run_supervised`
 /// specialization is a seed (design.md "Plans And Concurrent Loops",
 /// "Supervision.").
 pub fn run(allocator: Allocator, store: *LirStore, mode: ConcurrencyMode) Allocator.Error!void {
@@ -74,7 +74,7 @@ pub fn run(allocator: Allocator, store: *LirStore, mode: ConcurrencyMode) Alloca
     var walk = try walkBodies(allocator, store);
     defer walk.deinit(allocator);
     const calls = &walk.calls;
-    if (mode == .tasks) {
+    if (mode.hasTasks()) {
         for (0..store.procSpecCount()) |index| {
             if (supervises(store.getProcSpecImmediate(@fromBackingInt(@as(u32, @intCast(index)))))) walk.parks.set(index);
         }
@@ -104,12 +104,12 @@ fn supervises(proc: *const LIR.LirProcSpec) bool {
 }
 
 /// Whether any body-less procedure is marked as one that may suspend, or a
-/// `Tasks` build holds a `run_supervised` specialization.
+/// build with tasks holds a `run_supervised` specialization.
 fn anySeed(store: *const LirStore, mode: ConcurrencyMode) bool {
     for (0..store.procSpecCount()) |index| {
         const proc = store.getProcSpecImmediate(@fromBackingInt(@as(u32, @intCast(index))));
         if (proc.body.get() == null and proc.suspends == .may) return true;
-        if (mode == .tasks and supervises(proc)) return true;
+        if (mode.hasTasks() and supervises(proc)) return true;
     }
     return false;
 }

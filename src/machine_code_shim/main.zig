@@ -1038,6 +1038,7 @@ comptime {
         @export(&builtins.task.host_calls.free, .{ .name = shim_symbols.roc_task_free });
         @export(&builtins.task.host_calls.crashMessage, .{ .name = shim_symbols.roc_task_crash_message });
         @export(&builtins.dev_wrappers.roc_builtins_task_resume, .{ .name = shim_symbols.roc_builtins_task_resume });
+        @export(&builtins.dev_wrappers.roc_builtins_task_resume_parallel, .{ .name = shim_symbols.roc_builtins_task_resume_parallel });
         @export(&builtins.dev_wrappers.roc_builtins_task_wake, .{ .name = shim_symbols.roc_builtins_task_wake });
         @export(&builtins.dev_wrappers.roc_builtins_task_cancel, .{ .name = shim_symbols.roc_builtins_task_cancel });
     }

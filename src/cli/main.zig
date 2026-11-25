@@ -1396,7 +1396,7 @@ fn generatePlatformHostShimFromLirData(
 
     // A `Tasks` program's own symbols live in this module in a shim build,
     // its `ProgramTaskCall`s among them (design.md "Backends").
-    const defines_program_task_calls = store.createsTask();
+    const task_mode = store.taskMode();
     var bitcode_result = codegen.generateInterpreterShimModule(
         "roc_platform_shim",
         shim_entrypoints,
@@ -1404,7 +1404,7 @@ fn generatePlatformHostShimFromLirData(
         package_symbols,
         embedded_lir_image,
         default_run_start,
-        defines_program_task_calls,
+        task_mode,
     ) catch |err| {
         return ctx.fail(.{ .shim_generation_failed = .{ .err = err } });
     };
@@ -1431,7 +1431,7 @@ fn generatePlatformHostShimFromLirData(
     hash.update(&image_len_bytes);
     hash.update(if (embedded_lir_image != null) "embed" else "dispatch");
     hash.update(if (default_run_start) "default-run-start" else "host-provided-start");
-    hash.update(if (defines_program_task_calls) "program-task-calls" else "no-program-task-calls");
+    hash.update(if (task_mode) |mode| @tagName(mode) else "no-program-task-calls");
     for (entrypoint_names) |name| {
         hash.update(name);
         hash.update(&[_]u8{0});
@@ -2214,11 +2214,9 @@ fn requirePlatformTargets(ctx: *CliCtx, build_env: *const BuildEnv, app_path: []
 
 /// Reject a platform whose `concurrency` mode the chosen optimization level
 /// and lowering strategy do not support yet (design.md "What Implements It
-/// First"): `Tasks` runs under `.lss` on every backend, for every target.
-/// Discovery read the mode from the platform header, so this runs before
-/// any lowering.
-/// `ParallelTasks` is left to checking, which reports it as not yet
-/// implemented.
+/// First"): `Tasks` runs under `.lss` on every backend, for every target,
+/// and `ParallelTasks` on all of them but the interpreter. Discovery read the
+/// mode from the platform header, so this runs before any lowering.
 fn requireSupportedConcurrency(
     ctx: *CliCtx,
     build_env: *const BuildEnv,
@@ -2226,13 +2224,15 @@ fn requireSupportedConcurrency(
     strategy: base.SpecializationStrategy,
 ) CliMainError!void {
     const mode = build_env.getPlatformConcurrencyMode() orelse return;
-    switch (mode) {
-        .none, .parallel_tasks => return,
-        .tasks => {},
-    }
-    if (tasksLowers(strategy)) return;
+    const name = switch (mode) {
+        .none => return,
+        .tasks => "Tasks",
+        .parallel_tasks => "ParallelTasks",
+    };
+    const interprets = opt == .interpreter;
+    if (tasksLower(mode, interprets, strategy)) return;
     try renderProblem(ctx, .{ .unsupported_concurrency_lowering = .{
-        .mode = "Tasks",
+        .mode = name,
         .opt = @tagName(opt),
         .specialize = switch (strategy) {
             .lss => "yes",
@@ -2242,17 +2242,24 @@ fn requireSupportedConcurrency(
     return error.PlatformNotSupported;
 }
 
-/// Whether a `concurrency: Tasks` program lowers under `strategy`. The
+/// Whether a program whose platform has `mode`, a mode with tasks, lowers
+/// under `strategy` for a backend that is the interpreter or not. The
 /// continuation pass needs lambda-set specialization; the interpreter, the
 /// dev backend, LLVM and wasm implement the task runtime (design.md
-/// "Backends").
-fn tasksLowers(strategy: base.SpecializationStrategy) bool {
-    return strategy == .lss;
+/// "Backends"), but one interpreter runs no two resumes at once (design.md
+/// "Parallel Resumes").
+fn tasksLower(mode: base.ConcurrencyMode, interprets: bool, strategy: base.SpecializationStrategy) bool {
+    return strategy == .lss and !(mode == .parallel_tasks and interprets);
 }
 
-test "Tasks lowers only with lambda-set specialization" {
-    try std.testing.expect(tasksLowers(.lss));
-    try std.testing.expect(!tasksLowers(.boxy));
+test "modes with tasks lower only with lambda-set specialization, and ParallelTasks not on the interpreter" {
+    for ([_]base.ConcurrencyMode{ .tasks, .parallel_tasks }) |mode| {
+        try std.testing.expect(tasksLower(mode, false, .lss));
+        try std.testing.expect(!tasksLower(mode, false, .boxy));
+        try std.testing.expect(!tasksLower(mode, true, .boxy));
+    }
+    try std.testing.expect(tasksLower(.tasks, true, .lss));
+    try std.testing.expect(!tasksLower(.parallel_tasks, true, .lss));
 }
 
 /// The host inputs a shim run links for its selected target, copied out of
@@ -8732,13 +8739,13 @@ fn wasmRocHostRequirements(
 ) std.mem.Allocator.Error![]const []const u8 {
     const hosted = try hostedSymbolsFromLir(arena, store);
     // A `Tasks` program's `ProgramTaskCall`s call the host's
-    // `roc_task_ready` and `roc_task_abort` (design.md "Host Contract").
-    const all_task_host_fns = builtins_registry.task_host_fns;
-    const task_host_fns = if (store.createsTask()) all_task_host_fns.len else 0;
-    const requirements = try arena.alloc([]const u8, hosted.len + host_symbols.runtime_symbols.len + task_host_fns);
+    // `roc_task_ready` and `roc_task_abort`, and a `ParallelTasks` program's
+    // its `roc_task_thread_slot` (design.md "Host Contract").
+    const task_host_fns = if (store.taskMode()) |mode| mode.hostFns() else &.{};
+    const requirements = try arena.alloc([]const u8, hosted.len + host_symbols.runtime_symbols.len + task_host_fns.len);
     @memcpy(requirements[0..hosted.len], hosted);
     @memcpy(requirements[hosted.len..][0..host_symbols.runtime_symbols.len], &host_symbols.runtime_symbols);
-    for (requirements[hosted.len + host_symbols.runtime_symbols.len ..], all_task_host_fns[0..task_host_fns]) |*requirement, host_fn| requirement.* = host_fn.symbol();
+    for (requirements[hosted.len + host_symbols.runtime_symbols.len ..], task_host_fns) |*requirement, host_fn| requirement.* = host_fn.symbol();
     return requirements;
 }
 
@@ -8753,7 +8760,7 @@ fn wasmAppExports(
     static_data_exports: []const backend.StaticDataExport,
 ) Allocator.Error![]const []const u8 {
     const app = try sharedLibraryAppExports(ctx, entrypoints, static_data_exports);
-    if (!store.createsTask()) return app;
+    if (store.taskMode() == null) return app;
     const task_calls = [_][]const u8{
         shim_symbols.roc_task_resume,
         shim_symbols.roc_task_wake,
