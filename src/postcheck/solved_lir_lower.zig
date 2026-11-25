@@ -3182,6 +3182,8 @@ const Lowerer = struct {
             .run_arrived => .run_arrived,
             .run_ended => .run_ended,
             .run_supervised => .run_supervised,
+            // Only `.boxy` calls the task forms.
+            .task_create, .task_next, .task_spawn, .task_cancel, .task_supervised => .none,
             .cell_lock => .cell_lock,
             .cell_wait => .cell_wait,
             .cell_settle => .cell_settle,

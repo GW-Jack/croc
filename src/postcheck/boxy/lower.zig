@@ -1860,7 +1860,8 @@ pub const Program = struct {
     /// contains, lowered only when something calls the template itself. The
     /// owner of a closure that compile-time evaluation stored is such a
     /// scope: its body ran at compile time.
-    pub fn templateScope(self: *Program, module_index: ModuleIndex, template_id: checked_names.CheckedProcedureTemplateId) Allocator.Error!WorkerId {
+    pub fn templateScope(self: *Program, module_index: ModuleIndex, named_template: checked_names.CheckedProcedureTemplateId) Allocator.Error!WorkerId {
+        const template_id = self.taskFormTemplate(module_index, named_template);
         const key: WorkerKey = .{ .template = .{ .module = module_index, .template = template_id } };
         if (self.worker_ids.get(key)) |existing| return existing;
         const view = self.module(module_index);
@@ -1961,6 +1962,42 @@ pub const Program = struct {
         try self.worker_ids.put(self.allocator, key, id);
         if (imported) try self.declareImportedTemplateSignature(id);
         return id;
+    }
+
+    /// What a call of a `Shared` helper is: an operation on its arguments, or
+    /// the answer that a cell's state can hold a handle.
+    pub const SharedStateCall = union(enum) { op: LIR.LowLevel, tracked };
+
+    /// What a call of the `Shared` helper `helper` is in this program (design.md
+    /// "Shared State", "Under Boxy."), or null where the call is an ordinary one.
+    pub fn sharedStateCall(self: *const Program, helper: base.RunningSetHelper) ?SharedStateCall {
+        const mode = self.input.concurrency_mode;
+        if (!mode.hasTasks()) return null;
+        return switch (helper) {
+            .cell_lock => if (mode == .parallel_tasks) .{ .op = .cell_lock } else null,
+            .cell_wait => .{ .op = .cell_wait },
+            .cell_settle => .{ .op = .cell_settle },
+            .cell_tracked => .tracked,
+            .cell_track => .{ .op = .cell_track },
+            .cleanup_push => .{ .op = .cleanup_push },
+            .cleanup_pop => .{ .op = .cleanup_pop },
+            .none, .run_create, .run_next, .run_spawn, .run_cancel, .run_entry, .run_arrived, .run_ended, .run_supervised => null,
+            .task_create, .task_next, .task_spawn, .task_cancel, .task_supervised => null,
+        };
+    }
+
+    /// The template a program uses for `template`: in a build with tasks, a
+    /// running-set helper's task form (design.md "Plans And Concurrent
+    /// Loops", "Promotion."), and otherwise `template` itself.
+    fn taskFormTemplate(self: *const Program, module_index: ModuleIndex, template: checked_names.CheckedProcedureTemplateId) checked_names.CheckedProcedureTemplateId {
+        if (!self.input.concurrency_mode.hasTasks()) return template;
+        const templates = self.module(module_index).view.checked_procedure_templates.templates.items();
+        const form = templates[@backingInt(template)].running_set_helper.taskForm();
+        if (form == .none) return template;
+        for (templates, 0..) |candidate, index| {
+            if (candidate.running_set_helper == form) return @fromBackingInt(@intCast(index));
+        }
+        invariant("a running-set helper's module does not define its task form");
     }
 
     /// The integer list worker for `item` of a `List` template (design.md

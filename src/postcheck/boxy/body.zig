@@ -9037,6 +9037,10 @@ pub const Builder = struct {
             const key = worker.key.template;
             const owner = self.program.module(key.module);
             const template = owner.view.checked_procedure_templates.templates.items()[@backingInt(key.template)];
+            if (self.program.sharedStateCall(template.running_set_helper)) |call| return switch (call) {
+                .op => |op| try self.emitSharedStateOp(op, explicit, arg_types),
+                .tracked => try self.pushValue(try self.adaptValue(try self.boolValue(true), ret, result_ty)),
+            };
             if (template.provided_low_level) |op| {
                 // The wrapper's body drops its type-only operands, so this
                 // path does too.
@@ -9362,7 +9366,57 @@ pub const Builder = struct {
         try self.emitLowLevelCall(op, args, result_ty, arg_types);
     }
 
+    /// An operation on the shared cell `args[0]` or on the task's cleanups
+    /// (design.md "Shared State", "Waiting." and "Cleanups."), in place of a
+    /// call of its helper. A cell's payload is open, so its box is read out of
+    /// its storage as the pointer it is.
+    fn emitSharedStateOp(self: *Builder, op: LIR.LowLevel, args: []const LocalId, arg_types: []const TypeId) Allocator.Error!void {
+        if (op == .cell_wait) self.has_sites = true;
+        const closed_args = try self.allocator.dupe(LocalId, args);
+        defer self.allocator.free(closed_args);
+        for (args, arg_types, closed_args) |arg, ty, *closed_arg| {
+            if (try self.closed(ty)) continue;
+            closed_arg.* = try self.closedLocal(try self.program.layouts.layouts.insertBox(.opaque_ptr));
+            try self.emitDyn(closed_arg.*, .{ .copy = .{ .src = arg, .desc = try self.descOf(ty) } });
+        }
+        try self.emitLowLevel(try self.closedLocal(if (op == .cell_wait) .u32 else .zst), op, closed_args);
+        try self.pushValue(try self.unitValue());
+    }
+
+    /// An operation on one of the task's running sets (design.md "Plans And
+    /// Concurrent Loops", "Promotion."). A child task's result is a function
+    /// value, so its set is made for that layout whatever the entry returns,
+    /// and an arrival is read out of the slot the runtime names.
+    fn emitGroupOp(self: *Builder, op: LIR.LowLevel, args: []const LocalId, result_ty: TypeId) Allocator.Error!void {
+        const layouts = self.program.layouts.layouts;
+        if (op == .group_next) self.has_sites = true;
+        if (op == .group_arrival) {
+            const target = try self.localOf(result_ty, .frame);
+            const slot = try self.closedLocal(try layouts.insertPtr(self.store.getLocal(target).layout_idx));
+            try self.emitLowLevel(slot, .group_arrival, args);
+            try self.emitLinear(.{ .assign_low_level = .{
+                .target = target,
+                .op = .ptr_load,
+                .rc_effect = try self.store.addRcEffect(.loadsHostVisible()),
+                .args = try self.store.addLocalSpan(&.{slot}),
+                .next = undefined,
+            } });
+            return try self.pushValue(target);
+        }
+        const target = try self.localOf(result_ty, .frame);
+        try self.emitLinear(.{ .assign_low_level = .{
+            .target = target,
+            .op = op,
+            .rc_effect = try self.store.addRcEffect(op.rcEffect()),
+            .extra = if (op == .group_init) try self.store.addStmtRow(LIR.LowLevelExtra, .{ .group_result = .some(try layouts.insertErasedCallable()) }) else .none,
+            .args = try self.store.addLocalSpan(args),
+            .next = undefined,
+        } });
+        try self.pushValue(target);
+    }
+
     fn emitLowLevelCall(self: *Builder, op: LIR.LowLevel, args: []const LocalId, result_ty: TypeId, arg_types: []const TypeId) Allocator.Error!void {
+        if (op.namesRunningSet()) return try self.emitGroupOp(op, args, result_ty);
         const store = &self.program.store;
         var open = !store.isClosed(result_ty);
         for (arg_types) |arg_ty| open = open or !store.isClosed(arg_ty);

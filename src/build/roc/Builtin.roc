@@ -4056,6 +4056,75 @@ Builtin :: [].{
 
 		run_ended : Running(item) -> (Running(item), [Arrived(item), Ended])
 		run_ended = |running| (running, Ended)
+
+		# The task forms of `run_create!`, `run_next!`, `run_spawn!`, `run_cancel!`
+		# and `run_supervised!`, which a generic build with tasks calls in their
+		# place. The running set is the task's, named by the loop's id, so the value
+		# the loop passes around is an empty one. A child task's result is a function
+		# that returns the entry's result.
+		task_create! : U64, List(() => item), List(List(U64)), List(Bool), List(Bool), List(U64), U64 => Running(item)
+		task_create! = |id, entries, limit_paths, shields, backgrounds, limits, root_limit| {
+			count = List.len(entries)
+			# The traits are `GroupTrait`s: a result may hold a handle to shared state.
+			group_init!(id, count, limits, root_limit, 2)
+			var $index = 0
+			while $index < count {
+				group_push!(
+					id,
+					task_start(list_get_unsafe(entries, $index)),
+					list_get_unsafe(limit_paths, $index),
+					list_get_unsafe(shields, $index),
+					list_get_unsafe(backgrounds, $index),
+				)
+				$index = $index + 1
+			}
+			group_start!(id)
+			{ entries: [], background: [], next: 0, foreground_left: 0 }
+		}
+
+		task_next! : U64, Running(item) => (Running(item), [Arrived(item), Ended])
+		task_next! = |id, running|
+			if group_next!(id) == 0 {
+				finished = group_arrival!(id)
+				Concurrently.run_arrived(running, finished())
+			} else {
+				group_free!(id)
+				Concurrently.run_ended(running)
+			}
+
+		task_spawn! : U64, Running(item), (() => item) => Running(item)
+		task_spawn! = |id, running, entry| {
+			group_spawn!(id, task_start(entry))
+			running
+		}
+
+		task_cancel! : U64, Running(item) => Running(item)
+		task_cancel! = |id, running| {
+			group_cancel!(id)
+			running
+		}
+
+		task_supervised! : U64, (() => item) => item
+		task_supervised! = |max_restarts, f| {
+			# The loop id of every supervised set (`base.supervised_loop_id`).
+			id = 9223372036854775807
+			group_init!(id, 1, [], 0, 3)
+			group_push!(id, task_start(f), [], Bool.False, Bool.False)
+			group_start!(id)
+			if group_next!(id) == 0 {
+				finished = group_arrival!(id)
+				group_free!(id)
+				finished()
+			} else {
+				message = group_crash!(id)
+				group_free!(id)
+				if max_restarts == 0 {
+					crash "${message}"
+				} else {
+					Concurrently.task_supervised!(max_restarts - 1, f)
+				}
+			}
+		}
 	}
 
 	## Runs functions concurrently and combines their results. Each of these is a
@@ -28408,6 +28477,35 @@ cell_new! : item => Box(item)
 # Implemented by the compiler: puts the item in the cell and returns the one
 # that was there
 cell_exchange! : Box(item), item => item
+
+# Implemented by the compiler: the operations on a task's running sets, each
+# named by its loop's id (`Concurrently.task_create!`). The generic lowering
+# gives them their task, and gives a child task's result its type.
+group_init! : U64, U64, List(U64), U64, U8 => {}
+
+group_push! : U64, (() => (() -> item)), List(U64), Bool, Bool => {}
+
+group_start! : U64 => {}
+
+group_next! : U64 => U32
+
+group_arrival! : U64 => (() -> item)
+
+group_crash! : U64 => Str
+
+group_spawn! : U64, (() => (() -> item)) => {}
+
+group_cancel! : U64 => {}
+
+group_free! : U64 => {}
+
+# A child task's code: runs the entry, and returns a function that returns
+# the entry's result
+task_start : (() => item) -> (() => (() -> item))
+task_start = |entry| || {
+	result = entry()
+	|| result
+}
 
 # A shared cell's state, moved out of it for an update
 cell_take! : Box([Held(state), Moved]) => state

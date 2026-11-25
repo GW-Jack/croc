@@ -1325,7 +1325,7 @@ fn checkSequentialEquivalence(program: Twin, inspect: harness.LoweredInspectFn) 
     try expectTwinApps();
     defer freeNoneOutcomes();
     harness.runAppPathLoweredInspection(twin.none_path, plan_loop_options, recordNoneOutcomes) catch return error.TestUnexpectedResult;
-    harness.runAppPathLoweredInspection(twin.tasks_path, plan_loop_options, inspect) catch return error.TestUnexpectedResult;
+    runUnderEachStrategy(twin.tasks_path, .u64, inspect) catch return error.TestUnexpectedResult;
 }
 
 test "concurrent loops run on child tasks as a None build runs them, on the interpreter" {
@@ -1517,27 +1517,27 @@ fn compareQueueRunWasm(program: *const WasmProgram, want: QueueRun) E2eError!voi
     try expectQueueOutcome(want, got);
 }
 
-fn checkQueueRuns(program: Twin, options: harness.LirLoweringOptions, inspect: harness.LoweredInspectFn) E2eError!void {
+fn checkQueueRuns(program: Twin, target_usize: TargetUsize, inspect: harness.LoweredInspectFn) E2eError!void {
     twin = program;
     defer freeQueueRuns();
     harness.runAppPathLoweredInspection(twin.tasks_path, plan_loop_options, recordQueueRuns) catch return error.TestUnexpectedResult;
-    harness.runAppPathLoweredInspection(twin.tasks_path, options, inspect) catch return error.TestUnexpectedResult;
+    runUnderEachStrategy(twin.tasks_path, target_usize, inspect) catch return error.TestUnexpectedResult;
 }
 
 test "concurrent loops take the interpreter's steps under a queue, cancelled after any resume, on the dev backend" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
-    for ([_]Twin{ plan_loops, shared_waits }) |program| try checkQueueRuns(program, plan_loop_options, compareQueueDev);
+    for ([_]Twin{ plan_loops, shared_waits }) |program| try checkQueueRuns(program, .u64, compareQueueDev);
 }
 
 test "concurrent loops take the interpreter's steps under a queue, cancelled after any resume, on LLVM" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    for ([_]Twin{ plan_loops, shared_waits }) |program| try checkQueueRuns(program, plan_loop_options, compareQueueLlvm);
+    for ([_]Twin{ plan_loops, shared_waits }) |program| try checkQueueRuns(program, .u64, compareQueueLlvm);
 }
 
 test "concurrent loops take the interpreter's steps under a queue, cancelled after any resume, on the wasm backend" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    for ([_]Twin{ plan_loops, shared_waits }) |program| try checkQueueRuns(program, .{ .specialization_strategy = .lss, .target_usize = .u32 }, compareQueueWasm);
+    for ([_]Twin{ plan_loops, shared_waits }) |program| try checkQueueRuns(program, .u32, compareQueueWasm);
 }
 
 // Supervision (design.md "Plans And Concurrent Loops", "Supervision."): every
@@ -1596,18 +1596,18 @@ fn superviseCrashLlvm(lowered: *const lir.CheckedPipeline.LoweredProgram) harnes
 
 test "supervise! restarts a crashing function up to its limit and then crashes with its message, on the interpreter" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(plan_loops.tasks_path, plan_loop_options, superviseCrashInterpreter);
+    try runUnderEachStrategy(plan_loops.tasks_path, .u64, superviseCrashInterpreter);
 }
 
 test "supervise! restarts a crashing function up to its limit and then crashes with its message, on the dev backend" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(plan_loops.tasks_path, plan_loop_options, superviseCrashDev);
+    try runUnderEachStrategy(plan_loops.tasks_path, .u64, superviseCrashDev);
 }
 
 test "supervise! restarts a crashing function up to its limit and then crashes with its message, on LLVM" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(plan_loops.tasks_path, plan_loop_options, superviseCrashLlvm);
+    try runUnderEachStrategy(plan_loops.tasks_path, .u64, superviseCrashLlvm);
 }
 
 // Cleanups that a crash runs (design.md "Shared State", "Cleanups."): a supervised
@@ -1661,16 +1661,16 @@ fn cleanupsAfterCrashLlvm(lowered: *const lir.CheckedPipeline.LoweredProgram) ha
 
 test "a supervised crash runs its task's cleanups, innermost first and after its entries', on the interpreter" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(plan_loops.tasks_path, plan_loop_options, cleanupsAfterCrashInterpreter);
+    try runUnderEachStrategy(plan_loops.tasks_path, .u64, cleanupsAfterCrashInterpreter);
 }
 
 test "a supervised crash runs its task's cleanups, innermost first and after its entries', on the dev backend" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(plan_loops.tasks_path, plan_loop_options, cleanupsAfterCrashDev);
+    try runUnderEachStrategy(plan_loops.tasks_path, .u64, cleanupsAfterCrashDev);
 }
 
 test "a supervised crash runs its task's cleanups, innermost first and after its entries', on LLVM" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(plan_loops.tasks_path, plan_loop_options, cleanupsAfterCrashLlvm);
+    try runUnderEachStrategy(plan_loops.tasks_path, .u64, cleanupsAfterCrashLlvm);
 }

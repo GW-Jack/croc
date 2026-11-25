@@ -20,6 +20,13 @@ pub const RunningSetHelper = enum(u8) {
     run_arrived,
     run_ended,
     run_supervised,
+    /// The helpers' task forms under `.boxy` (design.md "Plans And
+    /// Concurrent Loops", "Promotion."), which no other lowering calls.
+    task_create,
+    task_next,
+    task_spawn,
+    task_cancel,
+    task_supervised,
     cell_lock,
     cell_wait,
     cell_settle,
@@ -27,6 +34,20 @@ pub const RunningSetHelper = enum(u8) {
     cell_track,
     cleanup_push,
     cleanup_pop,
+
+    /// The helper that is this one's task form, `none` if it has none.
+    pub fn taskForm(self: RunningSetHelper) RunningSetHelper {
+        return switch (self) {
+            .run_create => .task_create,
+            .run_next => .task_next,
+            .run_spawn => .task_spawn,
+            .run_cancel => .task_cancel,
+            .run_supervised => .task_supervised,
+            .none, .run_entry, .run_arrived, .run_ended => .none,
+            .task_create, .task_next, .task_spawn, .task_cancel, .task_supervised => .none,
+            .cell_lock, .cell_wait, .cell_settle, .cell_tracked, .cell_track, .cleanup_push, .cleanup_pop => .none,
+        };
+    }
 };
 
 /// The loop id of every supervised set. Monotype mints it for no loop

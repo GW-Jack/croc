@@ -34402,9 +34402,9 @@ arrives and where the loop ends. LIR construction sets it from the helper's
 Builtin declaration; every copy of a procedure keeps it, and so do LIR images and the
 native cache. The continuation pass finds a loop's operations by this mark
 and the loop id each call passes first, never by a name or by a body's
-shape. Boxy marks no procedure: it lowers every plan loop sequentially and
-no Boxy program reaches promotion, since the CLI rejects a `Tasks` platform
-under `--specialize=no`, so no pass reads a mark in a Boxy program.
+shape. Boxy marks no procedure, since one worker serves every item type and
+promotion has no layout to read there. It replaces the calls itself instead
+(Task forms under Boxy).
 
 Each operation carries explicit `RcEffect` data, which ARC reads like any
 other operation's:
@@ -34525,9 +34525,28 @@ inlines it. One call site each isn't enough, since a specialization's copies,
 which SpecConstr makes per call pattern and lambda-set solving per instance,
 keep its ids and can all be called from one procedure. The id may reach a call
 through copies of its literal local; the LIR checks follow them back to the
-literal. The Boxy strategy lowers every plan loop sequentially; it compiles no
-`Tasks` program, since the CLI rejects a `Tasks` platform under
-`--specialize=no`, so no Boxy loop's entries can suspend.
+literal.
+
+**Task forms under Boxy.** In a program whose platform has tasks, Boxy lowers
+every plan loop in the task form, since no type says which entries may suspend.
+In any other program every loop is sequential. A call of `run_create!`,
+`run_next!`, `run_spawn!`, `run_cancel!` or `run_supervised!` resolves to the
+template of the helper's task form (`RunningSetHelper.taskForm`): the Builtin
+helper `task_create!`, `task_next!`, `task_spawn!`, `task_cancel!` or
+`task_supervised!`, which has the same type. Those are Roc, written over
+operations that only they call: `group_init!`, `group_push!`, `group_start!`,
+`group_next!`, `group_arrival!`, `group_crash!`, `group_spawn!`,
+`group_cancel!` and `group_free!`. Each lowers to the running-set operation of
+its name, whose meaning is in Promotion, below; `group_crash!` is
+`group_arrival` typed as the crash's message.
+
+An entry's result is dynamic, and a running set's slots have one layout. So a
+child's start record is a function whose result is a *thunk*: `task_start(f)`
+runs `f` and returns a function that returns what `f` did. Every child's result
+is then an erased callable, with a closed layout and drop, and the owner calls
+the thunk once it takes the result. The thunk is pure, so calling it is not a
+site. The running set a loop carries is empty, as after promotion. Every other
+edge of a loop, including its exit sequence, is the loop's ordinary lowering.
 
 **Promotion.** The pass promotes before it finds any procedure's sites,
 since a promoted `next` is a park site (Park sites). In each procedure,
@@ -35018,11 +35037,22 @@ run as without them.
 | V9 | Where tasks run, every state is dropped: with its cell's last handle, or if it can hold a handle, at the latest when no running task can reach its cell |
 | V10 | A probe answers as the update would, and an update puts back on `Keep` and `Wait` the state it was given |
 
+**Under Boxy.** Promotion reads no helper mark there, so Boxy emits the
+operation itself where it would call a marked helper: `cell_lock`, in a build
+with parallel tasks only, `cell_wait`, `cell_settle`, `cell_track`,
+`cleanup_push` and `cleanup_pop`. The cell of an open state type is a dynamic
+value there, though its box is an ordinary pointer, so lowering first copies it
+to a closed box. `Shared.new!` is one procedure whatever its state, so
+`cell_tracked!` is always true there and every cell is tracked. Nor does a child
+task's thunk say what it holds, so every running set's results may hold handles.
+Both only make lists of cells longer.
+A Boxy program of a platform without tasks keeps the helpers' bodies.
+
 **What is built.** `new!`, `update!`, `get!` and `modify!` on every backend and
 both strategies, with poison, and waiting under `.lss` in programs of every
-mode. Under `.boxy`, where only `None` programs compile, a `Wait` crashes with
-the deadlock message. Cleanups run where tasks do, and cells are tracked there. The
-update and probe forms come next.
+mode and under `.boxy` in programs with tasks. In a `.boxy` program without
+tasks a `Wait` crashes with the deadlock message. Cleanups run where tasks do, and
+cells are tracked there. The update and probe forms come next.
 
 ### Host Contract
 
