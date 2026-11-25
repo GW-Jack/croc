@@ -1,5 +1,5 @@
 # test/echo/all_syntax_test.roc split into modules, for ci/perf/bench.roc.
-# Shared is imported by every module and Leaf by Strings only, so the
+# Common is imported by every module and Leaf by Strings only, so the
 # benchmarks can time an edit of a widely used module, a leaf and this entry
 # file against a warm cache.
 import Animal
@@ -10,7 +10,7 @@ import Operators
 import Records
 import Secret
 import ServerConfig
-import Shared
+import Common
 import Strings
 
 # ci/perf/bench.roc rewrites this number before each timed run.
@@ -109,7 +109,7 @@ main! = |_args| {
 	print!(Strings.format_names(["  Alice ", "Bob  ", " Charlie"]))
 	print!(letter_to_str(A))
 	print!(letter_to_str(C))
-	print!(perf_edit + Shared.perf_edit)
+	print!(perf_edit + Common.perf_edit)
 
 	Ok({})
 }

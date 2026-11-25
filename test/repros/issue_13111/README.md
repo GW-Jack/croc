@@ -10,8 +10,8 @@ zig build roc
 zig build run-test-zig-module-compile -Dtest-filter="issue 13111" -- --test-filter "issue 13111"
 ```
 
-The CLI must reject `base: "../Shared.roc"` at the dependency declaration,
-not report `Shared.value does not exist`. The unit tests require
+The CLI must reject `base: "../Common.roc"` at the dependency declaration,
+not report `Common.value does not exist`. The unit tests require
 `ResolutionFailed` and an `Invalid Package Dependency` diagnostic, including
 source highlighting after a sidecar round trip. Standalone module roots remain
 valid, and transitive URL dependencies obey the same header-kind contract.

@@ -1,4 +1,4 @@
-## Two packages whose `Shared` modules have one interface and different
+## Two packages whose `Common` modules have one interface and different
 ## bodies: distinct modules, whose workers and types must stay distinct.
 app [main!] {
 	left: "./left/main.roc",
@@ -8,8 +8,8 @@ app [main!] {
 
 import pf.Stdin
 import pf.Stdout
-import left.Shared as Left
-import right.Shared as Right
+import left.Common as Left
+import right.Common as Right
 
 main! = || {
 	n = Stdin.line!().count_utf8_bytes()

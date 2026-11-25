@@ -12114,13 +12114,13 @@ test "canonicalized module cache shares one entry between identical modules in d
     const cache_dir = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "cache", allocator);
     defer allocator.free(cache_dir);
 
-    // Two packages in one workspace, each holding a byte-identical `Shared.roc`.
+    // Two packages in one workspace, each holding a byte-identical `Common.roc`.
     try tmp_dir.dir.createDirPath(std.testing.io, "shared/app/.roc_echo_platform");
     try tmp_dir.dir.createDirPath(std.testing.io, "shared/pkg_a");
     try tmp_dir.dir.createDirPath(std.testing.io, "shared/pkg_b");
 
     const shared_module =
-        \\Shared := [].{
+        \\Common := [].{
         \\    result : Try(I64, Str)
         \\    result = Ok(7)
         \\    value : I64
@@ -12142,21 +12142,21 @@ test "canonicalized module cache shares one entry between identical modules in d
         \\}
         \\
         \\import pf.Echo
-        \\import a.Shared
-        \\import b.Shared as BShared
+        \\import a.Common
+        \\import b.Common as BCommon
         \\
         \\main! = |_args| {
-        \\    _ = Shared.value + BShared.value
+        \\    _ = Common.value + BCommon.value
         \\    Echo.line!("ok")
         \\    Ok({})
         \\}
         },
-        .{ .rel = "shared/pkg_a/main.roc", .data = "package [Shared] {}\n" },
-        .{ .rel = "shared/pkg_a/Shared.roc", .data = shared_module },
+        .{ .rel = "shared/pkg_a/main.roc", .data = "package [Common] {}\n" },
+        .{ .rel = "shared/pkg_a/Common.roc", .data = shared_module },
         // Distinct bytes so the two packages are distinct packages; their
-        // `Shared.roc` modules stay byte-identical, which is what this pins.
-        .{ .rel = "shared/pkg_b/main.roc", .data = "package [Shared] {} # second package\n" },
-        .{ .rel = "shared/pkg_b/Shared.roc", .data = shared_module },
+        // `Common.roc` modules stay byte-identical, which is what this pins.
+        .{ .rel = "shared/pkg_b/main.roc", .data = "package [Common] {} # second package\n" },
+        .{ .rel = "shared/pkg_b/Common.roc", .data = shared_module },
         .{ .rel = "shared/app/.roc_echo_platform/main.roc", .data = echo_platform_root_source },
         .{ .rel = "shared/app/.roc_echo_platform/Echo.roc", .data = echo_platform_echo_source },
     };

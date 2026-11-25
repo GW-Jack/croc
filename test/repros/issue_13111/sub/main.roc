@@ -1,3 +1,3 @@
 package [Uses] {
-    base: "../Shared.roc",
+    base: "../Common.roc",
 }

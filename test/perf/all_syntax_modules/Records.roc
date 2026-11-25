@@ -1,5 +1,5 @@
 import Builder
-import Shared
+import Common
 
 Records := [].{
 	tuple_demo = ("Roc", 1)
@@ -53,6 +53,6 @@ Records := [].{
 		hex: 0x5,
 		octal: 0o5,
 		binary: 0b0101,
-		label: Shared.label("literals", "all"),
+		label: Common.label("literals", "all"),
 	}
 }

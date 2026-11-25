@@ -89,7 +89,7 @@ benchmarks = {
 		{ label: "warm-no-change", scenario: WarmNoChange },
 		{ label: "warm-edit-leaf", scenario: WarmEdit("Leaf.roc") },
 		{ label: "warm-edit-entry", scenario: WarmEdit("main.roc") },
-		{ label: "warm-edit-widely-used", scenario: WarmEdit("Shared.roc") },
+		{ label: "warm-edit-widely-used", scenario: WarmEdit("Common.roc") },
 	]
 	commands = [
 		{ cmd: "check", args: ["check", "{file}"] },

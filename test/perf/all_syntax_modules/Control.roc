@@ -1,4 +1,4 @@
-import Shared
+import Common
 
 Control := [].{
 	question_postfix : List(Str) -> Try(I64, _)
@@ -76,7 +76,7 @@ Control := [].{
 				"NotTwo"
 
 		with_curlies =
-			if Shared.is_small(num) {
+			if Common.is_small(num) {
 				"Small"
 			} else {
 				"Large"

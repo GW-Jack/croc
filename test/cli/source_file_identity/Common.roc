@@ -1,4 +1,4 @@
-Shared := [].{
+Common := [].{
     suffix : Str
     suffix = "!"
 }

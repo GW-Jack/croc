@@ -1,4 +1,4 @@
-import Shared
+import Common
 
 C := [].{}
 
@@ -13,7 +13,7 @@ stored = make_adder(3)
 
 expect {
     dbg "C first"
-    Shared.check(3) == 13
+    Common.check(3) == 13
 }
 
 expect {

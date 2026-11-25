@@ -1,4 +1,4 @@
-import Shared
+import Common
 
 # A record builder combines wrapped field values using the suffix type's `map2`.
 Builder(a) := { value : a }.{
@@ -12,5 +12,5 @@ Builder(a) := { value : a }.{
 	run = |builder| builder.value
 
 	size_hint : U64
-	size_hint = Shared.perf_edit + 2
+	size_hint = Common.perf_edit + 2
 }

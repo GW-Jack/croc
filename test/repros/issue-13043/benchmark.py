@@ -66,7 +66,7 @@ def main():
         def run(case, side, iteration):
             specialize, fixture, command, scenario = case
             directory, source = projects[case, side]
-            edits = {"edit-entry": "main.roc", "edit-leaf": "Leaf.roc", "edit-shared": "Shared.roc"}
+            edits = {"edit-entry": "main.roc", "edit-leaf": "Leaf.roc", "edit-shared": "Common.roc"}
             if scenario in edits:
                 original = repo / "test/perf/all_syntax_modules" / edits[scenario]
                 text = original.read_text()

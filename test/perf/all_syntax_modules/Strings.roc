@@ -1,5 +1,5 @@
 import Leaf
-import Shared
+import Common
 
 Strings := [].{
 	multiline_str : U64 -> Str
@@ -17,9 +17,9 @@ Strings := [].{
 			.map(|name| name.trim())
 			|> Str.join_with(", ")
 			|> (|joined| {
-				if (joined.is_empty()) "No names provided" else Shared.label("Names", joined)
+				if (joined.is_empty()) "No names provided" else Common.label("Names", joined)
 			})
 
 	greeting : Str -> Str
-	greeting = |name| "${Leaf.greet(name)} (${(Leaf.perf_edit + Shared.perf_edit).to_str()})"
+	greeting = |name| "${Leaf.greet(name)} (${(Leaf.perf_edit + Common.perf_edit).to_str()})"
 }

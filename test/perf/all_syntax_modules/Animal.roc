@@ -1,4 +1,4 @@
-import Shared
+import Common
 
 # A nominal type with a custom is_eq method
 Animal := [Dog(Str), Cat(Str)].{
@@ -10,8 +10,8 @@ Animal := [Dog(Str), Cat(Str)].{
 
 	describe : Animal -> Str
 	describe = |animal| match animal {
-		Dog(name) => Shared.label("Dog", name)
-		Cat(name) => Shared.label("Cat", name)
+		Dog(name) => Common.label("Dog", name)
+		Cat(name) => Common.label("Cat", name)
 	}
 
 	# `...` is translated to `crash "not implemented"`.

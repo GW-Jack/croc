@@ -1,4 +1,4 @@
-import Shared
+import Common
 
 Matching := [].{
 	simple_match : [Red, Green, Blue, BabyBlue] -> Str
@@ -20,7 +20,7 @@ Matching := [].{
 			[2, .., 1] => 88
 			[1, .. as tail] => 77 + tail.len()
 			[_head, 5] => 55
-			[99, x] if Shared.is_small(x) => 99 + x
+			[99, x] if Common.is_small(x) => 99 + x
 			_ => 100
 		}
 	}
@@ -40,7 +40,7 @@ Matching := [].{
 
 	multi_payload_tag : [Foo(I64, Str), Bar] -> Str
 	multi_payload_tag = |tag| match tag {
-		Foo(num, name) => Shared.label("Foo", "${num.to_str()} and ${name}")
+		Foo(num, name) => Common.label("Foo", "${num.to_str()} and ${name}")
 		Bar => "Just Bar"
 	}
 

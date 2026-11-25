@@ -1,4 +1,4 @@
-import Shared
+import Common
 
 Operators := [].{
 
@@ -28,7 +28,7 @@ Operators := [].{
 
 			# unary operators
 			neg: -a,
-			total: Shared.sum([a, b]),
+			total: Common.sum([a, b]),
 		}
 	}
 
@@ -52,5 +52,5 @@ Operators := [].{
 
 	# A function that works for any type with a `to_str` method.
 	stringify : a -> Str where [a.to_str : a -> Str]
-	stringify = |value| Shared.label("value", value.to_str())
+	stringify = |value| Common.label("value", value.to_str())
 }

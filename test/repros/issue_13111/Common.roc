@@ -1,4 +1,4 @@
-Shared := [].{
+Common := [].{
     value : Str
     value = "hi"
 }

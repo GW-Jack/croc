@@ -1,6 +1,6 @@
 # Imported by every other module of this fixture, so ci/perf/bench.roc edits
 # it for the "warm, edit widely used" scenario.
-Shared := [].{
+Common := [].{
 	# ci/perf/bench.roc rewrites this number before each timed run.
 	perf_edit : U64
 	perf_edit = 0

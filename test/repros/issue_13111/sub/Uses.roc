@@ -1,6 +1,6 @@
-import base.Shared
+import base.Common
 
 Uses := [].{
     greeting : Str
-    greeting = Shared.value
+    greeting = Common.value
 }

@@ -1,4 +1,4 @@
-import Shared
+import Common
 
 # A defaulted field (`??`) and an optional field (`?:`).
 ServerConfig := { host : Str, port : U16 ?? 8080, timeout_ms ?: U64 }.{
@@ -9,6 +9,6 @@ ServerConfig := { host : Str, port : U16 ?? 8080, timeout_ms ?: U64 }.{
 			Err(MissingField) => "no timeout"
 		}
 
-		Shared.label(config.host, "${config.port.to_str()} (${timeout_str})")
+		Common.label(config.host, "${config.port.to_str()} (${timeout_str})")
 	}
 }

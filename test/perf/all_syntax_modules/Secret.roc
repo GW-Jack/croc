@@ -1,4 +1,4 @@
-import Shared
+import Common
 
 # Opaque type: users of the type can not access its fields.
 Secret :: {
@@ -10,7 +10,7 @@ Secret :: {
 	unlock : Secret, Str -> Str
 	unlock = |secret, password| {
 		if password == "open sesame" {
-			Shared.label("The secret key is", secret.key)
+			Common.label("The secret key is", secret.key)
 		} else {
 			"Wrong password!"
 		}

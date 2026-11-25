@@ -1,6 +1,6 @@
-import Shared
+import Common
 
 Second := [].{
     boom : U64
-    boom = crash "second module failed${Shared.suffix}"
+    boom = crash "second module failed${Common.suffix}"
 }
