@@ -962,6 +962,45 @@ pub const ReachableStmts = struct {
     }
 };
 
+/// Every statement that control can reach from a proc body, visited exactly
+/// once: the statements of `ReachableStmts` but those of a join body that no
+/// jump control can reach enters.
+pub const FlowStmts = struct {
+    stmts: ReachableStmts,
+    join_bodies: collections.DenseMap(LIR.JoinPointId, CFStmtId),
+
+    /// `ReachableStmts.initWithScratch` for this walk.
+    pub fn initWithScratch(store: *const LirStore, body: CFStmtId, scratch: *AnalysisScratch) Allocator.Error!FlowStmts {
+        const stmts = try ReachableStmts.initWithScratch(store, body, scratch);
+        return .{ .stmts = stmts, .join_bodies = collections.DenseMap(LIR.JoinPointId, CFStmtId).init(stmts.allocator) };
+    }
+
+    /// Release the walk's storage.
+    pub fn deinit(self: *FlowStmts) void {
+        self.join_bodies.deinit();
+        self.stmts.deinit();
+    }
+
+    /// The next unvisited statement, or null when the walk is done.
+    pub fn next(self: *FlowStmts) Allocator.Error!?CFStmtId {
+        while (self.stmts.work.pop()) |stmt_id| {
+            const entry = try self.stmts.visited.getOrPut(stmt_id);
+            if (entry.found_existing) continue;
+            const stmt = self.stmts.store.getCFStmtImmediate(stmt_id).*;
+            if (stmt == .join) try self.join_bodies.put(stmt.join.id, stmt.join.body);
+            // Control reaches a jump only through its join.
+            if (stmt == .jump) try self.push(self.join_bodies.get(stmt.jump.target).?);
+            try forEachFlowSuccessor(self.stmts.store, stmt, self, push);
+            return stmt_id;
+        }
+        return null;
+    }
+
+    fn push(self: *FlowStmts, stmt_id: CFStmtId) Allocator.Error!void {
+        try self.stmts.work.append(self.stmts.allocator, stmt_id);
+    }
+};
+
 /// Body-local definitions a copy of a loop body may rename: locals defined
 /// only inside the body and read only there, so the copy's stores and loads
 /// never share a slot with the original's. Every other local, the loop's

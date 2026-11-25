@@ -30074,7 +30074,10 @@ LIR lowerer records each emitted `assign_ref` target's provenance from it, and
 the resolution in `lir/erased_owner.zig` follows it. A LIR transform that
 rewrites the definitions on such a chain, as join scalarization does when it
 turns field reads into aliases, re-resolves the reuse sources of the procedures
-it changes with that resolution. Both lowerings record the closure as every
+it changes with that resolution. Only a definition that control can reach counts:
+a transform may leave a join that nothing jumps to, whose body ARC drops, as the
+continuation pass does where a copy of a body no longer runs on past a suspension
+site. Both lowerings record the closure as every
 erased call's reuse source, resolved to the allocation's root after lowering,
 and mark `result_reuse` when the call's result type holds exactly one
 erased-callable slot (`.boxy`: `types.Converter.erasedResultSlots`: a function

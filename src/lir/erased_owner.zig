@@ -184,7 +184,8 @@ pub fn resolveProcReuseSources(
 }
 
 /// Record `body`'s erased-allocation producer relation in `scratch.owners`
-/// and its owned erased calls in `scratch.calls`.
+/// and its owned erased calls in `scratch.calls`. A join body that nothing
+/// jumps to defines nothing, since ARC drops it.
 fn collectOwnedCalls(
     scratch: *Scratch,
     store: *const LirStore,
@@ -198,7 +199,7 @@ fn collectOwnedCalls(
     for (0..GuardedList.borrowLen(args)) |arg_index| {
         try scratch.owners.noteDefinition(GuardedList.at(args, arg_index), null);
     }
-    var stmts = try BodyClone.ReachableStmts.initWithScratch(store, body, &scratch.walks);
+    var stmts = try BodyClone.FlowStmts.initWithScratch(store, body, &scratch.walks);
     defer stmts.deinit();
     while (try stmts.next()) |current| {
         const stmt = store.getCFStmtImmediate(current);
@@ -212,4 +213,56 @@ fn collectOwnedCalls(
             .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .debug, .expect, .expect_err, .suspend_save, .suspend_return, .runtime_error, .comptime_exhaustiveness_failed, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join, .jump, .ret, .crash => {},
         }
     }
+}
+
+const testing = std.testing;
+
+test "a definition in the body of a join that nothing jumps to leaves an owned call its root" {
+    var store = LirStore.init(testing.allocator);
+    defer store.deinit();
+    var layouts = try layout_mod.Store.init(testing.allocator, .u64);
+    defer layouts.deinit();
+    const erased = try layouts.insertErasedCallable();
+    const owned = try store.addLocal(.{ .layout_idx = erased });
+    const extracted = try store.addLocal(.{ .layout_idx = erased });
+    const result = try store.addLocal(.{ .layout_idx = .u64 });
+    const arg_plan = try store.internErasedCallArgsPlan(&layouts, &.{});
+    const ret = try store.addCFStmt(.{ .ret = .{ .value = result } }, .test_fixture);
+    var copies: [2]LIR.CFStmtId = undefined;
+    var calls: [2]LIR.CFStmtId = undefined;
+    for (&copies, &calls) |*copy, *call| {
+        call.* = try store.addCFStmt(.{ .assign_call_erased = .{
+            .target = result,
+            .data = try store.addStmtRow(LIR.ErasedCallData, .{
+                .closure = extracted,
+                .args = .empty(),
+                .arg_plan = arg_plan,
+                .reuse_source = .some(extracted),
+            }),
+            .next = ret,
+        } }, .test_fixture);
+        copy.* = try store.addCFStmt(.{ .assign_ref = .{ .target = extracted, .op = .local(owned), .next = call.* } }, .test_fixture);
+    }
+    const body = try store.addCFStmt(.{ .join = .{
+        .id = @fromBackingInt(1),
+        .params = .empty(),
+        .body = copies[1],
+        .remainder = copies[0],
+    } }, .test_fixture);
+    const proc = try store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.forTest(1),
+        .args = try store.addLocalSpan(&.{owned}),
+        .frame_locals = try store.addLocalSpan(&.{ owned, extracted, result }),
+        .body = .some(body),
+        .ret_layout = .u64,
+    }, .none);
+    store.getProcSpecPtr(proc).shapes.erased_call = true;
+    var scratch = Scratch.init(testing.allocator);
+    defer scratch.deinit();
+
+    try resolveProcReuseSources(&scratch, &store, &layouts, proc);
+
+    const call = store.getCFStmtImmediate(calls[0]).assign_call_erased;
+    try testing.expectEqual(owned, store.stmtRow(call.data).reuse_source.get().?);
 }
