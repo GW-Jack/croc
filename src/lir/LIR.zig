@@ -1120,6 +1120,10 @@ pub const RunningSetHelper = enum(u8) {
     cell_lock,
     cell_wait,
     cell_settle,
+    /// `Shared.new!`'s helpers ("Releasing cells."): whether the cell's state can
+    /// hold a handle, and where such a cell was made.
+    cell_tracked,
+    cell_track,
     /// The helpers of `Shared.finally!` and `on_failure!` ("Cleanups."): before
     /// the body's call, and after it returns.
     cleanup_push,

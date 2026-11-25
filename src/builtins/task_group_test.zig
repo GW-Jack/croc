@@ -317,7 +317,8 @@ const abi_loop_id: u64 = 7;
 fn createThroughAbi(task: *RocTask, loop: *const Loop) *Group {
     const plan = loop.spec;
     const root_limit: u64 = if (plan.root_limit) |root| @as(u64, root) + 1 else 0;
-    dev_wrappers.roc_builtins_group_init(abi_loop_id, plan.starts.len, @ptrCast(plan.limits.ptr), plan.limits.len, root_limit, plan.supervised, plan.slot_size, plan.slot_alignment, loop.result_drop, task);
+    const traits: u8 = if (plan.supervised) @backingInt(task_mod.GroupTrait.supervised) else 0;
+    dev_wrappers.roc_builtins_group_init(abi_loop_id, plan.starts.len, @ptrCast(plan.limits.ptr), plan.limits.len, root_limit, traits, plan.slot_size, plan.slot_alignment, loop.result_drop, task);
     for (plan.starts, plan.marks) |start_record, marks| {
         var path: [8]u64 = undefined;
         for (marks.limit_path, path[0..marks.limit_path.len]) |limit, *wide| wide.* = limit;

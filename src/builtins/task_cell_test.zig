@@ -154,7 +154,7 @@ fn answer(ops: *RocOps, step: *const Step, crash_message: []const u8) void {
     if (step.answer == .crash) ops.crash(crash_message);
     if (step.answer == .add) step.cell.value += step.amount;
     step.cell.empty = false;
-    dev_wrappers.roc_builtins_cell_settle(step.cell, step.answer == .add);
+    dev_wrappers.roc_builtins_cell_settle(step.cell, step.answer == .add, false);
     if (step.log) |name| {
         Host.log[Host.log_len] = name;
         Host.log_len += 1;

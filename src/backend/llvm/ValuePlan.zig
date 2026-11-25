@@ -657,6 +657,7 @@ pub fn lowLevelAccess(op: LowLevel) OpAccess {
         .cell_lock,
         .cell_wait,
         .cell_settle,
+        .cell_track,
         .cleanup_push,
         .cleanup_pop,
         .crash,

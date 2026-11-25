@@ -1073,7 +1073,7 @@ const Twin = struct {
 const plan_loops = Twin{
     .tasks_path = "test/postcheck/plan_loops_tasks/app.roc",
     .none_path = "test/postcheck/plan_loops_none/app.roc",
-    .cases = &.{ "basic", "limits", "spawn", "background", "break", "return", "try", "nested", "children", "after_break", "supervise", "shared", "cleanups" },
+    .cases = &.{ "basic", "limits", "spawn", "background", "break", "return", "try", "nested", "children", "after_break", "supervise", "shared", "cleanups", "cycles" },
 };
 
 /// A program whose tasks wait on shared state, so its `None` build runs tasks
@@ -1222,7 +1222,9 @@ fn noneCase(lowered: *const lir.CheckedPipeline.LoweredProgram, name: []const u8
     const outcome = try CaseOutcome.init(result.asSlice(), host.trace.items);
     errdefer outcome.deinit();
     result.decref(ops);
-    try runtime.checkForLeaks();
+    // A program whose updates can't wait tracks no cells (design.md "Shared State",
+    // "Releasing cells.").
+    if (!std.mem.eql(u8, name, "cycles")) try runtime.checkForLeaks();
     return outcome;
 }
 

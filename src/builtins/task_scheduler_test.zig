@@ -244,7 +244,7 @@ fn entryCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: 
         if (step.answer == .crash) ops.crash("an update crashed");
         if (step.answer != .keep) cell.value += step.amount;
         cell.empty = false;
-        dev_wrappers.roc_builtins_cell_settle(cell, step.answer != .keep);
+        dev_wrappers.roc_builtins_cell_settle(cell, step.answer != .keep, false);
         run.note(index);
         entry.next += 1;
         // A hosted call that calls back into the program.

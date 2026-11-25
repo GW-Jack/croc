@@ -78,11 +78,13 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, mode:
                 .cell_lock => if (mode == .parallel_tasks) try promoteCell(allocator, store, proc_id, .cell_lock),
                 .cell_wait => try promoteCell(allocator, store, proc_id, .cell_wait),
                 .cell_settle => try promoteCell(allocator, store, proc_id, .cell_settle),
+                .cell_track => try promoteCell(allocator, store, proc_id, .cell_track),
                 .cleanup_push => try promoteCell(allocator, store, proc_id, .cleanup_push),
                 .cleanup_pop => try promoteCell(allocator, store, proc_id, .cleanup_pop),
-                .none, .run_create, .run_next, .run_spawn, .run_cancel, .run_entry, .run_arrived, .run_ended => {},
+                .none, .run_create, .run_next, .run_spawn, .run_cancel, .run_entry, .run_arrived, .run_ended, .cell_tracked => {},
             }
         }
+        for (0..proc_count) |index| try answerTracked(allocator, store, layouts, @fromBackingInt(@intCast(index)));
     }
     if (loops.count() == 0 and may_wait.count() == 0) return;
     for (0..proc_count) |index| try promoteIn(allocator, store, layouts, &loops, &starts, may_wait.isSet(index), @fromBackingInt(@intCast(index)));
@@ -113,7 +115,7 @@ fn describe(allocator: Allocator, store: *LirStore, layouts: *layout.Store, star
             .run_entry => &entry,
             .run_arrived => &arrived,
             .run_ended => &ended,
-            .none, .run_create, .run_next, .run_spawn, .run_cancel, .run_supervised, .cell_lock, .cell_wait, .cell_settle, .cleanup_push, .cleanup_pop => continue,
+            .none, .run_create, .run_next, .run_spawn, .run_cancel, .run_supervised, .cell_lock, .cell_wait, .cell_settle, .cell_tracked, .cell_track, .cleanup_push, .cleanup_pop => continue,
         };
         if (slot.*) |seen| {
             if (seen != callee) invariant("a run_next! specialization calls two specializations of one running-set helper", .{});
@@ -279,7 +281,7 @@ const Promoter = struct {
 
         // Before them: open the set, then enter the pushes at 0.
         const zero = try self.local(.u64);
-        const unsupervised = try self.local(.bool);
+        const traits = try self.local(.u8);
         var head = try self.jumpWith(push, i, zero, origin);
         head = try self.literal(zero, 0, .u64, head, origin);
         head = try self.store.addCFStmt(.{ .join = .{
@@ -293,10 +295,10 @@ const Promoter = struct {
             .op = .group_init,
             .rc_effect = try self.store.addRcEffect(LIR.LowLevel.group_init.rcEffect()),
             .extra = try self.store.addStmtRow(LIR.LowLevelExtra, .{ .group_result = .some(loop.result) }),
-            .args = try self.store.addLocalSpan(&.{ id, n, limits, root_limit, unsupervised }),
+            .args = try self.store.addLocalSpan(&.{ id, n, limits, root_limit, traits }),
             .next = head,
         } }, origin);
-        head = try self.literal(unsupervised, 0, .bool, head, origin);
+        head = try self.literal(traits, if (mayHoldHandle(self.layouts, loop.result)) 2 else 0, .u8, head, origin);
         head = try self.op(n, .list_len, &.{entries}, head, origin);
         self.replace(site, head);
     }
@@ -373,7 +375,7 @@ const Promoter = struct {
 /// `run_entry!(f)`, with its restart loop (design.md "Supervision."):
 ///
 ///     join restart(left = max_restarts) {
-///         group_init(id, 1, [], 0, True); group_push(id, start of f, [], False, False);
+///         group_init(id, 1, [], 0, supervised); group_push(id, start of f, [], False, False);
 ///         group_start(id); s = group_next(id)
 ///         match s {
 ///             0 => v = ptr_load(group_arrival(id)); group_free(id); ret v
@@ -447,7 +449,7 @@ fn promoteSupervised(allocator: Allocator, store: *LirStore, layouts: *layout.St
     const count = try b.local(.u64);
     const limits = try b.local(try layouts.insertList(.u64));
     const no_limit = try b.local(.u64);
-    const supervised = try b.local(.bool);
+    const traits = try b.local(.u8);
     const record = try b.local(try layouts.insertErasedCallable());
     const path = try b.local(try layouts.insertList(.u64));
     const no = try b.local(.bool);
@@ -467,10 +469,10 @@ fn promoteSupervised(allocator: Allocator, store: *LirStore, layouts: *layout.St
         .op = .group_init,
         .rc_effect = try store.addRcEffect(LIR.LowLevel.group_init.rcEffect()),
         .extra = try store.addStmtRow(LIR.LowLevelExtra, .{ .group_result = .some(child.result) }),
-        .args = try store.addLocalSpan(&.{ id, count, limits, no_limit, supervised }),
+        .args = try store.addLocalSpan(&.{ id, count, limits, no_limit, traits }),
         .next = body,
     } }, origin);
-    body = try b.literal(supervised, 1, .bool, body, origin);
+    body = try b.literal(traits, if (mayHoldHandle(layouts, child.result)) 3 else 1, .u8, body, origin);
     body = try b.literal(no_limit, 0, .u64, body, origin);
     body = try store.addCFStmt(.{ .assign_list = .{ .target = limits, .elems = .empty(), .next = body } }, origin);
     body = try b.literal(count, 1, .u64, body, origin);
@@ -494,7 +496,7 @@ fn promoteSupervised(allocator: Allocator, store: *LirStore, layouts: *layout.St
 fn promoteCell(allocator: Allocator, store: *LirStore, proc_id: ProcId, op: LIR.LowLevel) Allocator.Error!void {
     const args = try ContinuationPass.copyLocals(allocator, store, store.getProcSpecImmediate(proc_id).args);
     defer allocator.free(args);
-    const arity: usize = if (op == .cleanup_pop) 0 else if (op == .cell_lock or op == .cleanup_push) 1 else 2;
+    const arity: usize = if (op == .cleanup_pop) 0 else if (op == .cell_lock or op == .cleanup_push) 1 else if (op == .cell_settle) 3 else 2;
     if (args.len != arity) invariant("a shared-state helper does not take what its operation does", .{});
     const origin = store.stmtOrigin(store.getProcSpecImmediate(proc_id).body.get().?);
     const unit = try store.addLocal(.{ .layout_idx = store.getProcSpecImmediate(proc_id).ret_layout });
@@ -502,14 +504,75 @@ fn promoteCell(allocator: Allocator, store: *LirStore, proc_id: ProcId, op: LIR.
     const ret = try store.addCFStmt(.{ .ret = .{ .value = unit } }, origin);
     const value = try store.addCFStmt(.{ .assign_struct = .{ .target = unit, .fields = .empty(), .next = ret } }, origin);
     const head = try store.addLowLevelStmt(result, op, args, value, origin);
+    try setBody(allocator, store, proc_id, head, args, &.{ unit, result });
+}
+
+/// Make each call of `cell_tracked!` in a procedure its answer, a literal, by the
+/// layout the caller gives its cell (design.md "Shared State", "Releasing cells.").
+fn answerTracked(allocator: Allocator, store: *LirStore, layouts: *const layout.Store, proc_id: ProcId) Allocator.Error!void {
+    if (store.getProcSpecImmediate(proc_id).body.get() == null) return;
+    var stmts = try bodyStmts(allocator, store, proc_id);
+    defer stmts.deinit(allocator);
+    for (stmts.items) |stmt_id| {
+        const stmt = store.getCFStmtImmediate(stmt_id).*;
+        if (stmt != .assign_call) continue;
+        const call = stmt.assign_call;
+        if (store.getProcSpecImmediate(call.proc).running_set_helper != .cell_tracked) continue;
+        const args = store.getLocalSpan(call.args);
+        if (GuardedList.borrowLen(args) != 1) invariant("cell_tracked! does not take a cell", .{});
+        const tracked = cellTracked(store, layouts, GuardedList.at(args, 0));
+        store.getCFStmtPtr(stmt_id).* = .{ .assign_literal = .{
+            .target = call.target,
+            .value = .{ .i64_literal = .{ .value = @intFromBool(tracked), .layout_idx = store.getLocal(call.target).layout_idx } },
+            .next = call.next,
+        } };
+    }
+}
+
+/// Whether the state of a local's cell can hold a handle.
+fn cellTracked(store: *const LirStore, layouts: *const layout.Store, cell: LocalId) bool {
+    const cell_layout = layouts.getLayout(store.getLocal(cell).layout_idx);
+    if (cell_layout.tag == .box_of_zst) return false;
+    if (cell_layout.tag != .box) invariant("a shared cell's layout was not a box", .{});
+    if (layouts.getLayout(cell_layout.getIdx()).tag == .hole) invariant("a procedure that makes or updates a cell doesn't know its payload's layout", .{});
+    return mayHoldHandle(layouts, cell_layout.getIdx());
+}
+
+/// Whether a value of this layout may hold a handle to shared state, which is a box
+/// or captured by an erased callable. A recursive layout holds a box. Values of it
+/// are dropped where it is asked, so a hole in it holds nothing to release.
+fn mayHoldHandle(layouts: *const layout.Store, idx: layout.Idx) bool {
+    const l = layouts.getLayout(idx);
+    if (!layouts.layoutContainsRefcounted(l)) return false;
+    return switch (l.tag) {
+        .box, .erased_callable => true,
+        .list => mayHoldHandle(layouts, l.getIdx()),
+        .closure => mayHoldHandle(layouts, l.getClosure().captures_layout_idx),
+        .struct_ => {
+            const fields = layouts.getStructInfo(l).fields;
+            for (0..fields.len) |i| if (mayHoldHandle(layouts, fields.get(@intCast(i)).layout)) return true;
+            return false;
+        },
+        .tag_union => {
+            const variants = layouts.getTagUnionInfo(l).variants;
+            for (0..variants.len) |i| if (mayHoldHandle(layouts, variants.get(@intCast(i)).payload_layout)) return true;
+            return false;
+        },
+        .scalar, .box_of_zst, .list_of_zst, .zst => false,
+        .ptr, .hole, .dynamic => unreachable, // no value that tasks share or return has a pointer's, a hole's or a dynamic layout
+    };
+}
+
+fn setBody(allocator: Allocator, store: *LirStore, proc_id: ProcId, body: CFStmtId, args: []const LocalId, locals: []const LocalId) Allocator.Error!void {
     var frame = std.ArrayList(LocalId).empty;
     defer frame.deinit(allocator);
     try frame.appendSlice(allocator, args);
-    try frame.appendSlice(allocator, &.{ unit, result });
+    try frame.appendSlice(allocator, locals);
     std.mem.sort(LocalId, frame.items, {}, localLessThan);
+    const frame_locals = try store.addLocalSpan(frame.items);
     const proc = store.getProcSpecPtr(proc_id);
-    proc.body = .some(head);
-    proc.frame_locals = try store.addLocalSpan(frame.items);
+    proc.body = .some(body);
+    proc.frame_locals = frame_locals;
 }
 
 fn localLessThan(_: void, a: LocalId, b: LocalId) bool {
@@ -544,7 +607,7 @@ fn promoteIn(allocator: Allocator, store: *LirStore, layouts: *layout.Store, loo
             try ids.define(allocator, stmt.assign_ref.target, .{ .copy = stmt.assign_ref.op.source });
         } else if (stmt == .assign_call) switch (store.getProcSpecImmediate(stmt.assign_call.proc).running_set_helper) {
             .run_create, .run_next, .run_spawn, .run_cancel => try calls.append(allocator, stmt_id),
-            .none, .run_entry, .run_arrived, .run_ended, .run_supervised, .cell_lock, .cell_wait, .cell_settle, .cleanup_push, .cleanup_pop => {},
+            .none, .run_entry, .run_arrived, .run_ended, .run_supervised, .cell_lock, .cell_wait, .cell_settle, .cell_tracked, .cell_track, .cleanup_push, .cleanup_pop => {},
         };
     }
 
@@ -593,7 +656,7 @@ fn promoteIn(allocator: Allocator, store: *LirStore, layouts: *layout.Store, loo
             },
             .run_spawn => try promoter.promoteSpawn(stmt_id, loop),
             .run_cancel => try promoter.promoteCancel(stmt_id),
-            .none, .run_entry, .run_arrived, .run_ended, .run_supervised, .cell_lock, .cell_wait, .cell_settle, .cleanup_push, .cleanup_pop => unreachable, // `calls` holds only these four helpers' calls.
+            .none, .run_entry, .run_arrived, .run_ended, .run_supervised, .cell_lock, .cell_wait, .cell_settle, .cell_tracked, .cell_track, .cleanup_push, .cleanup_pop => unreachable, // `calls` holds only these four helpers' calls.
         }
     }
     var task_form_ids = task_form.keyIterator();

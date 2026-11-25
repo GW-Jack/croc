@@ -27,6 +27,7 @@ main! = |name| {
 		"supervise_crash" => supervise_crash!()
 		"shared" => shared!()
 		"cleanups" => cleanups!()
+		"cycles" => cycles!()
 		"cleanups_crash" => cleanups_crash!()
 		"stalled" => stalled!()
 		_ => "unknown"
@@ -323,6 +324,35 @@ cleanups! = || {
 		break
 	}
 	"${$joined} ${permits.get!().to_str()} ${Str.join_with(lost.get!(), ";")}"
+}
+
+# Each entry's state holds a function that holds the state's handle. One of them
+# is also in the loop's own state, which is on a cycle too.
+cycles! : () => Str
+cycles! = || {
+	kept : Shared(List(() => Str))
+	kept = Shared.new!([])
+	kept.modify!(|functions| functions.append(|| "kept ${kept.get!().len().to_str()}"))
+	knot! : Str, Bool -> (() => Str)
+	knot! = |name, keep| || {
+		own : Shared(List(() => Str))
+		own = Shared.new!([])
+		count! : () => Str
+		count! = || "${name} ${own.get!().len().to_str()}, a string too long to be small"
+		own.modify!(|functions| functions.append(count!))
+		if keep {
+			kept.modify!(|functions| functions.append(count!))
+		}
+		Host.fetch!(name)
+	}
+	var $joined = ""
+	for! body in List.concurrently([knot!("a", False), knot!("b", True), knot!("c", False)]) {
+		$joined = Str.concat($joined, body)
+	}
+	for function! in kept.get!() {
+		$joined = Str.concat($joined, function!())
+	}
+	$joined
 }
 
 # Every run crashes inside two cleanups. The inner one's runs first, after the

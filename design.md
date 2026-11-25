@@ -34570,8 +34570,8 @@ two are the dynamic operations `box` and `cell_exchange`.
 update! = |Cell(cell), f| {
     state = take!(cell)            # cell_lock!, then cell_exchange(cell, Moved) or the poison crash
     match f(state) {
-        Set(new, r) => { cell_exchange!(cell, Held(new)); cell_settle!(cell, True); r }
-        Keep(r) => { cell_exchange!(cell, Held(state)); cell_settle!(cell, False); r }
+        Set(new, r) => { cell_exchange!(cell, Held(new)); cell_settle!(cell, True, tracked); r }
+        Keep(r) => { cell_exchange!(cell, Held(state)); cell_settle!(cell, False, False); r }
         Wait => {
             cell_exchange!(cell, Held(state))
             cell_wait!(cell, Box.box(|| probe!(cell, f)))
@@ -34626,11 +34626,11 @@ Three Builtin helpers, marked as the running-set helpers are, stand for the
 runtime:
 - `cell_lock!(cell)` in Builtin does nothing;
 - `cell_wait!(cell, probe)` in Builtin crashes with the deadlock message;
-- `cell_settle!(cell, stored)` in Builtin does nothing.
+- `cell_settle!(cell, stored, tracked)` in Builtin does nothing.
 
 In a build with tasks the continuation pass replaces the bodies of the last two
 with the low-level operations `cell_wait(cell, probe, task) -> status` and
-`cell_settle(cell, stored)`, and in a `ParallelTasks` build the first one's
+`cell_settle(cell, stored, tracked)`, and in a `ParallelTasks` build the first one's
 with `cell_lock(cell)`. `cell_wait` is a park site beside `group_next`: it
 always returns the pending status, its resume entry calls its continuation with
 no second run, and the code after it never reads the status. A `cell_wait!`
@@ -34782,6 +34782,66 @@ task that is crashing keeps the first message and adds the cleanup's after it.
 In a `None` program a crash is the program's, in a cleanup as anywhere, so there
 cleanups run only for a cancel.
 
+**Releasing cells.** Values are immutable, so every reference cycle passes
+through a cell, and only a cell whose state can hold a handle is on one. A cell
+is *tracked* if its payload's layout holds a box or an erased callable, the two
+representations that a handle can be in. The other cells are freed with their
+last handle, as any value is. A tracked cell is on the list of one task, its
+*owner*, at first the one that made it, and the list holds a reference to it.
+The cell is freed in one of two ways:
+- *swept*: the list's reference is the last one, so nothing can use the cell;
+- *released*: its owner ended, so no running task can reach it. The runtime moves
+  its state out, which leaves it poisoned, and drops the state, which breaks every
+  cycle the cell is on.
+
+```text
+new! = |state| {
+    cell = cell_new!(Held(state))
+    if cell_tracked!(cell) { cell_track!(cell, Box.box(|| cell_release!(cell))) }
+    Cell(cell)
+}
+```
+
+`cell_tracked!` is a marked helper that answers `False`, and `cell_track!` one
+that does nothing. Where the continuation pass promotes `cell_settle!`, it
+replaces each call of the first with its answer, by the layout of the caller's
+cell, since the helper itself is one procedure for every layout it needn't
+know. It makes the second the low-level operation `cell_track(cell, release)`,
+which puts the cell on the running task's list. The list's reference is the one
+the release's closure holds. So untracked cells pay nothing. Nor do programs
+without tasks whose updates can't wait, but for the call. In the latter a cycle that the program drops is not freed, since
+nothing in them outlives the program but the cell.
+
+A task's list is swept when it has grown to twice what the last sweep left,
+so a task that makes cells for as long as it runs holds at most as many dead ones
+as live ones. A sweep reads each cell's count, and one is final: the list's is
+the only reference, so no task has one to copy.
+
+A handle leaves the tasks that its cell's owner started, and the owner, in two
+ways only: in the result of a task that ends, or in a state that an update
+stores. Captures go down the tree, a message of a crash is a `Str`, and no handle
+crosses the host boundary. So a task *escapes* when a handle that it or a task
+below it made may have left it:
+- when it ends with a result whose layout holds a box or an erased callable;
+- when it, or a task below it, stores a state in a tracked cell whose owner is
+  above it. A `Set` finds the cell's owner, or if that one escaped the nearest
+  task above that didn't, and every task from the running one up to that one
+  escapes. A `Set` passes `cell_settle!` for this what `cell_tracked!` answers.
+
+At its end, after its cleanups and before it reports, a task that escaped is
+swept and hands what is left of its list to its parent's. Any other releases
+its cells, as a root always does. So a released cell can't be reached: were it
+reachable from outside its owner's tasks, by V1 a chain of results and stores
+brought the handle there, and the first of them that left the owner's tasks made
+the owner escape. Escape is per task and not per cell, so a task that stores
+something in an outer tracked cell leaves its cycles to its parent, until a task
+that doesn't. The table from a cell to its owner is in the root, under the
+tree's lock.
+
+What is dropped late is a tracked cell that a sweep has yet to find, with its
+state. A crash's frames leak what they hold (Child Tasks, Crashes), so a cell
+they hold is not freed itself, but if it's tracked its state is.
+
 **Invariants.**
 
 | | Invariant |
@@ -34794,14 +34854,14 @@ cleanups run only for a cancel.
 | V6 | After a crash poisons a cell, every update of it crashes, and so does every task waiting on it |
 | V7 | A waiter whose function would not wait is never left parked |
 | V8 | A `None` build is one schedule of the `Tasks` build |
-| V9 | Every cell is freed: with its last handle, or when no running task can reach it |
+| V9 | Where tasks run, every state is dropped: with its cell's last handle, or if it can hold a handle, at the latest when no running task can reach its cell |
 | V10 | A probe answers as the update would, and an update puts back on `Keep` and `Wait` the state it was given |
 
 **What is built.** `new!`, `update!`, `get!` and `modify!` on every backend and
 both strategies, with poison, and waiting under `.lss` in programs of every
 mode. Under `.boxy`, where only `None` programs compile, a `Wait` crashes with
-the deadlock message. Cleanups run where tasks do. Holder sets and the update and
-probe forms come in that order.
+the deadlock message. Cleanups run where tasks do, and cells are tracked there. The
+update and probe forms come next.
 
 ### Host Contract
 

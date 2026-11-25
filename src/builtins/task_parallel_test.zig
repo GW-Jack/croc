@@ -200,7 +200,7 @@ var gate: u64 = 0;
 fn raiseGate() void {
     dev_wrappers.roc_builtins_cell_lock(&gate);
     gate += 1;
-    dev_wrappers.roc_builtins_cell_settle(&gate, true);
+    dev_wrappers.roc_builtins_cell_settle(&gate, true, false);
 }
 
 /// Whether an update that waits until `gate` is at least `until` would go on.
@@ -208,10 +208,73 @@ fn gateProbe(_: *RocOps, ret: ?[*]u8, _: ?[*]const u8, capture: ?[*]u8, _: ?[*]u
     ret.?[0] = @intFromBool(gate >= @as(*align(1) const u64, @ptrCast(capture.?)).*);
 }
 
-/// A leaf entry: pause `pauses` times, wait on `gate` `waits` times, then
-/// return `result`, or crash. While it waits, `until` is the value it waits
-/// for.
-const Leaf = extern struct { pauses: u32, waits: u32, crashes: bool, until: u64, result: u64 };
+/// A tracked cell's payload: the handle that its state holds.
+const Cell = extern struct { held: ?*Cell };
+
+fn countOf(cell: *Cell) *isize {
+    const words: [*]isize = @ptrCast(@alignCast(cell));
+    return &(words - 1)[0];
+}
+
+fn retainCell(cell: *Cell) *Cell {
+    _ = @atomicRmw(isize, countOf(cell), .Add, 1, .monotonic);
+    return cell;
+}
+
+fn dropCell(handle: ?*Cell, ops: *RocOps) void {
+    const cell = handle orelse return;
+    if (@atomicRmw(isize, countOf(cell), .Sub, 1, .acq_rel) != 1) return;
+    dropCell(cell.held, ops);
+    utils.freeDataPtrC(@ptrCast(cell), @alignOf(Cell), true, ops);
+}
+
+/// `cell_release!`.
+fn releaseCall(ops: *RocOps, ret: ?[*]u8, _: ?[*]const u8, capture: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {
+    const cell: *Cell = @as(*align(1) const *Cell, @ptrCast(capture.?)).*;
+    const held = cell.held;
+    cell.held = null;
+    dropCell(held, ops);
+    ret.?[0] = 0;
+}
+
+fn releaseDrop(capture: ?[*]u8, ops: *RocOps) callconv(.c) void {
+    dropCell(@as(*align(1) const *Cell, @ptrCast(capture.?)).*, ops);
+}
+
+/// `Shared.new!`.
+fn trackedCell(ops: *RocOps) *Cell {
+    const cell: *Cell = @ptrCast(@alignCast(utils.allocateWithRefcountC(@sizeOf(Cell), @alignOf(Cell), true, ops)));
+    cell.* = .{ .held = null };
+    const release = erased_callable.allocate(&releaseCall, &releaseDrop, @sizeOf(*Cell), ops);
+    @as(*align(1) *Cell, @ptrCast(erased_callable.capturePtr(release))).* = retainCell(cell);
+    task_mod.cellTrack(ops, @ptrCast(cell), release);
+    return cell;
+}
+
+/// Store `cell` in the state of `into`. Takes the handle that is stored.
+fn storeCell(into: *Cell, cell: *Cell, ops: *RocOps) void {
+    const bytes: [*]u8 = @ptrCast(into);
+    dev_wrappers.roc_builtins_cell_lock(bytes);
+    const before = into.held;
+    into.held = cell;
+    dev_wrappers.roc_builtins_cell_settle(bytes, true, true);
+    dropCell(before, ops);
+}
+
+/// Make a cell whose state holds its own handle. With `outer`, its state holds
+/// the handle of `outer`, whose state holds its handle, instead.
+fn makeCycle(outer: ?*Cell, ops: *RocOps) void {
+    const cell = trackedCell(ops);
+    storeCell(cell, retainCell(outer orelse cell), ops);
+    if (outer) |above| storeCell(above, retainCell(cell), ops);
+    dropCell(cell, ops);
+}
+
+/// A leaf entry: pause `pauses` times, wait on `gate` `waits` times, then make
+/// the cycles, and return `result`, or crash. While it waits, `until` is the
+/// value it waits for. `outer` is how many loops above the leaf's the cell is in
+/// whose state takes its last handle, or past the outermost.
+const Leaf = extern struct { pauses: u32, waits: u32, crashes: bool, outer: u32, loop: *Loop, until: u64, result: u64 };
 
 fn leafCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?[*]u8, out_desc: *?*const anyopaque) callconv(.c) void {
     const leaf = @as(*align(1) const Leaf, @ptrCast(capture.?)).*;
@@ -229,7 +292,7 @@ fn leafCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?
         dev_wrappers.roc_builtins_cell_lock(&gate);
         if (next.until == 0) next.until = gate + 1;
         if (gate >= next.until) {
-            dev_wrappers.roc_builtins_cell_settle(&gate, false);
+            dev_wrappers.roc_builtins_cell_settle(&gate, false, false);
             next.waits -= 1;
             next.until = 0;
             return leafCall(ops, ret, args, std.mem.asBytes(&next), null, out_desc);
@@ -241,6 +304,10 @@ fn leafCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?
         return;
     }
     if (leaf.crashes) ops.crash("a leaf crashed");
+    for (0..6) |_| makeCycle(null, ops);
+    var above: ?*Loop = leaf.loop;
+    for (0..leaf.outer) |_| above = if (above) |loop| loop.parent else null;
+    makeCycle(if (above) |loop| loop.cell else null, ops);
     @as(*align(1) u64, @ptrCast(ret.?)).* = leaf.result;
 }
 
@@ -251,6 +318,9 @@ const Ending = enum(u8) { exhaust, exit_early };
 /// own is.
 const Loop = struct {
     seed: u64,
+    parent: ?*Loop,
+    /// The loop's task's own cell, with a handle that the round drops.
+    cell: ?*Cell = null,
     depth: u8,
     entries: u32,
     limit: u32,
@@ -276,7 +346,7 @@ var loops_lock: std.atomic.Mutex = .unlocked;
 var loops: [max_tasks]Loop = undefined;
 var loops_len: usize = 0;
 
-fn newLoop(seed: u64, depth: u8) *Loop {
+fn newLoop(seed: u64, parent: ?*Loop, depth: u8) *Loop {
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
     acquire(&loops_lock);
@@ -285,6 +355,7 @@ fn newLoop(seed: u64, depth: u8) *Loop {
     loops_len += 1;
     loop.* = .{
         .seed = seed,
+        .parent = parent,
         .depth = depth,
         .entries = 1 + random.uintLessThan(u32, 6),
         .limit = 1 + random.uintLessThan(u32, 4),
@@ -299,13 +370,15 @@ fn entryStart(loop: *Loop, ops: *RocOps, index: u32) [*]u8 {
     var prng = std.Random.DefaultPrng.init(loop.seed ^ (@as(u64, index + 1) *% 0x9E37_79B9_7F4A_7C15));
     const random = prng.random();
     if (loop.depth > 0 and random.uintLessThan(u8, 3) == 0) {
-        const nested = newLoop(random.int(u64), loop.depth - 1);
+        const nested = newLoop(random.int(u64), loop, loop.depth - 1);
         return startRecord(ops, &loopCall, std.mem.asBytes(&nested));
     }
     const leaf: Leaf = .{
         .pauses = random.uintLessThan(u32, 4),
         .waits = random.uintLessThan(u32, 3),
         .until = 0,
+        .outer = random.uintLessThan(u32, 4),
+        .loop = loop,
         .crashes = shape.crashes and random.uintLessThan(u8, 12) == 0,
         .result = 1,
     };
@@ -316,6 +389,7 @@ fn loopCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?
     const loop: *Loop = @as(*align(1) const *Loop, @ptrCast(capture.?)).*;
     const task: *RocTask = @as(*const *RocTask, @ptrCast(@alignCast(args.?))).*;
     if (loop.group == null) {
+        loop.cell = trackedCell(ops);
         var starts: [8][*]u8 = undefined;
         for (starts[0..loop.entries], 0..) |*start, index| start.* = entryStart(loop, ops, @intCast(index));
         const marks: [8]task_mod.EntryMarks = @splat(.{ .limit_path = &.{0}, .shielded = false, .background = false });
@@ -403,7 +477,7 @@ fn runTree(seed: u64, round_shape: Shape, cancel: bool) RunError!void {
     test_host.live.store(0, .monotonic);
 
     const ops = &test_host.ops;
-    const loop = newLoop(prng.random().int(u64), 3);
+    const loop = newLoop(prng.random().int(u64), null, 3);
     var root: u64 = 0;
     root_task = RocTask.createParallel(ops, startRecord(ops, &loopCall, std.mem.asBytes(&loop)), @ptrCast(&root), buffers);
     // `raiseGate` is outside the tree, which has not stalled when its tasks wait.
@@ -423,6 +497,7 @@ fn runTree(seed: u64, round_shape: Shape, cancel: bool) RunError!void {
     if (!round_shape.crashes and !round_shape.closed) try std.testing.expect(root_status != .crashed);
     if (root_status == .done) try std.testing.expectEqual(@as(u64, 1), root);
     root_task.free();
+    for (loops[0..loops_len]) |*made| dropCell(made.cell, ops);
     // Every child ended before the root, so nothing is ready or running.
     try std.testing.expectEqual(@as(usize, 0), ready.len);
     try std.testing.expectEqual(@as(usize, 0), operations.len);

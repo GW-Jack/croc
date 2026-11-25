@@ -542,18 +542,18 @@ fn literal(f: *Fixture, target: LocalId, value: i64, layout_idx: layout.Idx, nex
 /// The loop id the running-set tests' loops name their sets by.
 const test_loop_id: i64 = 3;
 
-/// `group_init(id, count, [], 0, False, task)` for a set of `count` entries
+/// `group_init(id, count, [], 0, 0, task)` for a set of `count` entries
 /// with results of `result`, before `next`; `id`, `limits` and `no_limit` are
 /// the caller's locals, which this defines.
 fn groupInit(f: *Fixture, id: LocalId, count: i64, result: layout.Idx, task: ?LocalId, next: CFStmtId) TaskOpsTestError!CFStmtId {
     const count_local = try f.local(.u64);
     const no_limit = try f.local(.u64);
     const limits = try f.local(try f.layouts.insertList(.u64));
-    const unsupervised = try f.local(.bool);
+    const no_traits = try f.local(.u8);
     const unit = try f.local(.zst);
     var args = std.ArrayList(LocalId).empty;
     defer args.deinit(f.allocator);
-    try args.appendSlice(f.allocator, &.{ id, count_local, limits, no_limit, unsupervised });
+    try args.appendSlice(f.allocator, &.{ id, count_local, limits, no_limit, no_traits });
     if (task) |owner| try args.append(f.allocator, owner);
     var head = try f.store.addCFStmt(.{ .assign_low_level = .{
         .target = unit,
@@ -564,7 +564,7 @@ fn groupInit(f: *Fixture, id: LocalId, count: i64, result: layout.Idx, task: ?Lo
         .next = next,
     } }, .test_fixture);
     head = try f.store.addCFStmt(.{ .assign_list = .{ .target = limits, .elems = .empty(), .next = head } }, .test_fixture);
-    head = try literal(f, unsupervised, 0, .bool, head);
+    head = try literal(f, no_traits, 0, .u8, head);
     head = try literal(f, no_limit, 0, .u64, head);
     head = try literal(f, count_local, count, .u64, head);
     return try literal(f, id, test_loop_id, .u64, head);

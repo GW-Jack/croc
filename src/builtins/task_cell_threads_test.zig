@@ -220,7 +220,7 @@ fn scriptCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _:
             _ = step.cell.stored.fetchAdd(step.amount, .monotonic);
         }
         step.cell.empty = false;
-        dev_wrappers.roc_builtins_cell_settle(step.cell, step.answer == .add);
+        dev_wrappers.roc_builtins_cell_settle(step.cell, step.answer == .add, false);
         runner.next += 1;
     }
     @as(*align(1) u64, @ptrCast(ret.?)).* = 1;

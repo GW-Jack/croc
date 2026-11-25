@@ -1529,7 +1529,7 @@ pub fn roc_builtins_task_cancel(roc_task: *task.RocTask, abort: task.AbortFn, re
 /// Every `roc_builtins_group_*` call names its set by the loop's id and the
 /// owner, last, as the continuation pass appends a task: the owner's
 /// innermost open set (`task.openGroup`).
-pub fn roc_builtins_group_init(loop_id: u64, entry_count: u64, limits_bytes: ?[*]const u8, limits_len: usize, root_limit: u64, supervised: bool, slot_size: u64, slot_alignment: u64, result_drop: ?erased_callable.OnDropFn, owner: *task.RocTask) callconv(.c) void {
+pub fn roc_builtins_group_init(loop_id: u64, entry_count: u64, limits_bytes: ?[*]const u8, limits_len: usize, root_limit: u64, traits: u8, slot_size: u64, slot_alignment: u64, result_drop: ?erased_callable.OnDropFn, owner: *task.RocTask) callconv(.c) void {
     const limits: []const u64 = if (limits_len == 0) &.{} else @as([*]const u64, @ptrCast(@alignCast(limits_bytes.?)))[0..limits_len];
     _ = task.groupInit(
         owner,
@@ -1542,7 +1542,8 @@ pub fn roc_builtins_group_init(loop_id: u64, entry_count: u64, limits_bytes: ?[*
         if (result_drop == null) null else &dropResultThrough,
         if (result_drop) |drop| @ptrCast(@constCast(drop)) else null,
         null,
-        supervised,
+        traits & @backingInt(task.GroupTrait.supervised) != 0,
+        traits & @backingInt(task.GroupTrait.results_hold_handles) != 0,
     );
 }
 
@@ -1617,9 +1618,16 @@ pub fn roc_builtins_cell_wait(cell: *anyopaque, probe: [*]u8, owner: *task.RocTa
     return 2;
 }
 
-/// An update of `cell` answered without a `Wait`; `stored` when with `Set`.
-pub fn roc_builtins_cell_settle(cell: *anyopaque, stored: bool) callconv(.c) void {
-    task.cellSettle(cell, stored);
+/// An update of `cell` answered without a `Wait`; `stored` when with `Set`, and
+/// `tracked` when the state can hold a handle.
+pub fn roc_builtins_cell_settle(cell: *anyopaque, stored: bool, tracked: bool) callconv(.c) void {
+    task.cellSettle(cell, stored, tracked);
+}
+
+/// The running code made `cell`, whose state can hold a handle (design.md "Shared
+/// State", "Releasing cells."). Takes `release_call`.
+pub fn roc_builtins_cell_track(cell: [*]u8, release_call: [*]u8) callconv(.c) void {
+    task.cellTrack(in_process_host.ops(), cell, release_call);
 }
 
 /// The code that follows runs the body of a `finally!` or `on_failure!` (design.md

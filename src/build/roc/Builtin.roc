@@ -4019,7 +4019,8 @@ Builtin :: [].{
 		# bodies. The first, where tasks run on several threads, keeps every other
 		# update of the cell out until one of the others is called; the second
 		# pauses the task until a wake, when the probe would no longer answer 0;
-		# the third wakes the waiters an update gave reason to. Where nothing can
+		# the third wakes the waiters an update gave reason to, and is told whether it
+		# stored a state and whether that state can hold a handle. Where nothing can
 		# pause, an update that waits can never go on, and there are no waiters.
 		cell_lock! : Box(item) => {}
 		cell_lock! = |_cell| {}
@@ -4029,8 +4030,17 @@ Builtin :: [].{
 			crash "deadlock: no task can ever change the shared state this task waits for"
 		}
 
-		cell_settle! : Box(item), Bool => {}
-		cell_settle! = |_cell, _stored| {}
+		cell_settle! : Box(item), Bool, Bool => {}
+		cell_settle! = |_cell, _stored, _tracked| {}
+
+		# Where tasks run, the first answers whether the cell's state can hold a
+		# handle, and `Shared.new!` calls the second for a cell whose state can: the
+		# release is called when no running task can reach the cell.
+		cell_tracked! : Box(item) => Bool
+		cell_tracked! = |_cell| False
+
+		cell_track! : Box(item), Box(() => U8) => {}
+		cell_track! = |_cell, _release| {}
 
 		# The helpers of `Shared.finally!` and `Shared.on_failure!`: the first makes
 		# the cleanup run if the task is cancelled or crashes before the second.
@@ -4113,7 +4123,13 @@ Builtin :: [].{
 
 		## Makes shared state that starts as `state`, and returns a handle to it.
 		new! : state => Shared(state)
-		new! = |state| Cell(cell_new!(Held(state)))
+		new! = |state| {
+			cell = cell_new!(Held(state))
+			if Concurrently.cell_tracked!(cell) {
+				Concurrently.cell_track!(cell, Box.box(|| cell_release!(cell)))
+			}
+			Cell(cell)
+		}
 
 		## Runs the function on the state, as if no other task ran meanwhile. `Set`
 		## replaces the state, `Keep` leaves it as it was, and each returns the
@@ -4130,12 +4146,12 @@ Builtin :: [].{
 			match transform(state) {
 				Set(changed, answer) => {
 					_ = cell_exchange!(cell, Held(changed))
-					Concurrently.cell_settle!(cell, True)
+					Concurrently.cell_settle!(cell, True, Concurrently.cell_tracked!(cell))
 					answer
 				}
 				Keep(answer) => {
 					_ = cell_exchange!(cell, Held(state))
-					Concurrently.cell_settle!(cell, False)
+					Concurrently.cell_settle!(cell, False, False)
 					answer
 				}
 				Wait => {
@@ -4152,7 +4168,7 @@ Builtin :: [].{
 		get! = |Cell(cell)| {
 			state = cell_take!(cell)
 			_ = cell_exchange!(cell, Held(state))
-			Concurrently.cell_settle!(cell, False)
+			Concurrently.cell_settle!(cell, False, False)
 			state
 		}
 
@@ -4160,7 +4176,7 @@ Builtin :: [].{
 		modify! : Shared(state), (state -> state) => {}
 		modify! = |Cell(cell), transform| {
 			_ = cell_exchange!(cell, Held(transform(cell_take!(cell))))
-			Concurrently.cell_settle!(cell, True)
+			Concurrently.cell_settle!(cell, True, Concurrently.cell_tracked!(cell))
 		}
 
 		## Calls `body` and returns its result. However `body` ends, the state is
@@ -28428,7 +28444,15 @@ cell_probe! = |cell, transform|
 cell_cleanup! : Box([Held(state), Moved]), (state -> state) => U8
 cell_cleanup! = |cell, cleanup| {
 	_ = cell_exchange!(cell, Held(cleanup(cell_take!(cell))))
-	Concurrently.cell_settle!(cell, True)
+	Concurrently.cell_settle!(cell, True, Concurrently.cell_tracked!(cell))
+	0
+}
+
+# Drops a shared cell's state, when no running task can reach the cell. The
+# runtime calls it through its box.
+cell_release! : Box([Held(state), Moved]) => U8
+cell_release! = |cell| {
+	_ = cell_exchange!(cell, Moved)
 	0
 }
 

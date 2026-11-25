@@ -23,6 +23,8 @@ pub const RunningSetHelper = enum(u8) {
     cell_lock,
     cell_wait,
     cell_settle,
+    cell_tracked,
+    cell_track,
     cleanup_push,
     cleanup_pop,
 };

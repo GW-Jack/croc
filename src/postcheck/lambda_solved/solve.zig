@@ -3555,6 +3555,7 @@ const Solver = struct {
             .cell_lock,
             .cell_wait,
             .cell_settle,
+            .cell_track,
             .cleanup_push,
             .cleanup_pop,
             => Common.invariantFmt("low-level op {s} reached Lambda Solved", .{@tagName(op)}),

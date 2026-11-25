@@ -6719,6 +6719,7 @@ pub const Interpreter = struct {
                 const size_align = self.layout_store.layoutSizeAlign(self.layout_store.getLayout(result_layout));
                 const drop = try self.groupResultDrop(result_layout);
                 const root_limit = args[3].read(u64);
+                const traits = args[4].read(u8);
                 _ = builtins.task.groupInit(
                     taskOf(self.readPointerInt(args[5])),
                     args[0].read(u64),
@@ -6730,7 +6731,8 @@ pub const Interpreter = struct {
                     if (drop == null) null else &interpreterGroupResultDrop,
                     drop,
                     if (drop == null) null else &interpreterGroupResultDropRelease,
-                    args[4].read(u8) != 0,
+                    traits & @backingInt(builtins.task.GroupTrait.supervised) != 0,
+                    traits & @backingInt(builtins.task.GroupTrait.results_hold_handles) != 0,
                 );
                 break :blk Value.zst;
             },
@@ -6768,7 +6770,13 @@ pub const Interpreter = struct {
                 break :blk val;
             },
             .cell_settle => blk: {
-                builtins.task.cellSettle(@ptrFromInt(self.readPointerInt(args[0])), args[1].read(u8) != 0);
+                builtins.task.cellSettle(@ptrFromInt(self.readPointerInt(args[0])), args[1].read(u8) != 0, args[2].read(u8) != 0);
+                break :blk Value.zst;
+            },
+            .cell_track => blk: {
+                const release = self.readBoxedDataPointer(args[1]) orelse
+                    return self.invariantFailedError("LIR/interpreter invariant violated: cell_track had no release", .{});
+                builtins.task.cellTrack(self.roc_env.currentRocOps(), @ptrFromInt(self.readPointerInt(args[0])), release);
                 break :blk Value.zst;
             },
             .cleanup_push => blk: {

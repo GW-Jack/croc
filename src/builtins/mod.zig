@@ -58,6 +58,7 @@ test "builtins tests" {
     std.testing.refAllDecls(@import("task_conformance_test.zig"));
     std.testing.refAllDecls(@import("task_group_test.zig"));
     std.testing.refAllDecls(@import("task_cell_test.zig"));
+    std.testing.refAllDecls(@import("task_release_test.zig"));
     std.testing.refAllDecls(@import("task_group_threads_test.zig"));
     std.testing.refAllDecls(@import("task_parallel_test.zig"));
     std.testing.refAllDecls(@import("task_cell_threads_test.zig"));

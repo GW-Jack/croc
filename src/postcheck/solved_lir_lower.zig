@@ -3171,6 +3171,8 @@ const Lowerer = struct {
             .cell_lock => .cell_lock,
             .cell_wait => .cell_wait,
             .cell_settle => .cell_settle,
+            .cell_tracked => .cell_tracked,
+            .cell_track => .cell_track,
             .cleanup_push => .cleanup_push,
             .cleanup_pop => .cleanup_pop,
         };

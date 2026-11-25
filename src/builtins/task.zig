@@ -396,6 +396,16 @@ pub const RocTask = extern struct {
     cleanups: [*][*]u8,
     cleanups_len: usize,
     cleanups_capacity: usize,
+    /// The tracked cells the task owns, how many there are, and how many there
+    /// may be before they are swept (design.md "Shared State", "Releasing
+    /// cells.").
+    cells: ?*TrackedCell,
+    cells_len: usize,
+    cells_limit: usize,
+    /// Whether a handle that the task or one below it made may have left it.
+    escaped: bool,
+    /// A root's table of its tree's tracked cells, by address.
+    cell_table: CellTable,
     /// The next task in a list of host calls due once the tree is unlocked
     /// (`HostCalls`), and whether this one's operation is abandoned first.
     host_next: ?*RocTask,
@@ -467,6 +477,11 @@ pub const RocTask = extern struct {
             .cleanups = undefined,
             .cleanups_len = 0,
             .cleanups_capacity = 0,
+            .cells = null,
+            .cells_len = 0,
+            .cells_limit = min_cells_limit,
+            .escaped = false,
+            .cell_table = .{ .buckets = undefined, .capacity = 0, .len = 0 },
             .host_next = null,
             .host_abort = false,
             .scheduler = null,
@@ -1090,6 +1105,110 @@ pub const RocTask = extern struct {
         erased_callable.decref(self.cleanups[self.cleanups_len], self.ops);
     }
 
+    /// Put a tracked cell on the task's list, and sweep the list if it has grown
+    /// to its limit. Takes `release_call`.
+    fn trackCell(self: *RocTask, cell: [*]u8, release_call: [*]u8) void {
+        const tracked: *TrackedCell = @ptrCast(@alignCast(self.ops.alloc(@alignOf(TrackedCell), @sizeOf(TrackedCell))));
+        tracked.* = .{ .cell = cell, .release_call = release_call, .owner = self, .next = self.cells, .chain = null };
+        self.lockTree();
+        tracked.next = self.cells;
+        self.cells = tracked;
+        self.cells_len += 1;
+        self.root.cell_table.add(self.ops, tracked);
+        const full = self.cells_len > self.cells_limit;
+        self.unlockTree();
+        if (full) self.sweepCells();
+    }
+
+    /// Free the cells on the task's list that only the list refers to. One of
+    /// the task's own resumes is running, or one of a child's.
+    fn sweepCells(self: *RocTask) void {
+        var dead: ?*TrackedCell = null;
+        self.lockTree();
+        var at = &self.cells;
+        while (at.*) |tracked| {
+            if (tracked.inUse()) {
+                at = &tracked.next;
+                continue;
+            }
+            at.* = tracked.next;
+            tracked.next = dead;
+            dead = tracked;
+            self.cells_len -= 1;
+            self.root.cell_table.remove(tracked);
+        }
+        self.cells_limit = @max(min_cells_limit, 2 * self.cells_len);
+        self.unlockTree();
+        while (dead) |tracked| {
+            dead = tracked.next;
+            tracked.free(self.ops);
+        }
+    }
+
+    /// The task stored a state in `cell`, which is tracked: a handle that the
+    /// state holds may have left every task up to the one that owns the cell.
+    fn escapeTo(self: *RocTask, cell: [*]u8) void {
+        self.lockTree();
+        defer self.unlockTree();
+        // A cell made outside any task is no task's.
+        const tracked = self.root.cell_table.find(cell);
+        var inside: ?*RocTask = if (tracked) |found| found.owner else null;
+        while (inside) |owner| : (inside = if (owner.group) |group| group.owner else null) {
+            if (!owner.escaped) break;
+        }
+        var task = self;
+        while (task != inside) {
+            const group = task.group orelse break;
+            task.escaped = true;
+            task = group.owner;
+        }
+    }
+
+    /// At the task's end: hand its tracked cells to its parent if a handle may
+    /// have left it, or else release them, since no running task can reach one.
+    /// The tasks below it have ended.
+    fn endCells(self: *RocTask, status: Status) void {
+        const parent: ?*RocTask = if (self.group) |group| parent: {
+            // Once it is set, tasks on other threads may read it.
+            if (status == .done and group.results_hold_handles and !self.escaped) self.escaped = true;
+            break :parent if (self.escaped) group.owner else null;
+        } else null;
+        if (self.cells == null) return;
+        if (parent) |owner| {
+            self.sweepCells();
+            self.lockTree();
+            var last: ?*TrackedCell = null;
+            var next = self.cells;
+            while (next) |tracked| : (next = tracked.next) {
+                tracked.owner = owner;
+                last = tracked;
+            }
+            if (last) |tracked| {
+                tracked.next = owner.cells;
+                owner.cells = self.cells;
+                owner.cells_len += self.cells_len;
+                self.cells = null;
+                self.cells_len = 0;
+            }
+            const full = owner.cells_len > owner.cells_limit;
+            self.unlockTree();
+            if (full) owner.sweepCells();
+            return;
+        }
+        self.lockTree();
+        var released = self.cells;
+        self.cells = null;
+        self.cells_len = 0;
+        var next = released;
+        while (next) |tracked| : (next = tracked.next) self.root.cell_table.remove(tracked);
+        self.unlockTree();
+        while (released) |tracked| {
+            released = tracked.next;
+            tracked.release(self.ops);
+            tracked.free(self.ops);
+        }
+    }
+
     /// The task, if it waits on a cell: an update it runs is then the one that
     /// waited, run again.
     fn retriedWaiter(self: *RocTask) ?*RocTask {
@@ -1191,6 +1310,7 @@ pub const RocTask = extern struct {
     /// The task reached its terminal `status`. A child reports to its group
     /// and is freed before its resume returns (design.md "Child Tasks").
     fn end(self: *RocTask, status: Status) Status {
+        self.endCells(status);
         self.status = status;
         if (self.group) |group| group.report(self);
         return status;
@@ -1216,6 +1336,8 @@ pub const RocTask = extern struct {
         }
         if (self.capacity > 0) ops.dealloc(@ptrCast(self.entries), @alignOf(Entry));
         if (self.cleanups_capacity > 0) ops.dealloc(@ptrCast(self.cleanups), @alignOf([*]u8));
+        std.debug.assert(self.cells == null and self.cell_table.len == 0); // rationale: `endCells` empties a task's list, and a root ends after its tree's other tasks
+        if (self.cell_table.capacity > 0) ops.dealloc(@ptrCast(self.cell_table.buckets), @alignOf(?*TrackedCell));
         if (self.status == .crashed) ops.dealloc(@ptrCast(@constCast(self.crash_message)), 1);
         freeBuffer(ops, self.hosted_slot, self.hosted_slot_size, self.hosted_slot_alignment);
         freeBuffer(ops, self.result_buffer, self.result_buffer_size, self.result_buffer_alignment);
@@ -1270,6 +1392,98 @@ const SpinLock = struct {
 
     fn unlock(self: *SpinLock) void {
         @atomicStore(u32, &self.word, 0, .release);
+    }
+};
+
+/// How many tracked cells a task's list may hold before its first sweep.
+const min_cells_limit = 8;
+
+/// A tracked cell (design.md "Shared State", "Releasing cells."). A list of the
+/// task that owns it and its root's table hold it.
+const TrackedCell = struct {
+    /// The cell's payload.
+    cell: [*]u8,
+    /// The call that moves the state out of the cell, a boxed erased callable
+    /// that holds the cell.
+    release_call: [*]u8,
+    owner: *RocTask,
+    /// The next one of its owner's.
+    next: ?*TrackedCell,
+    /// The next one of its bucket of the table.
+    chain: ?*TrackedCell,
+
+    /// Whether anything but `release_call` refers to the cell. Once nothing
+    /// does, nothing can again.
+    fn inUse(self: *const TrackedCell) bool {
+        const count: [*]const isize = @ptrCast(@alignCast(self.cell));
+        // Another thread may have dropped the second reference after using the
+        // cell.
+        return !utils.rcUnique(@atomicLoad(isize, &(count - 1)[0], .acquire));
+    }
+
+    /// Move the state out of the cell and drop it.
+    fn release(self: *const TrackedCell, ops: *RocOps) void {
+        var answer: u8 = undefined;
+        var out_desc: ?*const anyopaque = null;
+        erased_callable.payloadPtr(self.release_call).callable_fn_ptr(ops, @ptrCast(&answer), null, erased_callable.capturePtr(self.release_call), null, &out_desc);
+    }
+
+    fn free(self: *TrackedCell, ops: *RocOps) void {
+        erased_callable.decref(self.release_call, ops);
+        ops.dealloc(@ptrCast(self), @alignOf(TrackedCell));
+    }
+};
+
+/// The tracked cells of a root's tree, by address.
+const CellTable = extern struct {
+    /// A power of two, or 0 and no buckets.
+    buckets: [*]?*TrackedCell,
+    capacity: usize,
+    len: usize,
+
+    fn bucket(self: *const CellTable, cell: [*]u8) *?*TrackedCell {
+        const hash = (@as(u64, @intFromPtr(cell)) >> 4) *% 0x9E37_79B9_7F4A_7C15;
+        return &self.buckets[@intCast((hash >> 32) & (self.capacity - 1))];
+    }
+
+    fn find(self: *const CellTable, cell: [*]u8) ?*TrackedCell {
+        if (self.capacity == 0) return null;
+        var next = self.bucket(cell).*;
+        while (next) |tracked| : (next = tracked.chain) if (tracked.cell == cell) return tracked;
+        return null;
+    }
+
+    fn add(self: *CellTable, ops: *RocOps, tracked: *TrackedCell) void {
+        if (self.len == self.capacity) self.grow(ops);
+        const head = self.bucket(tracked.cell);
+        tracked.chain = head.*;
+        head.* = tracked;
+        self.len += 1;
+    }
+
+    fn remove(self: *CellTable, tracked: *TrackedCell) void {
+        var at = self.bucket(tracked.cell);
+        while (at.*.? != tracked) at = &at.*.?.chain;
+        at.* = tracked.chain;
+        self.len -= 1;
+    }
+
+    fn grow(self: *CellTable, ops: *RocOps) void {
+        const old = self.*;
+        self.capacity = if (old.capacity == 0) 8 else old.capacity * 2;
+        self.buckets = @ptrCast(@alignCast(ops.alloc(@alignOf(?*TrackedCell), self.capacity * @sizeOf(?*TrackedCell))));
+        @memset(self.buckets[0..self.capacity], null);
+        if (old.capacity == 0) return;
+        for (old.buckets[0..old.capacity]) |first| {
+            var next = first;
+            while (next) |tracked| {
+                next = tracked.chain;
+                const head = self.bucket(tracked.cell);
+                tracked.chain = head.*;
+                head.* = tracked;
+            }
+        }
+        ops.dealloc(@ptrCast(old.buckets), @alignOf(?*TrackedCell));
     }
 };
 
@@ -1387,9 +1601,19 @@ pub fn cellWait(task: *RocTask, cell: *anyopaque, probe: [*]u8) void {
     task.unlockTree();
 }
 
+/// `cell_track`: the running code made `cell`, whose state can hold a handle. The
+/// running task's list takes `release_call` (design.md "Shared State", "Releasing
+/// cells.").
+pub fn cellTrack(ops: *RocOps, cell: [*]u8, release_call: [*]u8) void {
+    const task = currentTask() orelse return erased_callable.decref(release_call, ops);
+    task.trackCell(cell, release_call);
+}
+
 /// `cell_settle`: an update of `cell` by the running code answered without a
-/// `Wait`, and `stored` a new state or put back the one it was given.
-pub fn cellSettle(cell: *anyopaque, stored: bool) void {
+/// `Wait`, and `stored` a new state or put back the one it was given. `tracked`
+/// when the state can hold a handle.
+pub fn cellSettle(cell: *anyopaque, stored: bool, tracked: bool) void {
+    if (stored and tracked) if (currentTask()) |task| task.escapeTo(@ptrCast(cell));
     const waiters = cellWaiters(cell);
     const running = runningSlot().*;
     var calls: HostCalls = .{};
@@ -1535,6 +1759,12 @@ pub const EntryMarks = struct {
     background: bool,
 };
 
+/// The bits of `group_init`'s traits, which name `GroupSpec`'s fields.
+pub const GroupTrait = enum(u8) {
+    supervised = 1,
+    results_hold_handles = 2,
+};
+
 /// What a task-form loop's `group` operation hands the runtime.
 pub const GroupSpec = struct {
     /// The compiled loop's id (`openGroup`).
@@ -1561,6 +1791,8 @@ pub const GroupSpec = struct {
     /// Whether an entry's crash is a report for `groupNext` instead of its
     /// owner's crash (`Group.supervised`).
     supervised: bool = false,
+    /// `Group.results_hold_handles`.
+    results_hold_handles: bool = false,
 };
 
 /// What `groupNext` found.
@@ -1645,6 +1877,9 @@ pub const Group = struct {
     /// `groupNext` takes, and not a crash of its owner (design.md "Plans And
     /// Concurrent Loops", "Supervision.").
     supervised: bool,
+    /// Whether an entry's result may hold a handle to shared state (design.md
+    /// "Shared State", "Releasing cells.").
+    results_hold_handles: bool,
     /// The message of a supervised entry's crash, from its report until
     /// `groupNext` takes it or the owner's finish drops it.
     crash_message: str.RocStr,
@@ -1971,7 +2206,7 @@ fn growArray(ops: *RocOps, items: *anyopaque, old: u32, new: u32, size: usize, a
 /// in input order. Called from the owner's code during its resume.
 pub fn groupCreate(owner: *RocTask, spec: GroupSpec) *Group {
     if (spec.marks.len != spec.starts.len) utils.builtinInvariant(owner.ops, "a group's marks don't match its entries");
-    const group = groupInit(owner, spec.loop_id, spec.starts.len, spec.limits, spec.root_limit, spec.slot_size, spec.slot_alignment, spec.result_drop, spec.result_drop_context, spec.result_drop_release, spec.supervised);
+    const group = groupInit(owner, spec.loop_id, spec.starts.len, spec.limits, spec.root_limit, spec.slot_size, spec.slot_alignment, spec.result_drop, spec.result_drop_context, spec.result_drop_release, spec.supervised, spec.results_hold_handles);
     for (spec.starts, spec.marks) |start_record, marks| groupPush(group, start_record, marks.limit_path, marks.shielded, marks.background);
     groupStart(group);
     return group;
@@ -1993,6 +2228,7 @@ pub fn groupInit(
     result_drop_context: ?*anyopaque,
     result_drop_release: ?ResultDropReleaseFn,
     supervised: bool,
+    results_hold_handles: bool,
 ) *Group {
     const ops = owner.ops;
     if (supervised and entry_count != 1) utils.builtinInvariant(ops, "a supervised group was made for more or fewer entries than one");
@@ -2030,6 +2266,7 @@ pub fn groupInit(
         .unbegun = .{},
         .ending = false,
         .supervised = supervised,
+        .results_hold_handles = results_hold_handles,
         .crash_message = undefined,
     };
     if (limits.len > 0) {

@@ -715,11 +715,12 @@ pub const LowLevel = enum(u16) {
     // pass. Each names its running set by the loop's id, a `U64`, and the
     // owner task, last: the owner's innermost open set. The pass appends the
     // task to each, as it does at a call; before that, the task is absent.
-    /// (id, entry_count, limits, root_limit, supervised, task) -> {}: open
+    /// (id, entry_count, limits, root_limit, traits, task) -> {}: open
     /// loop `id`'s set for `entry_count` entries, borrowing `limits`
     /// (`List(U64)`); `root_limit` is 0 for none or 1 + the root limit's
-    /// index. `supervised` (`Bool`) makes the crash of the set's one entry a
-    /// report. The extra fields name the layout of an entry's result.
+    /// index. `traits` (`U8`) is the sum of 1 when the crash of the set's one
+    /// entry is a report, and 2 when an entry's result may hold a handle to
+    /// shared state. The extra fields name the layout of an entry's result.
     group_init,
     /// (id, start, limit_path, shielded, background, task) -> {}: add the
     /// next entry, taking its start record and borrowing `limit_path`.
@@ -752,16 +753,21 @@ pub const LowLevel = enum(u16) {
 
     // Operations on cells in a program with tasks (design.md "Shared State"),
     // which only the continuation pass makes, from the bodies of Builtin's
-    // five helpers. The pass appends the task to `cell_wait`.
+    // helpers. The pass appends the task to `cell_wait`.
     /// (cell) -> {}: an update is about to take the state of the cell, which it
     /// borrows; in a `ParallelTasks` program.
     cell_lock,
     /// (cell, probe, task) -> U32: the task's update of the cell, which it
     /// borrows, answered `Wait`; takes the probe. Always the pending status.
     cell_wait,
-    /// (cell, stored) -> {}: an update of the cell, which it borrows, answered
-    /// without a `Wait`; `stored` (`Bool`) when it was a `Set`.
+    /// (cell, stored, tracked) -> {}: an update of the cell, which it borrows,
+    /// answered without a `Wait`; `stored` (`Bool`) when it was a `Set`, and
+    /// `tracked` (`Bool`) when the cell's state can hold a handle.
     cell_settle,
+    /// (cell, release) -> {}: the running code made the cell, which it borrows,
+    /// and whose state can hold a handle; takes the release, a boxed function
+    /// that moves the state out.
+    cell_track,
     /// (cleanup) -> {}: the code that follows runs the body of a `finally!` or
     /// `on_failure!`; takes the cleanup, a boxed function.
     cleanup_push,
@@ -1431,6 +1437,8 @@ pub const LowLevel = enum(u16) {
         // Any task's store may run the probe.
         .cell_wait = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_1, .args_spawned = arg_1 }),
         .cell_settle = byType(.{ .may_allocate = true, .may_retain_or_release = true }),
+        // Any task of the tree may run or drop the release.
+        .cell_track = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_1, .args_spawned = arg_1 }),
         // The runtime runs the cleanup in whichever resume ends the task.
         .cleanup_push = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_0, .args_spawned = arg_0 }),
         .cleanup_pop = byType(.{ .may_retain_or_release = true }),
