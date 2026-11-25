@@ -638,7 +638,7 @@ NO CHANGE
 					(e-match
 						(match
 							(cond
-								(e-dispatch-call (method "by_statement") (constraint-fn-var 651)
+								(e-dispatch-call (method "by_statement") (constraint-fn-var 647)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "s"))))
@@ -670,7 +670,7 @@ NO CHANGE
 					(e-match
 						(match
 							(cond
-								(e-dispatch-call (method "by_param") (constraint-fn-var 663)
+								(e-dispatch-call (method "by_param") (constraint-fn-var 655)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "s"))))
@@ -702,7 +702,7 @@ NO CHANGE
 					(e-match
 						(match
 							(cond
-								(e-dispatch-call (method "by_field") (constraint-fn-var 675)
+								(e-dispatch-call (method "by_field") (constraint-fn-var 663)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "s"))))
@@ -734,7 +734,7 @@ NO CHANGE
 					(e-match
 						(match
 							(cond
-								(e-dispatch-call (method "by_literal") (constraint-fn-var 687)
+								(e-dispatch-call (method "by_literal") (constraint-fn-var 671)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "s"))))
@@ -766,7 +766,7 @@ NO CHANGE
 					(e-match
 						(match
 							(cond
-								(e-dispatch-call (method "by_call") (constraint-fn-var 699)
+								(e-dispatch-call (method "by_call") (constraint-fn-var 679)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "s"))))
@@ -793,27 +793,27 @@ NO CHANGE
 									(value
 										(e-string
 											(e-literal (string "c")))))))))
-				(e-call (constraint-fn-var 731)
+				(e-call (constraint-fn-var 707)
 					(e-lookup-external
 						(builtin))
-					(e-call (constraint-fn-var 726)
+					(e-call (constraint-fn-var 702)
 						(e-lookup-external
 							(builtin))
-						(e-call (constraint-fn-var 721)
+						(e-call (constraint-fn-var 697)
 							(e-lookup-external
 								(builtin))
 							(e-lookup-local
 								(p-assign (ident "a")))
 							(e-lookup-local
 								(p-assign (ident "b"))))
-						(e-call (constraint-fn-var 725)
+						(e-call (constraint-fn-var 701)
 							(e-lookup-external
 								(builtin))
 							(e-lookup-local
 								(p-assign (ident "c")))
 							(e-lookup-local
 								(p-assign (ident "d")))))
-					(e-call (constraint-fn-var 730)
+					(e-call (constraint-fn-var 706)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local

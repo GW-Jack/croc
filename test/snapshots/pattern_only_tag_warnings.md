@@ -805,7 +805,7 @@ main! = |args| {
 										(e-string
 											(e-literal (string "other")))))))))
 				(s-expr
-					(e-call (constraint-fn-var 610)
+					(e-call (constraint-fn-var 609)
 						(e-lookup-local
 							(p-assign (ident "echo!")))
 						(e-block
@@ -831,11 +831,11 @@ main! = |args| {
 									(p-assign (ident "alternatives"))))
 							(s-let
 								(p-assign (ident "#interp_5"))
-								(e-call (constraint-fn-var 573)
+								(e-call (constraint-fn-var 572)
 									(e-lookup-local
 										(p-assign (ident "describe_mode")))
 									(e-empty_record)))
-							(e-interpolation (constraint-fn-var 587) (dispatcher-var 195)
+							(e-interpolation (constraint-fn-var 586) (dispatcher-var 195)
 								(first
 									(e-literal (string "")))
 								(parts
