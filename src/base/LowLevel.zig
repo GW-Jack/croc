@@ -783,6 +783,11 @@ pub const LowLevel = enum(u16) {
     /// - `result_unique`: the result's outermost allocation has count 1 on
     ///   return, so ARC records a birth. A result that shares an argument's
     ///   outer allocation is never unique; interior sharing is irrelevant.
+    /// - `args_host_visible`: the op hands those arguments to code the ownership
+    ///   solver cannot see, such as a task record another task or a host thread
+    ///   drops. Host-visibility analysis seeds them.
+    /// - `result_host_visible`: the result came from such code, so its
+    ///   allocations may be held there too. Host-visibility analysis seeds it.
     ///
     /// ## What checks the claims
     ///
@@ -817,6 +822,13 @@ pub const LowLevel = enum(u16) {
         /// outermost result—interior sharing described by
         /// `result_shares_args` is irrelevant to the outermost count.
         result_unique: bool = false,
+        /// Argument positions the op hands to code the ownership solver cannot
+        /// see. Host-visibility analysis seeds them (design.md "Thread-Confined
+        /// Reference Counts").
+        args_host_visible: u64 = 0,
+        /// The result came from code the ownership solver cannot see, so
+        /// host-visibility analysis seeds it.
+        result_host_visible: bool = false,
 
         pub fn none() RcEffect {
             return .{};
@@ -934,6 +946,12 @@ pub const LowLevel = enum(u16) {
                 .retain_args = retain_mask,
                 .result_unique = true,
             };
+        }
+
+        /// Reads a value that code the ownership solver cannot see stored, such
+        /// as a hosted call's result or a child task's.
+        pub fn loadsHostVisible() RcEffect {
+            return .{ .result_host_visible = true };
         }
 
         /// Move consumed ownership units into the result without claiming that
@@ -1330,16 +1348,16 @@ pub const LowLevel = enum(u16) {
         .task_set_pending = byType(.none()),
         .task_hosted_slot = byType(.none()),
         .task_result_buffer = byType(.none()),
-        .task_create = byType(.consumesArgsRetainingArgs(arg_0, 0)),
+        .task_create = byType(.{ .may_retain_or_release = true, .consume_args = arg_0, .args_host_visible = arg_0 }),
 
         // Starting entries makes child tasks; ending, cancelling and
         // freeing a set drop start records and results nobody took.
         .group_init = byType(.{ .may_allocate = true }),
-        .group_push = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_1 }),
+        .group_push = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_1, .args_host_visible = arg_1 }),
         .group_start = byType(.{ .may_allocate = true, .may_retain_or_release = true }),
         .group_next = byType(.{ .may_allocate = true, .may_retain_or_release = true }),
         .group_arrival = byType(.none()),
-        .group_spawn = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_1 }),
+        .group_spawn = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_1, .args_host_visible = arg_1 }),
         .group_cancel = byType(.{ .may_retain_or_release = true }),
         .group_free = byType(.{ .may_retain_or_release = true }),
 

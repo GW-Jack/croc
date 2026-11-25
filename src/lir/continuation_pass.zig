@@ -621,7 +621,7 @@ fn siteHead(store: *LirStore, layouts: *layout.Store, sink: anytype, info: SiteI
     const poll = try sink.newLocal(.u32);
     const unit = try sink.newLocal(.zst);
     const pending = try store.addLowLevelStmt(unit, .task_set_pending, &.{occurrence.task}, edge, origin);
-    const load = try store.addLowLevelStmt(occurrence.target, .ptr_load, &.{slot}, ready, origin);
+    const load = try store.addHostVisibleLoad(occurrence.target, slot, ready, origin);
     const branch = try store.addCFStmt(.{ .switch_stmt = .{
         .cond = poll,
         .branches = try store.addCFSwitchBranches(&.{.{ .value = roc_ready, .body = load }}),
@@ -726,7 +726,7 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
     var head = switch (info.kind) {
         .park => call,
         .procedure, .hosted => blk: {
-            const load = try store.addLowLevelStmt(result.?, .ptr_load, &.{address.?}, call, origin);
+            const load = try store.addHostVisibleLoad(result.?, address.?, call, origin);
             break :blk try store.addLowLevelStmt(address.?, if (info.kind == .hosted) .task_hosted_slot else .task_result_buffer, &.{task}, load, origin);
         },
     };
@@ -1312,7 +1312,10 @@ fn verifyResumeEntry(allocator: Allocator, store: *const LirStore, data: LIR.Sus
                 at = read.next;
             },
             .assign_low_level => |op| {
-                if (op.op == .ptr_load) result = op.target;
+                if (op.op == .ptr_load) {
+                    if (!store.stmtRow(op.rc_effect).result_host_visible) invariant("a resume entry loads its call's result without marking it host-visible", .{});
+                    result = op.target;
+                }
                 at = op.next;
             },
             .assign_struct => |zero_sized| {
@@ -1688,6 +1691,7 @@ test "a resume entry reads its capture and the result buffer and calls the conti
     try testing.expectEqual(LIR.LowLevel.task_result_buffer, address.op);
     const result = f.at(address.next).assign_low_level;
     try testing.expectEqual(LIR.LowLevel.ptr_load, result.op);
+    try testing.expect(f.store.stmtRow(result.rc_effect).result_host_visible);
     const call = f.at(result.next).assign_call;
     try testing.expectEqual(c, call.proc);
     const call_args = try f.locals(call.args);
@@ -1753,6 +1757,7 @@ test "a hosted site reads the slot's address, branches on the poll, and the host
     try testing.expectEqual(@as(u64, 0), ready_branch.value);
     const load = f.at(ready_branch.body).assign_low_level;
     try testing.expectEqual(LIR.LowLevel.ptr_load, load.op);
+    try testing.expect(f.store.stmtRow(load.rc_effect).result_host_visible);
     try testing.expectEqual(t, load.target);
     try testing.expectEqual(build, load.next);
     // Pending: set the flag, save x, return.

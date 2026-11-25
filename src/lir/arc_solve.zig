@@ -3319,6 +3319,11 @@ fn liftSharedStmtFacts(solver: *Solver, proc_index: u32, current: LIR.CFStmtId) 
                     try solver.binding_facts.append(allocator, .{ .demand = arg });
                 }
             }
+            if (rc_effect.result_host_visible) try liftVisibilitySeed(solver, assign.target);
+            for (0..@min(GuardedList.borrowLen(args), 64)) |position| {
+                if ((rc_effect.args_host_visible & (@as(u64, 1) << @as(u6, @intCast(position)))) == 0) continue;
+                try liftVisibilitySeed(solver, GuardedList.at(args, position));
+            }
             if (assign.op == .erased_capture_load) {
                 try liftVisibilitySeed(solver, assign.target);
             } else {
@@ -4049,6 +4054,11 @@ fn computeVisibilityFromLift(
                 }
                 const effect = assign.op.arcInferenceRcEffect(store.stmtRow(assign.rc_effect));
                 const args = store.getLocalSpan(assign.args);
+                if (effect.result_host_visible) seedLocal(&visible, rc_local, target);
+                for (0..@min(GuardedList.borrowLen(args), 64)) |position| {
+                    if ((effect.args_host_visible & (@as(u64, 1) << @as(u6, @intCast(position)))) == 0) continue;
+                    seedLocal(&visible, rc_local, @backingInt(GuardedList.at(args, position)));
+                }
                 const share_mask = effect.result_aliases_consumed_args |
                     effect.result_borrows_args |
                     effect.retain_args |

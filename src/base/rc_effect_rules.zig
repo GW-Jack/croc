@@ -139,7 +139,8 @@ pub fn maskExceedsArgCount(effect: RcEffect, arg_count: usize) ?u6 {
         effect.result_aliases_consumed_args |
         effect.retain_args |
         effect.result_borrows_args |
-        effect.result_shares_args;
+        effect.result_shares_args |
+        effect.args_host_visible;
     if (named == 0) return null;
     if (arg_count >= 64) return null;
 

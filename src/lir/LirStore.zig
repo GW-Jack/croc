@@ -2177,6 +2177,24 @@ pub fn addLowLevelStmt(
     } }, origin);
 }
 
+/// Appends `target = ptr_load(address)` followed by `next`, for an address
+/// whose value code the ownership solver cannot see stored.
+pub fn addHostVisibleLoad(
+    self: *Self,
+    target: LocalId,
+    address: LocalId,
+    next: CFStmtId,
+    origin: StmtOrigin,
+) Allocator.Error!CFStmtId {
+    return self.addCFStmt(.{ .assign_low_level = .{
+        .target = target,
+        .op = .ptr_load,
+        .rc_effect = try self.addRcEffect(.loadsHostVisible()),
+        .args = try self.addLocalSpan(&.{address}),
+        .next = next,
+    } }, origin);
+}
+
 /// Appends `target = op` (a `dyn` statement) followed by `next`.
 pub fn addDynStmt(
     self: *Self,

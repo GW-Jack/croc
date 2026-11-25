@@ -13761,6 +13761,91 @@ test "RC atomicity: bodyless callee arguments keep atomic counts" {
     try f.expectRcAtomicity(list, .atomic);
 }
 
+test "RC atomicity: an argument an op hands to the host keeps atomic counts" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const list = try f.local(f.list_i64);
+    const alias = try f.local(f.list_i64);
+    const taken = try f.local(.i64);
+    const result = try f.local(.i64);
+
+    // list = []; alias = list; taken = op(list); expect(alias); ret 1—the
+    // op moves its argument where another thread may drop it, so the alias
+    // this procedure keeps is counted atomically.
+    const ret = try f.ret(result);
+    const result_assign = try f.assignI64(result, 1, ret);
+    const use_alias = try f.expectStmt(alias, result_assign);
+    const take = try f.assignLowLevel(taken, &.{list}, .{
+        .may_retain_or_release = true,
+        .consume_args = 1,
+        .args_host_visible = 1,
+    }, use_alias);
+    const alias_assign = try f.assignRefLocal(alias, list, take);
+    const body = try f.assignList(list, &.{}, alias_assign);
+    _ = try f.addProc(&.{}, body, .i64);
+
+    _ = try insert(&f.store, &f.layouts, .{ .thread_confined_rc = true });
+    try f.expectRcAtomicity(list, .atomic);
+}
+
+test "RC atomicity: an argument an op consumes itself keeps single-threaded counts" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const list = try f.local(f.list_i64);
+    const alias = try f.local(f.list_i64);
+    const taken = try f.local(.i64);
+    const result = try f.local(.i64);
+
+    const ret = try f.ret(result);
+    const result_assign = try f.assignI64(result, 1, ret);
+    const use_alias = try f.expectStmt(alias, result_assign);
+    const take = try f.assignLowLevel(taken, &.{list}, .{
+        .may_retain_or_release = true,
+        .consume_args = 1,
+    }, use_alias);
+    const alias_assign = try f.assignRefLocal(alias, list, take);
+    const body = try f.assignList(list, &.{}, alias_assign);
+    _ = try f.addProc(&.{}, body, .i64);
+
+    _ = try insert(&f.store, &f.layouts, .{ .thread_confined_rc = true });
+    try f.expectRcAtomicity(list, .single_thread);
+}
+
+test "RC atomicity: a value loaded from the host keeps atomic counts" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const visible_slot = try f.local(try f.layouts.insertPtr(f.list_i64));
+    const private_slot = try f.local(try f.layouts.insertPtr(f.list_i64));
+    const visible = try f.local(f.list_i64);
+    const private = try f.local(f.list_i64);
+    const result = try f.local(.i64);
+
+    // visible = ptr_load(visible_slot), marked; private = ptr_load(private_slot);
+    // ret 1—the host that stored the first may still hold it.
+    const ret = try f.ret(result);
+    const result_assign = try f.assignI64(result, 1, ret);
+    const load_private = try f.store.addLowLevelStmt(private, .ptr_load, &.{private_slot}, result_assign, .test_fixture);
+    const load_visible = try f.store.addHostVisibleLoad(visible, visible_slot, load_private, .test_fixture);
+    _ = try f.addProc(&.{ visible_slot, private_slot }, load_visible, .i64);
+
+    _ = try insert(&f.store, &f.layouts, .{ .thread_confined_rc = true });
+    try f.expectRcAtomicity(visible, .atomic);
+    try f.expectRcAtomicity(private, .single_thread);
+}
+
+test "RC atomicity: the start record a task operation takes is named host-visible" {
+    const taking = [_]struct { op: LIR.LowLevel, arg: u6 }{
+        .{ .op = .task_create, .arg = 0 },
+        .{ .op = .group_push, .arg = 1 },
+        .{ .op = .group_spawn, .arg = 1 },
+    };
+    for (taking) |case| {
+        const effect = case.op.rcEffect();
+        try testing.expectEqual(@as(u64, 1) << case.arg, effect.args_host_visible);
+        try testing.expectEqual(effect.consume_args, effect.args_host_visible);
+    }
+}
+
 test "uniqueness: freshly built list consumed by a checked op elides the check" {
     var f = try ArcTest.init(testing.allocator);
     defer f.deinit();

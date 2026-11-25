@@ -294,7 +294,7 @@ const Promoter = struct {
         const ended_t = try self.local(t_layout);
         var arrived = try self.jumpWith(joined, called.target, arrived_t, origin);
         arrived = try self.call(arrived_t, loop.arrived, &.{ running, value }, arrived, origin);
-        arrived = try self.op(value, .ptr_load, &.{slot}, arrived, origin);
+        arrived = try self.store.addHostVisibleLoad(value, slot, arrived, origin);
         arrived = try self.op(slot, .group_arrival, &.{id}, arrived, origin);
         var ended = try self.jumpWith(joined, called.target, ended_t, origin);
         ended = try self.call(ended_t, loop.ended, &.{running}, ended, origin);
@@ -395,7 +395,7 @@ fn promoteSupervised(allocator: Allocator, store: *LirStore, layouts: *layout.St
     const value = try b.local(child.result);
     var arrived = try store.addCFStmt(.{ .ret = .{ .value = value } }, origin);
     arrived = try b.op(try b.local(.zst), .group_free, &.{id}, arrived, origin);
-    arrived = try b.op(value, .ptr_load, &.{slot}, arrived, origin);
+    arrived = try store.addHostVisibleLoad(value, slot, arrived, origin);
     arrived = try b.op(slot, .group_arrival, &.{id}, arrived, origin);
 
     // It crashed.
@@ -413,7 +413,7 @@ fn promoteSupervised(allocator: Allocator, store: *LirStore, layouts: *layout.St
         .default_branch = again,
     } }, origin);
     crashed = try b.op(try b.local(.zst), .group_free, &.{id}, crashed, origin);
-    crashed = try b.op(message, .ptr_load, &.{message_ptr}, crashed, origin);
+    crashed = try store.addHostVisibleLoad(message, message_ptr, crashed, origin);
     crashed = try b.op(message_ptr, .group_arrival, &.{id}, crashed, origin);
 
     // Start it.

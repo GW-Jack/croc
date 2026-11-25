@@ -29187,7 +29187,9 @@ The analysis is one more monotone bit per local in the ARC solver, over
 edges the solver already walks:
 
 - seeds: parameters and returns of pinned procs (roots, hosted procs,
-  erased-callable procs, procs whose address escapes)
+  erased-callable procs, procs whose address escapes), values saved across a
+  suspension, and the arguments and results that a low-level op's `RcEffect`
+  names as host-visible
 - pure same-value aliases, in both directions
 - containment, in both directions: aggregate and capture operands link to
   the constructed value, and payload reads link to their source—storing a
@@ -29215,6 +29217,24 @@ spreads further than strictly necessary, which only keeps counts atomic
 that could have been plain, never the reverse. The mask is explicit
 primitive data, exactly like the rest of `RcEffect`; the analysis never
 guesses an op's sharing from its name or shape.
+
+Two more fields of `RcEffect` carry the seeds that concurrency adds. Unlike a
+sharing mask they name a boundary, not an edge: the value crosses into or out
+of code the solver cannot see, as it does at a hosted call.
+
+- `args_host_visible`: the op hands these arguments to such code.
+  `task_create`, `group_push` and `group_spawn` set it for the start record
+  they take. A record is an erased callable the task runtime drops or starts
+  later, from whichever thread resumes the task, so everything it captures is
+  visible to whatever else holds it.
+- `result_host_visible`: the result came from such code. `ptr_load` reads many
+  kinds of address, so this one belongs to the statement, not the operation.
+  The continuation pass sets it when it loads a suspending hosted call's result
+  from the hosted slot and a paused call's result from the result buffer, and
+  running-set promotion sets it when it loads an arrived result or a crash
+  message. A host that keeps its own reference to a string it returned updates
+  that string's count from another thread, whether the hosted call returned it
+  directly or delivered it to the slot.
 
 Emission attaches the chosen atomicity to each `incref`, `decref`, and
 `free` statement as explicit data; backends and the interpreter follow it

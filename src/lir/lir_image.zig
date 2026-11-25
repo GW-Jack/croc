@@ -116,7 +116,9 @@ pub const MAGIC: u32 = 0x52494c52; // "RLIR" in little-endian bytes.
 ///      `SuspendSaveData` row column.
 /// v88: procedure specs record which running-set helper they specialize
 ///      (`running_set_helper`).
-pub const FORMAT_VERSION: u32 = 88;
+/// v89: an operation's reference-count effect names the arguments and result
+///      it makes host-visible.
+pub const FORMAT_VERSION: u32 = 89;
 const StaticDataImage = @import("lir_image_static_data.zig").Schema(@This());
 
 /// Public `ImageError` declaration.
