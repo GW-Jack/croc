@@ -98,9 +98,10 @@ fn hostViolation(ops: *RocOps, comptime message: []const u8) void {
     if (monitors) ops.crashHost("host contract violated: " ++ message);
 }
 
-/// The task whose resume is running, claimed by every resume while the
-/// monitors are on: a resume that finds it taken overlapped another (P10),
-/// or ran inside its own task's resume, from a hosted call (P1).
+/// The task whose resume is running, claimed by every resume of a `Tasks`
+/// program while the monitors are on: a resume that finds it taken
+/// overlapped another (P10), or ran inside its own task's resume, from a
+/// hosted call (P1).
 var resuming: ?*RocTask = null;
 
 /// Recently freed tasks, with their ops, so a host that uses a task after
@@ -161,23 +162,39 @@ pub const host_calls = struct {
     }
 };
 
+/// The host's `roc_task_thread_slot` in a `ParallelTasks` program: the
+/// address of the running-task pointer the host keeps for the calling
+/// thread, null until a resume on that thread sets it (design.md "Parallel
+/// Resumes").
+pub const ThreadSlotFn = *const fn () callconv(.c) *?*RocTask;
+
 /// The task whose resume is running, which a crash exits to. A `Tasks`
 /// program's resumes never overlap (design.md "The Task Runtime"), so one
 /// pointer per process is enough.
-var running: ?*RocTask = null;
+var running_serial: ?*RocTask = null;
+
+/// The host's thread slots, from the first resume of a `ParallelTasks`
+/// program on; null in every other program.
+var thread_slot: ?ThreadSlotFn = null;
+
+/// The calling thread's running-task pointer.
+fn runningSlot() *?*RocTask {
+    const slot = @atomicLoad(?ThreadSlotFn, &thread_slot, .monotonic) orelse return &running_serial;
+    return slot();
+}
 
 /// Take the crash exit of the running task, if there is one and the target
 /// has crash exits: keep `msg` in the task and jump back to its resume.
 /// Returns otherwise, and the caller hands the crash to the host.
 pub fn crashRunning(msg: []const u8) void {
-    const task = running orelse return;
+    const slot = runningSlot();
+    const task = slot.* orelse return;
     if (!crash_exit.available()) return;
     // A crash while copying the message must reach the host, not loop.
-    running = null;
-    const copy: [*]u8 = @ptrCast(task.ops.alloc(1, @max(msg.len, 1)));
-    @memcpy(copy[0..msg.len], msg);
-    task.crash_message = copy;
-    task.crash_message_len = msg.len;
+    slot.* = null;
+    task.lockTree();
+    task.takeCrash(msg);
+    task.unlockTree();
     crash_exit.jump(&task.crash_jmp);
 }
 
@@ -185,16 +202,18 @@ pub fn crashRunning(msg: []const u8) void {
 /// the host ends the process rather than the task: the host's frames sit
 /// between the task's resume and the crash, and the exit would skip them.
 pub fn hostEnter() ?*RocTask {
-    const task = running;
-    running = null;
+    const slot = runningSlot();
+    const task = slot.*;
+    slot.* = null;
     return task;
 }
 
 /// Restore the running task `hostEnter` returned once the hosted call is
 /// back.
 pub fn hostLeave(task: ?*RocTask) void {
-    std.debug.assert(running == null); // rationale: hostEnter cleared it, and any resume ends by clearing it
-    running = task;
+    const slot = runningSlot();
+    std.debug.assert(slot.* == null); // rationale: hostEnter cleared it, and any resume ends by clearing it
+    slot.* = task;
 }
 
 /// Where compiled code finds the three fields the `task_*` low-level
@@ -300,6 +319,19 @@ pub const RocTask = extern struct {
     /// Whether the task ends `crashed`, with `crash_message`: its own crash,
     /// or one of its entries'.
     crashing: bool,
+    /// Whether one of the task's resumes is running, in a `ParallelTasks`
+    /// program while the monitors are on (P1).
+    resume_claimed: bool,
+    /// The lock of the task's tree, in a `ParallelTasks` program: the root's
+    /// `tree_lock`. Null in a `Tasks` program, whose resumes never overlap.
+    tree: ?*u32,
+    /// A root's lock over its tree (design.md "Parallel Resumes"): 0 free,
+    /// 1 held.
+    tree_lock: u32,
+    /// The next task in a list of host calls due once the tree is unlocked
+    /// (`HostCalls`), and whether this one's operation is abandoned first.
+    host_next: ?*RocTask,
+    host_abort: bool,
 
     /// A task whose list holds `start`, the root's start record, and whose
     /// outermost record writes to `root_result`. The host's first resume
@@ -340,6 +372,11 @@ pub const RocTask = extern struct {
             .open_groups = null,
             .finishing = false,
             .crashing = false,
+            .resume_claimed = false,
+            .tree = null,
+            .tree_lock = 0,
+            .host_next = null,
+            .host_abort = false,
         };
         task.push(.{ .record = start, .slot_drop = null, .from_task = false });
         forgetFreed(task);
@@ -409,14 +446,46 @@ pub const RocTask = extern struct {
         self.record_cache[class - 1] = record;
     }
 
-    /// `roc_task_resume` (`roc_builtins_task_resume`): keep the host's
-    /// `ready_fn` and `abort_fn` on the task for its children (design.md
-    /// "Child Tasks"), then resume it.
+    /// Take the lock of the task's tree, if it has one. The holder runs no
+    /// Roc code and calls no task function of the host; it may allocate.
+    fn lockTree(self: *const RocTask) void {
+        const lock = self.tree orelse return;
+        while (@cmpxchgWeak(u32, lock, 0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+
+    /// Release the lock of the task's tree. The root, which holds it, may be
+    /// freed as soon as it is released, so this is the holder's last access.
+    fn unlockTree(self: *const RocTask) void {
+        const lock = self.tree orelse return;
+        @atomicStore(u32, lock, 0, .release);
+    }
+
+    /// `roc_task_resume` of a `Tasks` program (`roc_builtins_task_resume`):
+    /// keep the host's `ready_fn` and `abort_fn` on the task for its children
+    /// (design.md "Child Tasks"), then resume it.
     pub fn resumeFromHost(self: *RocTask, ready_fn: ReadyFn, abort_fn: AbortFn) Status {
         if (!self.resumable()) return self.status;
-        self.ready_fn = ready_fn;
-        self.abort_fn = abort_fn;
+        self.keepHostFns(ready_fn, abort_fn);
         return self.resumeChecked();
+    }
+
+    /// `roc_task_resume` of a `ParallelTasks` program
+    /// (`roc_builtins_task_resume_parallel`), whose resumes of different
+    /// tasks may overlap: the root's first resume, before which it has no
+    /// children, gives its tree a lock (design.md "Parallel Resumes").
+    pub fn resumeParallelFromHost(self: *RocTask, ready_fn: ReadyFn, abort_fn: AbortFn, thread_slot_fn: ThreadSlotFn) Status {
+        if (!self.resumable()) return self.status;
+        @atomicStore(?ThreadSlotFn, &thread_slot, thread_slot_fn, .monotonic);
+        if (self.tree == null) self.tree = &self.tree_lock;
+        self.keepHostFns(ready_fn, abort_fn);
+        return self.resumeChecked();
+    }
+
+    /// Keep the host's functions, which are the same at every call, at the
+    /// first: after it, the task's children read them on their own threads.
+    fn keepHostFns(self: *RocTask, ready_fn: ReadyFn, abort_fn: AbortFn) void {
+        if (self.ready_fn == null) self.ready_fn = ready_fn;
+        if (self.abort_fn == null) self.abort_fn = abort_fn;
     }
 
     /// Resume the task with the host functions it has: run records,
@@ -439,39 +508,44 @@ pub const RocTask = extern struct {
     }
 
     fn resumeChecked(self: *RocTask) Status {
+        const serial = self.tree == null;
         self.claimResume();
-        defer self.releaseResume();
-        var completed = false;
-        if (self.started) {
-            // Readied: the parked bit of the word the task waited on is
-            // clear. For its hosted operation the host's one completion is
-            // counted, unless a cancel or a crash readied it; a group has
-            // at least one report waiting.
-            if (monitors) {
-                const seen = @atomicLoad(u32, self.waitWord(), .monotonic);
-                const readied = if (self.finishing or self.cancel_requested or self.crashing)
-                    seen & wake_parked == 0
-                else if (self.wait != null)
-                    seen & wake_parked == 0 and seen != 0
-                else
-                    seen == 1;
-                if (!readied) {
-                    self.releaseResume();
-                    hostViolation(self.ops, "a task was resumed without a roc_task_ready (P1)");
-                }
+        const status = self.runResume();
+        // A parallel resume gave up its claim when it parked, after which the
+        // task may be gone; giving up a serial one only compares pointers.
+        if (serial) self.releaseSerialResume();
+        return status;
+    }
+
+    fn runResume(self: *RocTask) Status {
+        // Readied: the parked bit of the word the task waited on is clear.
+        // For its hosted operation the host's one completion is counted,
+        // unless a cancel or a crash readied it; a group has at least one
+        // report waiting.
+        self.lockTree();
+        if (monitors and self.started) {
+            const seen = @atomicLoad(u32, self.waitWord(), .monotonic);
+            const readied = if (self.finishing or self.cancel_requested or self.crashing)
+                seen & wake_parked == 0
+            else if (self.wait != null)
+                seen & wake_parked == 0 and seen != 0
+            else
+                seen == 1;
+            if (!readied) {
+                self.unlockTree();
+                self.releaseResume();
+                hostViolation(self.ops, "a task was resumed without a roc_task_ready (P1)");
             }
-            if (self.wait == null) {
-                // Consuming the completion with acquire ordering makes the
-                // hosted slot the host wrote visible.
-                const word = @atomicRmw(u32, &self.wake_word, .Xchg, 0, .acquire);
-                completed = word & ~wake_parked != 0;
-            }
-            // A group's reports stay queued for `groupNext`.
-            self.wait = null;
-        } else {
-            self.started = true;
         }
-        if (self.finishing or self.cancel_requested or self.crashing) return self.finish(completed);
+        // Consuming a hosted completion with acquire ordering makes the
+        // hosted slot the host wrote visible. A group's reports stay queued
+        // for `groupNext`.
+        const completed = self.started and self.wait == null and self.consumeCompletion();
+        self.started = true;
+        self.wait = null;
+        const ending = self.finishing or self.cancel_requested or self.crashing;
+        self.unlockTree();
+        if (ending) return self.finish(completed);
         self.pending = 0;
         const exits = crash_exit.available();
         while (self.len > 0) {
@@ -482,19 +556,27 @@ pub const RocTask = extern struct {
                 // Kept in the task, since a crash exit restores no local.
                 self.running_record = entry.record;
                 self.running_from_task = entry.from_task;
-                running = self;
+                runningSlot().* = self;
                 if (crash_exit.save(&self.crash_jmp) != 0) return self.crashed();
             }
             self.call(entry.record, if (base == 0) self.root_result else self.result_buffer);
-            running = null;
+            if (exits) runningSlot().* = null;
             std.mem.reverse(Entry, self.entries[base..self.len]);
             self.releaseRecord(entry.record, entry.from_task);
-            if (self.pending != 0) {
-                if (self.park()) return .pending;
+            if (self.pending != 0) switch (self.park()) {
+                .parked => return .pending,
                 // The completion or the report came before the park: run
                 // on, from the suspension site's resume entry.
-                self.pending = 0;
-            }
+                .ready => self.pending = 0,
+                .ending_wait => return self.finish(false),
+                .ending_operation => {
+                    // Once `roc_task_abort` returns, no completion follows
+                    // (P4).
+                    callHost(self.abort_fn.?, self);
+                    if (monitors) @atomicStore(bool, &self.aborted, true, .monotonic);
+                    return self.finish(self.consumeCompletion());
+                },
+            };
         }
         if (self.open_groups != null) utils.builtinInvariant(self.ops, "a task's code finished with a concurrent loop still open");
         return self.end(.done);
@@ -506,31 +588,72 @@ pub const RocTask = extern struct {
         return if (self.wait) |group| &group.word else &self.wake_word;
     }
 
+    /// Take the hosted operation's completion, if the host published one.
+    fn consumeCompletion(self: *RocTask) bool {
+        return @atomicRmw(u32, &self.wake_word, .Xchg, 0, .acquire) & ~wake_parked != 0;
+    }
+
     /// Back from a crash exit: the records saved at call sites are
     /// consistent, so release them all; what the running frames owned is
     /// leaked. The task's children are cancelled, and it ends `crashed`
     /// once they have reported.
     fn crashed(self: *RocTask) Status {
         self.releaseRecord(self.running_record, self.running_from_task);
-        self.crashing = true;
         return self.finish(false);
     }
 
-    /// Park the task on its wait source: set the parked bit of its wake
-    /// word, but only while the word is zero. False when the source already
-    /// has something for the task: a host that finished on another thread
-    /// before the hosted function returned, or a report its group queued
-    /// since `groupNext` looked. The resume then carries on, so nothing is
-    /// lost and no `roc_task_ready` is due.
-    fn park(self: *RocTask) bool {
-        const word = self.waitWord();
-        const seen = @cmpxchgStrong(u32, word, 0, wake_parked, .acq_rel, .acquire) orelse return true;
-        if (self.wait != null) {
+    const Park = enum {
+        /// The task is parked: another thread may already be resuming it.
+        parked,
+        /// Its source already has something for it.
+        ready,
+        /// While its resume ran, a cancel reached it or one of its entries
+        /// crashed (a `ParallelTasks` program only), so it runs no more of
+        /// its code. It paused at a loop's `next`, or on a hosted operation
+        /// to abandon.
+        ending_wait,
+        ending_operation,
+    };
+
+    /// Park the task, whose code paused, on its wait source: set the parked
+    /// bit of its wake word, but only while the word is zero. It is not
+    /// when a host finished on another thread before the hosted function
+    /// returned, or a report was queued since `groupNext` looked. The resume
+    /// then carries on, so nothing is lost and no `roc_task_ready` is due.
+    ///
+    /// A cancel or an entry's crash marks the task and unparks it under the
+    /// tree's lock, so either it finds the task parked here, or this finds
+    /// the mark.
+    fn park(self: *RocTask) Park {
+        self.releaseParallelResume();
+        self.lockTree();
+        if (self.cancel_requested or self.crashing) {
+            const operation = self.wait == null;
             self.wait = null;
-            return false;
+            self.unlockTree();
+            self.claimParallelResume();
+            return if (operation) .ending_operation else .ending_wait;
         }
-        if (seen != 1) hostViolation(self.ops, "a task was woken more than once for one operation (P3)");
-        @atomicStore(u32, word, 0, .monotonic);
+        if (self.parkOnWait()) return .parked;
+        self.claimParallelResume();
+        return .ready;
+    }
+
+    /// Park on the wait source with the tree locked, and unlock it. False,
+    /// with no wait left, when the source has something for the task.
+    fn parkOnWait(self: *RocTask) bool {
+        const word = self.waitWord();
+        const seen = @cmpxchgStrong(u32, word, 0, wake_parked, .acq_rel, .acquire) orelse {
+            self.unlockTree();
+            return true;
+        };
+        const hosted = self.wait == null;
+        self.wait = null;
+        self.unlockTree();
+        if (hosted) {
+            if (seen != 1) hostViolation(self.ops, "a task was woken more than once for one operation (P3)");
+            @atomicStore(u32, word, 0, .monotonic);
+        }
         return false;
     }
 
@@ -559,51 +682,72 @@ pub const RocTask = extern struct {
         checkNotFreed(self, "cancelled");
         if (monitors and self.status != .pending) return hostViolation(self.ops, "a task was cancelled after it ended (P8)");
         if (monitors and self.group != null) return hostViolation(self.ops, "the host cancelled a child task, which only the runtime cancels (P8)");
-        self.requestCancel(abort, ready_fn);
+        self.keepHostFns(ready_fn, abort);
+        var calls: HostCalls = .{};
+        self.lockTree();
+        self.requestCancel(&calls);
+        self.unlockTree();
+        calls.make();
     }
 
     /// Request that the task's next resume finish it. A task parked with
     /// nothing for it is unparked here: its hosted operation abandoned with
-    /// `abort`, if it waits on one, and the task readied with `ready_fn`. One
-    /// that has something was readied by its source, or is about to be, and
-    /// a new task is resumed anyway.
+    /// `roc_task_abort`, if it waits on one, and the task readied with
+    /// `roc_task_ready`. One that has something was readied by its source,
+    /// or is about to be, and a new task is resumed anyway. One that is
+    /// running, in a `ParallelTasks` program, finds the request when it next
+    /// parks. The tree is locked.
     ///
     /// Unparking is a compare-and-swap from parked to zero, so exactly one
     /// of this and a racing wake or report clears the parked bit, and that
-    /// one readies the task. A wake that lands between the swap and `abort`
-    /// counts its completion without readying; the finishing resume
+    /// one readies the task. A wake that lands between the swap and the
+    /// abort counts its completion without readying; the finishing resume
     /// releases it.
-    fn requestCancel(self: *RocTask, abort: AbortFn, ready_fn: ReadyFn) void {
+    fn requestCancel(self: *RocTask, calls: *HostCalls) void {
         self.cancel_requested = true;
-        if (self.started) self.unpark(abort, ready_fn);
+        if (self.started) self.unpark(calls);
     }
 
     /// Ready a parked task that will run no more of its code, abandoning
     /// its hosted operation first if it waits on one. Nothing happens to a
-    /// task that isn't parked.
-    fn unpark(self: *RocTask, abort: AbortFn, ready_fn: ReadyFn) void {
+    /// task that isn't parked. The tree is locked.
+    fn unpark(self: *RocTask, calls: *HostCalls) void {
         if (@cmpxchgStrong(u32, self.waitWord(), wake_parked, 0, .acq_rel, .monotonic) != null) return;
-        if (self.wait == null) {
-            callHost(abort, self);
-            if (monitors) @atomicStore(bool, &self.aborted, true, .monotonic);
-        }
-        callHost(ready_fn, self);
+        calls.add(self, self.wait == null);
     }
 
     /// Claim the process's one running resume for this task, while the
-    /// monitors are on (P1, P10).
+    /// monitors are on (P1, P10), or in a `ParallelTasks` program the task's
+    /// own (P1).
     fn claimResume(self: *RocTask) void {
         if (!monitors) return;
+        if (self.tree != null) return self.claimParallelResume();
         const holder = @cmpxchgStrong(?*RocTask, &resuming, null, self, .acquire, .monotonic) orelse return;
         if (holder == self) hostViolation(self.ops, "a task was resumed inside its own resume, from a hosted call (P1)");
         hostViolation(self.ops, "two resumes ran at the same time (P10)");
     }
 
-    /// Give up the claim, if this task holds it. Safe to call twice, and
-    /// after the task is freed, since it only compares the pointer.
+    /// Give up the claim, if this task holds it.
     fn releaseResume(self: *RocTask) void {
         if (!monitors) return;
+        if (self.tree == null) self.releaseSerialResume() else self.releaseParallelResume();
+    }
+
+    fn releaseSerialResume(self: *RocTask) void {
+        if (!monitors) return;
         _ = @cmpxchgStrong(?*RocTask, &resuming, self, null, .release, .monotonic);
+    }
+
+    fn claimParallelResume(self: *RocTask) void {
+        if (!monitors or self.tree == null) return;
+        if (@atomicRmw(bool, &self.resume_claimed, .Xchg, true, .acquire)) hostViolation(self.ops, "a task was resumed while it was running (P1)");
+    }
+
+    /// Give up a parallel resume's claim. A park does so before it sets the
+    /// parked bit, after which another thread may resume the task.
+    fn releaseParallelResume(self: *RocTask) void {
+        if (!monitors or self.tree == null) return;
+        @atomicStore(bool, &self.resume_claimed, false, .release);
     }
 
     /// A resume of a task that runs no more of its code: cancelled, or
@@ -614,7 +758,9 @@ pub const RocTask = extern struct {
     /// included. The task ends once they have all reported.
     fn finish(self: *RocTask, completed: bool) Status {
         if (!self.finishing) {
+            self.lockTree();
             self.finishing = true;
+            self.unlockTree();
             if (completed) {
                 const innermost = self.entries[self.len - 1];
                 if (innermost.slot_drop) |slot_drop| slot_drop(self.hosted_slot, innermost.record, self.ops);
@@ -632,20 +778,26 @@ pub const RocTask = extern struct {
         // running.
         while (self.open_groups) |group| {
             group.dropReports();
+            self.releaseParallelResume();
+            self.lockTree();
             if (group.live > 0) {
                 self.wait = group;
-                if (self.park()) return .pending;
+                if (self.parkOnWait()) return .pending;
+                self.claimParallelResume();
                 continue;
             }
-            group.close();
+            const last_taken = group.reports_taken == group.reports_len;
+            self.unlockTree();
+            self.claimParallelResume();
+            if (last_taken) group.close();
         }
         return self.end(if (self.crashing) .crashed else .cancelled);
     }
 
-    /// One of the task's entries crashed with `message` (design.md "Child
-    /// Tasks", "Crashes"): the task runs no more of its code, and crashes
-    /// with the same message once its other children have reported. The
-    /// first crash's message is the one it keeps.
+    /// The task crashed, or one of its entries did, with `message` (design.md
+    /// "Child Tasks", "Crashes"): the task runs no more of its code, and
+    /// crashes with that message once its children have reported. The first
+    /// crash's message is the one it keeps. The tree is locked.
     fn takeCrash(self: *RocTask, message: []const u8) void {
         if (self.crashing) return;
         const copy: [*]u8 = @ptrCast(self.ops.alloc(1, @max(message.len, 1)));
@@ -684,8 +836,9 @@ pub const RocTask = extern struct {
         if (self.status == .crashed) ops.dealloc(@ptrCast(@constCast(self.crash_message)), 1);
         freeBuffer(ops, self.hosted_slot, self.hosted_slot_size, self.hosted_slot_alignment);
         freeBuffer(ops, self.result_buffer, self.result_buffer_size, self.result_buffer_alignment);
-        ops.dealloc(@ptrCast(self), @alignOf(RocTask));
+        // Before the address can be another thread's new task.
         noteFreed(self, ops);
+        ops.dealloc(@ptrCast(self), @alignOf(RocTask));
     }
 
     /// The buffer sizes the program gave this task, which its children get
@@ -721,6 +874,37 @@ pub const RocTask = extern struct {
             self.ops.realloc(@ptrCast(self.entries), bytes, @alignOf(Entry));
         self.entries = @ptrCast(@alignCast(raw));
         self.capacity = capacity;
+    }
+};
+
+/// Calls of the host's `roc_task_ready`, and `roc_task_abort` before it for
+/// a task whose operation is abandoned, that are due once the tree is
+/// unlocked, in order. Each task in the list is new or was unparked by what
+/// added it, so until its ready nothing else resumes, readies or frees it.
+const HostCalls = struct {
+    first: ?*RocTask = null,
+    last: ?*RocTask = null,
+
+    fn add(self: *HostCalls, task: *RocTask, abort: bool) void {
+        task.host_abort = abort;
+        task.host_next = null;
+        if (self.last) |last| last.host_next = task else self.first = task;
+        self.last = task;
+    }
+
+    /// Make the calls. The tree is unlocked: the host's functions may take
+    /// locks of its own.
+    fn make(self: *const HostCalls) void {
+        var next = self.first;
+        while (next) |task| {
+            // Once it is readied, another thread may resume the task.
+            next = task.host_next;
+            if (task.host_abort) {
+                callHost(task.abort_fn.?, task);
+                if (monitors) @atomicStore(bool, &task.aborted, true, .monotonic);
+            }
+            callHost(task.ready_fn.?, task);
+        }
     }
 };
 
@@ -801,9 +985,11 @@ pub const Next = union(enum) {
 /// Concurrent Loops", "Child Tasks").
 ///
 /// Everything but `word` is touched only inside resumes and the host's
-/// `roc_task_cancel`, which a `Tasks` host never overlaps (P10). The word
-/// follows the wake-word protocol, so the same steps hold when resumes run
-/// on several threads.
+/// `roc_task_cancel`, which a `Tasks` host never overlaps (P10), and in a
+/// `ParallelTasks` program only with the tree locked (design.md "Parallel
+/// Resumes"), except for what only the owner's code touches: pushing entries
+/// before `groupStart`, a taken entry's slot, dropped entries' start records
+/// and closing the group.
 pub const Group = struct {
     owner: *RocTask,
     /// The compiled loop's id, which each of its operations names
@@ -867,8 +1053,9 @@ pub const Group = struct {
     const State = enum(u8) { unstarted, running, reported, taken, dropped };
 
     const GroupEntry = struct {
-        /// The start record, while the entry hasn't started.
-        start: [*]u8,
+        /// The start record, until the entry starts or its record is
+        /// dropped.
+        start: ?[*]u8,
         /// The running child.
         child: ?*RocTask,
         slot: [*]u8,
@@ -901,14 +1088,14 @@ pub const Group = struct {
     }
 
     /// Start every unstarted entry whose limits have room, in input order.
-    fn startEligible(self: *Group) void {
+    fn startEligible(self: *Group, calls: *HostCalls) void {
         var index = self.first_unstarted;
         var first: ?u32 = null;
         while (index < self.len) : (index += 1) {
             const entry = &self.entries[index];
             if (entry.state != .unstarted) continue;
             if (self.hasRoom(entry)) {
-                self.start(index);
+                self.start(index, calls);
             } else if (first == null) {
                 first = index;
             }
@@ -916,18 +1103,26 @@ pub const Group = struct {
         self.first_unstarted = first orelse self.len;
     }
 
+    /// `startEligible` for the owner's code, which in a `ParallelTasks`
+    /// program may run while an entry of another of its groups crashes.
+    fn startUnlessCrashing(self: *Group, calls: *HostCalls) void {
+        if (!self.owner.crashing) self.startEligible(calls);
+    }
+
     /// Start the entry at `index` as a child task: it writes its result to
     /// its slot, and the host learns it is ready through the owner's
-    /// `roc_task_ready`.
-    fn start(self: *Group, index: u32) void {
+    /// `roc_task_ready`. The tree is locked.
+    fn start(self: *Group, index: u32, calls: *HostCalls) void {
         const owner = self.owner;
-        const ready_fn = owner.ready_fn orelse utils.builtinInvariant(owner.ops, "a task started children without the host's roc_task_ready; its resume came from no host");
+        if (owner.ready_fn == null) utils.builtinInvariant(owner.ops, "a task started children without the host's roc_task_ready; its resume came from no host");
         const entry = &self.entries[index];
         for (self.path(entry)) |limit| {
             self.limits[limit].running += 1;
             if (monitors and self.limits[limit].running > self.limits[limit].allowed) utils.builtinInvariant(owner.ops, "a limit has more running entries than it allows");
         }
-        const child = RocTask.create(owner.ops, entry.start, entry.slot, owner.bufferLayout());
+        const child = RocTask.create(owner.ops, entry.start.?, entry.slot, owner.bufferLayout());
+        entry.start = null;
+        child.tree = owner.tree;
         child.ready_fn = owner.ready_fn;
         child.abort_fn = owner.abort_fn;
         child.group = self;
@@ -937,7 +1132,7 @@ pub const Group = struct {
         entry.state = .running;
         self.unstarted -= 1;
         self.live += 1;
-        callHost(ready_fn, child);
+        calls.add(child, false);
     }
 
     /// Append an entry under the limits `limit_path`; it starts when they
@@ -987,6 +1182,8 @@ pub const Group = struct {
     /// group. A crash also makes the owner crash wherever it waits
     /// (design.md "Child Tasks", "Crashes").
     fn report(self: *Group, child: *RocTask) void {
+        var calls: HostCalls = .{};
+        child.lockTree();
         const owner = self.owner;
         const index = child.entry_index;
         const entry = &self.entries[index];
@@ -1004,41 +1201,52 @@ pub const Group = struct {
                 owner.takeCrash(message);
             }
         }
-        child.release();
         self.reports[self.reports_len] = index;
         self.reports_len += 1;
-        if (!owner.finishing and !owner.crashing) self.startEligible();
+        if (!owner.finishing and !owner.crashing) self.startEligible(&calls);
         // Count the report and clear the parked bit in one step, so
         // exactly one report readies a parked owner.
         var seen = @atomicLoad(u32, &self.word, .monotonic);
         while (@cmpxchgWeak(u32, &self.word, seen, (seen & ~wake_parked) + 1, .release, .monotonic)) |actual| seen = actual;
         if (seen & wake_parked != 0) {
-            callHost(owner.ready_fn.?, owner);
+            calls.add(owner, false);
         } else if (owner.crashing) {
-            // Parked elsewhere: on its hosted operation, or on another of
-            // its groups.
-            owner.unpark(owner.abort_fn.?, owner.ready_fn.?);
+            // Parked elsewhere, on its hosted operation or on another of
+            // its groups, or running.
+            owner.unpark(&calls);
         }
+        // Once the tree is unlocked, the owner may take this report, close
+        // the group and end.
+        child.unlockTree();
+        child.release();
+        calls.make();
     }
 
-    /// Take the next queued report, counting it off the wake word.
+    /// Take the next queued report, counting it off the wake word. The tree
+    /// is locked.
     fn takeReport(self: *Group) ?u32 {
         if (self.reports_taken == self.reports_len) return null;
         const index = self.reports[self.reports_taken];
         self.reports_taken += 1;
         _ = @atomicRmw(u32, &self.word, .Sub, 1, .acquire);
+        self.entries[index].state = .taken;
         return index;
     }
 
     /// Take every queued report and release the results in them.
     fn dropReports(self: *Group) void {
-        while (self.takeReport()) |index| self.dropResult(index);
+        const owner = self.owner;
+        while (true) {
+            owner.lockTree();
+            const taken = self.takeReport();
+            owner.unlockTree();
+            self.dropResult(taken orelse return);
+        }
     }
 
-    /// Release the result of a reported entry, if it finished with one.
+    /// Release the result of a taken entry, if it finished with one.
     fn dropResult(self: *Group, index: u32) void {
         const entry = &self.entries[index];
-        entry.state = .taken;
         if (entry.outcome == .crashed and self.supervised) self.crash_message.decref(self.owner.ops);
         if (entry.outcome != .done) return;
         if (self.result_drop) |drop| drop(entry.slot, self.result_drop_context, self.owner.ops);
@@ -1047,11 +1255,18 @@ pub const Group = struct {
     /// Drop the entries that haven't started, and cancel the running ones
     /// `reach` covers.
     fn cancelEntries(self: *Group, reach: Reach) void {
-        const owner = self.owner;
+        var calls: HostCalls = .{};
+        self.owner.lockTree();
+        self.cancelLocked(reach, &calls);
+        self.owner.unlockTree();
+        self.afterCancel(&calls);
+    }
+
+    /// `cancelEntries`' half under the lock: its other half is `afterCancel`.
+    fn cancelLocked(self: *Group, reach: Reach, calls: *HostCalls) void {
         for (self.entries[0..self.len]) |*entry| {
             switch (entry.state) {
                 .unstarted => {
-                    erased_callable.decref(entry.start, owner.ops);
                     entry.state = .dropped;
                     self.unstarted -= 1;
                     if (!entry.background) self.foreground_left -= 1;
@@ -1059,12 +1274,24 @@ pub const Group = struct {
                 .running => {
                     const child = entry.child.?;
                     if (reach == .exit and entry.shielded and child.started) continue;
-                    if (!child.cancel_requested) child.requestCancel(owner.abort_fn.?, owner.ready_fn.?);
+                    if (!child.cancel_requested) child.requestCancel(calls);
                 },
                 .reported, .taken, .dropped => {},
             }
         }
         self.first_unstarted = self.len;
+    }
+
+    /// Ready the tasks a cancel reached and release the start records it
+    /// dropped, the only ones left, which runs the program's drops, so with
+    /// the tree unlocked.
+    fn afterCancel(self: *Group, calls: *const HostCalls) void {
+        calls.make();
+        for (self.entries[0..self.len]) |*entry| {
+            const dropped = entry.start orelse continue;
+            entry.start = null;
+            erased_callable.decref(dropped, self.owner.ops);
+        }
     }
 
     /// Free the group once nothing in it runs or waits, and take it off its
@@ -1205,7 +1432,11 @@ pub fn groupPush(group: *Group, start_record: [*]u8, limit_path: anytype, shield
 /// Start every entry its limits allow, once `groupPush` has added them all.
 pub fn groupStart(group: *Group) void {
     if (group.len != group.block_slots) utils.builtinInvariant(group.owner.ops, "a group started before all its entries were added");
-    group.startEligible();
+    var calls: HostCalls = .{};
+    group.owner.lockTree();
+    group.startUnlessCrashing(&calls);
+    group.owner.unlockTree();
+    calls.make();
 }
 
 /// `next`: take one report (design.md "Plans And Concurrent Loops"). A
@@ -1215,47 +1446,65 @@ pub fn groupStart(group: *Group) void {
 /// queued and entries still to come, the owner parks on the group.
 pub fn groupNext(group: *Group) Next {
     const owner = group.owner;
-    while (group.takeReport()) |index| {
+    owner.lockTree();
+    while (true) {
+        // An entry crashed on another thread, so the owner takes no result
+        // after it: it suspends here, and finishes instead of parking.
+        if (owner.crashing) {
+            owner.wait = group;
+            owner.unlockTree();
+            return .pending;
+        }
+        const index = group.takeReport() orelse break;
         const entry = &group.entries[index];
         switch (entry.outcome) {
             .done => {
-                if (group.ending) {
-                    group.dropResult(index);
-                    continue;
+                const arrived = !group.ending;
+                owner.unlockTree();
+                if (arrived) {
+                    group.arrival = entry.slot;
+                    return .{ .arrived = .{ .index = index, .slot = entry.slot } };
                 }
-                entry.state = .taken;
-                group.arrival = entry.slot;
-                return .{ .arrived = .{ .index = index, .slot = entry.slot } };
+                group.dropResult(index);
+                owner.lockTree();
             },
-            .cancelled => entry.state = .taken,
+            .cancelled => {},
             .crashed => {
                 // The owner of any other group crashes before it runs code
                 // again, so its code never sees a crash report.
                 if (!group.supervised) utils.builtinInvariant(owner.ops, "a loop's next took a crash report");
-                entry.state = .taken;
+                owner.unlockTree();
                 group.arrival = @ptrCast(&group.crash_message);
                 return .{ .crashed = .{ .message = &group.crash_message } };
             },
             .pending => utils.builtinInvariant(owner.ops, "a loop's next took a report from a running entry"),
         }
     }
-    if (group.live == 0 and group.unstarted == 0) return .ended;
-    if (group.foreground_left == 0 and !group.ending) {
+    var calls: HostCalls = .{};
+    const cancelling = group.foreground_left == 0 and !group.ending and (group.live > 0 or group.unstarted > 0);
+    if (cancelling) {
         group.ending = true;
-        group.cancelEntries(.exit);
-        if (group.live == 0) return .ended;
+        group.cancelLocked(.exit, &calls);
     }
-    owner.wait = group;
-    return .pending;
+    const ended = group.live == 0 and group.unstarted == 0;
+    if (!ended) owner.wait = group;
+    owner.unlockTree();
+    if (cancelling) group.afterCancel(&calls);
+    return if (ended) .ended else .pending;
 }
 
 /// `spawn_in`: add an entry under the root limit, if the plan has one, and
 /// start it when that limit has room. It is never background or shielded.
 pub fn spawnIn(group: *Group, start_record: [*]u8) void {
-    const ops = group.owner.ops;
+    const owner = group.owner;
     const root_path: []const u32 = if (group.root_limit) |*root| root[0..1] else &.{};
-    group.append(start_record, allocBuffer(ops, group.slot_size, group.slot_alignment), true, root_path, false, false);
-    group.startEligible();
+    const slot = allocBuffer(owner.ops, group.slot_size, group.slot_alignment);
+    var calls: HostCalls = .{};
+    owner.lockTree();
+    group.append(start_record, slot, true, root_path, false, false);
+    group.startUnlessCrashing(&calls);
+    owner.unlockTree();
+    calls.make();
 }
 
 /// `cancel_group`, a loop exit: drop the entries that haven't started, and
@@ -1757,7 +2006,7 @@ test "a crash in a resumed record ends its task, releases every record and keeps
     var len: usize = undefined;
     const message = host_calls.crashMessage(task, &len);
     try std.testing.expectEqualStrings("a record crashed", message[0..len]);
-    try std.testing.expectEqual(@as(?*RocTask, null), running);
+    try std.testing.expectEqual(@as(?*RocTask, null), runningSlot().*);
     host_calls.free(task);
     try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
 }
@@ -1818,23 +2067,23 @@ test "a crash several frames deep leaves the resume's caller's values intact" {
     var len: usize = undefined;
     const message = host_calls.crashMessage(task, &len);
     try std.testing.expectEqualStrings("a record crashed deep", message[0..len]);
-    try std.testing.expectEqual(@as(?*RocTask, null), running);
+    try std.testing.expectEqual(@as(?*RocTask, null), runningSlot().*);
     host_calls.free(task);
     try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
 }
 
 test "a hosted call runs with no running task, so a crash in it reaches the host" {
     var task: RocTask = undefined;
-    running = &task;
-    defer running = null;
+    runningSlot().* = &task;
+    defer runningSlot().* = null;
     const saved = hostEnter();
     try std.testing.expectEqual(@as(?*RocTask, &task), saved);
-    try std.testing.expectEqual(@as(?*RocTask, null), running);
+    try std.testing.expectEqual(@as(?*RocTask, null), runningSlot().*);
     // With no running task, a crash returns to its caller, which hands it
     // to the host, rather than jumping to `task`'s exit.
     crashRunning("the host crashed");
     hostLeave(saved);
-    try std.testing.expectEqual(@as(?*RocTask, &task), running);
+    try std.testing.expectEqual(@as(?*RocTask, &task), runningSlot().*);
 }
 
 test "FieldOffsets is where RocTask keeps its first three fields, scaled by the pointer size" {

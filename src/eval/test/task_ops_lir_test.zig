@@ -145,6 +145,11 @@ fn bareTask(hosted_slot: [*]u8, result_buffer: [*]u8) RocTask {
         .open_groups = null,
         .finishing = false,
         .crashing = false,
+        .resume_claimed = false,
+        .tree = null,
+        .tree_lock = 0,
+        .host_next = null,
+        .host_abort = false,
     };
 }
 

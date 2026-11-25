@@ -355,6 +355,66 @@ test "a host whose resumes of two tasks overlap on two threads is caught (P10)" 
     try std.testing.expectEqual(@as(usize, 0), h.live());
 }
 
+threadlocal var parallel_running: ?*RocTask = null;
+
+fn parallelSlot() callconv(.c) *?*RocTask {
+    return &parallel_running;
+}
+
+fn resumeParallel(task: *RocTask) Status {
+    return task.resumeParallelFromHost(&ready, &abort, &parallelSlot);
+}
+
+fn resumeParallelAgain(task: *RocTask) void {
+    _ = resumeParallel(task);
+}
+
+fn runHeldParallel(task: *RocTask) void {
+    held_status = resumeParallel(task);
+}
+
+test "parallel resumes of two tasks may overlap, and a second resume of one is caught (P1)" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    reset();
+    var root_a: [8]u8 = @splat(0);
+    var root_b: [8]u8 = @splat(0);
+    const held = chainTask(&h.ops, &.{}, &root_a, 1);
+    @as(*align(1) Step, @ptrCast(erased_callable.capturePtr(held.entries[0].record))).hook = .hold_for_overlap;
+    const other = chainTask(&h.ops, &.{}, &root_b, 2);
+
+    const thread = try std.Thread.spawn(.{}, runHeldParallel, .{held});
+    while (!overlap_running.load(.acquire)) std.atomic.spinLoopHint();
+    try std.testing.expectEqual(Status.done, resumeParallel(other));
+    try expectCaught(caughtCrash(*RocTask, &resumeParallelAgain, held), "P1");
+    overlap_go.store(true, .release);
+    thread.join();
+    try std.testing.expectEqual(Status.done, held_status);
+
+    try std.testing.expectEqual(@as(u8, 1), root_a[0]);
+    try std.testing.expectEqual(@as(u8, 2), root_b[0]);
+    held.free();
+    other.free();
+    try std.testing.expectEqual(@as(usize, 0), h.live());
+}
+
+test "a parallel host that resumes a task inside one of its hosted calls is caught (P1)" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    reset();
+    var root: [8]u8 = @splat(0);
+    const task = chainTask(&h.ops, &.{.resume_own_task}, &root, 7);
+
+    try std.testing.expectEqual(Status.pending, resumeParallel(task));
+    try expectCaught(hook_message, "P1");
+    task.wake(&ready);
+    try std.testing.expectEqual(Status.done, resumeParallel(task));
+    task.free();
+    try std.testing.expectEqual(@as(usize, 0), h.live());
+}
+
 fn driveConforming(task: *RocTask) void {
     var status = task.resumeTask();
     while (status == .pending) {

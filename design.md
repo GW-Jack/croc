@@ -34690,8 +34690,8 @@ path, which every program shares.
 
 **One runtime per process.** The running task is a builtins global.
 Resumes of a `Tasks` program never overlap (P10), so one pointer is enough;
-`ParallelTasks` makes it thread-local. Each process has exactly one copy
-of it. Where a link holds two copies of the builtins, the host's task calls
+a `ParallelTasks` host keeps one for each thread (Parallel Resumes). Each
+process has exactly one copy of it. Where a link holds two copies of the builtins, the host's task calls
 come from the copy that runs the records. The interpreter shim bundles a
 builtins object beside the interpreter's own copy, so that object leaves
 the task calls and the program task calls' builtins out, and the shim
@@ -34726,9 +34726,9 @@ the records it releases and allocates new ones from them:
 
 Records are released in the order the resume runs them, not the reverse
 of their allocation order, so free lists fit where a stack would not.
-The cache only grows to the most records the task held at once. Only
-resumes and a cancel touch it, and those never overlap (P10), so it needs
-no lock. A Debug runtime traps on a record that has more than one reference
+The cache only grows to the most records the task held at once. Only the
+task's own resumes and its free touch it, and those never overlap (P1, P8),
+so it needs no lock. A Debug runtime traps on a record that has more than one reference
 when it is released.
 
 **Conformance.** A runtime with safety checks (`std.debug.runtime_safety`)
@@ -34919,6 +34919,86 @@ safe builds:
 A broken rule of the runtime's own is a `builtinInvariant`. A host's broken
 obligation, such as resuming a child that was already freed, is a
 `hostViolation`.
+
+### Parallel Resumes
+
+A `ParallelTasks` host may run resumes of different tasks at the same time,
+on several threads. P10 does not bind it, and every other obligation does: a
+task's own resumes never overlap (P1), each happens-after what readied the
+task (P2), and a cancel comes between resumes of its root, though resumes of
+the root's children may be running. Any host function may then be called on
+several threads at once, the allocation functions included.
+
+**Running task.** A crash must find the task its own thread is running. The
+builtins keep no thread-local storage: their object serves hosts with no
+thread-local support at all, and LLVM's builtins bitcode is compiled before
+its target is known. So the host keeps one pointer per thread, null when the
+thread starts, and returns its address:
+
+```c
+void **roc_task_thread_slot(void);   /* host, ParallelTasks only */
+```
+
+The resume hands the function to the runtime, as it does `roc_task_ready`.
+The runtime keeps the one address, the same for every resume, and reaches the
+running task through it: at a resume, at a crash, and around hosted calls. In
+a `Tasks` program there is none, and the running task is the builtins global.
+
+**The tree's lock.** One lock guards the state that tasks of one tree touch
+in each other: each group's entries, limits, counts and reports; and each
+task's wait source, its marks (`started`, `cancel_requested`, `crashing`,
+`finishing`) and its crash message. The root holds the lock's word. Its first
+resume, before which the tree has one task, points the root at it, and a
+child copies its parent's pointer. Roots share nothing, so a server whose
+requests are roots has one lock for each request. The pointer is null in a
+`Tasks` program, which takes no lock.
+
+The lock is a spin lock, since the builtins reach no operating system. Its
+holder runs no Roc code and calls no function of the host other than the
+allocation functions, which do not call back into the runtime. Two kinds of
+work a locked step finds are therefore done once it unlocks:
+- `roc_task_ready` and `roc_task_abort` calls, which a list threaded through
+  the tasks keeps in order. Each task in the list is new, or was unparked by
+  the step that listed it, so until its ready comes nothing else resumes,
+  readies or frees it;
+- releases of values: the start records a cancel dropped, and results nobody
+  takes. Only the owner's thread does these, for entries no other thread
+  reaches any more.
+
+Unlocking is the holder's last access to the tree. A report that releases
+the lock can let the owner close the group and the root end.
+
+Some state needs no lock. The wake words keep their protocol, and
+`roc_task_wake` takes no lock: the count of completions is the only thing it
+shares. A task's records, record cache, buffers and open-group list belong to
+its own resume, which P2 hands from thread to thread. A child's result slot
+passes to its owner with its report.
+
+**Marks on a running task.** In a `Tasks` program only a parked task can be
+cancelled or take an entry's crash. Here it may be running, and it runs on
+until it next pauses. Marking a task and unparking it are one locked step, and
+so are parking and looking for a mark. So either the mark finds the task
+parked and readies it, or the park finds the mark and does not park:
+- a task that paused on a hosted operation abandons it with
+  `roc_task_abort`, releases the result if one was counted, and finishes. The
+  operation has started, as it would have had the mark come a moment later;
+- a task that paused at a loop's `next` finishes. A `next` of an owner with
+  an entry's crash pending takes no arrival, and pauses there.
+
+A cancelled child that reaches its end without pausing reports its result,
+which the loop exit drops. If a task crashes after an entry's crash already
+reached it, it keeps the entry's message.
+
+**Monitors.** A resume claims its task, rather than the process, so a resume
+of a task that is running is caught (P1) and resumes of other tasks are not.
+A park gives the claim up before it sets the parked bit, after which another
+thread may resume the task or, once it ends, free it.
+
+**Tests.** `src/builtins/task_parallel_test.zig` runs random trees of loops
+on several threads that resume tasks and finish operations at once, with
+entries that crash, loops that exit early and roots that are cancelled, and
+checks results, statuses and leaks. `zig build run-test-builtins-tsan` runs
+it under ThreadSanitizer.
 
 ### Backends
 
