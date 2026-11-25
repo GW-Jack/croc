@@ -5468,6 +5468,52 @@ test "issue 13208 a record update keeps an iterator field passed through an anno
     }
 }
 
+test "a record update's carried fields are the fields its request asks for" {
+    // `upd` updates a record it passes straight to `D`, so the update is
+    // requested at `D`'s payload. The base is a generic call whose result no
+    // argument determines, so its carried fields take the request's fields.
+    // The other calls fix which types `upd` is specialized at first.
+    const allocator = std.testing.allocator;
+    const source =
+        \\T := [A, D({ r0 : Bool, r1 : U64, r2 : Str })].{
+        \\    same : T -> T
+        \\    same = |t| t
+        \\    any = |_| crash "any"
+        \\    make : Try(U64, Str), (Bool, U64) -> T
+        \\    make = |_, _| A
+        \\    from_list : List(U64) -> T
+        \\    from_list = |_| A
+        \\    upd = |list| T.same(
+        \\        D({
+        \\            ..T.from_list(list).any(),
+        \\            r1: T.make(Ok(1), T.any(list)).any(),
+        \\        }),
+        \\    ).any()
+        \\    outer = |v| {
+        \\        c = T.make(T.any(v), (True, 68)).any()
+        \\        match {
+        \\            ..match v {
+        \\                D(_) => match T.any(v) {
+        \\                    _ => T.upd([])
+        \\                }
+        \\                _ => crash "outer"
+        \\            },
+        \\            r0: T.any(v),
+        \\        } {
+        \\            { r0, .. } => if c r0 else r0
+        \\        }
+        \\    }
+        \\}
+        \\
+        \\main : List(U64) -> Bool
+        \\main = |list| T.outer(T.from_list(list))
+    ;
+    for ([_]lir.CheckedPipeline.InlineMode{ .none, .procedures, .wrappers }) |inline_mode| {
+        var lowered = try lowerModule(allocator, source, inline_mode);
+        defer lowered.deinit(allocator);
+    }
+}
+
 test "issue 11317 or-pattern captures reuse one closure with and without specialization" {
     const allocator = std.testing.allocator;
     const source =

@@ -11261,7 +11261,12 @@ the child, never the corresponding public slot. A record update follows the
 same rule for every field it does not supply or unset: that field's child is
 the base value's field, so a generated-private representation the base carries
 there is the update's field type, and the unchanged field has one type in the
-base and the result.
+base and the result. The base is lowered at a request instantiated from its own
+checked type, and before it is lowered each field it carries in that request is
+related to the field the update itself was requested at, as a supplied field's
+child is lowered at the requested field. A base whose result only its request
+determines, such as a generic call, therefore produces fields that differ from
+the requested ones only where they carry generated-private evidence.
 
 A call whose result type holds a codec representation's public named type (a
 helper or format method that returns the result of `FieldNames.rename_fields`,

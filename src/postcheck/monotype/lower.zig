@@ -37283,12 +37283,14 @@ const BodyContext = struct {
             .list => @memset(task.slots, try self.graph.listElementNode(task.node)),
             .record => |record| {
                 var slot_index: usize = 0;
-                if (record.record.ext) |ext| {
-                    task.slots[slot_index] = try self.instNode(checkedExpr(self.view, ExprSite.read(ext)).ty);
-                    slot_index += 1;
-                }
                 var construction = try self.constructionFields(task.node);
                 defer construction.deinit(self.allocator);
+                if (record.record.ext) |ext| {
+                    const base_node = try self.instNode(checkedExpr(self.view, ExprSite.read(ext)).ty);
+                    try self.relateCarriedFields(record.record, construction.fields, base_node);
+                    task.slots[slot_index] = base_node;
+                    slot_index += 1;
+                }
                 for (record.record.fields) |field_idx| {
                     const field = self.view.bodies.recordField(field_idx);
                     const construction_field = construction.get(try recordFieldName(self.nameStoreMut(), self.view, field.label));
@@ -51152,6 +51154,26 @@ const BodyContext = struct {
         try by_name.ensureTotalCapacity(self.allocator, @intCast(fields.len));
         for (fields, 0..) |field, index| try by_name.put(self.allocator, field.name, @intCast(index));
         return .{ .fields = fields, .by_name = by_name };
+    }
+
+    /// Relate the fields a record update carries unchanged: the request for
+    /// its base's field is the slot the update was requested at, as a supplied
+    /// field's request is its slot. The base's request is instantiated from
+    /// its own checked type, so nothing else relates the two.
+    fn relateCarriedFields(
+        self: *BodyContext,
+        record: anytype,
+        target_fields: []const InstField,
+        base_node: NodeId,
+    ) Allocator.Error!void {
+        var labels = try self.recordExprLabels(record);
+        defer labels.deinit(self.allocator);
+        var base_fields = try self.constructionFields(base_node);
+        defer base_fields.deinit(self.allocator);
+        for (target_fields) |field| {
+            if (labels.values.contains(field.name) or labels.unsets.contains(field.name)) continue;
+            try relateRequestComponent(self.graph, field.ty, base_fields.get(field.name).ty);
+        }
     }
 
     /// A checked record expression's supplied values and unset labels by their
