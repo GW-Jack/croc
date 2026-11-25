@@ -123,8 +123,8 @@ pub const Options = struct {
     owned_proc_signatures: bool = false,
     /// Non-owning runtime bytes before the entrypoint's typed capture.
     erased_capture_prefix: u32 = 0,
-    /// Give each erased callable type a class, which a platform with tasks
-    /// needs (design.md "Erased Calls That May Suspend").
+    /// Give each erased callable type a class, which a program some procedure
+    /// of which may suspend needs (design.md "Erased Calls That May Suspend").
     erased_classes: bool = false,
     inline_plan: SolvedInline.Plan = .{},
     /// Reuse checking workers for prepared procedure-body lowering.

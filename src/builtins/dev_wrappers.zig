@@ -1648,6 +1648,18 @@ pub fn roc_builtins_task_current() callconv(.c) *task.RocTask {
     return task.taskCurrent();
 }
 
+/// The call that follows hands `owner` to what `closure` holds.
+pub fn roc_builtins_task_hand(closure: [*]u8, owner: *task.RocTask) callconv(.c) void {
+    owner.hand(closure);
+}
+
+/// What an erased procedure that may suspend begins with in a `None` program
+/// (design.md "Shared State", "Programs without tasks."): whether to go on.
+/// Otherwise the call it was entered with has been made, as a run's root.
+pub fn roc_builtins_task_enter(ret: ?[*]u8, args: ?[*]const u8, capture: [*]u8, reuse: ?[*]u8, result_buffer_size: u64, result_buffer_alignment: u64) callconv(.c) bool {
+    return task.taskEnter(in_process_host.ops(), ret, args, capture, reuse, @intCast(result_buffer_size), @intCast(result_buffer_alignment));
+}
+
 /// The record just saved in `waiting` writes a result of `size` bytes at
 /// `alignment`, which its descriptor gave.
 pub fn roc_builtins_task_need_result(waiting: *task.RocTask, size: usize, alignment: usize) callconv(.c) void {

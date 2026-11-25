@@ -140,7 +140,9 @@ pub const MAGIC: u32 = 0x52494c52; // "RLIR" in little-endian bytes.
 /// v101: procedure specs record `effect_free`, and dynamic erased calls mark
 ///      suspension sites.
 /// v102: the operations include `erased_reuse_none`.
-pub const FORMAT_VERSION: u32 = 102;
+/// v103: the operations include `task_hand`, and a procedure that may suspend and
+///      the host may call says so (`asks_task`), with the program's `run_buffer`.
+pub const FORMAT_VERSION: u32 = 103;
 const StaticDataImage = @import("lir_image_static_data.zig").Schema(@This());
 
 /// Public `ImageError` declaration.
@@ -236,6 +238,8 @@ pub const ProgramView = struct {
 /// Public `LirStoreImage` declaration.
 pub const LirStoreImage = extern struct {
     runtime_contract: u64,
+    run_buffer_size: u32,
+    run_buffer_alignment: u32,
     cf_stmts: ArrayRef,
     cf_switch_branches: ArrayRef,
     str_match_steps: ArrayRef,
@@ -271,6 +275,8 @@ pub const LirStoreImage = extern struct {
         std.debug.assert(store.proc_rewrite == null and store.body_coordinator == null);
         return .{
             .runtime_contract = @backingInt(store.runtime_contract),
+            .run_buffer_size = store.run_buffer.size,
+            .run_buffer_alignment = store.run_buffer.alignment,
             .cf_stmts = try encoder.ref(store.cf_stmts.unsafeRawItemsForView()),
             .cf_switch_branches = try encoder.ref(store.cf_switch_branches.unsafeRawItemsForView()),
             .str_match_steps = try encoder.ref(store.str_match_steps.unsafeRawItemsForView()),
@@ -323,6 +329,7 @@ pub const LirStoreImage = extern struct {
         if (self.runtime_contract > 1) return error.InvalidLirImage;
         return .{
             .runtime_contract = @fromBackingInt(@intCast(self.runtime_contract)),
+            .run_buffer = .{ .size = self.run_buffer_size, .alignment = self.run_buffer_alignment },
             .cf_stmts = try guardedListFromRef(LIR.CFStmt, "LirStore.cf_stmts", base_ptr, image_size, self.cf_stmts),
             .cf_switch_branches = try guardedListFromRef(LIR.CFSwitchBranch, "LirStore.cf_switch_branches", base_ptr, image_size, self.cf_switch_branches),
             .str_match_steps = try guardedListFromRef(LIR.StrMatchStep, "LirStore.str_match_steps", base_ptr, image_size, self.str_match_steps),
@@ -566,7 +573,7 @@ comptime {
     // `recursive_digests` serve only commits,
     // which a view never makes; and its `commit_scratch` and
     // `scratch_field_offsets` are scratch that views start empty.
-    std.debug.assert(@typeInfo(LirStore).@"struct".field_names.len == 41);
+    std.debug.assert(@typeInfo(LirStore).@"struct".field_names.len == 42);
     std.debug.assert(@typeInfo(layout_mod.Store).@"struct".field_names.len == 22);
     std.debug.assert(@typeInfo(base.StringLiteral.Store).@"struct".field_names.len == 1);
 
@@ -904,7 +911,9 @@ test "persisted image bytes do not depend on what store memory held before" {
             .ret_layout = .u64,
             .running_set_helper = .run_next,
             .task_record = .resume_entry,
+            .asks_task = true,
         };
+        store.run_buffer = .{ .size = 24, .alignment = 8 };
         try lowered.root_procs.append(gpa, proc);
 
         const source_stmts = try gpa.dupe(u8, std.mem.sliceAsBytes(store.cf_stmts.unsafeRawItemsForView()));
@@ -931,6 +940,8 @@ test "persisted image bytes do not depend on what store memory held before" {
         try std.testing.expectEqual(name, view.store.getProcSpecImmediate(proc).name);
         try std.testing.expectEqual(LIR.RunningSetHelper.run_next, view.store.getProcSpecImmediate(proc).running_set_helper);
         try std.testing.expectEqual(LIR.TaskRecord.resume_entry, view.store.getProcSpecImmediate(proc).task_record);
+        try std.testing.expect(view.store.getProcSpecImmediate(proc).asks_task);
+        try std.testing.expectEqual(LIR.RunBuffer{ .size = 24, .alignment = 8 }, view.store.run_buffer);
         try std.testing.expectEqual(proc, view.root_procs[0]);
 
         images[built] = try gpa.alignedAlloc(u8, .@"16", fba.end_index);

@@ -1094,7 +1094,7 @@ const plan_loops = Twin{
 const shared_waits = Twin{
     .tasks_path = "test/postcheck/shared_waits_tasks/app.roc",
     .none_path = "test/postcheck/shared_waits_none/app.roc",
-    .cases = &.{ "queue", "body", "body_first", "nested", "cancelled", "oldest", "cleaned" },
+    .cases = &.{ "queue", "body", "body_first", "nested", "cancelled", "oldest", "cleaned", "boxed" },
 };
 
 /// The program the inspection functions run. Tests run one at a time.

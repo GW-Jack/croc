@@ -697,6 +697,10 @@ pub const LowLevel = enum(u16) {
     /// () -> erased callable: a declined reuse input, null, for a destination
     /// variant's last argument (design.md "Erased Calls That May Suspend").
     erased_reuse_none,
+    /// (closure, task) -> {}: the call that follows hands the task to what
+    /// the callable holds (design.md "Shared State", "Programs without
+    /// tasks.").
+    task_hand,
     /// (start, root_result, hosted_slot_size, hosted_slot_alignment,
     /// result_buffer_size, result_buffer_alignment) -> task: a new task whose
     /// list holds the start record, which it takes, and whose root result
@@ -1086,7 +1090,7 @@ pub const LowLevel = enum(u16) {
     /// Whether the continuation pass appends the procedure's task to this
     /// operation's operands.
     pub fn takesTask(self: LowLevel) bool {
-        return self.namesRunningSet() or self == .cell_wait;
+        return self.namesRunningSet() or self == .cell_wait or self == .task_hand;
     }
 
     /// Return the explicit RC metadata for this primitive. The masks identify
@@ -1421,6 +1425,7 @@ pub const LowLevel = enum(u16) {
         .task_result_buffer = byType(.none()),
         .task_current = byType(.none()),
         .erased_reuse_none = byType(.none()),
+        .task_hand = byType(.none()),
         .task_create = byType(.{ .may_retain_or_release = true, .consume_args = arg_0, .args_host_visible = arg_0 }),
         .task_create_parallel = byType(.{ .may_retain_or_release = true, .consume_args = arg_0, .args_host_visible = arg_0 }),
 

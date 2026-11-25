@@ -1827,6 +1827,7 @@ const VariantTable = struct {
             .running_set_helper = source_spec.running_set_helper,
             .erased_class = source_spec.erased_class,
             .task_record = source_spec.task_record,
+            .asks_task = source_spec.asks_task,
             .tail_transform = source_spec.tail_transform,
             .tail_group = source_spec.tail_group,
             .tail_carry = source_spec.tail_carry,

@@ -334,3 +334,70 @@ test "a run's result comes from memory that runEnd frees, none of it for a resul
 }
 
 fn emptyCall(_: *RocOps, _: ?[*]u8, _: ?[*]const u8, _: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {}
+
+/// What an erased procedure that may suspend was entered for.
+const Asked = struct { run: *Run, entered: u32 = 0, from_host: u32 = 0 };
+
+/// An erased procedure that may suspend: it asks for its task, and runs the
+/// root's code as the one that was handed it.
+fn askingCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, reuse: ?[*]u8, out_desc: *?*const anyopaque) callconv(.c) void {
+    const asked: *Asked = @as(*align(1) const *Asked, @ptrCast(capture.?)).*;
+    if (!task_mod.taskEnter(ops, ret, args, capture.?, reuse, 8, 8)) {
+        asked.from_host += 1;
+        return;
+    }
+    asked.entered += 1;
+    var task = task_mod.taskCurrent();
+    rootCall(ops, ret, @ptrCast(&task), @ptrCast(&asked.run), null, out_desc);
+}
+
+fn callFromHost(ops: *RocOps, callable: [*]u8) u64 {
+    var result: u64 = 0;
+    var out_desc: ?*const anyopaque = null;
+    erased_callable.payloadPtr(callable).callable_fn_ptr(ops, @ptrCast(&result), null, erased_callable.capturePtr(callable), null, &out_desc);
+    return result;
+}
+
+/// A root that hands its task to what it calls, and then calls the same code
+/// as its host would.
+fn handingCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?[*]u8, out_desc: *?*const anyopaque) callconv(.c) void {
+    const callable: [*]u8 = @as(*align(1) const [*]u8, @ptrCast(capture.?)).*;
+    const task: *RocTask = @as(*const *RocTask, @ptrCast(@alignCast(args.?))).*;
+    task.hand(callable);
+    erased_callable.payloadPtr(callable).callable_fn_ptr(ops, ret, null, erased_callable.capturePtr(callable), null, out_desc);
+    const asked: *Asked = @as(*align(1) const *Asked, @ptrCast(erased_callable.capturePtr(callable))).*;
+    if (asked.entered != 1 or asked.from_host != 0) ops.crash("a handed call was made again");
+    asked.run.group = null;
+    if (callFromHost(ops, callable) != 7) ops.crash("the host's call went wrong");
+}
+
+test "a procedure entered without its task is called again as the root of a run" {
+    var run: Run = undefined;
+    run.init(1);
+    defer run.deinit();
+    run.entry_count = 2;
+    for (run.entries[0..2]) |*entry| entry.* = .{ .run = &run, .len = 1 };
+    // The first entry waits for the second's store.
+    run.entries[0].steps[0] = .{ .cell = 0, .threshold = 1, .answer = .add, .amount = 5 };
+    run.entries[1].steps[0] = .{ .cell = 0, .threshold = 0, .answer = .add, .amount = 1 };
+    var asked = Asked{ .run = &run };
+    const callable = allocCallable(&run.ops, &askingCall, *Asked, &asked);
+    // The host's call runs both entries, and its result is the root's.
+    try testing.expectEqual(@as(u64, 7), callFromHost(&run.ops, callable));
+    try testing.expectEqual(@as(u32, 1), asked.entered);
+    try testing.expectEqual(@as(u32, 1), asked.from_host);
+    try testing.expectEqual(@as(isize, 1), run.live);
+
+    // Roc code that hands its task is the caller, and a host in its hosted
+    // call isn't.
+    run.entry_count = 0;
+    run.group = null;
+    asked = .{ .run = &run };
+    const result = Scheduler.run(&run.ops, allocCallable(&run.ops, &handingCall, [*]u8, callable), 8, 8, 8, 8);
+    try testing.expectEqual(@as(u64, 7), @as(*align(1) u64, @ptrCast(result)).*);
+    try testing.expectEqual(@as(u32, 2), asked.entered);
+    try testing.expectEqual(@as(u32, 1), asked.from_host);
+    Scheduler.runEnd(&run.ops, result, 8, 8);
+    utils.freeDataPtrC(callable, erased_callable.payload_alignment, erased_callable.allocation_has_refcounted_children, &run.ops);
+    try testing.expectEqual(@as(isize, 0), run.live);
+}

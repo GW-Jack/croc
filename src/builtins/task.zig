@@ -230,6 +230,47 @@ pub fn taskCurrent() *RocTask {
     return currentTask() orelse &idle_task;
 }
 
+/// What an erased procedure that may suspend begins with in a `None` program
+/// (design.md "Shared State", "Programs without tasks."). Holds when its caller
+/// handed it the running task. Otherwise the host called it, and the call is
+/// made again here, as the root of a run, before this returns false. The
+/// arguments, the capture and the reuse input are the call's own, which the
+/// run's root takes.
+pub fn taskEnter(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: [*]u8, reuse: ?[*]u8, buffer_size: usize, buffer_alignment: usize) bool {
+    const code = erased_callable.payloadPtr(capture - erased_callable.capture_offset).callable_fn_ptr;
+    if (takeHanded(&.{code})) return true;
+    Scheduler.runCall(ops, .{ .code = code, .args = args, .capture = capture, .reuse = reuse }, ret, buffer_size, buffer_alignment);
+    return false;
+}
+
+/// Whether the running task was handed to code that is one of `codes`, for an
+/// interpreter, whose callables share theirs. It is asked once per `hand`, so
+/// it clears what it finds.
+pub fn takeHanded(codes: []const erased_callable.CallableFnPtr) bool {
+    const task = currentTask() orelse return false;
+    const handed = task.handed orelse return false;
+    if (std.mem.findScalar(erased_callable.CallableFnPtr, codes, handed) == null) return false;
+    task.handed = null;
+    return true;
+}
+
+/// A call through an erased callable that a run makes as its root.
+pub const EnteredCall = struct {
+    code: erased_callable.CallableFnPtr,
+    args: ?[*]const u8,
+    capture: [*]u8,
+    reuse: ?[*]u8,
+
+    /// The start record's code. The result goes where the call's does.
+    fn start(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {
+        const call: *const EnteredCall = @ptrCast(@alignCast(capture.?));
+        const task: *RocTask = @as(*const *RocTask, @ptrCast(@alignCast(args.?))).*;
+        task.handed = call.code;
+        var out_desc: ?*const anyopaque = null;
+        call.code(ops, ret, call.args, call.capture, call.reuse, &out_desc);
+    }
+};
+
 /// Code that no task runs was about to pause: a function value the host
 /// called, whose frames can't be saved.
 pub fn requireTask(task: *RocTask, ops: *RocOps) void {
@@ -443,6 +484,9 @@ pub const RocTask = extern struct {
     /// The run that resumes the task, in a `None` program; null in a program
     /// whose host does.
     scheduler: ?*Scheduler,
+    /// The code of the callable that the call about to be made hands the task
+    /// to (`hand`), which only a `None` program reads.
+    handed: ?erased_callable.CallableFnPtr,
     /// The task's place in the heap that holds it (`TaskHeap`).
     heap_child: ?*RocTask,
     heap_sibling: ?*RocTask,
@@ -520,6 +564,7 @@ pub const RocTask = extern struct {
             .host_next = null,
             .host_abort = false,
             .scheduler = null,
+            .handed = null,
             .heap_child = null,
             .heap_sibling = null,
         };
@@ -555,6 +600,12 @@ pub const RocTask = extern struct {
     /// `task_ready`: whether the pending flag is clear.
     pub fn ready(self: *const RocTask) bool {
         return self.pending == 0;
+    }
+
+    /// `task_hand`: the call about to be made hands the task to what `closure`
+    /// holds.
+    pub fn hand(self: *RocTask, closure: [*]u8) void {
+        self.handed = erased_callable.payloadPtr(closure).callable_fn_ptr;
     }
 
     /// `task_set_pending`.
@@ -1423,6 +1474,7 @@ pub const RocTask = extern struct {
     fn call(self: *RocTask, record: [*]u8, ret: [*]u8) void {
         var task: *RocTask = self;
         var out_desc: ?*const anyopaque = null;
+        self.hand(record);
         erased_callable.payloadPtr(record).callable_fn_ptr(
             self.ops,
             ret,
@@ -2591,8 +2643,20 @@ pub const Scheduler = struct {
     /// it makes, until it ends. Returns the address of its result, which
     /// `runEnd` frees once the caller has moved it out.
     pub fn run(ops: *RocOps, start: [*]u8, buffer_size: usize, buffer_alignment: usize, result_size: usize, result_alignment: usize) [*]u8 {
-        @atomicStore(?*const fn () void, &run_crashed, &crashed, .monotonic);
         const result = allocBuffer(ops, result_size, result_alignment);
+        runRoot(ops, start, result, buffer_size, buffer_alignment);
+        return result;
+    }
+
+    /// Run `call` as the root, which writes its result to `ret`.
+    pub fn runCall(ops: *RocOps, call: EnteredCall, ret: ?[*]u8, buffer_size: usize, buffer_alignment: usize) void {
+        const start = erased_callable.allocate(&EnteredCall.start, null, @sizeOf(EnteredCall), ops);
+        @as(*EnteredCall, @ptrCast(@alignCast(erased_callable.capturePtr(start)))).* = call;
+        runRoot(ops, start, ret orelse &empty_buffer, buffer_size, buffer_alignment);
+    }
+
+    fn runRoot(ops: *RocOps, start: [*]u8, result: [*]u8, buffer_size: usize, buffer_alignment: usize) void {
+        @atomicStore(?*const fn () void, &run_crashed, &crashed, .monotonic);
         var self = Scheduler{ .thread = crash_exit.threadId(), .root = undefined, .running = null, .outer_run = null, .readied = .{} };
         self.enter();
         self.root = RocTask.create(ops, start, result, .{
@@ -2616,7 +2680,6 @@ pub const Scheduler = struct {
         }
         self.root.release();
         self.leave();
-        return result;
     }
 
     /// `task_run_end`.
@@ -3333,6 +3396,41 @@ test "a hosted call runs with no running task, so a crash in it reaches the host
     crashRunning("the host crashed");
     hostLeave(saved);
     try std.testing.expectEqual(@as(?*RocTask, &task), runningSlot().*);
+}
+
+fn unhandedCallable(_: *RocOps, _: ?[*]u8, _: ?[*]const u8, _: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {}
+
+test "a task is handed to the code of the callable it named, once" {
+    var test_env = utils.TestEnv.init(std.testing.allocator);
+    defer test_env.deinit();
+    const ops = test_env.getOps();
+    TestLog.reset();
+    const first = testRecord(ops, .{ .id = 1, .saves = .{ null, null }, .pauses = false, .result = 10 });
+    const second = testRecord(ops, .{ .id = 2, .saves = .{ null, null }, .pauses = false, .result = 20 });
+    defer utils.freeDataPtrC(first, erased_callable.payload_alignment, erased_callable.allocation_has_refcounted_children, ops);
+    defer utils.freeDataPtrC(second, erased_callable.payload_alignment, erased_callable.allocation_has_refcounted_children, ops);
+    erased_callable.payloadPtr(second).callable_fn_ptr = &unhandedCallable;
+    const first_code = erased_callable.payloadPtr(first).callable_fn_ptr;
+
+    // With no running task, the host called.
+    try std.testing.expect(!takeHanded(&.{first_code}));
+
+    var task: RocTask = idle_task;
+    runningSlot().* = &task;
+    defer runningSlot().* = null;
+    try std.testing.expect(!takeHanded(&.{first_code}));
+
+    // The host calls other code while the task has been handed: it isn't for
+    // that code, and stays for the code it names.
+    task.hand(first);
+    try std.testing.expect(!takeHanded(&.{&unhandedCallable}));
+    try std.testing.expect(takeHanded(&.{first_code}));
+    try std.testing.expect(!takeHanded(&.{first_code}));
+
+    // An interpreter's callables share their code.
+    task.hand(second);
+    try std.testing.expect(takeHanded(&.{ first_code, &unhandedCallable }));
+    try std.testing.expect(!takeHanded(&.{&unhandedCallable}));
 }
 
 test "FieldOffsets is where RocTask keeps its first three fields, scaled by the pointer size" {

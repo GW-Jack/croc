@@ -20,6 +20,7 @@ main! = |name| {
 		"cancelled" => cancelled!()
 		"oldest" => oldest!()
 		"cleaned" => cleaned!()
+		"boxed" => boxed!()
 		_ => "unknown"
 	}
 	Host.log!("end ${name}")
@@ -249,4 +250,66 @@ cleaned! = || {
 	first = exit_at!([hold!("a"), hold!("b"), || "put"])
 	second = exit_at!([hold!("c"), || "put"])
 	"${first} ${second} ${permits.get!().to_str()} ${order.get!()}"
+}
+
+# Boxed functions that wait: one called from a list, one that returns another,
+# one in tail position, and one that never waits, called through the same type.
+boxed! : () => Str
+boxed! = || {
+	count = Shared.new!(0.U64)
+	await! : Str -> Box((U64 => Str))
+	await! = |name| Box.box(
+		|n| {
+			so_far = count.update!(|c| if (c >= n) Keep(c) else Wait)
+			Host.log!("${name} saw ${so_far.to_str()} of ${n.to_str()}")
+			"${name} saw ${so_far.to_str()}, too long to be small "
+		},
+	)
+	add! : Str -> Box((U64 => Str))
+	add! = |name| Box.box(
+		|n| {
+			count.modify!(|c| c + n)
+			Host.log!("${name} added ${n.to_str()}")
+			"${name} "
+		},
+	)
+	later! : Str -> Box((U64 => Box((U64 => Str))))
+	later! = |name| Box.box(
+		|n| {
+			body = Box.unbox(await!(name))(n)
+			Box.box(
+				|m| {
+					count.update!(|c| if (c >= m) Set(c + 1, {}) else Wait)
+					Host.log!("${name} went on from ${body}")
+					"${body}then ${m.to_str()} "
+				},
+			)
+		},
+	)
+	tail! : Box((U64 => Str)), U64 => Str
+	tail! = |box, n| Box.unbox(box)(n)
+
+	entries = [
+		|| {
+			make! = Box.unbox(later!("late"))
+			first! = Box.unbox(make!(1))
+			second! = Box.unbox(make!(2))
+			Str.concat(second!(4), first!(3))
+		},
+		|| tail!(await!("tail"), 3),
+		|| {
+			var $all = ""
+			for box in [add!("one"), await!("list"), add!("two")] {
+				$all = Str.concat($all, Box.unbox(box)(1))
+			}
+			$all
+		},
+		|| tail!(add!("three"), 2),
+	]
+	var $joined = ""
+	for! body in List.concurrently(entries) {
+		Host.log!("got ${body}")
+		$joined = Str.concat($joined, body)
+	}
+	$joined
 }

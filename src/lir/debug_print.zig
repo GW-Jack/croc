@@ -46,6 +46,7 @@ pub fn writeProc(
     if (proc.effect_free) try writer.writeAll(" effect_free");
     if (proc.running_set_helper != .none) try writer.print(" running_set_helper={s}", .{@tagName(proc.running_set_helper)});
     if (proc.task_record != .none) try writer.print(" task_record={s}", .{@tagName(proc.task_record)});
+    if (proc.asks_task) try writer.writeAll(" asks_task");
     try writer.writeAll("\n");
 
     if (proc.body.get()) |body| {

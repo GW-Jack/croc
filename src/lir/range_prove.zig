@@ -8150,6 +8150,7 @@ const Pass = struct {
             .task_result_buffer,
             .task_current,
             .erased_reuse_none,
+            .task_hand,
             .task_create,
             .task_create_parallel,
             .task_run,

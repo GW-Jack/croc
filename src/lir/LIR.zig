@@ -1069,6 +1069,13 @@ pub const ProcAbi = enum {
     erased_record,
 };
 
+/// The result buffer of a run that a program without tasks makes itself
+/// (design.md "Shared State", "Programs without tasks.").
+pub const RunBuffer = struct {
+    size: u32 = 0,
+    alignment: u32 = 1,
+};
+
 /// The unit a procedure is emitted with (design.md "Mode Specialization",
 /// emission units). A direct call demands an ownership variant of its callee
 /// only when the two procedures share a unit, except the outcome-restitution
@@ -1513,8 +1520,8 @@ pub const ErasedCallData = struct {
     /// Set by the tail-drive pass: where calls pending after this
     /// statement are run.
     drive: PendingDrive = .none,
-    /// The erased callable type the call calls through, when the program's
-    /// platform has tasks (design.md "Erased Calls That May Suspend").
+    /// The erased callable type the call calls through, when some procedure
+    /// of the program may suspend (design.md "Erased Calls That May Suspend").
     erased_class: ErasedClass = .none,
     /// Set by `SuspensionMarks` on a call that may reach a procedure that
     /// may suspend: a suspension site (design.md "Suspendability").
@@ -2256,6 +2263,12 @@ pub const LirProcSpec = struct {
     /// Set by the continuation pass on the erased callables it builds for
     /// task records.
     task_record: TaskRecord = .none,
+    /// Set by the continuation pass on the erased procedures that may suspend
+    /// of a program without tasks: the procedure's entry asks whether its
+    /// caller handed it the running task, and otherwise makes the call again
+    /// as the root of a run, and returns. The host can enter it, so this comes
+    /// before the procedure takes its arguments, and nothing in LIR does it.
+    asks_task: bool = false,
     /// Tail-recursion rewrite applied by the TRMC pass, if any.
     tail_transform: TailTransform = .none,
     /// Set by ARC on every procedure that makes or receives a same-SCC tail

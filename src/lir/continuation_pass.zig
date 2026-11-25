@@ -135,8 +135,9 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
     // A promoted loop's `group_next` is a park site, so promotion comes
     // before any procedure's sites are found.
     try RunningSetPromotion.run(allocator, store, layouts, roots.mode);
-    var shells = try splitErased(allocator, store, layouts);
+    var shells = try splitErased(allocator, store, layouts, roots.mode);
     defer shells.deinit(allocator);
+    if (roots.mode == .none) try handErased(allocator, store, &shells);
 
     var plans = std.ArrayList(ProcPlan).empty;
     defer {
@@ -184,7 +185,8 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
             switch (SiteStmt.at(store, site.call)) {
                 .park, .dyn => {},
                 .call => |call| if (!isHosted(store, call.proc)) try appendLocal(store, &store.getCFStmtPtr(site.call).assign_call.args, plan.task),
-                .erased => |call| {
+                // Without tasks a call passes none (`handErased`).
+                .erased => |call| if (roots.mode.hasTasks()) {
                     var data = store.stmtRow(call.data);
                     try appendLocal(store, &data.args, plan.task);
                     data.arg_plan = try argsPlan(allocator, store, layouts, data.args);
@@ -307,6 +309,18 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
             .tasks => try startRoot(allocator, store, layouts, root.*, .task_create, may_suspend, buffers),
             .parallel_tasks => try startRoot(allocator, store, layouts, root.*, .task_create_parallel, may_suspend, buffers),
         };
+    }
+
+    if (roots.mode == .none) {
+        store.run_buffer = .{
+            .size = std.math.cast(u32, buffers.result_buffer_size) orelse invariant("a result is larger than any value", .{}),
+            .alignment = @intCast(buffers.result_buffer_alignment),
+        };
+        for (0..proc_count) |index| {
+            const proc = store.getProcSpecPtr(@fromBackingInt(@intCast(index)));
+            const shell = index < shells.bit_length and shells.isSet(index);
+            proc.asks_task = shell or (proc.abi == .erased_record and proc.suspends != .never and proc.body.get() != null);
+        }
     }
 
     try SuspensionMarks.run(allocator, store, roots.mode);
@@ -643,7 +657,11 @@ fn argsPlan(allocator: Allocator, store: *LirStore, layouts: *const layout.Store
 /// is only ever in a Roc-ABI procedure, and neither the capture pointer nor
 /// the memory it points into has to outlive the shell's call (design.md
 /// "Erased Calls That May Suspend"). Returns the shells, by procedure index.
-fn splitErased(allocator: Allocator, store: *LirStore, layouts: *layout.Store) Allocator.Error!std.DynamicBitSetUnmanaged {
+///
+/// Without tasks the shell keeps its arguments and reads the running task,
+/// which its caller handed it (design.md "Shared State", "Programs without
+/// tasks.").
+fn splitErased(allocator: Allocator, store: *LirStore, layouts: *layout.Store, mode: ConcurrencyMode) Allocator.Error!std.DynamicBitSetUnmanaged {
     const count = store.procSpecCount();
     var shells = try std.DynamicBitSetUnmanaged.initEmpty(allocator, count);
     errdefer shells.deinit(allocator);
@@ -652,10 +670,50 @@ fn splitErased(allocator: Allocator, store: *LirStore, layouts: *layout.Store) A
         const proc = store.getProcSpecImmediate(proc_id);
         if (proc.body.get() == null or proc.suspends == .never or proc.erased_class == .none) continue;
         if (proc.abi != .erased_callable) invariant("a procedure with an erased class is not an erased callable", .{});
-        try splitShell(allocator, store, layouts, proc_id);
+        try splitShell(allocator, store, layouts, proc_id, mode);
         shells.set(index);
     }
     return shells;
+}
+
+/// In a program without tasks, hand the task to the callee right before every
+/// erased call that is a site. The task itself comes with the other operations
+/// that name it (`passTaskToRunningSets`).
+fn handErased(allocator: Allocator, store: *LirStore, shells: *const std.DynamicBitSetUnmanaged) Allocator.Error!void {
+    var seen = try std.DynamicBitSetUnmanaged.initEmpty(allocator, store.cfStmtCount());
+    defer seen.deinit(allocator);
+    var work = std.ArrayList(CFStmtId).empty;
+    defer work.deinit(allocator);
+    for (0..store.procSpecCount()) |index| {
+        const proc_id: ProcId = @fromBackingInt(@intCast(index));
+        const proc = store.getProcSpecImmediate(proc_id);
+        if (proc.suspends == .never or (index < shells.bit_length and shells.isSet(index))) continue;
+        var calls = std.ArrayList(CFStmtId).empty;
+        defer calls.deinit(allocator);
+        try work.append(allocator, proc.body.get() orelse continue);
+        while (work.pop()) |stmt_id| {
+            if (seen.isSet(@backingInt(stmt_id))) continue;
+            seen.set(@backingInt(stmt_id));
+            const stmt = store.getCFStmtImmediate(stmt_id).*;
+            if (stmt == .assign_call_erased and store.stmtRow(stmt.assign_call_erased.data).suspension_site) try calls.append(allocator, stmt_id);
+            try body_clone.appendSuccessors(store, &work, stmt_id, allocator);
+        }
+        for (calls.items) |stmt_id| {
+            const stmt = store.getCFStmtImmediate(stmt_id).*;
+            const origin = store.stmtOrigin(stmt_id);
+            const unit = try store.addLocal(.{ .layout_idx = .zst });
+            try appendLocal(store, &store.getProcSpecPtr(proc_id).frame_locals, unit);
+            const closure = store.stmtRow(stmt.assign_call_erased.data).closure;
+            const call = try store.addCFStmt(stmt, origin);
+            try store.replaceCFStmt(stmt_id, .{ .assign_low_level = .{
+                .target = unit,
+                .op = .task_hand,
+                .rc_effect = try store.addRcEffect(LIR.LowLevel.task_hand.rcEffect()),
+                .args = try store.addLocalSpan(&.{closure}),
+                .next = call,
+            } }, origin);
+        }
+    }
 }
 
 /// The hidden arguments a statement reads.
@@ -699,7 +757,7 @@ fn captureLoad(allocator: Allocator, store: *const LirStore, body: CFStmtId, cap
     return load;
 }
 
-fn splitShell(allocator: Allocator, store: *LirStore, layouts: *layout.Store, shell: ProcId) Allocator.Error!void {
+fn splitShell(allocator: Allocator, store: *LirStore, layouts: *layout.Store, shell: ProcId, mode: ConcurrencyMode) Allocator.Error!void {
     const source = store.getProcSpecImmediate(shell).*;
     const body = source.body.get().?;
     const origin = store.stmtOrigin(body);
@@ -763,7 +821,7 @@ fn splitShell(allocator: Allocator, store: *LirStore, layouts: *layout.Store, sh
     for (explicit) |arg| try shell_args.append(allocator, try freshLocal(store, &frame, allocator, store.getLocal(arg).layout_idx));
     try call_args.appendSlice(allocator, shell_args.items);
     const task = try freshLocal(store, &frame, allocator, .opaque_ptr);
-    try shell_args.append(allocator, task);
+    if (mode.hasTasks()) try shell_args.append(allocator, task);
     const call_plan = try argsPlan(allocator, store, layouts, try store.addLocalSpan(shell_args.items));
     const shell_capture = try freshLocal(store, &frame, allocator, .opaque_ptr);
     const shell_reuse = try freshLocal(store, &frame, allocator, store.getLocal(reuse).layout_idx);
@@ -781,6 +839,7 @@ fn splitShell(allocator: Allocator, store: *LirStore, layouts: *layout.Store, sh
         .next = ret,
     } }, origin);
     if (record) |local| head = try store.addLowLevelStmt(local, .erased_capture_load, &.{ shell_capture, shell_reuse }, head, origin);
+    if (!mode.hasTasks()) head = try store.addLowLevelStmt(task, .task_current, &.{}, head, origin);
 
     std.mem.sort(LocalId, frame.items, {}, localLessThan);
     const spec = store.getProcSpecPtr(shell);
@@ -2349,7 +2408,7 @@ test "an erased callable whose class may suspend becomes a shell around its body
     _ = try f.addProc(&.{ t_cl, t_x }, &.{ t_cl, t_x, t_u }, tail_site);
     const count = f.store.procSpecCount();
 
-    try run(testing.allocator, &f.store, &f.layouts, .none);
+    try run(testing.allocator, &f.store, &f.layouts, .{ .procs = &.{}, .provided = &.{}, .mode = .tasks });
 
     // E keeps its procedure: rec = erased_capture_load(capture, reuse); w = body(y, rec, task); ret w
     const shell = f.spec(e);
@@ -2424,6 +2483,89 @@ test "an erased callable whose class may suspend becomes a shell around its body
     defer testing.allocator.free(tail_args);
     try testing.expectEqual(@as(usize, 2), tail_args.len);
     try testing.expect(f.at(f.at(tail_site).assign_call_erased.next) == .ret);
+}
+
+test "without tasks a shell reads the running task, which calls hand it, and an unhanded one runs" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const erased = try f.layouts.insertErasedCallable();
+    const class: LIR.ErasedClass = @fromBackingInt(1);
+    const plan = try f.store.internErasedCallArgsPlan(&f.layouts, &.{.u64});
+    // E(y) = t = seed(); ret t
+    const y = try f.local();
+    const capture = try f.store.addLocal(.{ .layout_idx = .opaque_ptr });
+    const reuse = try f.store.addLocal(.{ .layout_idx = erased });
+    const t = try f.local();
+    const e = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.forTest(90),
+        .args = try f.store.addLocalSpan(&.{ y, capture, reuse }),
+        .frame_locals = try f.store.addLocalSpan(&.{ y, capture, reuse, t }),
+        .body = .some(try f.callSeed(t, try f.stmt(.{ .ret = .{ .value = t } }))),
+        .ret_layout = .u64,
+        .abi = .erased_callable,
+        .erased_class = class,
+        .erased_capture_arg = .some(capture),
+        .erased_reuse_arg = .some(reuse),
+        .erased_call_args = .some(plan),
+    }, .none);
+    // g(cl, x) = u = cl(x); v = {u, x}; ret v
+    const cl = try f.store.addLocal(.{ .layout_idx = erased });
+    const x = try f.local();
+    const u = try f.local();
+    const v = try f.local();
+    const g_ret = try f.stmt(.{ .ret = .{ .value = v } });
+    const g_build = try f.stmt(.{ .assign_struct = .{ .target = v, .fields = try f.store.addLocalSpan(&.{ u, x }), .next = g_ret } });
+    const site = try f.stmt(.{ .assign_call_erased = .{
+        .target = u,
+        .data = try f.store.addStmtRow(LIR.ErasedCallData, .{
+            .closure = cl,
+            .args = try f.store.addLocalSpan(&.{x}),
+            .arg_plan = plan,
+            .erased_class = class,
+        }),
+        .next = g_build,
+    } });
+    const g = try f.addProc(&.{ cl, x }, &.{ cl, x, u, v }, site);
+
+    try run(testing.allocator, &f.store, &f.layouts, .none);
+
+    // E keeps its signature: task = task_current(); r = body(y, task); ret r
+    const shell = f.spec(e);
+    try testing.expectEqual(plan, shell.erased_call_args.get().?);
+    const shell_args = try f.locals(shell.args);
+    defer testing.allocator.free(shell_args);
+    try testing.expectEqual(@as(usize, 3), shell_args.len); // y, capture, reuse
+    const current = f.at(shell.body.get().?).assign_low_level;
+    try testing.expectEqual(LIR.LowLevel.task_current, current.op);
+    const body_call = f.at(current.next).assign_call;
+    try testing.expectEqual(LIR.Suspends.may, f.spec(body_call.proc).suspends);
+    const body_args = try f.locals(body_call.args);
+    defer testing.allocator.free(body_args);
+    try testing.expectEqualSlices(LocalId, &.{ shell_args[0], current.target }, body_args);
+    try testing.expect(f.at(body_call.next) == .ret);
+    // Entered by the host, it runs with a buffer for the program's results.
+    try testing.expectEqual(LIR.RunBuffer{ .size = 8, .alignment = 8 }, f.store.run_buffer);
+    for (0..f.store.procSpecCount()) |index| {
+        const proc: ProcId = @fromBackingInt(@intCast(index));
+        try testing.expectEqual(proc == e, f.spec(proc).asks_task);
+    }
+    try testing.expect(f.store.runsTasks());
+
+    // g hands its task to the callee right before the call, which keeps its
+    // arguments, and tests the pending flag after it.
+    const g_args = try f.locals(f.spec(g).args);
+    defer testing.allocator.free(g_args);
+    const hand = f.at(f.spec(g).body.get().?).assign_low_level;
+    try testing.expectEqual(LIR.LowLevel.task_hand, hand.op);
+    const hand_args = try f.locals(hand.args);
+    defer testing.allocator.free(hand_args);
+    try testing.expectEqualSlices(LocalId, &.{ cl, g_args[2] }, hand_args);
+    const call = f.at(hand.next).assign_call_erased;
+    const data = f.store.stmtRow(call.data);
+    try testing.expectEqual(plan, data.arg_plan);
+    try testing.expectEqual(@as(usize, 1), data.args.len);
+    try testing.expectEqual(LIR.LowLevel.task_ready, f.at(call.next).assign_low_level.op);
 }
 
 test "a Boxy erased procedure reads its task, tests the pending flag after its erased site and keeps its arguments" {

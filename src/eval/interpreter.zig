@@ -3552,6 +3552,8 @@ pub const Interpreter = struct {
 
     pub const InterpretedCallable = struct {
         proc: LIR.LirProcSpecId,
+        /// The capture pointer of the erased ABI it is entered with.
+        entry_capture: [*]u8,
         capture_ptr: [*]u8,
     };
 
@@ -3561,11 +3563,15 @@ pub const Interpreter = struct {
         const code = @intFromPtr(payload.callable_fn_ptr);
         if (code == staticErasedCallableTrampolineAddress()) {
             const capture = builtins.erased_callable.capturePtr(data_ptr);
-            return .{ .proc = @fromBackingInt(staticCallableHeader(capture).proc_id), .capture_ptr = capture };
+            return .{ .proc = @fromBackingInt(staticCallableHeader(capture).proc_id), .entry_capture = capture, .capture_ptr = capture };
         }
         if (code != @intFromPtr(&interpreterErasedCallableTrampoline)) return null;
         const context = erasedCallableInterpreterContextFromPayload(data_ptr);
-        return .{ .proc = @fromBackingInt(@intCast(context.proc_id)), .capture_ptr = erasedCallableInterpreterCaptureValuePtr(data_ptr) };
+        return .{
+            .proc = @fromBackingInt(@intCast(context.proc_id)),
+            .entry_capture = builtins.erased_callable.capturePtr(data_ptr),
+            .capture_ptr = erasedCallableInterpreterCaptureValuePtr(data_ptr),
+        };
     }
 
     fn staticErasedCallableTrampoline(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, reuse: ?[*]u8, out_desc: *?*const anyopaque) callconv(.c) void {
@@ -3573,7 +3579,14 @@ pub const Interpreter = struct {
             ops.crash("static interpreted callable omitted its capture address");
         };
         const header = staticCallableHeader(capture_ptr);
-        header.owner.call(header.owner.context, .{ .proc = @fromBackingInt(header.proc_id), .capture_ptr = capture_ptr }, ops, ret, args, reuse, out_desc);
+        header.owner.call(header.owner.context, .{ .proc = @fromBackingInt(header.proc_id), .entry_capture = capture_ptr, .capture_ptr = capture_ptr }, ops, ret, args, reuse, out_desc);
+    }
+
+    /// Whether the caller of the interpreted callable being entered handed it
+    /// the running task. The interpreter's callables share their code, so every
+    /// one asks, and the answer is always for the one being entered.
+    fn takeHanded() bool {
+        return builtins.task.takeHanded(&.{ &interpreterErasedCallableTrampoline, &staticErasedCallableTrampoline });
     }
 
     pub fn erasedCallableInterpreterContextFromCapture(capture_ptr: ?[*]u8) *ErasedCallableInterpreterContext {
@@ -3611,7 +3624,7 @@ pub const Interpreter = struct {
             retained.retain();
             retained.enter();
         }
-        context.interpreter.callInterpreterErasedCallable(.{ .proc = @fromBackingInt(@intCast(context.proc_id)), .capture_ptr = capture_ptr + context.capture_value_offset }, ops, ret, args, reuse, out_desc) catch |err| context.interpreter.crashErasedCallable(owner, ops, err, .call);
+        context.interpreter.callInterpreterErasedCallable(.{ .proc = @fromBackingInt(@intCast(context.proc_id)), .entry_capture = capture_ptr, .capture_ptr = capture_ptr + context.capture_value_offset }, ops, ret, args, reuse, out_desc) catch |err| context.interpreter.crashErasedCallable(owner, ops, err, .call);
         leaveAndReleaseErasedCallableOwner(owner);
     }
 
@@ -3748,6 +3761,17 @@ pub const Interpreter = struct {
 
         const proc_id = callable.proc;
         const proc_spec = self.store.getProcSpec(proc_id);
+        const handed = takeHanded();
+        if (proc_spec.asks_task and !handed) {
+            out_desc.* = null;
+            builtins.task.Scheduler.runCall(ops, .{
+                .code = builtins.erased_callable.payloadPtr(callable.entry_capture - builtins.erased_callable.capture_offset).callable_fn_ptr,
+                .args = args,
+                .capture = callable.entry_capture,
+                .reuse = reuse_ptr,
+            }, ret, self.store.run_buffer.size, self.store.run_buffer.alignment);
+            return;
+        }
         if (proc_spec.abi == .erased_record) {
             out_desc.* = null;
             return self.callErasedRecordProc(proc_id, proc_spec, callable.capture_ptr, ret, args, reuse_ptr);
@@ -3935,6 +3959,9 @@ pub const Interpreter = struct {
             proc_arg_layouts[reuse_index] = self.store.getLocal(reuse_param).layout_idx;
 
             self.erased_caller_drives = true;
+            if (!takeHanded() and proc_spec.asks_task) {
+                return self.invariantFailedError("LIR/interpreter invariant violated: an erased call didn't hand its task to procedure {d}, which may suspend", .{@backingInt(proc_id)});
+            }
             const proc_result = try self.evalProcById(proc_id, proc_args, proc_arg_layouts);
             return .{
                 .value = proc_result.value,
@@ -6818,6 +6845,12 @@ pub const Interpreter = struct {
                 break :blk Value.zst;
             },
             .erased_reuse_none => try self.pointerValue(ll.ret_layout, 0),
+            .task_hand => blk: {
+                const closure = self.readBoxedDataPointer(args[0]) orelse
+                    return self.invariantFailedError("LIR/interpreter invariant violated: task_hand had no callable", .{});
+                taskOf(self.readPointerInt(args[1])).hand(closure);
+                break :blk Value.zst;
+            },
             .task_current => try self.pointerValue(ll.ret_layout, @intFromPtr(builtins.task.taskCurrent())),
             .cell_new, .cell_exchange => unreachable, // lowering to LIR replaces a cell operation with box and pointer operations
             .group_arrival => try self.pointerValue(ll.ret_layout, @intFromPtr(builtins.task.groupArrival(self.openGroup(args[0], args[1])))),

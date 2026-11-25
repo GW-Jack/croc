@@ -34324,8 +34324,9 @@ destination variant's, keeps the call's mark.
 
 **Erased Calls That May Suspend.** A call through an erased callable enters
 whichever procedure the callable holds, so the call and every procedure it
-can enter must agree on whether the task is passed. In a build with tasks,
-LIR construction gives each erased callable type a *class*: the digest of the
+can enter must agree on whether the task is passed. In a build with tasks, and
+in a program without them that holds a `cell_wait!` specialization, LIR
+construction gives each erased callable type a *class*: the digest of the
 type's source function type and its members. The erased calls through the
 type and the erased-callable procedures of its members carry that class
 (`ErasedCallData.erased_class`, `LirProcSpec.erased_class`). A procedure's
@@ -35361,6 +35362,50 @@ treats the program as it does a `Tasks` program, with three differences:
   packs the start record, calls `task_run`, moves the result out of the address
   that returns and calls `task_run_end`. A root that can't suspend is not
   changed.
+- an erased call that may suspend passes no task (below).
+
+Such a program's host may hold a function value and call it, which a host of a
+program with tasks can't (Explicit Inputs), and a value the host made may be
+called by Roc code. So the erased ABI is the one it has without tasks, and a
+procedure learns from the task that its caller is Roc code which goes on when
+the callee pauses. Right before an erased call that is a site,
+`task_hand(closure, task)` writes the callable's code address in the task as
+*handed*, and the runtime does so before it calls a record. Every erased
+procedure that may suspend *asks* (`LirProcSpec.asks_task`): its first act, from
+the raw arguments of the erased ABI and before it takes any of them, is
+
+```text
+if not task_enter(ret, args, capture, reuse, buffer size, buffer alignment):
+    return
+```
+
+`task_enter` reads the code address of the callable that was entered from its
+capture pointer. If the running task was handed that code, it clears the mark and
+the procedure goes on, with `task_current()` as its task. Otherwise the host
+called, and `task_enter` makes the same call again, with the same arguments and
+the same place for the result, from the start record of a run's root, which hands
+the root its code. The run lasts until the root ends, inside the run whose hosted
+call the host is in, if there is one. Then the procedure, which has taken nothing,
+returns. The buffer is the program's (`LirStore.run_buffer`), the size that
+`task_run` is given. None of this is LIR: the arguments' owner and the result's
+place are the entered call's either way, so ARC sees one call.
+
+Nothing runs between the mark and the callee's first act, so a procedure that
+asks clears every mark made for it, and one that finds its own was entered by
+that call. A callee that doesn't ask leaves the mark: the mark names that
+callee's code, or the host's, which no procedure that asks has. The interpreter's
+callables share their code, so each of them asks, and only one that may suspend
+uses the answer.
+
+A shell is then the one a program with tasks has, without the argument:
+
+```text
+E(args, capture, reuse):
+    task = task_current()
+    rec = erased_capture_load(capture, reuse)
+    r = call body(args, rec, task)
+    ret r
+```
 
 `task_run(start, buffer size, buffer alignment, result size, result alignment)
 -> address` makes a root task and is its host until it ends. It resumes the

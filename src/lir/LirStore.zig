@@ -1027,6 +1027,10 @@ pub fn StoreSpanBorrowMut(comptime T: type, comptime field_name: []const u8) typ
 /// Producer-owned execution capability, retained in serialized images.
 runtime_contract: lir_defs.RuntimeContract = .specialized,
 
+/// What an erased procedure that asks for its task (`LirProcSpec.asks_task`)
+/// makes a run with.
+run_buffer: lir_defs.RunBuffer = .{},
+
 cf_stmts: GuardedList.List(CFStmt, "LirStore.cf_stmts"),
 cf_switch_branches: GuardedList.List(CFSwitchBranch, "LirStore.cf_switch_branches"),
 str_match_steps: GuardedList.List(StrMatchStep, "LirStore.str_match_steps"),
@@ -2105,6 +2109,9 @@ pub fn taskMode(self: *const Self) ?TaskMode {
 pub fn runsTasks(self: *const Self) bool {
     for (self.getCFStmts()) |stmt| {
         if (stmt == .assign_low_level and stmt.assign_low_level.op == .task_run) return true;
+    }
+    for (0..self.procSpecCount()) |index| {
+        if (self.getProcSpecImmediate(@fromBackingInt(@intCast(index))).asks_task) return true;
     }
     return false;
 }

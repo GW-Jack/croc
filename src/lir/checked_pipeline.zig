@@ -2217,7 +2217,7 @@ fn generateConsumerLir(prepared: *PreparedSolved, consumer: Consumer) LowerResou
         .completed_scalar_values = target.completed_scalar_values,
         .completed_erased_members = consumer.completed_erased_members,
         .erased_capture_prefix = target.erased_capture_prefix,
-        .erased_classes = target.concurrency_mode != .none,
+        .erased_classes = target.concurrency_mode.hasTasks() or holdsWait(&prepared.program.lifted),
     });
     if (target.timing) |timing| timing.addSolvedLirParallel(parallel_metrics.?.*);
     lir_gen_timing_scope.end();
@@ -2225,6 +2225,17 @@ fn generateConsumerLir(prepared: *PreparedSolved, consumer: Consumer) LowerResou
     errdefer lowered.deinit();
 
     return .{ .output = lowered, .target = target };
+}
+
+/// Whether the program has a `cell_wait!` specialization, so some procedure of
+/// it may suspend whatever its platform's mode (design.md "Erased Calls That May
+/// Suspend").
+fn holdsWait(lifted: *const postcheck.MonotypeLifted.Ast.Program) bool {
+    for (lifted.view().fns) |lifted_fn| {
+        const source = lifted_fn.source orelse continue;
+        if (source.running_set_helper == .cell_wait) return true;
+    }
+    return false;
 }
 
 /// The lowerer owns resetting its per-run output. Prefer the caller's slot so
