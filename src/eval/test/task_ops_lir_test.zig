@@ -111,12 +111,14 @@ pub fn readyTask(_: *RocTask) callconv(.c) void {}
 /// A task with the fields the operations read and nothing the runtime uses:
 /// these tests run no records.
 fn bareTask(hosted_slot: [*]u8, result_buffer: [*]u8) RocTask {
-    return RocTask.initial(undefined, undefined, .{
+    var task: RocTask = undefined;
+    task.init(undefined, undefined, .{
         .hosted_slot_size = 0,
         .hosted_slot_alignment = 1,
         .result_buffer_size = 0,
         .result_buffer_alignment = 1,
     }, hosted_slot, result_buffer);
+    return task;
 }
 
 test "task_ready reads the pending flag and task_set_pending sets it" {

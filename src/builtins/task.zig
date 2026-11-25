@@ -217,12 +217,16 @@ fn currentTask() ?*RocTask {
 }
 
 /// What `task_current` gives code no task runs: never pending.
-var idle_task: RocTask = .initial(undefined, &empty_buffer, .{
-    .hosted_slot_size = 0,
-    .hosted_slot_alignment = 1,
-    .result_buffer_size = 0,
-    .result_buffer_alignment = 1,
-}, &empty_buffer, &empty_buffer);
+var idle_task: RocTask = idle: {
+    var task: RocTask = undefined;
+    task.init(undefined, &empty_buffer, .{
+        .hosted_slot_size = 0,
+        .hosted_slot_alignment = 1,
+        .result_buffer_size = 0,
+        .result_buffer_alignment = 1,
+    }, &empty_buffer, &empty_buffer);
+    break :idle task;
+};
 
 /// `task_current`: the task whose code is running, or the idle task while
 /// none runs (design.md "Boxy Procedures That May Suspend").
@@ -491,9 +495,10 @@ pub const RocTask = extern struct {
     heap_child: ?*RocTask,
     heap_sibling: ?*RocTask,
 
-    /// A task with no records, which has not run.
-    pub fn initial(ops: *RocOps, root_result: [*]u8, buffers: BufferLayout, hosted_slot: [*]u8, result_buffer: [*]u8) RocTask {
-        return .{
+    /// Make `self` a task with no records, which has not run. Its fields are
+    /// written in place: returning it would build it on the stack and copy it.
+    pub fn init(self: *RocTask, ops: *RocOps, root_result: [*]u8, buffers: BufferLayout, hosted_slot: [*]u8, result_buffer: [*]u8) void {
+        self.* = .{
             .pending = 0,
             .hosted_slot = hosted_slot,
             .result_buffer = result_buffer,
@@ -575,7 +580,7 @@ pub const RocTask = extern struct {
     /// runs it.
     pub fn create(ops: *RocOps, start: [*]u8, root_result: [*]u8, buffers: BufferLayout) *RocTask {
         const task: *RocTask = @ptrCast(@alignCast(ops.alloc(@alignOf(RocTask), @sizeOf(RocTask))));
-        task.* = initial(
+        task.init(
             ops,
             root_result,
             buffers,
@@ -912,7 +917,7 @@ pub const RocTask = extern struct {
         const word = self.waitWord();
         const hosted = self.waitsOnOperation();
         // Before the parked bit is set, after which a wake counts it again.
-        if (!hosted) _ = @atomicRmw(u32, &self.root.busy, .Sub, 1, .monotonic);
+        if (!hosted) self.subBusy();
         const seen = @cmpxchgStrong(u32, word, 0, wake_parked, .acq_rel, .acquire) orelse {
             const stalled = if (hosted) null else self.stalledWaiter();
             if (stalled == self) {
@@ -1030,9 +1035,18 @@ pub const RocTask = extern struct {
         return true;
     }
 
-    /// The task, parked on a group or a cell until here, can run again.
+    /// The task, new or parked on a group or a cell until here, can run. Only a
+    /// `ParallelTasks` program's count changes on two threads at once: a cell's
+    /// wake changes it under the cell's lock, not the tree's.
     fn addBusy(self: *RocTask) void {
-        _ = @atomicRmw(u32, &self.root.busy, .Add, 1, .monotonic);
+        const busy = &self.root.busy;
+        if (self.tree == null) busy.* += 1 else _ = @atomicRmw(u32, busy, .Add, 1, .monotonic);
+    }
+
+    /// The task ended, or is about to park on a group or a cell.
+    fn subBusy(self: *RocTask) void {
+        const busy = &self.root.busy;
+        if (self.tree == null) busy.* -= 1 else _ = @atomicRmw(u32, busy, .Sub, 1, .monotonic);
     }
 
     /// If the task's tree stalled, because none of its tasks can run unless one
@@ -2074,10 +2088,10 @@ pub const Group = struct {
         const child = RocTask.create(owner.ops, entry.start.?, entry.slot, owner.bufferLayout());
         entry.start = null;
         child.root = owner.root;
+        child.tree = owner.tree;
         owner.root.tasks_started += 1;
         child.task_number = owner.root.tasks_started;
         child.addBusy();
-        child.tree = owner.tree;
         child.ready_fn = owner.ready_fn;
         child.abort_fn = owner.abort_fn;
         child.scheduler = owner.scheduler;
@@ -2177,7 +2191,7 @@ pub const Group = struct {
         // Its code won't run again, so its entries are cancelled here too.
         const ends_here = if (owner.tree == null) !was_crashing else parked;
         if (owner.crashing and !owner.finishing and ends_here) owner.cancelGroups(&calls);
-        _ = @atomicRmw(u32, &child.root.busy, .Sub, 1, .monotonic);
+        child.subBusy();
         if (child.stalledWaiter()) |waiter| _ = waiter.unpark(&calls);
         // Once the tree is unlocked, the owner may take this report, close
         // the group and end.
