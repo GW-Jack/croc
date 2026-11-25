@@ -4168,8 +4168,8 @@ pub const Uniqueness = struct {
     /// Bit set => some statement consumes the local's value (moves its
     /// unit, or would retain to do so).
     consumed: std.bit_set.DynamicBitSetUnmanaged,
-    /// Per local bound by exactly one definition that is a pure same-value
-    /// alias or a read-only view, the local it aliases. A runtime uniqueness
+    /// Per local whose every definition is a pure same-value alias or a
+    /// read-only view of one source, the local it aliases. A runtime uniqueness
     /// check that only reads such a local reads the count of that source's
     /// value.
     read_source: []OptionalU32,
@@ -6988,16 +6988,24 @@ fn computeUniquenessDetailed(
         if (conds[index] != 0) unique.unset(index);
     }
 
-    // The value a check that only reads `local` reads: the source of the one
-    // pure same-value alias or view definition that binds it.
+    // The value a check that only reads `local` reads: the one source that
+    // every definition binding it aliases or views. Emission unshares a
+    // suffix that several paths reach into one copy per path, so one view of
+    // the source can be bound by several definitions.
+    const same_source_view_counts = try allocator.alloc(u32, local_count);
+    defer allocator.free(same_source_view_counts);
+    @memset(same_source_view_counts, 0);
+    for (view_defs.items) |def| {
+        if (view_source[def.target] == OptionalU32.some(def.source)) same_source_view_counts[def.target] += 1;
+    }
     const read_source = try allocator.alloc(OptionalU32, local_count);
     for (read_source, 0..) |*slot, index| {
-        slot.* = if (def_counts[index] != 1)
-            .none
-        else if (view_source[index] != .none)
+        slot.* = if (view_source[index] != .none and same_source_view_counts[index] == def_counts[index])
             view_source[index]
+        else if (alias_source[index] != .none and same_source_alias_counts[index] == def_counts[index])
+            alias_source[index]
         else
-            alias_source[index];
+            .none;
     }
 
     const result = Uniqueness{

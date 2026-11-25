@@ -15284,6 +15284,50 @@ test "uniqueness: the owned flag read through a borrowed alias of a fresh list i
     try testing.expectEqual(@as(u64, 1), f.uniqueArgsFor(appended));
 }
 
+test "uniqueness: the owned flag stays check-free in every copy of an unshared suffix" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const choice = try f.local(.u64);
+    const other = try f.local(f.list_i64);
+    const list = try f.local(f.list_i64);
+    const view = try f.local(f.list_i64);
+    const flag = try f.local(.u64);
+    const elem = try f.local(.i64);
+    const used = try f.local(f.list_i64);
+    const appended = try f.local(f.list_i64);
+    const result = try f.local(.i64);
+
+    // switch choice { 1 => used := checked_op(other); _ => {} }
+    // list = []; view = list; flag = list_owned_unique(view); appended = checked_op(list).
+    // Only the second arm releases `other`, so emission gives each arm its
+    // own copy of the suffix and binds `view` once per copy.
+    const ret = try f.ret(result);
+    const result_assign = try f.assignI64(result, 1, ret);
+    const append = try f.assignLowLevel(appended, &.{ list, elem }, LIR.LowLevel.RcEffect.runtimeUniqueness(1), result_assign);
+    const measure = try f.store.addCFStmt(.{ .assign_low_level = .{
+        .target = flag,
+        .op = .list_owned_unique,
+        .rc_effect = try f.store.addRcEffect(LIR.LowLevel.list_owned_unique.rcEffect()),
+        .args = try f.span(&.{view}),
+        .next = append,
+    } }, .test_fixture);
+    const view_assign = try f.assignRefLocal(view, list, measure);
+    const suffix = try f.assignList(list, &.{}, view_assign);
+    const use_other = try f.assignLowLevel(used, &.{ other, elem }, LIR.LowLevel.RcEffect.runtimeUniqueness(1), suffix);
+    const dispatch = try f.switchStmt(choice, use_other, suffix, null);
+    const body = try f.assignI64(elem, 5, dispatch);
+    _ = try f.addProc(&.{ choice, other }, body, .i64);
+
+    try f.run();
+    var copies: usize = 0;
+    for (0..f.store.cfStmtCount()) |index| {
+        const stmt = f.store.getCFStmt(@fromBackingInt(@intCast(@as(u32, @intCast(index)))));
+        if (stmt != .assign_low_level or stmt.assign_low_level.target != flag) continue;
+        if (f.store.stmtRowOrDefault(stmt.assign_low_level.extra).unique_args == 1) copies += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), copies);
+}
+
 test "uniqueness: a record handed through a result join keeps its field births" {
     var f = try ArcTest.init(testing.allocator);
     defer f.deinit();

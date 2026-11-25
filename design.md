@@ -29504,7 +29504,9 @@ with every link of the borrowed alias chain down to it free of holder-adding
 occurrences. This is the shape a Builtin wrapper leaves behind when its inlined
 parameter feeds an op that only inspects the list, such as `list_owned_unique`.
 The certifier accepts such a claim when the birth holds at the end of the
-argument's chain of single alias definitions.
+argument's chain of aliases. Each link is one source that every definition of
+the alias names: emission unshares a statement suffix that several paths reach
+into one copy per path, so one view can have a definition in each copy.
 
 The first two conditions are one more monotone bit per local in the ARC
 solver—born unique, destroyed by any flow edge that can add a holder—
