@@ -626,6 +626,12 @@ pub const RocTask = extern struct {
         self.endWait();
         const ending = self.finishing or self.cancel_requested or self.crashing;
         self.unlockTree();
+        if (monitors and !ending and self.tree == null) {
+            if (self.group) |group| {
+                const owner = group.owner;
+                if (owner.cancel_requested or owner.crashing) utils.builtinInvariant(self.ops, "a task's code ran after its owner was cancelled or crashed");
+            }
+        }
         if (ending) return self.finish(completed);
         self.pending = 0;
         const exits = self.scheduler == null and crash_exit.available();
@@ -823,17 +829,55 @@ pub const RocTask = extern struct {
     /// one readies the task. A wake that lands between the swap and the
     /// abort counts its completion without readying; the finishing resume
     /// releases it.
+    ///
+    /// A task that isn't running never runs its code again, so its entries are
+    /// cancelled here too, and theirs. A running one's are when it next parks.
     fn requestCancel(self: *RocTask, calls: *HostCalls) void {
+        var task = self;
+        // Down the tree, a task before its descendants, entering the groups
+        // only of a task that isn't running.
+        var down = task.markCancelled(calls);
+        while (true) {
+            var place = if (down) task.firstEntry() else null;
+            while (place == null) {
+                if (task == self) return;
+                const group = task.group.?;
+                place = group.entryFrom(task.entry_index + 1);
+                task = group.owner;
+            }
+            task = place.?;
+            down = !task.cancel_requested and task.markCancelled(calls);
+        }
+    }
+
+    /// Request that the task finish. Returns whether its own code surely runs no
+    /// more: in a `ParallelTasks` program, whether it was parked.
+    fn markCancelled(self: *RocTask, calls: *HostCalls) bool {
         @atomicStore(bool, &self.cancel_requested, true, .monotonic);
-        if (self.started) self.unpark(calls);
+        const parked = self.started and self.unpark(calls);
+        return self.tree == null or parked;
+    }
+
+    /// Cancel the task's entries, whose code won't run again. The tree is
+    /// locked; the start records it drops are released when the task finishes.
+    fn cancelGroups(self: *RocTask, calls: *HostCalls) void {
+        var group = self.open_groups;
+        while (group) |open| : (group = open.outer) open.cancelLocked(.all, calls);
     }
 
     /// Ready a parked task that will run no more of its code, abandoning
     /// its hosted operation first if it waits on one. Nothing happens to a
-    /// task that isn't parked. The tree is locked.
-    fn unpark(self: *RocTask, calls: *HostCalls) void {
-        if (@cmpxchgStrong(u32, self.waitWord(), wake_parked, 0, .acq_rel, .monotonic) != null) return;
+    /// task that isn't parked, and the result is false. The tree is locked.
+    fn unpark(self: *RocTask, calls: *HostCalls) bool {
+        if (@cmpxchgStrong(u32, self.waitWord(), wake_parked, 0, .acq_rel, .monotonic) != null) return false;
         calls.add(self, self.waitsOnOperation());
+        return true;
+    }
+
+    /// The first running entry of the task's open groups.
+    fn firstEntry(self: *RocTask) ?*RocTask {
+        const outermost = Group.justInside(self.open_groups, null) orelse return null;
+        return outermost.entryFrom(0);
     }
 
     /// Claim the process's one running resume for this task, while the
@@ -1579,6 +1623,7 @@ pub const Group = struct {
         self.live -= 1;
         if (!entry.background) self.foreground_left -= 1;
         for (self.path(entry)) |limit| self.limits[limit].running -= 1;
+        const was_crashing = owner.crashing;
         if (child.status == .crashed) {
             const message = child.crash_message[0..child.crash_message_len];
             if (self.supervised) {
@@ -1589,18 +1634,22 @@ pub const Group = struct {
         }
         self.reports[self.reports_len] = index;
         self.reports_len += 1;
-        if (!owner.finishing and !owner.crashing) self.startEligible(&calls);
+        if (!owner.finishing and !owner.crashing and !owner.cancel_requested) self.startEligible(&calls);
         // Count the report and clear the parked bit in one step, so
         // exactly one report readies a parked owner.
         var seen = @atomicLoad(u32, &self.word, .monotonic);
         while (@cmpxchgWeak(u32, &self.word, seen, (seen & ~wake_parked) + 1, .release, .monotonic)) |actual| seen = actual;
-        if (seen & wake_parked != 0) {
+        var parked = seen & wake_parked != 0;
+        if (parked) {
             calls.add(owner, false);
         } else if (owner.crashing) {
             // Parked elsewhere, on its hosted operation or on another of
             // its groups, or running.
-            owner.unpark(&calls);
+            parked = owner.unpark(&calls);
         }
+        // Its code won't run again, so its entries are cancelled here too.
+        const ends_here = if (owner.tree == null) !was_crashing else parked;
+        if (owner.crashing and !owner.finishing and ends_here) owner.cancelGroups(&calls);
         // Once the tree is unlocked, the owner may take this report, close
         // the group and end.
         child.unlockTree();
@@ -1668,6 +1717,30 @@ pub const Group = struct {
         self.first_unstarted = self.len;
         // Every entry that has not begun was cancelled, so it may end now.
         if (self.owner.scheduler) |scheduler| scheduler.readied.takeAll(&self.unbegun);
+    }
+
+    /// The group of the list that starts at `innermost` just inside of
+    /// `outer`, or its outermost.
+    fn justInside(innermost: ?*Group, outer: ?*Group) ?*Group {
+        var group = innermost;
+        while (group) |open| : (group = open.outer) {
+            if (open.outer == outer) return open;
+        }
+        return null;
+    }
+
+    /// The first running entry from `index` on, or of the groups inside this
+    /// one that its owner opened after it.
+    fn entryFrom(self: *Group, index: usize) ?*RocTask {
+        var group = self;
+        var from = index;
+        while (true) {
+            for (group.entries[from..group.len]) |*entry| {
+                if (entry.child) |child| return child;
+            }
+            group = justInside(group.owner.open_groups, group) orelse return null;
+            from = 0;
+        }
     }
 
     /// Ready the tasks a cancel reached and release the start records it
@@ -2094,42 +2167,13 @@ pub const Scheduler = struct {
         var task = self.root;
         while (true) {
             if (!task.started) return task.group;
-            var place = outermostEntry(task);
+            var place = task.firstEntry();
             while (place == null) {
                 const group = task.group orelse return null;
-                place = entryAfter(group, task.entry_index + 1);
+                place = group.entryFrom(task.entry_index + 1);
                 task = group.owner;
             }
             task = place.?;
-        }
-    }
-
-    /// The first running entry of the task's open groups.
-    fn outermostEntry(task: *RocTask) ?*RocTask {
-        return entryAfter(outermostGroup(task.open_groups, null) orelse return null, 0);
-    }
-
-    /// The group of the list that starts at `innermost` just inside of
-    /// `outer`, or its outermost.
-    fn outermostGroup(innermost: ?*Group, outer: ?*Group) ?*Group {
-        var group = innermost;
-        while (group) |open| : (group = open.outer) {
-            if (open.outer == outer) return open;
-        }
-        return null;
-    }
-
-    /// The first running entry of `group` from `index` on, or of the groups
-    /// inside it that its owner opened after it.
-    fn entryAfter(group: *Group, index: usize) ?*RocTask {
-        var current = group;
-        var from = index;
-        while (true) {
-            for (current.entries[from..current.len]) |*entry| {
-                if (entry.child) |child| return child;
-            }
-            current = outermostGroup(current.owner.open_groups, current) orelse return null;
-            from = 0;
         }
     }
 

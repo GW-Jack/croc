@@ -619,9 +619,9 @@ test "a host that wakes a child after the runtime aborted its operation is caugh
     const loop = try parkedLoop(&h.ops, &group, &root, true);
 
     try std.testing.expectEqual(Status.pending, loop.child.resumeFromHost(&readyChild, &abort));
-    // Cancelling the root readies it. Its next resume cancels the child.
+    // Cancelling the parked root cancels the child too.
     loop.root.cancel(&abort, &readyChild);
-    try std.testing.expectEqual(@as(u32, 0), aborts);
+    try std.testing.expectEqual(@as(u32, 1), aborts);
     try std.testing.expectEqual(Status.pending, loop.root.resumeFromHost(&readyChild, &abort));
     try std.testing.expectEqual(@as(u32, 1), aborts);
     try std.testing.expectEqual(loop.child, last_readied.?);

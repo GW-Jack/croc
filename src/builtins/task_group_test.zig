@@ -765,6 +765,92 @@ test "cancelling a root cancels its grandchildren, and every task ends after its
     try std.testing.expectEqual(@as(usize, 0), env.getAllocationCount());
 }
 
+/// A root whose entry 0 runs an inner loop of entries 2 and 3, one at a time,
+/// and whose entry 1 pauses, then crashes if `crashes`. Driven until entry 2 is
+/// queued, not yet resumed, and entry 1 is parked on its operation.
+const QueuedGrandchild = struct {
+    env: utils.TestEnv,
+    inner_starts: [2][*]u8,
+    inner: Loop,
+    starts: [2][*]u8,
+    loop: Loop,
+    result: u64,
+    root: *RocTask,
+
+    fn init(self: *QueuedGrandchild, crashes: bool) error{TestExpectedEqual}!void {
+        self.env = utils.TestEnv.init(std.testing.allocator);
+        const ops = self.env.getOps();
+        Host.reset();
+        self.inner_starts = .{
+            startRecord(ops, .{ .id = 2, .pauses = 1, .result = 2 }),
+            startRecord(ops, .{ .id = 3, .pauses = 1, .result = 3 }),
+        };
+        const limited: task_mod.EntryMarks = .{ .limit_path = &.{0}, .shielded = false, .background = false };
+        self.inner = .{ .spec = spec(&self.inner_starts, &.{ limited, limited }, &.{1}, null) };
+        self.starts = .{
+            startRecord(ops, .{ .id = 0, .pauses = 0, .result = 0, .inner = &self.inner }),
+            startRecord(ops, .{ .id = 1, .pauses = 1, .result = 1, .crashes = crashes }),
+        };
+        self.loop = .{ .spec = spec(&self.starts, &.{ plain, plain }, &.{}, null) };
+        self.root = rootTask(ops, &self.loop, &self.result);
+        try std.testing.expectEqual(Status.pending, Host.resumeTask(self.root));
+        const entry_1 = Host.ready[1];
+        for (0..2) |_| {
+            const entry = Host.ready[Host.ready_head];
+            Host.ready_head += 1;
+            Host.live += 1;
+            try std.testing.expectEqual(Status.pending, Host.resumeTask(entry));
+        }
+        try std.testing.expectEqual(@as(usize, 1), Host.ready_len - Host.ready_head);
+        try std.testing.expectEqualSlices(*RocTask, &.{entry_1}, Host.pending[0..Host.pending_len]);
+    }
+
+    /// Free the root, which leaves nothing allocated.
+    fn finish(self: *QueuedGrandchild) error{TestExpectedEqual}!void {
+        self.root.free();
+        try std.testing.expectEqual(@as(usize, 0), self.env.getAllocationCount());
+    }
+};
+
+test "cancelling a parked root cancels the entries its tasks had queued, which start no operation" {
+    var tree: QueuedGrandchild = undefined;
+    try tree.init(false);
+    defer tree.env.deinit();
+    const entry_2 = Host.ready[Host.ready_head];
+    const entry_1 = Host.pending[0];
+    const entry_0 = entry_2.group.?.owner;
+    tree.root.cancel(&Host.abortTask, &Host.readyTask);
+    // The root, then its entries, in tree order; entry 2 was queued already.
+    try std.testing.expectEqualSlices(*RocTask, &.{ entry_2, tree.root, entry_0, entry_1 }, Host.ready[Host.ready_head..Host.ready_len]);
+    try std.testing.expectEqualSlices(*RocTask, &.{entry_1}, Host.aborted[0..Host.aborts]);
+    try std.testing.expectEqual(Status.cancelled, Host.drive(tree.root, .pending, null));
+    // Entry 3, behind the limit, never started, and no entry's code ran.
+    try std.testing.expectEqual(@as(usize, 3), Host.ended[@backingInt(Status.cancelled)]);
+    try std.testing.expectEqual(@as(usize, 1), Host.aborts);
+    try std.testing.expectEqual(@as(usize, 0), Host.pending_len);
+    try tree.finish();
+}
+
+test "an entry's crash cancels the entries its parked owner's tasks had queued, which start no operation" {
+    var tree: QueuedGrandchild = undefined;
+    try tree.init(true);
+    defer tree.env.deinit();
+    const entry_1 = Host.pending[0];
+    const entry_2 = Host.ready[Host.ready_head];
+    const entry_0 = entry_2.group.?.owner;
+    Host.pending_len = 0;
+    // The host resumes entry 1 before entry 2, which it queued first.
+    entry_1.wake(&Host.readyTask);
+    Host.ready_len -= 1;
+    try std.testing.expectEqual(Status.crashed, Host.resumeTask(entry_1));
+    try std.testing.expectEqualSlices(*RocTask, &.{ entry_2, tree.root, entry_0 }, Host.ready[Host.ready_head..Host.ready_len]);
+    try std.testing.expectEqual(Status.crashed, Host.drive(tree.root, .pending, null));
+    try std.testing.expectEqual(@as(usize, 2), Host.ended[@backingInt(Status.cancelled)]);
+    try std.testing.expectEqual(@as(usize, 0), Host.aborts);
+    try std.testing.expectEqual(@as(usize, 0), Host.pending_len);
+    try tree.finish();
+}
+
 test "the task tree orders an ancestor before its descendants and siblings by creation" {
     var env = utils.TestEnv.init(std.testing.allocator);
     defer env.deinit();

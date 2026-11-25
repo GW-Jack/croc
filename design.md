@@ -35117,9 +35117,24 @@ them as an exit would, waits until they've reported, drops their reports, and
 reports `Ended`.
 
 **Cancellation.** Cancelling a task cancels the running entries of each of its
-groups and drops the entries that haven't started. The task reaches its
-terminal status after its children do. A child's pending operation is
-aborted through `abort`, as a root's is.
+groups, shielded ones included, and drops the entries that haven't started.
+The task reaches its terminal status after its children do. A child's pending
+operation is aborted through `abort`, as a root's is.
+
+A task that isn't running runs none of its code after the request, so its
+entries are cancelled by the request itself, under the tree's lock, and so are
+theirs. Were they cancelled in the task's next resume, entries the host had
+already queued before that resume would run more of their code first, and
+make hosted calls for a task that can no longer use them. The request goes
+down the tree a task before its entries, entries in order, so the host sees
+their `abort` and `ready` calls in tree order. No entry of a cancelled task
+starts. Those that haven't are dropped when the task finishes, since releasing
+their start records runs the program's drops.
+
+In a `ParallelTasks` program the request cannot tell a task that is running
+from one that was readied and not resumed yet. The request goes below a task
+only if that task was parked, and the entries of any other are cancelled when it
+next parks or resumes.
 
 **Crashes.** A child's crash exit catches the crash in its own resume, as a
 root's does. The child's descendants are cancelled, and once they have
@@ -35132,6 +35147,8 @@ it gets there depends on where it is parked:
   function while entries run, and that operation may never complete. So
   the runtime does what a cancel does: it clears the parked bit with a
   compare-and-swap, calls `abort` on the operation, then calls `ready`.
+
+The owner's other entries are cancelled then too, as a cancel's are.
 
 On its next resume the owner releases a hosted result that was already
 counted, as a cancelled task does, and crashes at its wait with the child's
