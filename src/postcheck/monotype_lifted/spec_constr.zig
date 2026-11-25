@@ -7651,6 +7651,9 @@ const Cloner = struct {
         join: *LetCaseJoin,
         site: LetCaseJumpSite,
         rest_ty: Type.TypeId,
+        /// The site's bindings, then the strict parts of its values.
+        bindings: *BindingChain = undefined,
+        values: []Value = &.{},
         change_start: usize = 0,
         value_expr: Ast.ExprId = undefined,
         bind: Ast.PatId = undefined,
@@ -7658,42 +7661,57 @@ const Cloner = struct {
 
     fn stepInlineLetCaseJoin(self: *Cloner, frame: *CloneFrame, task: *InlineLetCaseJoinTask, input: ?CloneResult) Common.LowerError!CloneStep {
         const join = task.join;
-        const site = task.site;
         const body = switch (frame.cursor) {
-            0 => {
+            // The continuation can use a binder any number of times, so each
+            // value's strict parts are bound at the site, in the order they
+            // ran there, and the binders hold only reads of them.
+            0, 1 => {
+                if (frame.cursor == 0) {
+                    const arena = self.arena.allocator();
+                    task.bindings = try arena.create(BindingChain);
+                    task.bindings.* = task.site.bindings;
+                    task.values = try arena.alloc(Value, task.site.values.len);
+                    frame.cursor = 1;
+                } else {
+                    task.values[frame.index] = input.?.get(.value);
+                    frame.index += 1;
+                }
+                if (frame.index < task.values.len) {
+                    return .{ .call = try self.makeReusableTask(task.site.values[frame.index], task.bindings) };
+                }
                 task.change_start = self.subst.watermark();
                 switch (join.binding) {
                     .locals => |locals| {
-                        if (site.values.len != locals.len) {
+                        if (task.values.len != locals.len) {
                             Common.invariant("let-of-case jump site argument count differed from join binder count");
                         }
-                        for (locals, site.values) |local, value| try self.subst.put(self.pass.program, local, value);
-                        frame.cursor = 1;
+                        for (locals, task.values) |local, value| try self.subst.put(self.pass.program, local, value);
+                        frame.cursor = 2;
                         return .{ .call = .{ .expr = join.body } };
                     },
                     .pattern => |binding| {
-                        if (try self.bindPatToFlowValue(binding.pat, site.values[0])) {
-                            frame.cursor = 1;
+                        if (try self.bindPatToFlowValue(binding.pat, task.values[0])) {
+                            frame.cursor = 2;
                             return .{ .call = .{ .expr = join.body } };
                         }
                         // The pattern could not consume the value's structure; keep
                         // an ordinary let of the materialized value at the site.
                         self.subst.restore(task.change_start);
-                        frame.cursor = 2;
-                        return .{ .call = .{ .materialize = .{ .value = site.values[0] } } };
+                        frame.cursor = 3;
+                        return .{ .call = .{ .materialize = .{ .value = task.values[0] } } };
                     },
                 }
             },
-            1 => blk: {
+            2 => blk: {
                 const body = input.?.get(.expr);
                 self.subst.restore(task.change_start);
                 break :blk body;
             },
-            2 => {
+            3 => {
                 task.value_expr = input.?.get(.expr);
                 task.change_start = self.subst.watermark();
                 task.bind = try self.clonePat(join.binding.pattern.pat, .bind_runtime);
-                frame.cursor = 3;
+                frame.cursor = 4;
                 return .{ .call = .{ .expr = join.body } };
             },
             else => blk: {
@@ -7707,8 +7725,8 @@ const Cloner = struct {
                 } } });
             },
         };
-        const wrapped = try self.wrapBindings(site.bindings, body);
-        self.pass.program.setExprData(site.expr, self.pass.program.getExpr(wrapped).data);
+        const wrapped = try self.wrapBindings(task.bindings.*, body);
+        self.pass.program.setExprData(task.site.expr, self.pass.program.getExpr(wrapped).data);
         return .{ .ret = .none };
     }
 

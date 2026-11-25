@@ -11851,7 +11851,9 @@ body still sees the shape; and a join with exactly one jump site is inlined only
 when its body is closed under lexical loop control. A body containing a `break`
 or `continue` for an enclosing loop retains the typed join, because moving that
 body beneath a different loop would retarget the transfer. Otherwise its body
-is cloned directly at the site against the site's full symbolic values.
+is cloned directly at the site against the site's full symbolic values, whose
+strict parts are bound there first: the body can use a binder any number of
+times, and each part still runs once, before it.
 
 Case-of-case distribution follows the same rule by counting, before it clones
 anything, how many inner leaves select each outer arm from the arm values

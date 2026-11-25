@@ -4756,6 +4756,28 @@ test "spec constr preserves nested known-match payload effect order" {
     , &.{ "\"payload\"", "\"branch-before\"" });
 }
 
+test "spec constr runs the parts of a let's only arm value once, before the rest of the block" {
+    try expectOptimizedDbgEvents(
+        \\tap : I64 -> I64
+        \\tap = |n| {
+        \\    dbg "part"
+        \\    if n < 0 { tap(n + 1) } else { n }
+        \\}
+        \\
+        \\pick : Bool, I64 -> I64
+        \\pick = |flag, n| {
+        \\    a : (I64, I64)
+        \\    a = if flag { crash "flag" } else { (tap(n), 1) }
+        \\    dbg "rest"
+        \\    b = List.map([1.I64, 2], |k| if k == 1 { a } else { (k, k) })
+        \\    a.0 + a.1 + List.fold(b, 0, |sum, pair| sum + pair.0)
+        \\}
+        \\
+        \\main : I64
+        \\main = pick(Str.is_empty("k"), 1) + pick(Str.is_empty("l"), 2)
+    , &.{ "\"part\"", "\"rest\"", "\"part\"", "\"rest\"" });
+}
+
 test "spec constr writes dynamically discovered workers once" {
     const allocator = std.testing.allocator;
     const source =
