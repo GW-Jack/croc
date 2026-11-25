@@ -13,6 +13,10 @@
 //! enters agree that the task is passed (design.md "Erased Calls That May
 //! Suspend").
 //!
+//! Boxy lowering decides what it knows by type (design.md "Boxy Procedures That
+//! May Suspend"): a dynamic erased call it marks is a site, and nothing in a
+//! procedure it marks `effect_free` is one.
+//!
 //! Every procedure with a body and every call gets its mark committed, so
 //! running this again after rewrites replaces stale marks.
 
@@ -41,7 +45,8 @@ const ErasedCall = struct {
 };
 
 /// Every direct call and every classed erased call in every procedure body,
-/// and the procedures whose bodies hold a `group_next` or a `cell_wait`.
+/// and the procedures whose bodies hold a `group_next`, a `cell_wait` or a
+/// dynamic erased call that is a site.
 const Walk = struct {
     calls: std.ArrayList(DirectCall),
     erased: std.ArrayList(ErasedCall),
@@ -120,7 +125,7 @@ pub fn run(allocator: Allocator, store: *LirStore, mode: ConcurrencyMode) Alloca
     for (calls.items) |call| {
         const updated = &store.getCFStmtPtr(call.stmt).assign_call;
         var extra = store.stmtRowOrDefault(updated.extra);
-        const site = may.isSet(call.callee);
+        const site = may.isSet(call.callee) and !effectFree(store, call.caller);
         if (extra.suspension_site == site) continue;
         extra.suspension_site = site;
         updated.extra = try store.addOptionalStmtRow(LIR.CallExtra, extra);
@@ -148,8 +153,11 @@ fn seeds(proc: *const LIR.LirProcSpec, mode: ConcurrencyMode) bool {
 /// Whether any procedure is marked as one that may suspend, or this
 /// compilation holds a seed's body. A marked procedure with a body need not be
 /// a seed, and its mark may be stale: an erased class that held a suspending
-/// procedure no longer may suspend once that procedure is gone.
+/// procedure no longer may suspend once that procedure is gone. A Boxy
+/// program's seeds are statements, the dynamic erased calls and running-set
+/// operations lowering makes in any program with tasks, so it is walked.
 fn anySeedOrMark(store: *const LirStore, mode: ConcurrencyMode) bool {
+    if (mode.hasTasks() and store.runtime_contract == .boxy) return true;
     for (0..store.procSpecCount()) |index| {
         const proc = store.getProcSpecImmediate(@fromBackingInt(@as(u32, @intCast(index))));
         if (proc.suspends == .may) return true;
@@ -159,7 +167,8 @@ fn anySeedOrMark(store: *const LirStore, mode: ConcurrencyMode) bool {
 }
 
 /// Every direct and classed erased call in every procedure body, and the
-/// procedures that hold a `group_next` or a `cell_wait`.
+/// procedures that hold a `group_next`, a `cell_wait` or a dynamic erased call
+/// that is a site.
 fn walkBodies(allocator: Allocator, store: *const LirStore) Allocator.Error!Walk {
     var calls = std.ArrayList(DirectCall).empty;
     errdefer calls.deinit(allocator);
@@ -187,6 +196,10 @@ fn walkBodies(allocator: Allocator, store: *const LirStore) Allocator.Error!Walk
             if (stmt == .assign_call_erased) {
                 const class = store.stmtRow(stmt.assign_call_erased.data).erased_class;
                 if (class != .none) try erased.append(allocator, .{ .caller = @intCast(proc_index), .class = class, .stmt = stmt_id });
+            }
+            if (stmt == .dyn) {
+                const op = store.stmtRow(stmt.dyn.data);
+                if (op == .call_erased and op.call_erased.suspension_site) parks.set(proc_index);
             }
             if (stmt == .assign_low_level and (stmt.assign_low_level.op == .group_next or stmt.assign_low_level.op == .cell_wait)) parks.set(proc_index);
             try body_clone.appendSuccessors(store, &work, stmt_id, allocator);
@@ -266,7 +279,7 @@ fn propagate(allocator: Allocator, store: *const LirStore, walk: *const Walk, ma
         var call_index = first_caller[callee];
         while (call_index != no_link) : (call_index = next_caller[call_index]) {
             const caller = calls[call_index].caller;
-            if (may.isSet(caller)) continue;
+            if (may.isSet(caller) or effectFree(store, caller)) continue;
             may.set(caller);
             try pending.append(allocator, caller);
         }
@@ -281,6 +294,10 @@ fn propagate(allocator: Allocator, store: *const LirStore, walk: *const Walk, ma
             try pending.append(allocator, proc);
         }
     }
+}
+
+fn effectFree(store: *const LirStore, proc_index: u32) bool {
+    return store.getProcSpecImmediate(@fromBackingInt(proc_index)).effect_free;
 }
 
 const no_link = std.math.maxInt(u32);
@@ -305,7 +322,7 @@ const ClassLinks = struct {
 };
 
 /// Debug check that the marks are complete: a direct call is a site exactly
-/// when its callee may suspend, a classed erased call exactly when its class
+/// when its callee may suspend and its caller isn't effect free, a classed erased call exactly when its class
 /// may, a procedure of a class may suspend exactly when the class may, and
 /// any other procedure with a body exactly when it holds a site, a
 /// `group_next` and a `cell_wait` being ones.
@@ -315,7 +332,7 @@ fn verify(allocator: Allocator, store: *const LirStore, walk: *const Walk, class
     for (walk.calls.items) |call| {
         const site = store.stmtRowOrDefault(store.getCFStmtImmediate(call.stmt).assign_call.extra).suspension_site;
         const callee_may = store.getProcSpecImmediate(@fromBackingInt(call.callee)).suspends == .may;
-        if (site != callee_may) invariant("suspension site mark disagrees with its callee's mark", .{});
+        if (site != (callee_may and !effectFree(store, call.caller))) invariant("suspension site mark disagrees with its callee's mark", .{});
         if (site) has_site.set(call.caller);
     }
     for (walk.erased.items) |call| {
@@ -328,6 +345,7 @@ fn verify(allocator: Allocator, store: *const LirStore, walk: *const Walk, class
         if (proc.body.get() == null) continue;
         const class_may = proc.erased_class != .none and classes.contains(proc.erased_class);
         if (has_site.isSet(index) and proc.erased_class != .none and !class_may) invariant("a procedure with a suspension site is in an erased class that never suspends", .{});
+        if (proc.effect_free and has_site.isSet(index)) invariant("an effect-free procedure holds a suspension site", .{});
         if ((proc.suspends == .may) != (has_site.isSet(index) or class_may)) invariant("procedure suspends mark disagrees with its suspension sites", .{});
     }
 }
@@ -363,6 +381,25 @@ fn addBodyless(store: *LirStore, identity: u32, suspends: LIR.Suspends) Allocato
         .ret_layout = .u64,
         .external = true,
         .suspends = suspends,
+    }, .none);
+}
+
+/// A procedure whose body is a dynamic erased call, a site or not.
+fn addDynRelay(store: *LirStore, identity: u32, suspension_site: bool) Allocator.Error!LIR.LirProcSpecId {
+    const value = try store.addLocal(.{ .layout_idx = .u64 });
+    const callable = try store.addLocal(.{ .layout_idx = .opaque_ptr });
+    const ret = try store.addCFStmt(.{ .ret = .{ .value = value } }, .test_fixture);
+    const call = try store.addDynStmt(value, .{ .call_erased = .{
+        .closure = callable,
+        .args = null,
+        .suspension_site = suspension_site,
+    } }, ret, .test_fixture);
+    return store.addProcSpec(.{
+        .name = store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.forTest(identity),
+        .args = .empty(),
+        .body = .some(call),
+        .ret_layout = .u64,
     }, .none);
 }
 
@@ -565,6 +602,31 @@ fn addErasedRelay(store: *LirStore, identity: u32, class: LIR.ErasedClass, throu
 
 fn isErasedSite(store: *const LirStore, call: LIR.CFStmtId) bool {
     return store.stmtRow(store.getCFStmtImmediate(call).assign_call_erased.data).suspension_site;
+}
+
+test "a dynamic erased call marked a site makes its procedure suspend, and nothing in an effect-free procedure is a site" {
+    const a = testing.allocator;
+    var store = LirStore.init(a);
+    defer store.deinit();
+    const site = try addDynRelay(&store, 1, true);
+    const plain = try addDynRelay(&store, 2, false);
+    const caller = try addRelay(&store, 3, site);
+    const free = try addRelay(&store, 4, site);
+    store.getProcSpecPtr(free.proc).effect_free = true;
+    const above = try addRelay(&store, 5, free.proc);
+    store.runtime_contract = .boxy;
+
+    try run(a, &store, .tasks);
+
+    for ([_]LIR.LirProcSpecId{ site, caller.proc }) |proc| {
+        try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(proc).suspends);
+    }
+    for ([_]LIR.LirProcSpecId{ plain, free.proc, above.proc }) |proc| {
+        try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(proc).suspends);
+    }
+    try testing.expect(isSite(&store, caller.call.?));
+    try testing.expect(!isSite(&store, free.call.?));
+    try testing.expect(!isSite(&store, above.call.?));
 }
 
 test "a suspending procedure of an erased class makes the class's procedures and calls suspend, and only that class's" {

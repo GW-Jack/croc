@@ -1692,6 +1692,7 @@ const VariantTable = struct {
             // The variant's body is the source's, so it suspends where the
             // source does.
             .suspends = source_spec.suspends,
+            .effect_free = source_spec.effect_free,
             .running_set_helper = source_spec.running_set_helper,
             .erased_class = source_spec.erased_class,
             .task_record = source_spec.task_record,
@@ -1747,6 +1748,7 @@ const VariantTable = struct {
             .may_leave_pending = source_spec.may_leave_pending,
             .tail_carry = source_spec.tail_carry,
             .suspends = source_spec.suspends,
+            .effect_free = source_spec.effect_free,
             .running_set_helper = source_spec.running_set_helper,
             .erased_class = source_spec.erased_class,
             .rc_read_only_params = source_spec.rc_read_only_params,

@@ -43,6 +43,7 @@ pub fn writeProc(
     if (proc.tail_group.get()) |group| try writer.print(" tail_group={d}", .{@backingInt(group)});
     if (proc.tail_carry) try writer.writeAll(" tail_carry");
     if (proc.suspends == .may) try writer.writeAll(" suspends=may");
+    if (proc.effect_free) try writer.writeAll(" effect_free");
     if (proc.running_set_helper != .none) try writer.print(" running_set_helper={s}", .{@tagName(proc.running_set_helper)});
     if (proc.task_record != .none) try writer.print(" task_record={s}", .{@tagName(proc.task_record)});
     try writer.writeAll("\n");
@@ -484,6 +485,7 @@ const Printer = struct {
                 if (call.reuse_closure) try writer.writeAll(" owned");
                 if (call.result_reuse) try writer.writeAll(" result_reuse");
                 if (call.deferred) try writer.writeAll(" deferred");
+                if (call.suspension_site) try writer.writeAll(" suspension_site");
                 if (call.drive != .none) try writer.print(" drive={s}", .{@tagName(call.drive)});
             },
             .table_entry => |entry| try writer.print(" #{d}", .{entry.index}),

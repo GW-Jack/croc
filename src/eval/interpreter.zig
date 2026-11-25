@@ -9219,6 +9219,15 @@ pub const Interpreter = struct {
                     try self.invokeErasedInto(closure, if (ret_size == 0) null else ret, args, if (c.reuse_closure) closure else null);
                 }
                 if (self.hasPendingCall()) try self.drivePendingInto(ret, ret_size);
+                if (c.suspension_site and builtins.task.taskCurrent().pending != 0) {
+                    // The callee paused, so its result is poison, as a paused
+                    // direct call's is. The erased-call entry restores
+                    // `unwinding_pause`, so the task's flag says that the
+                    // pause goes on unwinding here.
+                    self.unwinding_pause = true;
+                    if (self.store.getLocal(target).dyn == null) frame.setLocal(target, try self.poisonUninitializedValue(self.store.getLocal(target).layout_idx));
+                    return;
+                }
                 try self.finishResultStorage(frame, stmt_id, target, ret);
             },
         }

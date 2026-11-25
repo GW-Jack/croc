@@ -27,6 +27,7 @@ const TaskMode = @import("builtins").builtin_registry.TaskMode;
 
 const LIR = core.LIR;
 const LirStore = core.LirStore;
+const DynOps = core.DynOps;
 const GuardedList = LirStore.GuardedList;
 const Allocator = std.mem.Allocator;
 const CFStmtId = LIR.CFStmtId;
@@ -103,6 +104,9 @@ const SiteInfo = struct {
     /// The call's target in the procedure that contains the site.
     target: LocalId,
     kind: SiteKind,
+    /// The descriptor of the procedure's dynamic result, which is among the
+    /// live values of a site that is not a tail site.
+    result_desc: ?LocalId,
     /// The site's continuation and resume entry, or null for a tail site.
     continuation: ?ProcId,
     resume_entry: ?ProcId,
@@ -148,11 +152,11 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
         // The bodies come after every procedure there was before the split.
         if (index < shells.bit_length and shells.isSet(index)) continue;
         switch (proc.abi) {
-            .roc => {},
+            .roc, .erased_record => {},
             // `splitErased` left no classed one, and an unclassed one's
             // erased callers have no task to pass it (design.md "What
             // Implements It First").
-            .erased_callable, .erased_record => std.debug.panic("not yet implemented: an erased callable outside every class that may suspend", .{}),
+            .erased_callable => std.debug.panic("not yet implemented: an erased callable outside every class that may suspend", .{}),
         }
         var sites = try ContinuationSites.analyze(allocator, store, proc_id);
         errdefer sites.deinit();
@@ -163,14 +167,22 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
     // The task: a hidden argument after the explicit ones, passed on at
     // every site to a procedure. A hosted site takes it in the host's
     // shape, which the hosted rewrite builds.
+    // A Boxy erased procedure's callers pass no task: it reads the one that is
+    // running, as a call from code that can't pause does.
     for (plans.items) |*plan| {
         plan.task = try store.addLocal(.{ .layout_idx = .opaque_ptr });
-        try appendLocal(store, &store.getProcSpecPtr(plan.proc).args, plan.task);
         try appendLocal(store, &store.getProcSpecPtr(plan.proc).frame_locals, plan.task);
+        if (store.getProcSpecImmediate(plan.proc).abi == .erased_record) {
+            const body = store.getProcSpecImmediate(plan.proc).body.get().?;
+            const read = try store.addLowLevelStmt(plan.task, .task_current, &.{}, body, store.stmtOrigin(body));
+            store.getProcSpecPtr(plan.proc).body = .some(read);
+        } else {
+            try appendLocal(store, &store.getProcSpecPtr(plan.proc).args, plan.task);
+        }
         try passTaskToRunningSets(allocator, store, plan.proc, plan.task);
         for (plan.sites.sites) |site| {
             switch (SiteStmt.at(store, site.call)) {
-                .park => {},
+                .park, .dyn => {},
                 .call => |call| if (!isHosted(store, call.proc)) try appendLocal(store, &store.getCFStmtPtr(site.call).assign_call.args, plan.task),
                 .erased => |call| {
                     var data = store.stmtRow(call.data);
@@ -182,6 +194,8 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
             }
         }
     }
+
+    try passCurrentTask(allocator, store, proc_count);
 
     // One placeholder per continuation and resume entry first, so copies
     // can call and save any of them.
@@ -196,7 +210,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
             const kind: SiteKind = switch (stmt) {
                 .call => |call| if (isHosted(store, call.proc)) .hosted else .{ .procedure = call.proc },
                 .park => |op| if (op.op == .cell_wait) .cell else .{ .running_set = GuardedList.at(store.getLocalSpan(op.args), 0) },
-                .erased => .erased,
+                .erased, .dyn => .erased,
             };
             if (kind == .hosted) hosted_procs.set(@backingInt(stmt.call.proc));
             const target = stmt.target();
@@ -204,6 +218,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
                 .live_after = site.live_after,
                 .target = target,
                 .kind = kind,
+                .result_desc = ContinuationSites.resultDesc(store, plan.proc),
                 .continuation = null,
                 .resume_entry = null,
                 .capture_layout = .zst,
@@ -225,7 +240,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
                     .identity = source.identity.derived("resume", &key),
                     .args = .empty(),
                     .ret_layout = source.ret_layout,
-                    .abi = .erased_callable,
+                    .abi = if (info.result_desc == null) .erased_callable else .erased_record,
                     .task_record = .resume_entry,
                 }, store.procLoc(plan.proc));
                 try nameDerived(allocator, store, info.resume_entry.?, plan.proc, "resume", ordinal);
@@ -260,7 +275,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
         for (plan.sites.sites) |site| {
             const info = infos.get(site.call).?;
             if (info.continuation == null) continue;
-            try buildResumeEntry(allocator, store, layouts, info, store.stmtOrigin(site.call));
+            try buildResumeEntry(allocator, store, layouts, plan.proc, info, store.stmtOrigin(site.call));
         }
     }
 
@@ -272,7 +287,10 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
     while (slot_iter.next()) |index| {
         Buffers.fit(&buffers.hosted_slot_size, &buffers.hosted_slot_alignment, layouts, store.getProcSpecImmediate(@fromBackingInt(@intCast(index))).ret_layout);
     }
+    // A dynamic result's size is in its descriptor, so each pending edge of
+    // its procedure makes room for it.
     for (plans.items) |plan| {
+        if (store.getProcSpecImmediate(plan.proc).dyn_result != .none) continue;
         Buffers.fit(&buffers.result_buffer_size, &buffers.result_buffer_alignment, layouts, store.getProcSpecImmediate(plan.proc).ret_layout);
     }
 
@@ -293,6 +311,49 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
 
     try SuspensionMarks.run(allocator, store, roots.mode);
     if (builtin.mode == .debug) try verify(allocator, store);
+}
+
+/// Pass the task that is running to what needs one in code that holds none: a
+/// procedure that may suspend called from code that never pauses, whose result
+/// is never pending, and a running-set operation in a procedure that has no
+/// suspension site.
+fn passCurrentTask(allocator: Allocator, store: *LirStore, proc_count: usize) Allocator.Error!void {
+    var seen = collections.DenseMapUnmanaged(CFStmtId, void).empty;
+    defer seen.deinit(allocator);
+    var work = std.ArrayList(CFStmtId).empty;
+    defer work.deinit(allocator);
+    for (0..proc_count) |index| {
+        const proc_id: ProcId = @fromBackingInt(@intCast(index));
+        const proc = store.getProcSpecImmediate(proc_id);
+        if (proc.suspends != .never) continue;
+        const effect_free = proc.effect_free;
+        try work.append(allocator, proc.body.get() orelse continue);
+        while (work.pop()) |stmt_id| {
+            if ((try seen.getOrPut(allocator, stmt_id)).found_existing) continue;
+            try body_clone.appendSuccessors(store, &work, stmt_id, allocator);
+            var stmt = store.getCFStmtImmediate(stmt_id).*;
+            const args = if (stmt == .assign_call) call: {
+                // A start record's code passes the task it makes.
+                const callee = stmt.assign_call.proc;
+                if (!effect_free or store.getProcSpecImmediate(callee).suspends == .never) continue;
+                if (isHosted(store, callee)) invariant("an effect-free procedure calls a suspending hosted procedure", .{});
+                break :call &stmt.assign_call.args;
+            } else if (stmt == .assign_low_level and stmt.assign_low_level.op.takesTask()) &stmt.assign_low_level.args else continue;
+            const task = try store.addLocal(.{ .layout_idx = .opaque_ptr });
+            try appendLocal(store, &store.getProcSpecPtr(proc_id).frame_locals, task);
+            try appendLocal(store, args, task);
+            const origin = store.stmtOrigin(stmt_id);
+            const taking = try store.addCFStmt(stmt, origin);
+            try seen.put(allocator, taking, {});
+            try store.replaceCFStmt(stmt_id, .{ .assign_low_level = .{
+                .target = task,
+                .op = .task_current,
+                .rc_effect = try store.addRcEffect(LIR.LowLevel.task_current.rcEffect()),
+                .args = .empty(),
+                .next = taking,
+            } }, origin);
+        }
+    }
 }
 
 /// Give a procedure the pass derives from `source` its source location and
@@ -775,9 +836,16 @@ fn captureLayout(allocator: Allocator, store: *const LirStore, layouts: *layout.
     defer fields.deinit(allocator);
     for (live_after) |live| {
         if (live == target) continue;
-        try fields.append(allocator, .{ .index = @intCast(fields.items.len), .layout = store.getLocal(live).layout_idx });
+        try fields.append(allocator, .{ .index = @intCast(fields.items.len), .layout = try savedLayout(store, layouts, live) });
     }
     return layouts.putStructFields(fields.items);
+}
+
+/// The layout a record holds the live value `live` at: a dynamic value is
+/// saved as `DynOp.save` makes it.
+fn savedLayout(store: *const LirStore, layouts: *layout.Store, live: LocalId) Allocator.Error!layout.Idx {
+    const info = store.getLocal(live);
+    return if (info.dyn == null) info.layout_idx else layouts.insertErasedCallable();
 }
 
 /// Where a site's new locals go: the cloner's when it is in a copy, the
@@ -817,27 +885,42 @@ const Occurrence = struct {
     extra: LIR.StmtRowId(LIR.CallExtra),
     /// An erased call's data, in the same locals; null at any other site.
     erased: ?LIR.ErasedCallData = null,
+    /// A dynamic erased call, in the same locals; null at any other site.
+    dyn: ?LIR.DynOp = null,
 
     /// The occurrence of the site `stmt` in its own procedure.
     fn of(store: *const LirStore, stmt: SiteStmt, task: LocalId, live: []const LocalId) Occurrence {
         return switch (stmt) {
             .call => |call| .{ .task = task, .target = call.target, .live = live, .proc = call.proc, .args = call.args, .extra = call.extra },
             .erased => |call| .{ .task = task, .target = call.target, .live = live, .proc = null, .args = .empty(), .extra = .none, .erased = store.stmtRow(call.data) },
+            .dyn => |dyn| .{ .task = task, .target = stmt.target(), .live = live, .proc = null, .args = .empty(), .extra = .none, .dyn = store.stmtRow(dyn.data) },
             .park => |op| .{ .task = task, .target = op.target, .live = live, .proc = null, .args = op.args, .extra = .none },
         };
     }
 };
 
 /// `suspend_save task R(f, k) [saved]; suspend_return`, where the saved
-/// values are the live ones other than the call's result.
-fn pendingEdge(store: *LirStore, info: SiteInfo, occurrence: Occurrence, origin: LIR.StmtOrigin) Allocator.Error!CFStmtId {
+/// values are the live ones other than the call's result, each dynamic one
+/// saved by a `save` before. An edge of a procedure with a dynamic result
+/// first makes room for it in the task's result buffer.
+fn pendingEdge(store: *LirStore, layouts: *layout.Store, sink: anytype, info: SiteInfo, occurrence: Occurrence, origin: LIR.StmtOrigin) Allocator.Error!CFStmtId {
+    const Save = struct { target: LocalId, value: LocalId, desc: LocalId };
+    var saves = std.ArrayList(Save).empty;
+    defer saves.deinit(store.allocator);
     var saved = try std.ArrayList(LocalId).initCapacity(store.allocator, occurrence.live.len);
     defer saved.deinit(store.allocator);
     for (occurrence.live) |live| {
-        if (live != occurrence.target) saved.appendAssumeCapacity(live);
+        if (live == occurrence.target) continue;
+        const dyn = store.localDyn(live) orelse {
+            saved.appendAssumeCapacity(live);
+            continue;
+        };
+        const target = try sink.newLocal(try layouts.insertErasedCallable());
+        try saves.append(store.allocator, .{ .target = target, .value = live, .desc = dyn.desc });
+        saved.appendAssumeCapacity(target);
     }
     const ret = try store.addCFStmt(.{ .suspend_return = {} }, origin);
-    return store.addCFStmt(.{ .suspend_save = .{
+    var head = try store.addCFStmt(.{ .suspend_save = .{
         .task = occurrence.task,
         .data = try store.addStmtRow(LIR.SuspendSaveData, .{
             .proc = info.resume_entry.?,
@@ -848,6 +931,15 @@ fn pendingEdge(store: *LirStore, info: SiteInfo, occurrence: Occurrence, origin:
         }),
         .next = ret,
     } }, origin);
+    var index = saves.items.len;
+    while (index > 0) {
+        index -= 1;
+        const save = saves.items[index];
+        head = try store.addDynStmt(save.target, .{ .save = .{ .value = save.value, .desc = save.desc } }, head, origin);
+    }
+    const result_desc = info.result_desc orelse return head;
+    const position = std.mem.findScalar(LocalId, info.live_after, result_desc) orelse invariant("a site's live values do not include its procedure's result descriptor", .{});
+    return store.addDynStmt(null, .{ .result_need = .{ .task = occurrence.task, .desc = occurrence.live[position] } }, head, origin);
 }
 
 /// The statement that starts an occurrence of a site that is not a tail
@@ -857,7 +949,7 @@ fn pendingEdge(store: *LirStore, info: SiteInfo, occurrence: Occurrence, origin:
 /// the `RocPoll`; a park site keeps its operation and branches on the
 /// status.
 fn siteHead(store: *LirStore, layouts: *layout.Store, sink: anytype, info: SiteInfo, occurrence: Occurrence, ready: CFStmtId, origin: LIR.StmtOrigin) Allocator.Error!LIR.CFStmt {
-    const edge = try pendingEdge(store, info, occurrence, origin);
+    const edge = try pendingEdge(store, layouts, sink, info, occurrence, origin);
     if (info.kind.parks()) {
         const op: LIR.LowLevel = if (info.kind == .cell) .cell_wait else .group_next;
         return .{ .assign_low_level = .{
@@ -878,6 +970,11 @@ fn siteHead(store: *LirStore, layouts: *layout.Store, sink: anytype, info: SiteI
             .uninitialized_branch = edge,
         } }, origin);
         const read = try store.addLowLevelStmt(ready_flag, .task_ready, &.{occurrence.task}, test_stmt, origin);
+        if (occurrence.dyn) |op| return .{ .dyn = .{
+            .target = occurrence.target,
+            .data = try store.addStmtRow(LIR.DynOp, op),
+            .next = read,
+        } };
         if (occurrence.erased) |data| return .{ .assign_call_erased = .{
             .target = occurrence.target,
             .data = try store.addStmtRow(LIR.ErasedCallData, data),
@@ -945,38 +1042,89 @@ fn rewriteSite(store: *LirStore, layouts: *layout.Store, sink: *FrameSink, info:
     try store.replaceCFStmt(site, head, origin);
 }
 
+/// Locals of a procedure the pass builds that stand for another's live
+/// values.
+const LiveLocals = struct {
+    store: *LirStore,
+    allocator: Allocator,
+    frame: *std.ArrayList(LocalId),
+    /// Each live value's local here.
+    of: collections.DenseMapUnmanaged(LocalId, LocalId) = .empty,
+
+    fn deinit(self: *LiveLocals) void {
+        self.of.deinit(self.allocator);
+    }
+
+    fn closed(self: *LiveLocals, layout_idx: layout.Idx) Allocator.Error!LocalId {
+        const local = try self.store.addLocal(.{ .layout_idx = layout_idx });
+        try self.frame.append(self.allocator, local);
+        return local;
+    }
+
+    /// A dynamic local with the descriptor of `other`, a local of the other
+    /// procedure whose descriptor has a local here.
+    fn dynamic(self: *LiveLocals, other: LocalId, storage: LIR.DynStorage) Allocator.Error!LocalId {
+        const info = self.store.getLocal(other);
+        const desc = self.of.get(info.dyn.?.desc) orelse invariant("a dynamic live value's descriptor is not live", .{});
+        const local = try self.store.addLocal(.{ .layout_idx = info.layout_idx, .dyn = .{ .desc = desc, .storage = storage } });
+        try self.frame.append(self.allocator, local);
+        return local;
+    }
+
+    /// The result local of a procedure that returns what `proc` does, whose
+    /// descriptor has a local here, or null when its result is closed.
+    fn result(self: *LiveLocals, proc: ProcId) Allocator.Error!?LocalId {
+        const local = self.store.getProcSpecImmediate(proc).dyn_result.get() orelse return null;
+        return try self.dynamic(local, .result);
+    }
+};
+
 /// `R(f, k)`: load the saved values and the call's result, then call
 /// `C(f, k)` with them and the task. A park site has no result to load: a
 /// running set's `R` calls the site's retry (`buildParkRetry`) with the saved
 /// values and the task, and a wait's calls `C(f, k)` with them, which never
 /// reads the status.
-fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Store, info: SiteInfo, origin: LIR.StmtOrigin) Allocator.Error!void {
+fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Store, proc: ProcId, info: SiteInfo, origin: LIR.StmtOrigin) Allocator.Error!void {
     const entry = info.resume_entry.?;
     const ret_layout = store.getProcSpecImmediate(entry).ret_layout;
     var frame = std.ArrayList(LocalId).empty;
     defer frame.deinit(allocator);
-    const Fresh = struct {
-        store: *LirStore,
-        frame: *std.ArrayList(LocalId),
-        allocator: Allocator,
-        fn local(self: @This(), layout_idx: layout.Idx) Allocator.Error!LocalId {
-            const id = try self.store.addLocal(.{ .layout_idx = layout_idx });
-            try self.frame.append(self.allocator, id);
-            return id;
-        }
-    };
-    const fresh = Fresh{ .store = store, .frame = &frame, .allocator = allocator };
+    var locals = LiveLocals{ .store = store, .allocator = allocator, .frame = &frame };
+    defer locals.deinit();
 
-    const task = try fresh.local(.opaque_ptr);
-    const capture = try fresh.local(.opaque_ptr);
-    const reuse = try fresh.local(try layouts.insertErasedCallable());
-    const result_layout = store.getLocal(info.target).layout_idx;
-    const result: ?LocalId = if (info.kind.parks()) null else try fresh.local(result_layout);
-    const address: ?LocalId = if (info.kind.parks()) null else try fresh.local(try layouts.insertPtr(result_layout));
-    const value = try fresh.local(ret_layout);
+    const task = try locals.closed(.opaque_ptr);
+    const capture = try locals.closed(.opaque_ptr);
+    const reuse = try locals.closed(try layouts.insertErasedCallable());
 
+    // Each saved value's field, and the closed ones are the values.
+    const Restore = struct { target: LocalId, saved: LocalId };
     var fields = std.ArrayList(LocalId).empty;
     defer fields.deinit(allocator);
+    for (info.live_after) |live| {
+        if (live == info.target) continue;
+        const field = try locals.closed(try savedLayout(store, layouts, live));
+        try fields.append(allocator, field);
+        if (store.localDyn(live) == null) try locals.of.put(allocator, live, field);
+    }
+    var restores = std.ArrayList(Restore).empty;
+    defer restores.deinit(allocator);
+    var field_index: usize = 0;
+    for (info.live_after) |live| {
+        if (live == info.target) continue;
+        defer field_index += 1;
+        if (store.localDyn(live) == null) continue;
+        const restored = try locals.dynamic(live, .frame);
+        try locals.of.put(allocator, live, restored);
+        try restores.append(allocator, .{ .target = restored, .saved = fields.items[field_index] });
+    }
+
+    const target_dynamic = store.localDyn(info.target) != null;
+    const loads = !info.kind.parks();
+    const result: ?LocalId = if (!loads) null else if (target_dynamic) try locals.dynamic(info.target, .frame) else try locals.closed(store.getLocal(info.target).layout_idx);
+    const address: ?LocalId = if (!loads) null else try locals.closed(if (target_dynamic) .opaque_ptr else try layouts.insertPtr(store.getLocal(info.target).layout_idx));
+    const dyn_result = try locals.result(proc);
+    const value = dyn_result orelse try locals.closed(ret_layout);
+
     var call_args = try std.ArrayList(LocalId).initCapacity(allocator, info.live_after.len + 1);
     defer call_args.deinit(allocator);
     for (info.live_after) |live| {
@@ -984,15 +1132,13 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
             if (info.kind == .cell) invariant("a wait on shared state has a status the code after it reads", .{});
             if (result) |loaded| call_args.appendAssumeCapacity(loaded);
         } else {
-            const field = try fresh.local(store.getLocal(live).layout_idx);
-            try fields.append(allocator, field);
-            call_args.appendAssumeCapacity(field);
+            call_args.appendAssumeCapacity(locals.of.get(live).?);
         }
     }
     call_args.appendAssumeCapacity(task);
 
     const callee = switch (info.kind) {
-        .running_set => try buildParkRetry(allocator, store, info, origin),
+        .running_set => try buildParkRetry(allocator, store, layouts, proc, info, origin),
         .procedure, .erased, .hosted, .cell => info.continuation.?,
     };
     const ret = try store.addCFStmt(.{ .ret = .{ .value = value } }, origin);
@@ -1005,13 +1151,21 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
     var head = switch (info.kind) {
         .running_set, .cell => call,
         .procedure => |called| blk: {
-            const load = try store.addTaskResultLoad(result.?, address.?, called, call, origin);
+            const load = if (target_dynamic)
+                try store.addDynStmt(result.?, .{ .take = .{ .address = address.? } }, call, origin)
+            else if (store.getProcSpecImmediate(called).dyn_result != .none)
+                try store.addHostVisibleLoad(result.?, address.?, call, origin)
+            else
+                try store.addTaskResultLoad(result.?, address.?, called, call, origin);
             break :blk try store.addLowLevelStmt(address.?, .task_result_buffer, &.{task}, load, origin);
         },
         // No procedure is named, so the result is as visible as any erased
         // call's.
         .erased => blk: {
-            const load = try store.addHostVisibleLoad(result.?, address.?, call, origin);
+            const load = if (target_dynamic)
+                try store.addDynStmt(result.?, .{ .take = .{ .address = address.? } }, call, origin)
+            else
+                try store.addHostVisibleLoad(result.?, address.?, call, origin);
             break :blk try store.addLowLevelStmt(address.?, .task_result_buffer, &.{task}, load, origin);
         },
         .hosted => blk: {
@@ -1019,17 +1173,23 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
             break :blk try store.addLowLevelStmt(address.?, .task_hosted_slot, &.{task}, load, origin);
         },
     };
+    var index = restores.items.len;
+    while (index > 0) {
+        index -= 1;
+        head = try store.addDynStmt(restores.items[index].target, .{ .restore = .{ .saved = restores.items[index].saved } }, head, origin);
+    }
+    if (restores.items.len > 0 or (loads and target_dynamic)) head = try store.addDynStmt(null, .frame_alloc, head, origin);
     if (fields.items.len > 0) {
         if (info.capture_layout == .zst) {
             // Every saved value is zero-sized, so there is no capture to read.
-            var index = fields.items.len;
+            index = fields.items.len;
             while (index > 0) {
                 index -= 1;
                 head = try store.addCFStmt(.{ .assign_struct = .{ .target = fields.items[index], .fields = .empty(), .next = head } }, origin);
             }
         } else {
-            const record = try fresh.local(info.capture_layout);
-            var index = fields.items.len;
+            const record = try locals.closed(info.capture_layout);
+            index = fields.items.len;
             while (index > 0) {
                 index -= 1;
                 head = try store.addCFStmt(.{ .assign_ref = .{ .target = fields.items[index], .op = LIR.RefOp.field(record, @intCast(index)), .next = head } }, origin);
@@ -1043,9 +1203,10 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
     spec.args = try store.addLocalSpan(&.{ task, capture, reuse });
     spec.frame_locals = try store.addLocalSpan(frame.items);
     spec.body = .some(head);
+    spec.dyn_result = .of(dyn_result);
     spec.erased_capture_arg = .some(capture);
     spec.erased_reuse_arg = .some(reuse);
-    spec.erased_call_args = .some(try store.internErasedCallArgsPlan(layouts, &.{.opaque_ptr}));
+    if (spec.abi == .erased_callable) spec.erased_call_args = .some(try store.internErasedCallArgsPlan(layouts, &.{.opaque_ptr}));
     spec.shapes = spec.shapes.merged(store.shapes);
 }
 
@@ -1056,7 +1217,7 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
 /// `R` runs no park site of its own because `suspend_return` stays in
 /// Roc-ABI procedures (design.md "Backends"): an erased-ABI procedure stores
 /// its result through `ret` after its body.
-fn buildParkRetry(allocator: Allocator, store: *LirStore, info: SiteInfo, origin: LIR.StmtOrigin) Allocator.Error!ProcId {
+fn buildParkRetry(allocator: Allocator, store: *LirStore, layouts: *layout.Store, proc: ProcId, info: SiteInfo, origin: LIR.StmtOrigin) Allocator.Error!ProcId {
     const entry = info.resume_entry.?;
     const ret_layout = store.getProcSpecImmediate(entry).ret_layout;
     const retry = try store.addProcSpec(.{
@@ -1071,10 +1232,17 @@ fn buildParkRetry(allocator: Allocator, store: *LirStore, info: SiteInfo, origin
     defer frame.deinit(allocator);
     var sink = FrameSink{ .store = store };
     defer sink.locals.deinit(store.allocator);
-    const status = try freshLocal(store, &frame, allocator, store.getLocal(info.target).layout_idx);
-    const value = try freshLocal(store, &frame, allocator, ret_layout);
+    var locals = LiveLocals{ .store = store, .allocator = allocator, .frame = &frame };
+    defer locals.deinit();
+    const status = try locals.closed(store.getLocal(info.target).layout_idx);
     var params = std.ArrayList(LocalId).empty;
     defer params.deinit(allocator);
+    for (info.live_after) |saved| {
+        if (saved == info.target or store.localDyn(saved) != null) continue;
+        try locals.of.put(allocator, saved, try locals.closed(store.getLocal(saved).layout_idx));
+    }
+    const dyn_result = try locals.result(proc);
+    const value = dyn_result orelse try locals.closed(ret_layout);
     var live = try std.ArrayList(LocalId).initCapacity(allocator, info.live_after.len + 1);
     defer live.deinit(allocator);
     var loop_id: ?LocalId = null;
@@ -1082,7 +1250,7 @@ fn buildParkRetry(allocator: Allocator, store: *LirStore, info: SiteInfo, origin
         if (saved == info.target) {
             live.appendAssumeCapacity(status);
         } else {
-            const param = try freshLocal(store, &frame, allocator, store.getLocal(saved).layout_idx);
+            const param = locals.of.get(saved) orelse try locals.dynamic(saved, .param);
             try params.append(allocator, param);
             live.appendAssumeCapacity(param);
             if (saved == info.kind.running_set) loop_id = param;
@@ -1101,7 +1269,7 @@ fn buildParkRetry(allocator: Allocator, store: *LirStore, info: SiteInfo, origin
         .args = try store.addLocalSpan(live.items),
         .next = ret,
     } }, origin);
-    const edge = try pendingEdge(store, info, .{ .task = task, .target = status, .live = live_here, .proc = null, .args = .empty(), .extra = .none }, origin);
+    const edge = try pendingEdge(store, layouts, &sink, info, .{ .task = task, .target = status, .live = live_here, .proc = null, .args = .empty(), .extra = .none }, origin);
     const branch = try parkBranch(store, &sink, task, status, edge, call, origin);
     const id = loop_id orelse invariant("a park site's loop id is not among its saved values", .{});
     const head = try store.addLowLevelStmt(status, .group_next, &.{ id, task }, branch, origin);
@@ -1109,6 +1277,7 @@ fn buildParkRetry(allocator: Allocator, store: *LirStore, info: SiteInfo, origin
 
     std.mem.sort(LocalId, frame.items, {}, localLessThan);
     const spec = store.getProcSpecPtr(retry);
+    spec.dyn_result = .of(dyn_result);
     spec.args = try store.addLocalSpan(params.items);
     spec.frame_locals = try store.addLocalSpan(frame.items);
     spec.body = .some(head);
@@ -1240,6 +1409,8 @@ const ContinuationRewriter = struct {
     layouts: *layout.Store,
     infos: *const collections.DenseMapUnmanaged(CFStmtId, SiteInfo),
     ret_layout: layout.Idx,
+    /// The dynamic result of the procedure being copied.
+    dyn_result: ?LocalId,
     /// The task of the procedure being copied.
     task: LocalId,
     /// The enclosing joins the copied code jumps to, which the continuation
@@ -1262,7 +1433,7 @@ const ContinuationRewriter = struct {
 
     pub fn interceptStmt(self: *ContinuationRewriter, cloner: anytype, old_id: CFStmtId, stmt: LIR.CFStmt, origin: LIR.StmtOrigin) Allocator.Error!body_clone.Intercept {
         switch (stmt) {
-            .assign_call, .assign_call_erased, .assign_low_level => {
+            .assign_call, .assign_call_erased, .assign_low_level, .dyn => {
                 const site_stmt = ContinuationSites.SiteStmt.of(stmt) orelse return .none;
                 const info = self.infos.get(old_id) orelse return .none;
                 const continuation = info.continuation orelse return .none;
@@ -1272,7 +1443,7 @@ const ContinuationRewriter = struct {
                 for (info.live_after) |local| live.appendAssumeCapacity(try cloner.mapLocal(local));
 
                 // Ready: `r = C(f, j)(live..., task); ret r`.
-                const result = try cloner.addTemp(self.ret_layout);
+                const result = if (self.dyn_result) |local| try cloner.mapLocal(local) else try cloner.addTemp(self.ret_layout);
                 const ret = try cloner.store.addCFStmt(.{ .ret = .{ .value = result } }, origin);
                 var args = try std.ArrayList(LocalId).initCapacity(self.allocator, live.items.len + 1);
                 defer args.deinit(self.allocator);
@@ -1308,6 +1479,15 @@ const ContinuationRewriter = struct {
                             .extra = .none,
                             .erased = data,
                         };
+                    },
+                    .dyn => |dyn| .{
+                        .task = task,
+                        .target = try cloner.mapLocal(site_stmt.target()),
+                        .live = live.items,
+                        .proc = null,
+                        .args = .empty(),
+                        .extra = .none,
+                        .dyn = try DynOps.remapOperands(cloner.store, cloner.store.stmtRow(dyn.data), cloner, @TypeOf(cloner.*).mapLocal),
                     },
                     .park => |op| .{
                         .task = task,
@@ -1349,7 +1529,6 @@ const ContinuationRewriter = struct {
             .debug,
             .expect,
             .expect_err,
-            .dyn,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .incref,
@@ -1404,15 +1583,39 @@ fn buildContinuation(
         .layouts = layouts,
         .infos = infos,
         .ret_layout = ret_layout,
+        .dyn_result = store.getProcSpecImmediate(plan.proc).dyn_result.get(),
         .task = plan.task,
         .next_join_point = scopes.next_join_point,
     }, allocator);
     defer cloner.deinit();
     defer cloner.rewriter.deinit();
 
+    // A dynamic live value is a parameter, whose bytes the code may not write
+    // again: unless it is a parameter of `f` too, which nothing in `f` writes,
+    // the copy has its own storage for it, filled before its first statement.
+    const dyn_result = cloner.rewriter.dyn_result;
+    var copies = std.ArrayList(struct { target: LocalId, param: LocalId, desc: LocalId }).empty;
+    defer copies.deinit(allocator);
     var args = try std.ArrayList(LocalId).initCapacity(allocator, site.live_after.len + 1);
     defer args.deinit(allocator);
-    for (site.live_after) |live| args.appendAssumeCapacity(try cloner.mapLocal(live));
+    for (site.live_after) |live| {
+        const info = store.getLocal(live);
+        const dyn = info.dyn orelse {
+            args.appendAssumeCapacity(try cloner.mapLocal(live));
+            continue;
+        };
+        const here = try cloner.mapLocal(live);
+        if (dyn.storage == .param) {
+            args.appendAssumeCapacity(here);
+            continue;
+        }
+        if (live != dyn_result) store.getLocalPtr(here).dyn_storage = .frame;
+        const desc = try cloner.mapLocal(dyn.desc);
+        const param = try store.addLocal(.{ .layout_idx = info.layout_idx, .dyn = .{ .desc = desc, .storage = .param } });
+        try cloner.new_locals.append(allocator, param);
+        args.appendAssumeCapacity(param);
+        try copies.append(allocator, .{ .target = here, .param = param, .desc = desc });
+    }
     args.appendAssumeCapacity(try cloner.mapLocal(plan.task));
 
     var inner = try cloner.cloneStmt(SiteStmt.at(store, site.call).next());
@@ -1458,6 +1661,21 @@ fn buildContinuation(
         } }, store.stmtOrigin(join_stmt));
     }
 
+    const origin = store.stmtOrigin(site.call);
+    var copy_index = copies.items.len;
+    while (copy_index > 0) {
+        copy_index -= 1;
+        const copy = copies.items[copy_index];
+        inner = try store.addDynStmt(copy.target, .{ .copy = .{ .src = copy.param, .desc = copy.desc } }, inner, origin);
+    }
+    for (cloner.new_locals.items) |local| {
+        const dyn = store.localDyn(local) orelse continue;
+        if (dyn.storage != .frame) continue;
+        inner = try store.addDynStmt(null, .frame_alloc, inner, origin);
+        break;
+    }
+    const result_here = if (dyn_result) |local| try cloner.mapLocal(local) else null;
+
     var frame = try std.ArrayList(LocalId).initCapacity(allocator, cloner.new_locals.items.len);
     defer frame.deinit(allocator);
     frame.appendSliceAssumeCapacity(cloner.new_locals.items);
@@ -1468,6 +1686,7 @@ fn buildContinuation(
     }.lessThan);
 
     const spec = store.getProcSpecPtr(continuation);
+    spec.dyn_result = .of(result_here);
     spec.args = try store.addLocalSpan(args.items);
     spec.frame_locals = try store.addLocalSpan(frame.items);
     spec.body = .some(inner);
@@ -1523,12 +1742,11 @@ fn verify(allocator: Allocator, store: *const LirStore) Allocator.Error!void {
             const stmt = SiteStmt.at(store, site.call);
             if (stmt == .call) try calls.append(allocator, .{ .callee = stmt.call.proc, .tail = site.tail });
             if (site.tail) continue;
-            const save_id = pendingSave(store, stmt) orelse invariant("continuation pass left a site that is not a tail site without its pending test", .{});
-            // design.md "Backends": an erased-ABI procedure stores its
-            // result through `ret` after its body, so `suspend_return`
-            // stays in Roc-ABI procedures.
-            if (proc.abi != .roc) invariant("a pending edge in an erased-ABI procedure", .{});
-            const save = store.getCFStmtImmediate(save_id).suspend_save;
+            const edge = pendingEdgeOf(store, stmt) orelse invariant("continuation pass left a site that is not a tail site without its pending test", .{});
+            // design.md "Erased Calls That May Suspend": a specialized
+            // build's erased procedures are shells around Roc-ABI ones.
+            if (proc.abi == .erased_callable) invariant("a pending edge in an erased callable", .{});
+            const save = store.getCFStmtImmediate(edge.save).suspend_save;
             const data = store.stmtRow(save.data);
             continuations.set(@backingInt(try verifyResumeEntry(allocator, store, data)));
 
@@ -1538,7 +1756,7 @@ fn verify(allocator: Allocator, store: *const LirStore) Allocator.Error!void {
             defer expected.deinit(allocator);
             const slot: ?LocalId = switch (stmt) {
                 .call => |call| if (isHosted(store, call.proc)) GuardedList.at(store.getLocalSpan(call.args), 1) else null,
-                .erased, .park => null,
+                .erased, .dyn, .park => null,
             };
             const target = stmt.target();
             for (site.live_after) |live| {
@@ -1547,7 +1765,9 @@ fn verify(allocator: Allocator, store: *const LirStore) Allocator.Error!void {
             }
             var saved = std.ArrayList(LocalId).empty;
             defer saved.deinit(allocator);
-            for (0..GuardedList.borrowLen(store.getLocalSpan(data.saved))) |i| try saved.append(allocator, GuardedList.at(store.getLocalSpan(data.saved), i));
+            for (0..GuardedList.borrowLen(store.getLocalSpan(data.saved))) |i| {
+                try saved.append(allocator, savedValue(store, edge.head, GuardedList.at(store.getLocalSpan(data.saved), i)));
+            }
             std.mem.sort(LocalId, saved.items, {}, localLessThan);
             if (!std.mem.eql(LocalId, expected.items, saved.items)) invariant("a pending edge does not save exactly the values live after its site", .{});
         }
@@ -1557,9 +1777,12 @@ fn verify(allocator: Allocator, store: *const LirStore) Allocator.Error!void {
     }
 }
 
-/// The `suspend_save` that a site's pending test leads to on its cold side,
-/// or null when the site has no pending test.
-fn pendingSave(store: *const LirStore, site: SiteStmt) ?CFStmtId {
+/// A site's pending edge: its first statement, and its `suspend_save`.
+const Edge = struct { head: CFStmtId, save: CFStmtId };
+
+/// The pending edge that a site's pending test leads to on its cold side, or
+/// null when the site has no pending test.
+fn pendingEdgeOf(store: *const LirStore, site: SiteStmt) ?Edge {
     if (site == .park) {
         const op = site.park;
         const next = store.getCFStmtImmediate(op.next).*;
@@ -1568,8 +1791,7 @@ fn pendingSave(store: *const LirStore, site: SiteStmt) ?CFStmtId {
         if (GuardedList.borrowLen(branches) != 1 or GuardedList.at(branches, 0).value != park_pending) return null;
         const pending = store.getCFStmtImmediate(GuardedList.at(branches, 0).body).*;
         if (pending != .assign_low_level or pending.assign_low_level.op != .task_set_pending) return null;
-        if (store.getCFStmtImmediate(pending.assign_low_level.next).* != .suspend_save) return null;
-        return pending.assign_low_level.next;
+        return edgeAt(store, pending.assign_low_level.next);
     }
     const target = site.target();
     const next = store.getCFStmtImmediate(site.next()).*;
@@ -1579,16 +1801,40 @@ fn pendingSave(store: *const LirStore, site: SiteStmt) ?CFStmtId {
         if (branch.cond != target or !branch.default_is_cold) return null;
         const pending = store.getCFStmtImmediate(branch.default_branch).*;
         if (pending != .assign_low_level or pending.assign_low_level.op != .task_set_pending) return null;
-        if (store.getCFStmtImmediate(pending.assign_low_level.next).* != .suspend_save) return null;
-        return pending.assign_low_level.next;
+        return edgeAt(store, pending.assign_low_level.next);
     }
     if (next != .assign_low_level or next.assign_low_level.op != .task_ready) return null;
     const test_stmt = store.getCFStmtImmediate(next.assign_low_level.next).*;
     if (test_stmt != .switch_initialized_payload) return null;
     const pending_test = test_stmt.switch_initialized_payload;
     if (pending_test.cond != next.assign_low_level.target or pending_test.payload != target or !pending_test.uninitialized_is_cold) return null;
-    if (store.getCFStmtImmediate(pending_test.uninitialized_branch).* != .suspend_save) return null;
-    return pending_test.uninitialized_branch;
+    return edgeAt(store, pending_test.uninitialized_branch);
+}
+
+/// The edge at `head`: the dynamic values' saves, then the `suspend_save`.
+fn edgeAt(store: *const LirStore, head: CFStmtId) ?Edge {
+    var at = head;
+    while (true) {
+        const stmt = store.getCFStmtImmediate(at).*;
+        if (stmt == .suspend_save) return .{ .head = head, .save = at };
+        if (stmt != .dyn) return null;
+        const op = store.stmtRow(stmt.dyn.data);
+        if (op != .save and op != .result_need) return null;
+        at = stmt.dyn.next;
+    }
+}
+
+/// The live value a `suspend_save` operand holds: what an edge's `save` made it
+/// from, or the operand itself.
+fn savedValue(store: *const LirStore, head: CFStmtId, operand: LocalId) LocalId {
+    var at = head;
+    while (true) {
+        const stmt = store.getCFStmtImmediate(at).*;
+        if (stmt != .dyn) return operand;
+        const op = store.stmtRow(stmt.dyn.data);
+        if (op == .save and stmt.dyn.target == operand) return op.save.value;
+        at = stmt.dyn.next;
+    }
 }
 
 /// Check that the resume entry `data` names reads its captures as fields in
@@ -1598,7 +1844,7 @@ fn pendingSave(store: *const LirStore, site: SiteStmt) ?CFStmtId {
 /// park site is checked as one.
 fn verifyResumeEntry(allocator: Allocator, store: *const LirStore, data: LIR.SuspendSaveData) Allocator.Error!ProcId {
     const entry = store.getProcSpecImmediate(data.proc);
-    if (entry.abi != .erased_callable) invariant("a pending edge saves a procedure that is not an erased callable", .{});
+    if (entry.abi == .roc) invariant("a pending edge saves a procedure that is not erased", .{});
     if (entry.task_record != .resume_entry) invariant("a pending edge saves a procedure that is not a resume entry", .{});
     const entry_args = store.getLocalSpan(entry.args);
     if (GuardedList.borrowLen(entry_args) != 3) invariant("a resume entry does not take the task, its capture and its reuse input", .{});
@@ -1628,6 +1874,19 @@ fn verifyResumeEntry(allocator: Allocator, store: *const LirStore, data: LIR.Sus
                 at = zero_sized.next;
             },
             .assign_call => |found| break found,
+            .dyn => |dyn| {
+                const op = store.stmtRow(dyn.data);
+                if (op == .restore) {
+                    const index = std.mem.findScalar(LocalId, fields.items, op.restore.saved) orelse
+                        invariant("a resume entry restores a value that is not a capture", .{});
+                    fields.items[index] = dyn.target.?;
+                } else if (op == .take) {
+                    result = dyn.target.?;
+                } else if (op != .frame_alloc) {
+                    invariant("a resume entry's dynamic statement is not one the continuation pass makes", .{});
+                }
+                at = dyn.next;
+            },
             .init_uninitialized,
             .assign_literal,
             .assign_call_erased,
@@ -1640,7 +1899,6 @@ fn verifyResumeEntry(allocator: Allocator, store: *const LirStore, data: LIR.Sus
             .debug,
             .expect,
             .expect_err,
-            .dyn,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .incref,
@@ -2166,6 +2424,128 @@ test "an erased callable whose class may suspend becomes a shell around its body
     defer testing.allocator.free(tail_args);
     try testing.expectEqual(@as(usize, 2), tail_args.len);
     try testing.expect(f.at(f.at(tail_site).assign_call_erased.next) == .ret);
+}
+
+test "a Boxy erased procedure reads its task, tests the pending flag after its erased site and keeps its arguments" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    f.store.runtime_contract = .boxy;
+    const capture = try f.store.addLocal(.{ .layout_idx = .opaque_ptr });
+    const x = try f.local();
+    const closure = try f.store.addLocal(.{ .layout_idx = try f.layouts.insertErasedCallable() });
+    const t = try f.local();
+    const s = try f.local();
+    // E(x, closure) = t = closure(); s = {t, x}; ret s
+    const ret = try f.stmt(.{ .ret = .{ .value = s } });
+    const build = try f.stmt(.{ .assign_struct = .{ .target = s, .fields = try f.store.addLocalSpan(&.{ t, x }), .next = ret } });
+    const site = try f.store.addDynStmt(t, .{ .call_erased = .{ .closure = closure, .args = null, .suspension_site = true } }, build, .test_fixture);
+    const e = try f.addProc(&.{ x, closure, capture }, &.{ x, closure, capture, t, s }, site);
+    f.store.getProcSpecPtr(e).abi = .erased_record;
+    f.store.getProcSpecPtr(e).erased_capture_arg = .some(capture);
+    // Effect free: g() = t = h(); ret t, where h suspends, and pure(x) = ret x.
+    const h_site = try f.local();
+    const h_ret = try f.stmt(.{ .ret = .{ .value = h_site } });
+    const h = try f.addProc(&.{}, &.{h_site}, try f.callSeed(h_site, h_ret));
+    const g_value = try f.local();
+    const g_ret = try f.stmt(.{ .ret = .{ .value = g_value } });
+    const g_call = try f.stmt(.{ .assign_call = .{ .target = g_value, .proc = h, .args = .empty(), .next = g_ret } });
+    const g = try f.addProc(&.{}, &.{g_value}, g_call);
+    f.store.getProcSpecPtr(g).effect_free = true;
+
+    try run(testing.allocator, &f.store, &f.layouts, .none);
+
+    // task = task_current(); t = closure(); switch task_ready(task)
+    try testing.expectEqual(@as(usize, 3), f.store.getLocalSpan(f.spec(e).args).len);
+    const read = f.at(f.spec(e).body.get().?).assign_low_level;
+    try testing.expectEqual(LIR.LowLevel.task_current, read.op);
+    const call = f.at(read.next).dyn;
+    try testing.expectEqual(closure, f.store.stmtRow(call.data).call_erased.closure);
+    const flag = f.at(call.next).assign_low_level;
+    try testing.expectEqual(LIR.LowLevel.task_ready, flag.op);
+    const flag_args = try f.locals(flag.args);
+    defer testing.allocator.free(flag_args);
+    try testing.expectEqualSlices(LocalId, &.{read.target}, flag_args);
+    const branch = f.at(flag.next).switch_initialized_payload;
+    const save = f.at(branch.uninitialized_branch).suspend_save;
+    try testing.expectEqual(read.target, save.task);
+    const saved = try f.locals(f.store.stmtRow(save.data).saved);
+    defer testing.allocator.free(saved);
+    try testing.expectEqualSlices(LocalId, &.{x}, saved);
+
+    // The effect-free procedure never suspends, and passes the running task.
+    try testing.expectEqual(LIR.Suspends.never, f.spec(g).suspends);
+    try testing.expectEqual(@as(usize, 0), f.store.getLocalSpan(f.spec(g).args).len);
+    const g_read = f.at(f.spec(g).body.get().?).assign_low_level;
+    try testing.expectEqual(LIR.LowLevel.task_current, g_read.op);
+    const passed = f.at(g_read.next).assign_call;
+    const passed_args = try f.locals(passed.args);
+    defer testing.allocator.free(passed_args);
+    try testing.expectEqualSlices(LocalId, &.{g_read.target}, passed_args);
+    try testing.expectEqual(g_ret, passed.next);
+}
+
+test "a dynamic live value is saved and restored through its descriptor, and a dynamic result makes room for itself" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    f.store.runtime_contract = .boxy;
+    const desc = try f.store.addLocal(.{ .layout_idx = .opaque_ptr });
+    const value = try f.store.addLocal(.{ .layout_idx = .opaque_ptr, .dyn = .{ .desc = desc, .storage = .param } });
+    const result = try f.store.addLocal(.{ .layout_idx = .opaque_ptr, .dyn = .{ .desc = desc, .storage = .result } });
+    const t = try f.local();
+    // f(desc, value) = t = seed(); result = copy(value); ret result
+    const ret = try f.stmt(.{ .ret = .{ .value = result } });
+    const copy = try f.store.addDynStmt(result, .{ .copy = .{ .src = value, .desc = desc } }, ret, .test_fixture);
+    const p = try f.addProc(&.{ desc, value }, &.{ desc, value, result, t }, try f.callSeed(t, copy));
+    f.store.getProcSpecPtr(p).ret_layout = .opaque_ptr;
+    f.store.getProcSpecPtr(p).dyn_result = .some(result);
+    const count = f.store.procSpecCount();
+
+    try run(testing.allocator, &f.store, &f.layouts, .none);
+
+    const call = f.at(f.spec(p).body.get().?).assign_call;
+    const flag = f.at(call.next).assign_low_level;
+    const branch = f.at(flag.next).switch_initialized_payload;
+    // result_need(task, desc); v' = save(value, desc); suspend_save [desc, v']
+    const need = f.at(branch.uninitialized_branch).dyn;
+    try testing.expectEqual(desc, f.store.stmtRow(need.data).result_need.desc);
+    const saving = f.at(need.next).dyn;
+    try testing.expectEqual(value, f.store.stmtRow(saving.data).save.value);
+    try testing.expectEqual(desc, f.store.stmtRow(saving.data).save.desc);
+    const save = f.at(saving.next).suspend_save;
+    const saved = try f.locals(f.store.stmtRow(save.data).saved);
+    defer testing.allocator.free(saved);
+    try testing.expectEqualSlices(LocalId, &.{ desc, saving.target.? }, saved);
+
+    // R: load the capture, frame_alloc, restore, then call C, whose result
+    // goes where R's own does.
+    const r: ProcId = @fromBackingInt(@intCast(count + 1));
+    try testing.expectEqual(LIR.ProcAbi.erased_record, f.spec(r).abi);
+    const r_result = f.spec(r).dyn_result.get().?;
+    try testing.expectEqual(LIR.DynStorage.result, f.store.localDyn(r_result).?.storage);
+    var restored: ?LocalId = null;
+    var allocated = false;
+    var at = f.spec(r).body.get().?;
+    const made = while (true) {
+        const stmt = f.at(at);
+        if (stmt == .assign_call) break stmt.assign_call;
+        if (stmt == .dyn) {
+            const op = f.store.stmtRow(stmt.dyn.data);
+            if (op == .frame_alloc) allocated = true;
+            if (op == .restore) {
+                try testing.expect(allocated);
+                restored = stmt.dyn.target;
+            }
+            at = stmt.dyn.next;
+        } else if (stmt == .assign_ref) {
+            at = stmt.assign_ref.next;
+        } else {
+            at = stmt.assign_low_level.next;
+        }
+    };
+    try testing.expectEqual(r_result, made.target);
+    const made_args = try f.locals(made.args);
+    defer testing.allocator.free(made_args);
+    try testing.expect(std.mem.findScalar(LocalId, made_args, restored.?) != null);
 }
 
 test "a hosted site reads the slot's address, branches on the poll, and the hosted procedure takes the host's shape" {

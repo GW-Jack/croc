@@ -310,6 +310,7 @@ pub fn remapOperands(store: *LirStore, op: DynOp, context: anytype, comptime map
             .result_reuse = call.result_reuse,
             .deferred = call.deferred,
             .drive = call.drive,
+            .suspension_site = call.suspension_site,
         } },
         .closure => |closure| .{ .closure = .{ .proc = closure.proc, .capture = try Remap.one(context, closure.capture), .reuse = try Remap.opt(context, closure.reuse), .reuse_unique = closure.reuse_unique, .frame = try Remap.opt(context, closure.frame) } },
         .view => |view| .{ .view = .{ .address = try Remap.one(context, view.address), .owner = try Remap.opt(context, view.owner) } },

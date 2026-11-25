@@ -7115,7 +7115,10 @@ const Certifier = struct {
                     if (self.isRc(args)) try self.consumeUnit(state, state.valueOf(args), args);
                 }
                 const defined = target.?;
-                if (self.isRc(defined)) _ = try self.bindFresh(state, defined, 1, &.{});
+                if (self.isRc(defined)) {
+                    const value = try self.bindFresh(state, defined, 1, &.{});
+                    if (call.suspension_site) self.values.items[value].suspension_result = true;
+                }
             },
         }
     }

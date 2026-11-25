@@ -8602,9 +8602,8 @@ fn generateCFStmtNode(self: *Self, work: *std.ArrayList(StmtWork), wa: Allocator
         // the epilogue still restores the stack and releases the carry.
         .suspend_return => {
             if (builtin.mode == .debug) {
-                const abi = self.store.getProcSpec(self.current_proc_id.?).abi;
-                if (abi == .erased_callable or abi == .erased_record) {
-                    base.invariant("WasmCodeGen invariant violated: suspend_return in an erased-ABI procedure, which stores its result after its body", .{});
+                if (self.store.getProcSpec(self.current_proc_id.?).abi == .erased_callable) {
+                    base.invariant("WasmCodeGen invariant violated: suspend_return in an erased callable", .{});
                 }
             }
             if (self.currentDynResult() == null) {

@@ -35767,10 +35767,11 @@ byte:
   - `suspend_return` in a procedure with a value result returns zero, not
     an unset local. A caller copies a returned aggregate out of the address
     it gets back before it tests `task_ready`, and an unset address could
-    lie outside memory. The pass puts `suspend_return` only in Roc-ABI
-    procedures: a record reaches its continuation, and the start record its
-    root, at a tail site, and an erased-ABI procedure stores its result
-    through `ret` after its body.
+    lie outside memory. The pass puts no `suspend_return` in an
+    `erased_callable` procedure, which stores its result through `ret` after
+    its body: a record reaches its continuation, and the start record its
+    root, at a tail site. One in an `erased_record` procedure, which Boxy's
+    function values have, writes no result either.
 
   A final wasm module exports the merged builtins' `roc_task_free` and
   `roc_task_crash_message` by those names, and the program task calls

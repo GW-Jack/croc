@@ -1706,6 +1706,10 @@ pub const DynOp = union(enum) {
         /// Set by the tail-drive pass: where calls pending after this
         /// statement are run.
         drive: PendingDrive = .none,
+        /// Set by lowering on a call that may suspend, by its checked type
+        /// and its caller's: a suspension site (design.md "Boxy Procedures
+        /// That May Suspend").
+        suspension_site: bool = false,
     },
     /// An erased callable of `proc` (an `erased_record` procedure) whose
     /// capture is the dynamic record `capture`, consumed. The record's first
@@ -2229,6 +2233,12 @@ pub const LirProcSpec = struct {
     /// calls of one class may suspend, or none may (design.md "Erased Calls
     /// That May Suspend").
     erased_class: ErasedClass = .none,
+    /// Set by Boxy lowering on a procedure whose checked function is pure, in
+    /// a program of a platform with tasks: it runs to completion, so nothing
+    /// in it is a suspension site and it passes a procedure that may suspend
+    /// whichever task is running (design.md "Boxy Procedures That May
+    /// Suspend").
+    effect_free: bool = false,
     /// Set by Monotype's LIR construction on every specialization of a
     /// running-set helper, and kept by every copy of the procedure. Boxy
     /// sets none (design.md "Plans And Concurrent Loops", "Helper marks.").

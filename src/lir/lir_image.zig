@@ -135,7 +135,9 @@ pub const MAGIC: u32 = 0x52494c52; // "RLIR" in little-endian bytes.
 ///      (`suspension_site`).
 /// v98: the operations include `task_current`, `save`, `restore`, `take` and
 ///      `result_need`.
-pub const FORMAT_VERSION: u32 = 98;
+/// v99: procedure specs record `effect_free`, and dynamic erased calls mark
+///      suspension sites.
+pub const FORMAT_VERSION: u32 = 99;
 const StaticDataImage = @import("lir_image_static_data.zig").Schema(@This());
 
 /// Public `ImageError` declaration.

@@ -16,7 +16,11 @@
 //! resume goes straight on to the code after it ("Shared State").
 //!
 //! A classed erased call that its `ErasedCallData` marks a site is one too
-//! (design.md "Erased Calls That May Suspend").
+//! (design.md "Erased Calls That May Suspend"), and so is a dynamic erased call
+//! that lowering marks one ("Boxy Procedures That May Suspend").
+//!
+//! Every mention of a dynamic local reads the locals that say what its bytes
+//! are: its descriptor, and its product's field descriptors.
 //!
 //! A tail site is a call to a procedure (never a hosted one) or an erased
 //! call whose result the procedure returns unchanged: the next statements only copy it into
@@ -39,21 +43,24 @@ const LocalId = LIR.LocalId;
 /// One suspension site and what the continuation pass needs about it.
 pub const Site = struct {
     /// The `assign_call` statement whose `CallExtra` marks it a site, the
-    /// `assign_call_erased` whose `ErasedCallData` does, or a park site's
-    /// `group_next` or `cell_wait`.
+    /// `assign_call_erased` whose `ErasedCallData` or `dyn` whose `call_erased`
+    /// does, or a park site's `group_next` or `cell_wait`.
     call: CFStmtId,
     park: bool,
     tail: bool,
     /// The values live after the call, the call's target included when the
-    /// code after it reads it, in ascending local order.
+    /// code after it reads it, in ascending local order. At a site that is not
+    /// a tail site the descriptors of a dynamic target and of the procedure's
+    /// dynamic result are among them.
     live_after: []const LocalId,
 };
 
-/// A site's statement: a call, an erased call, or a park site's `group_next`
-/// or `cell_wait`.
+/// A site's statement: a call, an erased call, a dynamic erased call, or a
+/// park site's `group_next` or `cell_wait`.
 pub const SiteStmt = union(enum) {
     call: @FieldType(LIR.CFStmt, "assign_call"),
     erased: @FieldType(LIR.CFStmt, "assign_call_erased"),
+    dyn: @FieldType(LIR.CFStmt, "dyn"),
     park: @FieldType(LIR.CFStmt, "assign_low_level"),
 
     /// `stmt` as a site's statement, or null when it can't be one. A call
@@ -62,6 +69,7 @@ pub const SiteStmt = union(enum) {
         return switch (stmt) {
             .assign_call => |call| .{ .call = call },
             .assign_call_erased => |call| .{ .erased = call },
+            .dyn => |dyn| .{ .dyn = dyn },
             .assign_low_level => |op| if (op.op == .group_next or op.op == .cell_wait) .{ .park = op } else null,
             .init_uninitialized,
             .assign_ref,
@@ -76,7 +84,6 @@ pub const SiteStmt = union(enum) {
             .debug,
             .expect,
             .expect_err,
-            .dyn,
             .runtime_error,
             .comptime_exhaustiveness_failed,
             .incref,
@@ -108,6 +115,10 @@ pub const SiteStmt = union(enum) {
         return switch (self) {
             .call => |call| store.stmtRowOrDefault(call.extra).suspension_site,
             .erased => |call| store.stmtRow(call.data).suspension_site,
+            .dyn => |dyn| switch (store.stmtRow(dyn.data)) {
+                .call_erased => |call| call.suspension_site,
+                .frame_alloc, .table_entry, .copy, .field_addr, .list_item_addr, .box_payload_addr, .tag_discriminant, .tag_payload_addr, .record, .record_update, .tag, .list, .box, .slot_alloc, .slot_store, .cell_exchange, .eq, .hash, .inspect, .closure, .view, .adapt, .save, .restore, .take, .result_need => false,
+            },
             .park => true,
         };
     }
@@ -116,6 +127,7 @@ pub const SiteStmt = union(enum) {
         return switch (self) {
             .call => |call| call.target,
             .erased => |call| call.target,
+            .dyn => |dyn| dyn.target orelse invariant("a dynamic erased call has no target", .{}),
             .park => |op| op.target,
         };
     }
@@ -124,6 +136,7 @@ pub const SiteStmt = union(enum) {
         return switch (self) {
             .call => |call| call.next,
             .erased => |call| call.next,
+            .dyn => |dyn| dyn.next,
             .park => |op| op.next,
         };
     }
@@ -173,32 +186,45 @@ pub fn analyze(allocator: Allocator, store: *const LirStore, proc_id: LIR.LirPro
         const stmt = SiteStmt.at(store, call_id);
         const next_node = builder.node_of.get(stmt.next()) orelse invariant("a suspension site's successor was not walked", .{});
         const row = &rows[next_node];
-        // A park site's loop id, when the code after it doesn't keep it live.
+        const tail = switch (stmt) {
+            .call => |call| store.getProcSpecImmediate(call.proc).hosted.get() == null and
+                try returnsUnchanged(allocator, store, &builder.join_of, call.target, call.next),
+            .erased, .dyn => try returnsUnchanged(allocator, store, &builder.join_of, stmt.target(), stmt.next()),
+            .park => false,
+        };
+        var live = std.ArrayList(LocalId).empty;
+        var it = row.iterator();
+        while (it.next()) |bit| try live.append(out, builder.locals.items[bit]);
+        // What a resume reads even when the code after the site doesn't: a
+        // park site's loop id, and the descriptors of the results it moves.
         const loop_id: ?LocalId = switch (stmt) {
-            .call, .erased => null,
+            .call, .erased, .dyn => null,
             .park => |op| if (op.op == .group_next) LirStore.GuardedList.at(store.getLocalSpan(op.args), 0) else null,
         };
-        const id_live = if (loop_id) |local| if (builder.bit_of.get(local)) |bit| row.isSet(bit) else false else true;
-        const live = try out.alloc(LocalId, row.count() + @intFromBool(!id_live));
-        var it = row.iterator();
-        var i: usize = 0;
-        while (it.next()) |bit| : (i += 1) live[i] = builder.locals.items[bit];
-        if (!id_live) live[i] = loop_id.?;
-        std.mem.sort(LocalId, live, {}, localLessThan);
+        const target_desc = if (tail) null else if (store.localDyn(stmt.target())) |dyn| dyn.desc else null;
+        const result_desc = if (tail) null else resultDesc(store, proc_id);
+        for ([_]?LocalId{ loop_id, target_desc, result_desc }) |extra| {
+            const local = extra orelse continue;
+            if (std.mem.findScalar(LocalId, live.items, local) == null) try live.append(out, local);
+        }
+        std.mem.sort(LocalId, live.items, {}, localLessThan);
         site.* = .{
             .call = call_id,
             .park = stmt == .park,
-            .tail = switch (stmt) {
-                .call => |call| store.getProcSpecImmediate(call.proc).hosted.get() == null and
-                    try returnsUnchanged(allocator, store, &builder.join_of, call.target, call.next),
-                .erased => |call| try returnsUnchanged(allocator, store, &builder.join_of, call.target, call.next),
-                .park => false,
-            },
-            .live_after = live,
+            .tail = tail,
+            .live_after = live.items,
         };
     }
     result.sites = sites;
     return result;
+}
+
+/// The descriptor of a procedure's dynamic result, or null when its result is
+/// closed.
+pub fn resultDesc(store: *const LirStore, proc_id: LIR.LirProcSpecId) ?LocalId {
+    const result = store.getProcSpecImmediate(proc_id).dyn_result.get() orelse return null;
+    const dyn = store.localDyn(result) orelse invariant("a dynamic result is not a dynamic local", .{});
+    return dyn.desc;
 }
 
 fn localLessThan(_: void, lhs: LocalId, rhs: LocalId) bool {
@@ -327,23 +353,32 @@ const Builder = struct {
         return slot.value_ptr.*;
     }
 
-    const Note = struct { builder: *Builder, list: *std.ArrayList(u32) };
+    /// The inventory a mention goes to, and the reads of its statement.
+    const Note = struct { builder: *Builder, list: *std.ArrayList(u32), reads: *std.ArrayList(u32) };
 
     fn note(ctx: Note, local: LocalId) void {
         if (ctx.builder.failed != null) return;
-        const bit = ctx.builder.bitFor(local) catch |err| {
-            ctx.builder.failed = err;
-            return;
-        };
-        ctx.list.append(ctx.builder.allocator, bit) catch |err| {
+        ctx.builder.mention(ctx.list, ctx.reads, local) catch |err| {
             ctx.builder.failed = err;
         };
+    }
+
+    fn mention(self: *Builder, list: *std.ArrayList(u32), reads: *std.ArrayList(u32), local: LocalId) Allocator.Error!void {
+        try list.append(self.allocator, try self.bitFor(local));
+        const info = self.store.getLocal(local);
+        const dyn = info.dyn orelse return;
+        try reads.append(self.allocator, try self.bitFor(dyn.desc));
+        if (info.product == .none) return;
+        const descriptors = self.store.getLocalSpan(self.store.stmtRow(info.product).descriptors);
+        for (0..LirStore.GuardedList.borrowLen(descriptors)) |i| {
+            try reads.append(self.allocator, try self.bitFor(LirStore.GuardedList.at(descriptors, i)));
+        }
     }
 
     fn noteSpan(self: *Builder, list: *std.ArrayList(u32), span: LIR.LocalSpan) Allocator.Error!void {
         const locals = self.store.getLocalSpan(span);
         for (0..LirStore.GuardedList.borrowLen(locals)) |i| {
-            try list.append(self.allocator, try self.bitFor(LirStore.GuardedList.at(locals, i)));
+            try self.mention(list, list, LirStore.GuardedList.at(locals, i));
         }
     }
 
@@ -404,8 +439,8 @@ const Builder = struct {
                 .crash,
                 => {
                     try body_clone.appendSuccessors(self.store, &successors, stmt_id, self.allocator);
-                    body_clone.forEachStmtRead(self.store, stmt, Note{ .builder = self, .list = &self.reads.items[node] }, note);
-                    body_clone.forEachStmtDef(self.store, stmt, Note{ .builder = self, .list = &self.defs.items[node] }, note);
+                    body_clone.forEachStmtRead(self.store, stmt, Note{ .builder = self, .list = &self.reads.items[node], .reads = &self.reads.items[node] }, note);
+                    body_clone.forEachStmtDef(self.store, stmt, Note{ .builder = self, .list = &self.defs.items[node], .reads = &self.reads.items[node] }, note);
                     if (self.failed) |err| return err;
                 },
             }
