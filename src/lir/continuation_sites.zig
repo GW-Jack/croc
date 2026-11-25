@@ -15,8 +15,11 @@
 //! reads it. A `cell_wait` is the other park site: it always parks, and its
 //! resume goes straight on to the code after it ("Shared State").
 //!
-//! A tail site is a call to a procedure (never a hosted one) whose result
-//! the procedure returns unchanged: the next statements only copy it into
+//! A classed erased call that its `ErasedCallData` marks a site is one too
+//! (design.md "Erased Calls That May Suspend").
+//!
+//! A tail site is a call to a procedure (never a hosted one) or an erased
+//! call whose result the procedure returns unchanged: the next statements only copy it into
 //! join parameters with `set_local` and jump, until a `ret` returns a local
 //! that still holds it.
 
@@ -35,8 +38,9 @@ const LocalId = LIR.LocalId;
 
 /// One suspension site and what the continuation pass needs about it.
 pub const Site = struct {
-    /// The `assign_call` statement whose `CallExtra` marks it a site, or a
-    /// park site's `group_next` or `cell_wait`.
+    /// The `assign_call` statement whose `CallExtra` marks it a site, the
+    /// `assign_call_erased` whose `ErasedCallData` does, or a park site's
+    /// `group_next` or `cell_wait`.
     call: CFStmtId,
     park: bool,
     tail: bool,
@@ -45,22 +49,23 @@ pub const Site = struct {
     live_after: []const LocalId,
 };
 
-/// A site's statement: a call, or a park site's `group_next` or
-/// `cell_wait`.
+/// A site's statement: a call, an erased call, or a park site's `group_next`
+/// or `cell_wait`.
 pub const SiteStmt = union(enum) {
     call: @FieldType(LIR.CFStmt, "assign_call"),
+    erased: @FieldType(LIR.CFStmt, "assign_call_erased"),
     park: @FieldType(LIR.CFStmt, "assign_low_level"),
 
     /// `stmt` as a site's statement, or null when it can't be one. A call
-    /// is a site only when its `CallExtra` says so, which callers check.
+    /// is a site only when `isMarked` says so, which callers check.
     pub fn of(stmt: LIR.CFStmt) ?SiteStmt {
         return switch (stmt) {
             .assign_call => |call| .{ .call = call },
+            .assign_call_erased => |call| .{ .erased = call },
             .assign_low_level => |op| if (op.op == .group_next or op.op == .cell_wait) .{ .park = op } else null,
             .init_uninitialized,
             .assign_ref,
             .assign_literal,
-            .assign_call_erased,
             .assign_packed_erased_fn,
             .assign_list,
             .assign_struct,
@@ -97,9 +102,20 @@ pub const SiteStmt = union(enum) {
         return of(store.getCFStmtImmediate(id).*) orelse invariant("a suspension site is neither a call nor a park site", .{});
     }
 
+    /// Whether the statement's mark says it is a site. A `group_next` is one
+    /// by being there.
+    pub fn isMarked(self: SiteStmt, store: *const LirStore) bool {
+        return switch (self) {
+            .call => |call| store.stmtRowOrDefault(call.extra).suspension_site,
+            .erased => |call| store.stmtRow(call.data).suspension_site,
+            .park => true,
+        };
+    }
+
     pub fn target(self: SiteStmt) LocalId {
         return switch (self) {
             .call => |call| call.target,
+            .erased => |call| call.target,
             .park => |op| op.target,
         };
     }
@@ -107,6 +123,7 @@ pub const SiteStmt = union(enum) {
     pub fn next(self: SiteStmt) CFStmtId {
         return switch (self) {
             .call => |call| call.next,
+            .erased => |call| call.next,
             .park => |op| op.next,
         };
     }
@@ -138,10 +155,8 @@ pub fn analyze(allocator: Allocator, store: *const LirStore, proc_id: LIR.LirPro
     var site_nodes = std.ArrayList(u32).empty;
     defer site_nodes.deinit(allocator);
     for (builder.stmts.items, 0..) |stmt_id, node| {
-        switch (SiteStmt.of(store.getCFStmtImmediate(stmt_id).*) orelse continue) {
-            .call => |call| if (!store.stmtRowOrDefault(call.extra).suspension_site) continue,
-            .park => {},
-        }
+        const stmt = SiteStmt.of(store.getCFStmtImmediate(stmt_id).*) orelse continue;
+        if (!stmt.isMarked(store)) continue;
         try site_nodes.append(allocator, @intCast(node));
     }
     if (site_nodes.items.len == 0) return result;
@@ -160,7 +175,7 @@ pub fn analyze(allocator: Allocator, store: *const LirStore, proc_id: LIR.LirPro
         const row = &rows[next_node];
         // A park site's loop id, when the code after it doesn't keep it live.
         const loop_id: ?LocalId = switch (stmt) {
-            .call => null,
+            .call, .erased => null,
             .park => |op| if (op.op == .group_next) LirStore.GuardedList.at(store.getLocalSpan(op.args), 0) else null,
         };
         const id_live = if (loop_id) |local| if (builder.bit_of.get(local)) |bit| row.isSet(bit) else false else true;
@@ -174,7 +189,9 @@ pub fn analyze(allocator: Allocator, store: *const LirStore, proc_id: LIR.LirPro
             .call = call_id,
             .park = stmt == .park,
             .tail = switch (stmt) {
-                .call => |call| try isTailSite(allocator, store, &builder.join_of, call),
+                .call => |call| store.getProcSpecImmediate(call.proc).hosted.get() == null and
+                    try returnsUnchanged(allocator, store, &builder.join_of, call.target, call.next),
+                .erased => |call| try returnsUnchanged(allocator, store, &builder.join_of, call.target, call.next),
                 .park => false,
             },
             .live_after = live,
@@ -188,20 +205,21 @@ fn localLessThan(_: void, lhs: LocalId, rhs: LocalId) bool {
     return @backingInt(lhs) < @backingInt(rhs);
 }
 
-fn isTailSite(
+/// Whether the code from `next` returns `target` as it is.
+fn returnsUnchanged(
     allocator: Allocator,
     store: *const LirStore,
     join_of: *const collections.DenseMapUnmanaged(LIR.JoinPointId, CFStmtId),
-    call: @FieldType(LIR.CFStmt, "assign_call"),
+    target: LocalId,
+    next: CFStmtId,
 ) Allocator.Error!bool {
-    if (store.getProcSpecImmediate(call.proc).hosted.get() != null) return false;
     // The locals that hold the call's result on the path being followed.
     var holders = collections.DenseMapUnmanaged(LocalId, void).empty;
     defer holders.deinit(allocator);
-    try holders.put(allocator, call.target, {});
+    try holders.put(allocator, target, {});
     var entered = collections.DenseMapUnmanaged(LIR.JoinPointId, void).empty;
     defer entered.deinit(allocator);
-    var at = call.next;
+    var at = next;
     while (true) {
         switch (store.getCFStmtImmediate(at).*) {
             .ret => |ret| return holders.contains(ret.value),

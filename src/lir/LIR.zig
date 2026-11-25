@@ -1045,6 +1045,17 @@ pub const ErasedCallableOnDrop = union(enum) {
     }
 };
 
+/// Identifies one erased callable type among a program's: the calls through a
+/// value of the type and every procedure the program may put in one carry the
+/// same class. LIR construction names a class by the digest of the type and
+/// its members, so equal classes name equal sets of procedures. `none` is a
+/// call or procedure that belongs to no class, which never suspends through
+/// one (design.md "Erased Calls That May Suspend").
+pub const ErasedClass = enum(u64) {
+    none = 0,
+    _,
+};
+
 /// Concrete callable ABI used to enter a LIR procedure.
 pub const ProcAbi = enum {
     roc,
@@ -1492,6 +1503,12 @@ pub const ErasedCallData = struct {
     /// Set by the tail-drive pass: where calls pending after this
     /// statement are run.
     drive: PendingDrive = .none,
+    /// The erased callable type the call calls through, when the program's
+    /// platform has tasks (design.md "Erased Calls That May Suspend").
+    erased_class: ErasedClass = .none,
+    /// Set by `SuspensionMarks` on a call that may reach a procedure that
+    /// may suspend: a suspension site (design.md "Suspendability").
+    suspension_site: bool = false,
 };
 
 /// The fields of `CFStmt.suspend_save` other than its task and successor,
@@ -2188,6 +2205,11 @@ pub const LirProcSpec = struct {
     /// body's producer commits it. `SuspensionMarks` computes it for every
     /// procedure with a body.
     suspends: Suspends = .never,
+    /// On an erased-callable procedure lowered for a platform with tasks: the
+    /// erased callable type whose calls may enter it. All the procedures and
+    /// calls of one class may suspend, or none may (design.md "Erased Calls
+    /// That May Suspend").
+    erased_class: ErasedClass = .none,
     /// Set by Monotype's LIR construction on every specialization of a
     /// running-set helper, and kept by every copy of the procedure. Boxy
     /// sets none (design.md "Plans And Concurrent Loops", "Helper marks.").
@@ -2255,7 +2277,7 @@ pub const LirProcSpec = struct {
     capture_reuse_fn_params: u64 = 0,
 
     comptime {
-        std.debug.assert(@sizeOf(LirProcSpec) == 264);
+        std.debug.assert(@sizeOf(LirProcSpec) == 272);
     }
 
     /// The body ARC analyzes and places reference counts in. A static

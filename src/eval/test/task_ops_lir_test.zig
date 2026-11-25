@@ -331,6 +331,139 @@ pub fn pausingNestedProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
     return roots[0];
 }
 
+/// An erased callable of class 1, `(y) => body` of a `List(U64)`, with the hidden arguments
+/// `capture` and `reuse`.
+fn erasedMember(f: *Fixture, y: LocalId, capture: LocalId, reuse: LocalId, frame: []const LocalId, body: CFStmtId) TaskOpsTestError!LIR.LirProcSpecId {
+    return try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = try f.store.addLocalSpan(&.{ y, capture, reuse }),
+        .frame_locals = try f.store.addLocalSpan(frame),
+        .body = .some(body),
+        .ret_layout = try f.layouts.insertList(.u64),
+        .abi = .erased_callable,
+        .erased_class = @fromBackingInt(1),
+        .erased_capture_arg = .some(capture),
+        .erased_reuse_arg = .some(reuse),
+        .erased_call_args = .some(try f.store.internErasedCallArgsPlan(&f.layouts, &.{.u64})),
+    }, .none);
+}
+
+/// A program whose task pauses inside a procedure it calls through an erased
+/// callable, after the continuation pass: the provides root
+/// `g(x) = e = <E, {[x, x]}>; n = <N>; a = n(x); t = e(a[0]); ret t[0] + x`
+/// over `E(y){list} = s = h(y); ret [s + len(list)]` and `N(y) = [y]`, with
+/// `h` the suspending hosted call of a `U64` result. `E` and `N` are of one
+/// erased class, so `N` takes the task too. A paused call's result is a list
+/// nobody may read. Returns the task entry that takes `g`'s place among the
+/// roots.
+pub fn pausingErasedProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
+    const allocator = f.allocator;
+    const erased = try f.layouts.insertErasedCallable();
+    const list_u64 = try f.layouts.insertList(.u64);
+    const record_layout = try f.layouts.putStructFields(&.{.{ .index = 0, .layout = list_u64 }});
+    const h_arg = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const h = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = try f.store.addLocalSpan(&.{h_arg}),
+        .ret_layout = .u64,
+        .hosted = .some(.{ .symbol = try f.store.insertString("roc_test_pause"), .dispatch_index = 0 }),
+        .suspends = .may,
+    }, .none);
+    const e = blk: {
+        const y = try f.store.addLocal(.{ .layout_idx = .u64 });
+        const capture = try f.store.addLocal(.{ .layout_idx = .opaque_ptr });
+        const reuse = try f.store.addLocal(.{ .layout_idx = erased });
+        const record = try f.store.addLocal(.{ .layout_idx = record_layout });
+        const list = try f.store.addLocal(.{ .layout_idx = list_u64 });
+        const s = try f.store.addLocal(.{ .layout_idx = .u64 });
+        const len = try f.store.addLocal(.{ .layout_idx = .u64 });
+        const r = try f.store.addLocal(.{ .layout_idx = .u64 });
+        const out = try f.store.addLocal(.{ .layout_idx = list_u64 });
+        const wrap = try f.store.addCFStmt(.{ .assign_list = .{ .target = out, .elems = try f.store.addLocalSpan(&.{r}), .next = try f.ret(out) } }, .test_fixture);
+        const add = try f.op(r, .num_int_add_wrap, &.{ s, len }, wrap);
+        const call = try f.store.addCFStmt(.{ .assign_call = .{
+            .target = s,
+            .proc = h,
+            .args = try f.store.addLocalSpan(&.{y}),
+            .next = try f.op(len, .list_len, &.{list}, add),
+        } }, .test_fixture);
+        const read = try f.store.addCFStmt(.{ .assign_ref = .{ .target = list, .op = LIR.RefOp.field(record, 0), .next = call } }, .test_fixture);
+        const body = try f.op(record, .erased_capture_load, &.{ capture, reuse }, read);
+        break :blk try erasedMember(f, y, capture, reuse, &.{ y, capture, reuse, record, list, s, len, r, out }, body);
+    };
+    const n = blk: {
+        const y = try f.store.addLocal(.{ .layout_idx = .u64 });
+        const capture = try f.store.addLocal(.{ .layout_idx = .opaque_ptr });
+        const reuse = try f.store.addLocal(.{ .layout_idx = erased });
+        const out = try f.store.addLocal(.{ .layout_idx = list_u64 });
+        const wrap = try f.store.addCFStmt(.{ .assign_list = .{ .target = out, .elems = try f.store.addLocalSpan(&.{y}), .next = try f.ret(out) } }, .test_fixture);
+        break :blk try erasedMember(f, y, capture, reuse, &.{ y, capture, reuse, out }, wrap);
+    };
+    const x = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const list = try f.store.addLocal(.{ .layout_idx = list_u64 });
+    const record = try f.store.addLocal(.{ .layout_idx = record_layout });
+    const e_fn = try f.store.addLocal(.{ .layout_idx = erased });
+    const n_fn = try f.store.addLocal(.{ .layout_idx = erased });
+    const a = try f.store.addLocal(.{ .layout_idx = list_u64 });
+    const a_item = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const t = try f.store.addLocal(.{ .layout_idx = list_u64 });
+    const t_item = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const zero = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const r = try f.store.addLocal(.{ .layout_idx = .u64 });
+    const plan = try f.store.internErasedCallArgsPlan(&f.layouts, &.{.u64});
+    const add = try f.op(r, .num_int_add_wrap, &.{ t_item, x }, try f.ret(r));
+    const call_e = try f.store.addCFStmt(.{ .assign_call_erased = .{
+        .target = t,
+        .data = try f.store.addStmtRow(LIR.ErasedCallData, .{
+            .closure = e_fn,
+            .args = try f.store.addLocalSpan(&.{a_item}),
+            .arg_plan = plan,
+            .reuse_source = .some(e_fn),
+            .erased_class = @fromBackingInt(1),
+        }),
+        .next = try f.op(t_item, .list_get_unsafe, &.{ t, zero }, add),
+    } }, .test_fixture);
+    const call_n = try f.store.addCFStmt(.{ .assign_call_erased = .{
+        .target = a,
+        .data = try f.store.addStmtRow(LIR.ErasedCallData, .{
+            .closure = n_fn,
+            .args = try f.store.addLocalSpan(&.{x}),
+            .arg_plan = plan,
+            .reuse_source = .some(n_fn),
+            .erased_class = @fromBackingInt(1),
+        }),
+        .next = try f.op(a_item, .list_get_unsafe, &.{ a, zero }, call_e),
+    } }, .test_fixture);
+    const pack_n = try packStarts(f, &.{n}, &.{n_fn}, call_n);
+    const pack_e = try f.store.addCFStmt(.{ .assign_packed_erased_fn = .{
+        .target = e_fn,
+        .data = try f.store.addStmtRow(LIR.PackedErasedFnData, .{
+            .proc = e,
+            .capture = .some(record),
+            .capture_layout = .some(record_layout),
+            .on_drop = lir.ContinuationPass.hostDrop(&f.layouts, record_layout),
+        }),
+        .next = pack_n,
+    } }, .test_fixture);
+    const build = try f.store.addCFStmt(.{ .assign_struct = .{ .target = record, .fields = try f.store.addLocalSpan(&.{list}), .next = pack_e } }, .test_fixture);
+    const make_list = try f.store.addCFStmt(.{ .assign_list = .{ .target = list, .elems = try f.store.addLocalSpan(&.{ x, x }), .next = build } }, .test_fixture);
+    const body = try literal(f, zero, 0, .u64, make_list);
+    const g = try f.store.addProcSpec(.{
+        .name = f.store.freshSyntheticSymbol(),
+        .identity = LIR.ProcIdentity.programLocal("task-ops-test", f.store.next_synthetic_symbol),
+        .args = try f.store.addLocalSpan(&.{x}),
+        .frame_locals = try f.store.addLocalSpan(&.{ x, list, record, e_fn, n_fn, a, a_item, t, t_item, zero, r }),
+        .body = .some(body),
+        .ret_layout = .u64,
+    }, .none);
+    try lir.SuspensionMarks.run(allocator, &f.store, .none);
+    var roots = [_]LIR.LirProcSpecId{g};
+    try lir.ContinuationPass.run(allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .mode = .tasks });
+    return roots[0];
+}
+
 /// An interpreter for `f`'s program whose hosted calls go to `host`, kept
 /// alive while its records are.
 const PausingRun = struct {
@@ -415,6 +548,55 @@ test "a task paused inside a called procedure resumes in its caller's continuati
     task.wake(&readyTask);
     try std.testing.expectEqual(builtins.task.Status.done, task.resumeTask());
     try std.testing.expectEqual(@as(u64, 42), root);
+    task.free();
+    try f.runtime_env.checkForLeaks();
+}
+
+test "a task paused inside an erased callable resumes in its body and then in its caller's continuation" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const entry = try pausingErasedProgram(&f);
+    _ = try lir.Arc.insert(&f.store, &f.layouts, .{ .roots = &.{entry} });
+    var host = PausingHost{};
+    var run: PausingRun = undefined;
+    try run.init(&f, &host);
+    defer run.deinit();
+    var root: u64 = 0;
+    const task = try run.start(entry, @ptrCast(&root));
+
+    // N returned its argument without pausing. E's body saves its record,
+    // which holds the captured list, at the hosted call; E's shell has
+    // nothing left to do, and g saves its own record.
+    try std.testing.expectEqual(builtins.task.Status.pending, task.resumeTask());
+    try std.testing.expectEqual(@as(u32, 1), host.calls);
+    try std.testing.expectEqual(@as(u64, 20), host.x);
+    try std.testing.expectEqual(@as(usize, 2), task.len);
+
+    @as(*align(1) u64, @ptrCast(host.slot.?)).* = 22;
+    task.wake(&readyTask);
+    try std.testing.expectEqual(builtins.task.Status.done, task.resumeTask());
+    try std.testing.expectEqual(@as(u64, 22 + 2 + 20), root);
+    task.free();
+    try f.runtime_env.checkForLeaks();
+}
+
+test "cancelling a task paused inside an erased callable releases what it captured" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const entry = try pausingErasedProgram(&f);
+    _ = try lir.Arc.insert(&f.store, &f.layouts, .{ .roots = &.{entry} });
+    var host = PausingHost{};
+    var run: PausingRun = undefined;
+    try run.init(&f, &host);
+    defer run.deinit();
+    var root: u64 = 0;
+    const task = try run.start(entry, @ptrCast(&root));
+    try std.testing.expectEqual(builtins.task.Status.pending, task.resumeTask());
+
+    aborted = null;
+    task.cancel(&abortRecord, &readyTask);
+    try std.testing.expectEqual(task, aborted.?);
+    try std.testing.expectEqual(builtins.task.Status.cancelled, task.resumeTask());
     task.free();
     try f.runtime_env.checkForLeaks();
 }

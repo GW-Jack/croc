@@ -2667,6 +2667,13 @@ pub const Interpreter = struct {
                         self.recordCallerFailureLocForCalleeError(call_loc, call_region, call_inline_scope, err);
                         return err;
                     };
+                    if (self.unwinding_pause) {
+                        // The callee paused, so its result is poison, as a
+                        // paused direct call's is.
+                        frame.setLocal(assign_stmt.target, result.value);
+                        current = assign_stmt.next;
+                        continue;
+                    }
                     try self.checkCallResultLayout(result.layout, target_layout);
                     try self.setLocalChecked(
                         frame,

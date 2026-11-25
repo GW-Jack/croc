@@ -33793,10 +33793,29 @@ Loops, "Supervision.") are seeds too, before promotion as after it. A program
 with no seed skips the walk; a Debug compiler walks anyway and checks that no
 `group_next` is there. The fixpoint propagates from each seed to the callers that call it directly and commits
 both marks on every procedure with a body, so a recomputation after rewrites
-replaces stale marks rather than adding to them. Erased calls are never
-sites here; the continuation pass rejects an erased-callable procedure that
-may suspend (What Implements It First). A clone of a call, such as a
+replaces stale marks rather than adding to them. A clone of a call, such as a
 destination variant's, keeps the call's mark.
+
+**Erased Calls That May Suspend.** A call through an erased callable enters
+whichever procedure the callable holds, so the call and every procedure it
+can enter must agree on whether the task is passed. In a build with tasks,
+LIR construction gives each erased callable type a *class*: the digest of the
+type's source function type and its members. The erased calls through the
+type and the erased-callable procedures of its members carry that class
+(`ErasedCallData.erased_class`, `LirProcSpec.erased_class`). A procedure's
+class is part of its identity, so a function that two erased types hold is
+two procedures, each of one class. In any other build no class is set, and
+an erased callable the continuation pass makes (a resume entry or a start
+record's procedure) has none either: only the task runtime enters it, and
+the runtime passes it the task.
+
+A class may suspend when one of its procedures may. Then all its procedures
+may, and every call through the class is a suspension site, recorded on its
+`ErasedCallData`. The fixpoint propagates over classes as it does over direct
+calls. Equal classes hold equal members, so a class with a suspending
+procedure holds it in every unit that computes the marks. A type whose
+members are all pure has a class that never suspends, though its function
+type has the same Monotype form as an effectful one's.
 
 The marks are computed right after LIR construction, so the procedure-local
 rewrites can see them, and computed again from the rewritten LIR by the
@@ -33823,7 +33842,8 @@ alone:
   procedure that may suspend contains a call that list-append promotion
   doesn't recognize, so it is never promoted as an append helper.
 
-A site whose callee is a procedure and whose result the procedure returns
+A site whose callee is a procedure, or that is an erased call, and whose
+result the procedure returns
 unchanged (the call's next statement returns its target, directly or by
 setting a join parameter to it and jumping to a join body that returns that
 parameter) is a *tail site*. Its caller has nothing left to do, so it gets
@@ -33907,6 +33927,33 @@ saves `R(f, j)`, the same resume entry `f`'s own site `j` saves, so each
 site of `f` has one continuation and one resume entry however many copies
 reach it. Every procedure the pass makes is marked when the pass recomputes
 the marks at its end.
+
+**Erased procedures.** The pass first splits every erased-callable procedure
+whose class may suspend, whether or not its own body holds a site. The body
+becomes a Roc-ABI procedure of its own. It takes the explicit arguments, then
+the capture record in place of the load that read it, then the reuse argument
+when its body packs a callable into it. The erased procedure keeps its
+identity and its place in every packing, and becomes a *shell*:
+
+```text
+E(args, task, capture, reuse):
+    rec = erased_capture_load(capture, reuse)
+    r = call body(args, rec, task)
+    ret r
+```
+
+The task is its last explicit argument, so it is in the procedure's
+`ErasedCallArgsPlan` and the erased ABI's fixed part is unchanged. The call is
+a tail site, so a shell has no pending edge and saves no record. Nothing that
+outlives the call points into the callable: the body holds the captures it
+saves by its own references. From here the body is like any other procedure,
+and the rest of this section says nothing more about erased ABIs.
+
+An erased call that is a site passes the task after its explicit arguments,
+with the argument plan to match, and reads the pending flag afterwards as a
+call to a procedure does. A resume entry reads its result from the task's
+result buffer. There is no one callee to relate that result to, so the load's
+result is host-visible, as an erased call's own result is.
 
 **Resume entries.** For each such site the pass makes a *resume entry*
 `R(f, k)`: an erased-callable procedure whose capture is the site's live
@@ -35688,12 +35735,10 @@ Until the rest exists:
   way. One interpreter's state is not safe to use on two threads, so it
   cannot run two resumes at once (Parallel Resumes);
 - the continuation pass stops with a not-yet-implemented panic, in every
-  build mode, when an erased-callable procedure other than a resume entry or
-  start record may suspend: its erased callers have no task to pass it. An
-  effectful function is erased at many explicit boundaries (Erased Callable
-  Requirements), so only this pass sees exactly when one may suspend. The
-  dev backend's not-yet-implemented panics are the precedent. Erased calls
-  become suspension sites, and the panic goes, when `.boxy` is supported.
+  build mode, when an erased-callable procedure that belongs to no class
+  may suspend, other than a resume entry or start record: its erased callers
+  have no task to pass it. The dev backend's not-yet-implemented panics are
+  the precedent.
 
 ### The Reference Platform
 

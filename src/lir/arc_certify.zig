@@ -5981,6 +5981,10 @@ const Certifier = struct {
                     // allocation into the callee; any other call borrows it.
                     try self.applyCall(&state, assign_stmt.target, arc_sig.RcSig.all_owned, assign.args, assign_stmt.next);
                     if (assign.reuse_closure) try self.consumeUnit(&state, owner_value, owner);
+                    if (assign.suspension_site and self.isRc(assign_stmt.target)) {
+                        const target_value = state.valueOf(assign_stmt.target);
+                        if (target_value != no_value) self.values.items[target_value].suspension_result = true;
+                    }
                     cursor = assign_stmt.next;
                 },
                 .assign_packed_erased_fn => |assign_stmt| {

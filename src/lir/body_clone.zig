@@ -2593,6 +2593,8 @@ pub fn BodyCloner(comptime Rewriter: type) type {
                             .reuse_closure = s.reuse_closure,
                             .reuse_source = .of(try self.mapMaybeLocal(s.reuse_source.get())),
                             .result_reuse = s.result_reuse,
+                            .erased_class = s.erased_class,
+                            .suspension_site = s.suspension_site,
                         }),
                         .next = inline_stmt.next,
                     } };

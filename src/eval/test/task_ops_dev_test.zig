@@ -175,6 +175,30 @@ test "a task paused inside a called procedure resumes in its caller's continuati
     try f.runtime_env.checkForLeaks();
 }
 
+test "a task paused inside an erased callable resumes in its body and then in its caller's continuation on the dev backend" {
+    if (comptime !backend.host_lir_codegen_available) return error.SkipZigTest;
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const entry = try lir_test.pausingErasedProgram(&f);
+    var run: DevRun = undefined;
+    try run.init(&f, entry, &.{ .u64, .opaque_ptr });
+    defer run.deinit();
+    var root: u64 = 0;
+    const task = run.start(@ptrCast(&root));
+    const host = &PausingHost.seen;
+
+    try std.testing.expectEqual(builtins.task.Status.pending, task.resumeTask());
+    try std.testing.expectEqual(@as(u64, 20), host.x);
+    try std.testing.expectEqual(@as(usize, 2), task.len);
+    @as(*align(1) u64, @ptrCast(host.slot.?)).* = 22;
+    task.wake(&lir_test.readyTask);
+    try std.testing.expectEqual(builtins.task.Status.done, task.resumeTask());
+    try std.testing.expectEqual(@as(u64, 22 + 2 + 20), root);
+    try std.testing.expectEqual(@as(u32, 1), host.calls);
+    task.free();
+    try f.runtime_env.checkForLeaks();
+}
+
 test "cancelling a woken task releases the hosted result in its slot and its records on the dev backend" {
     if (comptime !backend.host_lir_codegen_available) return error.SkipZigTest;
     var f = try Fixture.init(std.testing.allocator);

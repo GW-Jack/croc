@@ -153,6 +153,7 @@ const Printer = struct {
                     if (s.result_reuse) try writer.writeAll(" result_reuse");
                     if (s.deferred) try writer.writeAll(" deferred");
                     if (s.drive != .none) try writer.print(" drive={s}", .{@tagName(s.drive)});
+                    if (s.suspension_site) try writer.writeAll(" suspension_site");
                     try writer.writeByte('\n');
                     current = inline_s.next;
                 },

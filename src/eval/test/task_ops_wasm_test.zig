@@ -241,6 +241,28 @@ test "a task paused inside a called procedure resumes in its caller's continuati
     try std.testing.expectEqual(@as(i64, 0), run.session.liveAllocations());
 }
 
+test "a task paused inside an erased callable resumes in its body and then in its caller's continuation on the wasm backend" {
+    var f = try Fixture.initFor(std.testing.allocator, .u32);
+    defer f.deinit();
+    const entry = try lir_test.pausingErasedProgram(&f);
+    var run: WasmRun = undefined;
+    try run.init(&f, entry, &.{ .u64, .opaque_ptr });
+    defer run.deinit();
+    const root = run.session.alloc(8, 8);
+    const task = try run.start(root);
+
+    try std.testing.expectEqual(Status.pending, try run.resumeTask(task));
+    try std.testing.expectEqual(@as(u64, 20), run.host.x);
+    std.mem.writeInt(u64, run.session.memory()[run.host.slot..][0..8], 22, .little);
+    try run.call(shim_symbols.roc_task_wake, task);
+    try std.testing.expectEqual(Status.done, try run.resumeTask(task));
+    try std.testing.expectEqual(@as(u64, 22 + 2 + 20), std.mem.readInt(u64, run.session.memory()[root..][0..8], .little));
+    try std.testing.expectEqual(@as(u32, 1), run.host.calls);
+    try run.call(shim_symbols.roc_task_free, task);
+    run.session.free();
+    try std.testing.expectEqual(@as(i64, 0), run.session.liveAllocations());
+}
+
 test "a task whose hosted result has a slot release resumes and releases that result on the wasm backend" {
     var f = try Fixture.initFor(std.testing.allocator, .u32);
     defer f.deinit();

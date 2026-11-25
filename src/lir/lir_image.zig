@@ -130,7 +130,10 @@ pub const MAGIC: u32 = 0x52494c52; // "RLIR" in little-endian bytes.
 /// v94: `task_run` and `task_run_end` join them.
 /// v95: `cleanup_push` and `cleanup_pop` join them.
 /// v96: `cell_tracked` and `cell_track` join them.
-pub const FORMAT_VERSION: u32 = 96;
+/// v97: erased calls and erased procedures name their erased callable type
+///      (`erased_class`), and erased calls mark suspension sites
+///      (`suspension_site`).
+pub const FORMAT_VERSION: u32 = 97;
 const StaticDataImage = @import("lir_image_static_data.zig").Schema(@This());
 
 /// Public `ImageError` declaration.

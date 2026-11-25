@@ -1693,6 +1693,7 @@ const VariantTable = struct {
             // source does.
             .suspends = source_spec.suspends,
             .running_set_helper = source_spec.running_set_helper,
+            .erased_class = source_spec.erased_class,
             .task_record = source_spec.task_record,
             .tail_transform = source_spec.tail_transform,
             .tail_group = source_spec.tail_group,
@@ -1747,6 +1748,7 @@ const VariantTable = struct {
             .tail_carry = source_spec.tail_carry,
             .suspends = source_spec.suspends,
             .running_set_helper = source_spec.running_set_helper,
+            .erased_class = source_spec.erased_class,
             .rc_read_only_params = source_spec.rc_read_only_params,
             .rc_ret_unique = source_spec.rc_ret_unique,
             .rc_ret_unique_fields = source_spec.rc_ret_unique_fields,
@@ -2881,6 +2883,8 @@ const Inserter = struct {
                             .reuse_source = assign.reuse_source,
                             .result_reuse = assign.result_reuse,
                             .deferred = step.replaces_frame,
+                            .erased_class = assign.erased_class,
+                            .suspension_site = assign.suspension_site,
                         }),
                         .next = next,
                     } }, origin);
