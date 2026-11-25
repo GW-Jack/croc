@@ -1344,6 +1344,32 @@ test "concurrent loops run on child tasks as a None build runs them, on LLVM" {
     try checkSequentialEquivalence(plan_loops, compareLlvm);
 }
 
+/// The `None` outcomes of `twin` under `strategy`, which the caller frees.
+fn noneOutcomes(strategy: Strategy) E2eError![]CaseOutcome {
+    defer freeNoneOutcomes();
+    harness.runAppPathLoweredInspection(twin.none_path, .{ .specialization_strategy = strategy, .target_usize = .u64 }, recordNoneOutcomes) catch return error.TestUnexpectedResult;
+    return none_outcomes.toOwnedSlice(std.testing.allocator);
+}
+
+test "a None build runs alike under both strategies, on the interpreter" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    for ([_]Twin{ plan_loops, shared_waits }) |program| {
+        twin = program;
+        var outcomes: [2][]CaseOutcome = .{ &.{}, &.{} };
+        defer for (outcomes) |made| {
+            for (made) |outcome| outcome.deinit();
+            std.testing.allocator.free(made);
+        };
+        for ([_]Strategy{ .lss, .boxy }, &outcomes) |strategy, *made| made.* = try noneOutcomes(strategy);
+        for (twin.cases, outcomes[0], outcomes[1]) |name, lss, boxy| {
+            errdefer std.log.err("case {s}", .{name});
+            try std.testing.expectEqualStrings(lss.result, boxy.result);
+            try std.testing.expectEqual(lss.trace.len, boxy.trace.len);
+            for (lss.trace, boxy.trace) |want, got| try std.testing.expectEqualStrings(want, got);
+        }
+    }
+}
+
 test "tasks that wait on shared state run in a None build as on a host with tasks, on the interpreter" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     try checkSequentialEquivalence(shared_waits, compareInterpreter);

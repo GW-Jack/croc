@@ -264,3 +264,48 @@ test "a call that may pause between an update and its cleanup is warned about" {
         ,
     }) |body| try expectWarnings(body, &.{});
 }
+
+test "a module that refers to Shared.update! says so" {
+    const Case = struct { body: []const u8, refers: bool };
+    for ([_]Case{
+        .{ .body = "main! : Shared(U64) => U64\nmain! = |h| h.update!(|n| if n == 0 { Wait } else { Set(n - 1, n) })", .refers = true },
+        .{ .body = "main! : Shared(U64) => U64\nmain! = |h| Shared.update!(h, |n| Keep(n))", .refers = true },
+        .{ .body =
+        \\main! : Shared(U64) => U64
+        \\main! = |h| {
+        \\    f! = Shared.update!
+        \\    f!(h, |n| Keep(n))
+        \\}
+        , .refers = true },
+        // Through a requirement its caller fills.
+        .{ .body =
+        \\change! : a, b => U64 where [a.update! : a, b => U64]
+        \\change! = |target, transform| target.update!(transform)
+        \\
+        \\main! : Shared(U64) => U64
+        \\main! = |h| change!(h, |n| Keep(n))
+        , .refers = true },
+        .{ .body =
+        \\change! : a, b => U64 where [a.update! : a, b => U64]
+        \\change! = |target, transform| target.update!(transform)
+        \\
+        \\main! : Shared(U64) => U64
+        \\main! = |h| h.get!()
+        , .refers = false },
+        .{ .body =
+        \\main! : Shared(U64) => U64
+        \\main! = |h| {
+        \\    h.modify!(|n| n + 1)
+        \\    h.finally!(|n| n, || h.get!())
+        \\}
+        , .refers = false },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ "Sem :: {}.{}\n\n", case.body, "\n" });
+        defer std.testing.allocator.free(source);
+        var env = try TestEnv.init("Test", source);
+        defer env.deinit();
+        errdefer std.debug.print("case:\n{s}\n", .{source});
+        try env.assertNoErrors();
+        try std.testing.expectEqual(case.refers, env.module_env.refers_to_shared_update);
+    }
+}

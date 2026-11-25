@@ -77,9 +77,11 @@ const ClassSet = std.AutoHashMapUnmanaged(LIR.ErasedClass, void);
 ///
 /// `mode` is the platform's: every `cell_wait` specialization is a seed, and in
 /// a build with tasks every `run_supervised` one (design.md "Shared State",
-/// "Waiting."; "Plans And Concurrent Loops", "Supervision.").
-pub fn run(allocator: Allocator, store: *LirStore, mode: ConcurrencyMode) Allocator.Error!void {
-    if (!anySeedOrMark(store, mode)) {
+/// "Waiting."; "Plans And Concurrent Loops", "Supervision."). `boxy_runs_tasks`
+/// is whether this is a Boxy program that may pause (design.md "Boxy Procedures
+/// That May Suspend").
+pub fn run(allocator: Allocator, store: *LirStore, mode: ConcurrencyMode, boxy_runs_tasks: bool) Allocator.Error!void {
+    if (!anySeedOrMark(store, mode, boxy_runs_tasks)) {
         // Nothing can suspend and nothing is marked as if it could: commit
         // `never` without walking. A Debug compiler walks anyway and checks
         // that no call is a site. Nor is there a `group_next`: a loop has the
@@ -155,9 +157,9 @@ fn seeds(proc: *const LIR.LirProcSpec, mode: ConcurrencyMode) bool {
 /// a seed, and its mark may be stale: an erased class that held a suspending
 /// procedure no longer may suspend once that procedure is gone. A Boxy
 /// program's seeds are statements, the dynamic erased calls and running-set
-/// operations lowering makes in any program with tasks, so it is walked.
-fn anySeedOrMark(store: *const LirStore, mode: ConcurrencyMode) bool {
-    if (mode.hasTasks() and store.runtime_contract == .boxy) return true;
+/// operations lowering makes in any program that may pause, so it is walked.
+fn anySeedOrMark(store: *const LirStore, mode: ConcurrencyMode, boxy_runs_tasks: bool) bool {
+    if (boxy_runs_tasks) return true;
     for (0..store.procSpecCount()) |index| {
         const proc = store.getProcSpecImmediate(@fromBackingInt(@as(u32, @intCast(index))));
         if (proc.suspends == .may) return true;
@@ -422,7 +424,7 @@ test "a suspending seed marks its direct callers transitively, and only them" {
     const other = try addRelay(&store, 5, plain);
     const leaf = try addRelay(&store, 6, null);
 
-    try run(a, &store, .none);
+    try run(a, &store, .none, false);
 
     try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(seed).suspends);
     try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(relay.proc).suspends);
@@ -442,13 +444,13 @@ test "running again replaces stale marks" {
     const plain = try addBodyless(&store, 2, .never);
     const relay = try addRelay(&store, 3, seed);
     const root = try addRelay(&store, 4, relay.proc);
-    try run(a, &store, .none);
+    try run(a, &store, .none, false);
     try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(root.proc).suspends);
 
     // A rewrite retargets the relay's call to a procedure that never
     // suspends; the relay and its caller stop being suspendable.
     store.getCFStmtPtr(relay.call.?).assign_call.proc = plain;
-    try run(a, &store, .none);
+    try run(a, &store, .none, false);
     try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(relay.proc).suspends);
     try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(root.proc).suspends);
     try testing.expect(!isSite(&store, relay.call.?));
@@ -462,7 +464,7 @@ test "without a suspending seed every procedure with a body is never" {
     const plain = try addBodyless(&store, 1, .never);
     const relay = try addRelay(&store, 2, plain);
     store.getProcSpecPtr(relay.proc).suspends = .may;
-    try run(a, &store, .none);
+    try run(a, &store, .none, false);
     try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(relay.proc).suspends);
     try testing.expect(!isSite(&store, relay.call.?));
 }
@@ -486,7 +488,7 @@ test "a recursive cycle through a suspending call is marked as a whole" {
     const odd_back_call = try store.addCFStmt(.{ .assign_call = .{ .target = odd_value, .proc = even.proc, .args = .empty(), .next = odd_seed_call } }, .test_fixture);
     store.getProcSpecPtr(odd.proc).body = .some(odd_back_call);
 
-    try run(a, &store, .none);
+    try run(a, &store, .none, false);
     try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(even.proc).suspends);
     try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(odd.proc).suspends);
     try testing.expect(isSite(&store, even_call));
@@ -519,7 +521,7 @@ test "a running set's next makes its procedure suspend, and its callers" {
     const caller = try addRelay(&store, 3, parking);
     const leaf = try addRelay(&store, 4, null);
 
-    try run(a, &store, .none);
+    try run(a, &store, .none, false);
 
     try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(seed).suspends);
     try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(parking).suspends);
@@ -540,7 +542,7 @@ test "a wait on shared state makes its helper suspend, and the helper's callers,
         const caller = try addRelay(&store, 3, helper.proc);
         const settling = try addRelay(&store, 4, settle.proc);
 
-        try run(a, &store, mode);
+        try run(a, &store, mode, false);
 
         try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(helper.proc).suspends);
         try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(caller.proc).suspends);
@@ -616,7 +618,7 @@ test "a dynamic erased call marked a site makes its procedure suspend, and nothi
     const above = try addRelay(&store, 5, free.proc);
     store.runtime_contract = .boxy;
 
-    try run(a, &store, .tasks);
+    try run(a, &store, .tasks, true);
 
     for ([_]LIR.LirProcSpecId{ site, caller.proc }) |proc| {
         try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(proc).suspends);
@@ -651,7 +653,7 @@ test "a suspending procedure of an erased class makes the class's procedures and
     const quiet_caller = try addErasedRelay(&store, 8, .none, quiet);
     const unclassed = try addErasedRelay(&store, 9, .none, .none);
 
-    try run(a, &store, .none);
+    try run(a, &store, .none, false);
 
     for ([_]LIR.LirProcSpecId{ suspending.proc, other.proc, through.proc, caller.proc, root.proc }) |proc| {
         try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(proc).suspends);
@@ -668,18 +670,18 @@ test "a suspending procedure of an erased class makes the class's procedures and
     // Running again after a rewrite took the suspending call away replaces
     // the marks.
     store.getCFStmtPtr(suspending.call.?).assign_call.proc = quiet_member.proc;
-    try run(a, &store, .none);
+    try run(a, &store, .none, false);
     try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(other.proc).suspends);
     try testing.expect(!isErasedSite(&store, through.call));
     try testing.expect(!isErasedSite(&store, caller.call));
 
     // So does running again after one took the program's only seed away.
     store.getCFStmtPtr(suspending.call.?).assign_call.proc = seed;
-    try run(a, &store, .none);
+    try run(a, &store, .none, false);
     try testing.expect(isErasedSite(&store, caller.call));
     store.getCFStmtPtr(suspending.call.?).assign_call.proc = quiet_member.proc;
     store.getProcSpecPtr(seed).suspends = .never;
-    try run(a, &store, .none);
+    try run(a, &store, .none, false);
     try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(other.proc).suspends);
     try testing.expect(!isErasedSite(&store, through.call));
     try testing.expect(!isErasedSite(&store, caller.call));

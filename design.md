@@ -19539,13 +19539,19 @@ host allocation and free operations.
 
 #### Per-Module Output
 
-This section is about programs whose platform declares no tasks. One whose
-platform does lowers whole, as an optimized build does: which procedures may
-suspend depends on code in other modules (Boxy Procedures That May Suspend),
-and every template has its task forms. Its dev run, dev build and wasm dev
-build therefore read and file no unit for the program, and link it as an
-optimized build is linked. Compile-time evaluation has no task, so it still
-runs and files the units of each module, which are lowered without one.
+This section is about programs that don't pause. One that may (Boxy Procedures
+That May Suspend) lowers whole, as an optimized build does: which procedures may
+suspend depends on code in other modules, and every template has its task forms.
+Its dev run, dev build and wasm dev build therefore read and file no unit for the
+program, and link it as an optimized build is linked. Compile-time evaluation has
+no task, so it still runs and files the units of each module, which are lowered
+without one.
+
+A platform's header says that its programs have tasks, so discovery knows before
+anything is checked. That a `None` program's updates may wait is known once its
+modules are checked, so such a program is first set up for units, whose building
+checking may have begun, and then lowers whole: its link takes none of them, and
+no image link it began is published. What it filed is right for other programs.
 
 Everything Boxy emits for a module is a function of that module's checked
 checked module and its imports' checked modules, and of the target (pointer
@@ -33973,6 +33979,12 @@ links no compiler-owned code, it is cached by the checked host identity and
 the link inputs, and the root program is lowered for it only when that
 cache misses.
 
+A run whose updates may wait lowers whole once checking finds that (Per-Module
+Output), and so does a rebuild of a composed run. Its image calls the Boxy runtime
+of its host executable, which a composed run's doesn't link, so the two have
+different checked host identities: an edit that takes a run from one to the other
+is rejected as one that changes the host interface is, until the run is restarted.
+
 The compiler parent process is the sole owner of committing candidate descriptor offsets
 and shared-memory image-byte reclamation. It keeps unbounded process-local lists of descriptor offsets,
 reclaimed descriptor slots, and reclaimed image regions. After a rebuild commits
@@ -34421,8 +34433,21 @@ it finds no suspension site.
 
 Under `.boxy` a function value is called through one erased ABI, whatever it
 holds, and no class says which procedures a call can enter. So Boxy decides by
-checked type instead, and it only ever decides in programs whose platform has
-tasks.
+checked type instead, and only in programs that may pause: those whose platform
+has tasks, and those without tasks whose updates may wait (`Input.runs_tasks`).
+
+**Which programs without tasks.** `.lss` knows the updates that can wait from
+the specializations it made, before it lowers a body. Boxy decides what an erased
+call is as it lowers each body, so it needs the answer first, and takes it from
+checking. A module of the program's that refers to `Shared.update!`, by name or
+as a method, says so (`ModuleEnv.refers_to_shared_update`), and a program may
+wait when a module of it does. A `Shared` can be passed to a module that says
+nothing, but a `Wait` is the answer of an update's function, and only code that
+refers to `Shared.update!` can run one. The Builtin module's own references count
+as nothing: none of its functions but `update!` itself can wait.
+
+Such a program is lowered as one with tasks is, except in what Shared State,
+"Programs without tasks.", says.
 
 **Sites.** A dynamic erased call is a suspension site
 (`DynOp.call_erased.suspension_site`) when the checked type of the function it
@@ -34440,8 +34465,8 @@ function. A pure call of it never pauses, because a pure function value has no
 site.
 
 A dynamic erased call that is a site is a seed, and the marks go on from there
-over direct calls, stopping at effect-free procedures. A Boxy program with tasks
-is always walked, since its seeds are statements.
+over direct calls, stopping at effect-free procedures. A Boxy program that may
+pause is always walked, since its seeds are statements.
 
 **The task.** The erased ABI is unchanged, so a caller passes no task. A
 procedure with a Roc ABI takes it as under `.lss`; an erased one that may
@@ -34489,7 +34514,7 @@ copies a result that is not there through it. So the old buffer outlives that
 call, and the runtime frees it once the record has returned or crashed. A child
 starts from the program's size, not from its parent's.
 
-**Whole programs.** A `.boxy` program with tasks lowers as one program
+**Whole programs.** A `.boxy` program that may pause lowers as one program
 (Per-Module Output), so the marks see every procedure.
 
 ### The Continuation Pass
@@ -35353,8 +35378,10 @@ is made visible where `cell_wait` takes it, since any thread's crash may run it.
 **Programs without tasks.** In a `None` program under `.lss`, only a
 `cell_wait!` specialization is a seed of the suspension marks, so a program none
 of whose updates can reach `Wait` has no procedure that may suspend and runs as
-Plans And Concurrent Loops says, on one stack. Otherwise the continuation pass
-treats the program as it does a `Tasks` program, with three differences:
+Plans And Concurrent Loops says, on one stack. Under `.boxy` it is one none of
+whose modules refers to `Shared.update!` (Boxy Procedures That May Suspend).
+Otherwise the continuation pass treats the program as it does a `Tasks` program,
+with these differences:
 - hosted calls never pause, since a `None` platform declares none `suspending`;
 - `run_supervised!` keeps its body, which runs its function once, since a crash
   ends the program;
@@ -35396,6 +35423,12 @@ that call. A callee that doesn't ask leaves the mark: the mark names that
 callee's code, or the host's, which no procedure that asks has. The interpreter's
 callables share their code, so each of them asks, and only one that may suspend
 uses the answer.
+
+Under `.boxy` a call of an erased procedure that may suspend from code that is
+effect free is no site, and hands nothing. The callee asks, finds no mark, and
+runs to its end as the root of a run, which never pauses since its arguments are
+pure. Erased procedures that don't call anything effectful don't ask, so only a
+pure caller of a worker generic over effects pays for it.
 
 A shell is then the one a program with tasks has, without the argument:
 

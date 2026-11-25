@@ -2807,39 +2807,39 @@ fn rocRunSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, arg0: []const u8
 
         const specialization_strategy = currentRuntimeSpecializationStrategy(args.specialization_strategy, args.opt);
         switch (args.opt) {
-            .dev => if (unitImageRunApplies(args.opt, args.no_cache, specialization_strategy, selected.target) and modulesLowerApart(&build_env)) {
-                run_tables = RunUnitTables.init(ctx);
-                const tables = &run_tables.?;
-                run_units = try lowerRunUnits(ctx, &build_env, tables, selected.target, args.path, &reporter, args.watch);
-                const units = &run_units.?;
-                shm_handle_opt = try publishDevRunImage(ctx, selected.target, .{ .composed = .{ .units = units, .reporter = &reporter } }, args.watch);
-                // The library units' images belong to the build environment.
-                units.releaseCode(ctx.gpa);
-                entrypoint_names = units.entrypoint_names;
-                hosted_symbols = units.hosted_symbols;
-                checked_host_identity = units.checked_host_identity;
-                diagnostics = units.counts;
-                if (entrypoint_names.len == 0) {
-                    base.invariant("default roc command invariant violated: no platform entrypoints in checked root requests", .{});
+            .dev => {
+                const artifact: PlatformEntrypointArtifact = .{ .dev_run_image = .{ .target = selected.target, .hot_reload = args.watch } };
+                if (unitImageRunApplies(args.opt, args.no_cache, specialization_strategy, selected.target) and modulesLowerApart(&build_env)) {
+                    run_tables = RunUnitTables.init(ctx);
+                    const tables = &run_tables.?;
+                    const checked = try checkRunUnits(ctx, &build_env, tables, selected.target, args.path, &reporter, args.watch);
+                    if (try checkedRunLowersApart(ctx, &build_env, checked)) {
+                        run_units = try lowerRunUnits(ctx, &build_env, tables, selected.target, &reporter, args.watch, checked);
+                    } else {
+                        lowered_result = try lowerCheckedLir(ctx, &build_env, ctx.gpa, artifact, args.opt, specialization_strategy, selected.target, &reporter, checked);
+                    }
+                } else {
+                    lowered_result = try lowerDiscoveredLir(ctx, &build_env, ctx.gpa, artifact, args.path, args.opt, specialization_strategy, &reporter);
                 }
-                // The host executable may need the root program lowered, which
-                // needs the build environment.
-                const link = try RunPlatformLink.init(ctx.arena, platform, selected.link_spec, build_env.getPlatformBundleHash());
-                try prepareComposedRunHost(ctx, &reporter, &build_env, tables, units, link, if (args.no_cache) null else &cache_manager, temp_dir_path, exe_path);
-                reporter.finish();
-                break :blk link;
-            } else {
-                lowered_result = try lowerDiscoveredLir(
-                    ctx,
-                    &build_env,
-                    ctx.gpa,
-                    .{ .dev_run_image = .{ .target = selected.target, .hot_reload = args.watch } },
-                    args.path,
-                    args.opt,
-                    specialization_strategy,
-                    &reporter,
-                );
-                const result = if (lowered_result) |*value| value else unreachable; // lowerDiscoveredLir assigned it on the line above
+                if (run_units) |*units| {
+                    shm_handle_opt = try publishDevRunImage(ctx, selected.target, .{ .composed = .{ .units = units, .reporter = &reporter } }, args.watch);
+                    // The library units' images belong to the build environment.
+                    units.releaseCode(ctx.gpa);
+                    entrypoint_names = units.entrypoint_names;
+                    hosted_symbols = units.hosted_symbols;
+                    checked_host_identity = units.checked_host_identity;
+                    diagnostics = units.counts;
+                    if (entrypoint_names.len == 0) {
+                        base.invariant("default roc command invariant violated: no platform entrypoints in checked root requests", .{});
+                    }
+                    // The host executable may need the root program lowered, which
+                    // needs the build environment.
+                    const link = try RunPlatformLink.init(ctx.arena, platform, selected.link_spec, build_env.getPlatformBundleHash());
+                    try prepareComposedRunHost(ctx, &reporter, &build_env, &run_tables.?, units, link, if (args.no_cache) null else &cache_manager, temp_dir_path, exe_path);
+                    reporter.finish();
+                    break :blk link;
+                }
+                const result = if (lowered_result) |*value| value else unreachable; // a run that isn't units lowered whole above
                 if (result.lowered.lir_result.store.runtime_contract == .boxy) {
                     const object = EmbeddedTargetObjects.forTarget(selected.target).boxy_runtime orelse return error.UnsupportedTarget;
                     run_package_objects = try run_package_objects.withBoxyRuntime(ctx.arena, object);
@@ -5999,20 +5999,11 @@ fn rocInternalHotReloadDev(ctx: *CliCtx, raw_args: []const []const u8) CliMainEr
     const display_path = runDisplayPath(args.path, synthetic_default_app);
     try discoverRunDependencies(ctx, &build_env, args.path, display_path, null);
 
-    if (source_rewrite == null and unitImageRunApplies(.dev, args.no_cache, args.specialization_strategy, selected_target) and modulesLowerApart(&build_env)) {
-        return rebuildComposedRunImage(ctx, args, &shm, selected_target, &build_env, &run_tables);
-    }
-
-    var lowered_result = try lowerDiscoveredLir(
-        ctx,
-        &build_env,
-        ctx.gpa,
-        .{ .dev_run_image = .{ .target = selected_target, .hot_reload = true } },
-        display_path,
-        .dev,
-        args.specialization_strategy,
-        null,
-    );
+    const artifact: PlatformEntrypointArtifact = .{ .dev_run_image = .{ .target = selected_target, .hot_reload = true } };
+    var lowered_result = if (source_rewrite == null and unitImageRunApplies(.dev, args.no_cache, args.specialization_strategy, selected_target) and modulesLowerApart(&build_env)) whole: {
+        if (try rebuildComposedRunImage(ctx, args, &shm, selected_target, &build_env, &run_tables)) |waiting| break :whole waiting;
+        return;
+    } else try lowerDiscoveredLir(ctx, &build_env, ctx.gpa, artifact, display_path, .dev, args.specialization_strategy, null);
     defer lowered_result.deinit();
 
     try writeHotReloadWatchPathsFile(ctx, args.watch_inputs_file, lowered_result.watch_inputs, source_rewrite);
@@ -6062,8 +6053,9 @@ fn rocInternalHotReloadDev(ctx: *CliCtx, raw_args: []const []const u8) CliMainEr
 
 /// A hot-reload rebuild of a run composed from unit images: check the
 /// program, build its changed units, and compose the next generation into
-/// the allocation the parent chose.
-fn rebuildComposedRunImage(ctx: *CliCtx, args: HotReloadDevWorkerArgs, shm: *SharedMemoryAllocator, target: RocTarget, build_env: *BuildEnv, tables: *RunUnitTables) CliMainError!void {
+/// the allocation the parent chose. A program whose updates may wait is lowered
+/// whole instead, and returned for the caller to publish.
+fn rebuildComposedRunImage(ctx: *CliCtx, args: HotReloadDevWorkerArgs, shm: *SharedMemoryAllocator, target: RocTarget, build_env: *BuildEnv, tables: *RunUnitTables) CliMainError!?LoweredCoordinatorResult {
     // A rebuild's output is captured; it reports no progress.
     var reporter = progress.Reporter.init(.{
         .std_io = ctx.io.std_io,
@@ -6073,7 +6065,11 @@ fn rebuildComposedRunImage(ctx: *CliCtx, args: HotReloadDevWorkerArgs, shm: *Sha
         .is_tty = false,
     });
     defer reporter.deinit();
-    var units = try lowerRunUnits(ctx, build_env, tables, target, args.path, &reporter, true);
+    const checked = try checkRunUnits(ctx, build_env, tables, target, args.path, &reporter, true);
+    if (!try checkedRunLowersApart(ctx, build_env, checked)) {
+        return try lowerCheckedLir(ctx, build_env, ctx.gpa, .{ .dev_run_image = .{ .target = target, .hot_reload = true } }, .dev, args.specialization_strategy, target, null, checked);
+    }
+    var units = try lowerRunUnits(ctx, build_env, tables, target, &reporter, true, checked);
     defer units.deinit(ctx.gpa);
 
     try writeHotReloadWatchPathsFile(ctx, args.watch_inputs_file, units.watch_inputs, null);
@@ -6105,6 +6101,7 @@ fn rebuildComposedRunImage(ctx: *CliCtx, args: HotReloadDevWorkerArgs, shm: *Sha
         },
     };
     shm.updateHeader();
+    return null;
 }
 
 fn writeDevRunImageToSharedMemory(
@@ -6671,7 +6668,21 @@ fn lowerDiscoveredLir(
     // The checked host identity covers each entrypoint's host boundary digest.
     runtime_lowering.target.host_boundary_digests = true;
     build_env.setRuntimeLowering(runtime_lowering);
+    const checked = try checkDiscoveredRun(ctx, build_env, display_path, reporter);
+    return lowerCheckedLir(ctx, build_env, lir_allocator, artifact, opt, specialization_strategy, RocTarget.detectNative(), reporter, checked);
+}
 
+/// A discovered run, checked.
+const CheckedRun = struct {
+    root_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
+    counts: CheckDiagnosticCounts,
+    /// Owned by what lowers the run.
+    watch_inputs: []const compile.watch_inputs.Input,
+};
+
+/// Check a discovered run whose runtime lowering is declared, reporting its
+/// diagnostics.
+fn checkDiscoveredRun(ctx: *CliCtx, build_env: *BuildEnv, display_path: []const u8, reporter: ?*progress.Reporter) CliMainError!CheckedRun {
     if (reporter) |r| r.begin("Type Checking");
     build_env.compileDiscovered() catch |err| {
         if (reporter) |r| r.fail();
@@ -6690,8 +6701,26 @@ fn lowerDiscoveredLir(
         return error.TypeCheckingFailed;
     }
     if (reporter) |r| try finishFrontEndPhase(ctx.arena, ctx.reportConfig(.stderr), r, build_env.getTimingInfo());
+    return .{ .root_artifact = build_env.executableRootCheckedArtifact(), .counts = counts, .watch_inputs = watch_inputs };
+}
 
-    const root_artifact = build_env.executableRootCheckedArtifact();
+/// Lower the whole program of a checked run, whose runtime lowering was declared
+/// for `target`.
+fn lowerCheckedLir(
+    ctx: *CliCtx,
+    build_env: *BuildEnv,
+    lir_allocator: Allocator,
+    artifact: PlatformEntrypointArtifact,
+    opt: cli_args.OptLevel,
+    specialization_strategy: base.SpecializationStrategy,
+    target: RocTarget,
+    reporter: ?*progress.Reporter,
+    checked: CheckedRun,
+) CliMainError!LoweredCoordinatorResult {
+    const counts = checked.counts;
+    const watch_inputs = checked.watch_inputs;
+    errdefer compile.watch_inputs.deinit(ctx.gpa, watch_inputs);
+    const root_artifact = checked.root_artifact;
     const imported_artifacts = try build_env.collectImportedArtifactViews(ctx.gpa, root_artifact);
     defer ctx.gpa.free(imported_artifacts);
     const relation_artifacts = try build_env.collectRelationArtifactViews(ctx.gpa, root_artifact);
@@ -6711,7 +6740,7 @@ fn lowerDiscoveredLir(
         .{ .platform_entrypoints = artifact },
         opt,
         specialization_strategy,
-        RocTarget.detectNative(),
+        target,
         true,
         build_env.postCheckExecutor(),
         &spec_timing,
@@ -6780,6 +6809,23 @@ fn lowerDiscoveredLir(
 fn modulesLowerApart(build_env: *const BuildEnv) bool {
     const mode = build_env.getPlatformConcurrencyMode() orelse return true;
     return !mode.hasTasks();
+}
+
+/// Whether the program of a checked build whose `modulesLowerApart` lowers its
+/// modules apart after all. Its updates may wait if not, so it may pause, and
+/// its declared consumer is made to lower it whole.
+fn checkedModulesLowerApart(
+    build_env: *BuildEnv,
+    root_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
+    imported_artifacts: []const check.CheckedArtifact.ImportedModuleView,
+    relation_artifacts: []const check.CheckedArtifact.ImportedModuleView,
+) bool {
+    if (!lir.CheckedPipeline.updatesMayWait(.{
+        .root = check.CheckedArtifact.loweringViewWithRelations(root_artifact, relation_artifacts),
+        .imports = imported_artifacts,
+    })) return true;
+    if (build_env.runtimeProgramSession()) |session| session.lowerWhole();
+    return false;
 }
 
 /// Whether a dev run composes its run image from unit images
@@ -6871,13 +6917,9 @@ const RunUnits = struct {
     }
 };
 
-/// Check a discovered dev run and build its units: every library unit
-/// restored from the per-module cache or lowered and filed there, as `roc
-/// build` does (design.md "Caching Under `.boxy`"), and the root unit (the
-/// app with the platform modules paired with it) restored from the cache or
-/// lowered and compiled with entrypoint wrappers the machine-code shim
-/// calls.
-fn lowerRunUnits(
+/// Check a discovered dev run declared to run as units, whose compile-time
+/// evaluation builds units against `tables`.
+fn checkRunUnits(
     ctx: *CliCtx,
     build_env: *BuildEnv,
     tables: *RunUnitTables,
@@ -6885,7 +6927,7 @@ fn lowerRunUnits(
     display_path: []const u8,
     reporter: *progress.Reporter,
     hot_reload: bool,
-) CliMainError!RunUnits {
+) CliMainError!CheckedRun {
     var runtime_lowering = checkedRuntimeLoweringConfig(.{ .platform_entrypoints = .{ .dev_run_image = .{ .target = target, .hot_reload = hot_reload } } }, .dev, .boxy, target);
     // The checked host identity covers each entrypoint's host boundary digest.
     runtime_lowering.target.host_boundary_digests = true;
@@ -6899,30 +6941,47 @@ fn lowerRunUnits(
         lowering.link_reads_pieces = false;
     };
 
-    reporter.begin("Type Checking");
-    build_env.compileDiscovered() catch |err| {
-        reporter.fail();
-        _ = try renderDrainedBuildEnvReports(ctx, build_env, display_path);
-        return err;
-    };
-    const counts = try renderDrainedBuildEnvReports(ctx, build_env, display_path);
-    const watch_inputs = try build_env.collectWatchInputStates();
-    errdefer compile.watch_inputs.deinit(ctx.gpa, watch_inputs);
-    // An app root that never finished checking has no program; its
-    // diagnostics have already been rendered.
-    if (!build_env.executable_artifacts_finalized) {
-        reporter.fail();
-        return error.TypeCheckingFailed;
-    }
-    try finishFrontEndPhase(ctx.arena, ctx.reportConfig(.stderr), reporter, build_env.getTimingInfo());
-
-    const root_artifact = build_env.executableRootCheckedArtifact();
+    const checked = try checkDiscoveredRun(ctx, build_env, display_path, reporter);
+    errdefer compile.watch_inputs.deinit(ctx.gpa, checked.watch_inputs);
     // A `provides` entry whose type is erroneous declares no host ABI, so no
     // program exists to run; the error was rendered with the diagnostics.
-    if (root_artifact.hasProvidedExportWithoutAbi()) {
+    if (checked.root_artifact.hasProvidedExportWithoutAbi()) {
         reporter.fail();
         return error.TypeCheckingFailed;
     }
+    return checked;
+}
+
+/// Whether a checked run declared to run as units does
+/// (`checkedModulesLowerApart`).
+fn checkedRunLowersApart(ctx: *CliCtx, build_env: *BuildEnv, checked: CheckedRun) Allocator.Error!bool {
+    errdefer compile.watch_inputs.deinit(ctx.gpa, checked.watch_inputs);
+    const imported_artifacts = try build_env.collectImportedArtifactViews(ctx.gpa, checked.root_artifact);
+    defer ctx.gpa.free(imported_artifacts);
+    const relation_artifacts = try build_env.collectRelationArtifactViews(ctx.gpa, checked.root_artifact);
+    defer ctx.gpa.free(relation_artifacts);
+    return checkedModulesLowerApart(build_env, checked.root_artifact, imported_artifacts, relation_artifacts);
+}
+
+/// Build the units of a checked dev run: every library unit
+/// restored from the per-module cache or lowered and filed there, as `roc
+/// build` does (design.md "Caching Under `.boxy`"), and the root unit (the
+/// app with the platform modules paired with it) restored from the cache or
+/// lowered and compiled with entrypoint wrappers the machine-code shim
+/// calls.
+fn lowerRunUnits(
+    ctx: *CliCtx,
+    build_env: *BuildEnv,
+    tables: *RunUnitTables,
+    target: RocTarget,
+    reporter: *progress.Reporter,
+    hot_reload: bool,
+    checked: CheckedRun,
+) CliMainError!RunUnits {
+    const counts = checked.counts;
+    const watch_inputs = checked.watch_inputs;
+    errdefer compile.watch_inputs.deinit(ctx.gpa, watch_inputs);
+    const root_artifact = checked.root_artifact;
     const imported_artifacts = try build_env.collectImportedArtifactViews(ctx.gpa, root_artifact);
     defer ctx.gpa.free(imported_artifacts);
     const relation_artifacts = try build_env.collectRelationArtifactViews(ctx.gpa, root_artifact);
@@ -12473,11 +12532,11 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResu
     // A dev executable of a `.boxy` program for a target with a fast dev
     // link format is linked by a fast dev link, whose output file and host
     // job start before any compile work.
-    const fast_link: ?*FastDevLink = if (fastDevLinkApplies(target, link_type, args, &build_env))
+    const started_fast_link: ?*FastDevLink = if (fastDevLinkApplies(target, link_type, args, &build_env))
         try FastDevLink.start(ctx, args, &build_env, platform_dir, target, link_type, final_output_path, build_scratch_dir)
     else
         null;
-    defer if (fast_link) |fast| fast.deinit(ctx.gpa);
+    defer if (started_fast_link) |fast| fast.deinit(ctx.gpa);
     // A `.boxy` dev build of a wasm target is linked by composing images,
     // whose output file and image job start before any compile work too.
     const wasm_fast_link: ?*WasmFastLink = if (wasmFastLinkApplies(target, args, &build_env))
@@ -12499,18 +12558,18 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResu
     // "Caching Under `.boxy`"): the root program is the root unit, whose
     // calls into other modules compile against their objects' export
     // interfaces.
-    const boxy_units = runtime_strategy == .boxy and args.opt == .dev and target_arch != .wasm32 and modulesLowerApart(&build_env);
-    var boxy_interfaces: ?postcheck.Boxy.Lower.ExportInterfaces = if (boxy_units) postcheck.Boxy.Lower.ExportInterfaces.init(ctx.gpa, ctx.io.std_io) else null;
-    defer if (boxy_interfaces) |*interfaces| interfaces.deinit();
+    const declared_units = runtime_strategy == .boxy and args.opt == .dev and target_arch != .wasm32 and modulesLowerApart(&build_env);
+    var declared_interfaces: ?postcheck.Boxy.Lower.ExportInterfaces = if (declared_units) postcheck.Boxy.Lower.ExportInterfaces.init(ctx.gpa, ctx.io.std_io) else null;
+    defer if (declared_interfaces) |*interfaces| interfaces.deinit();
     // Filled once checking has published every module; the root unit reads
     // its names only when it lowers, after that.
     var boxy_digests = compile.boxy_interface.Digests{ .gpa = ctx.gpa, .io = ctx.io.std_io, .names = .{} };
     defer boxy_digests.deinit();
-    const boxy_root_unit: ?postcheck.Boxy.Lower.ModuleUnit = if (boxy_interfaces) |*interfaces| .{ .imports = interfaces, .root = true, .names = &boxy_digests.names } else null;
-    runtime_lowering.target.boxy_unit = boxy_root_unit;
+    const declared_root_unit: ?postcheck.Boxy.Lower.ModuleUnit = if (declared_interfaces) |*interfaces| .{ .imports = interfaces, .root = true, .names = &boxy_digests.names } else null;
+    runtime_lowering.target.boxy_unit = declared_root_unit;
     // A build of the host target at dev opt links the objects compile-time
     // evaluation builds, so their exports go in the link's table.
-    if (boxy_interfaces) |*interfaces| if (build_env.boxy_object_lowering) |*lowering| {
+    if (declared_interfaces) |*interfaces| if (build_env.boxy_object_lowering) |*lowering| {
         if (lowering.target == target) lowering.interfaces = interfaces;
     };
     build_env.setRuntimeLowering(runtime_lowering);
@@ -12518,10 +12577,10 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResu
     // The link reads every unit's object, so compile-time evaluation
     // builds the units the link needs as their modules are checked, with
     // their pieces when the link composes them.
-    if (boxy_interfaces != null) if (build_env.boxy_object_lowering) |*lowering| {
+    if (declared_interfaces != null) if (build_env.boxy_object_lowering) |*lowering| {
         if (lowering.target == target) {
             lowering.links = true;
-            lowering.link_reads_pieces = fast_link == null;
+            lowering.link_reads_pieces = started_fast_link == null;
         }
     };
     build_env.setValidateTargetFilesForSelectedTarget(true);
@@ -12533,7 +12592,14 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResu
     const relation_artifacts = try build_env.collectRelationArtifactViews(ctx.gpa, root_artifact);
     defer ctx.gpa.free(relation_artifacts);
 
-    if (wasmUnitsApply(target, args, &build_env)) {
+    // A program whose updates may wait was declared as units, and lowers whole.
+    const lowers_apart = modulesLowerApart(&build_env) and
+        (runtime_strategy != .boxy or args.opt != .dev or checkedModulesLowerApart(&build_env, root_artifact, imported_artifacts, relation_artifacts));
+    const fast_link = if (lowers_apart) started_fast_link else null;
+    const boxy_interfaces: ?*postcheck.Boxy.Lower.ExportInterfaces = if (declared_interfaces) |*interfaces| (if (lowers_apart) interfaces else null) else null;
+    const boxy_root_unit = if (lowers_apart) declared_root_unit else null;
+
+    if (lowers_apart and wasmUnitsApply(target, args, &build_env)) {
         const units = try buildWasmUnits(ctx, args, &build_env, &reporter, root_artifact, imported_artifacts, relation_artifacts, target, resolved_targets_config);
         defer units.deinit(ctx.gpa);
         if (wasm_fast_link) |fast| {
@@ -12545,7 +12611,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResu
     // Every other module's object comes first: the root unit compiles its
     // calls against their export interfaces.
     if (boxy_interfaces != null) boxy_digests = try build_env.boxyLinkDigests();
-    const boxy_library: ?BoxyLibraryObjects = if (boxy_interfaces) |*interfaces|
+    const boxy_library: ?BoxyLibraryObjects = if (boxy_interfaces) |interfaces|
         try buildBoxyLibraryObjects(ctx, BoxyUnitPolicy.ofBuild(args), &build_env, &reporter, root_artifact, target, interfaces, &boxy_digests, fast_link != null, null, "Lowering Modules")
     else
         null;
@@ -12560,7 +12626,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResu
     if (dev_diagnostics.isSet(.trace_boxy_work)) if (boxy_library) |library| std.debug.print("boxy-work: library units {d}, root key {s}\n", .{ library.pieces.len, &std.fmt.bytesToHex(boxy_root_key.?.bytes[0..8], .lower) });
     // The root program's object is cached under its own key too: a build
     // whose every module is cached lowers nothing.
-    if (boxy_library) |library| if (try compile.boxy_unit.restore(ctx.gpa, boxy_cache_manager, boxy_root_key.?, target, &boxy_interfaces.?)) |entry| {
+    if (boxy_library) |library| if (try compile.boxy_unit.restore(ctx.gpa, boxy_cache_manager, boxy_root_key.?, target, boxy_interfaces.?)) |entry| {
         defer compile.boxy_object_cache.deinitEntry(ctx.gpa, entry);
         build_env.recordBoxyObjects(1, 0);
         if (fast_link) |fast| {
@@ -12666,7 +12732,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResu
         if (fast_link) |fast| {
             try fast.link(ctx, &reporter, &build_env, root_image.?, library, build_scratch_dir);
             if (!args.no_cache) {
-                const records = try compile.boxy_unit.exportRecords(ctx.gpa, &lowered, &boxy_interfaces.?);
+                const records = try compile.boxy_unit.exportRecords(ctx.gpa, &lowered, boxy_interfaces.?);
                 defer ctx.gpa.free(records);
                 try compile.boxy_unit.store(ctx.gpa, boxy_cache_manager, boxy_root_key.?, .{
                     .exports = records,
@@ -12690,7 +12756,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResu
             .boxy_runtime = lowered.lir_result.store.runtime_contract == .boxy,
         };
         if (boxy_root_key) |root_key| {
-            const records = try compile.boxy_unit.exportRecords(ctx.gpa, &lowered, &boxy_interfaces.?);
+            const records = try compile.boxy_unit.exportRecords(ctx.gpa, &lowered, boxy_interfaces.?);
             defer ctx.gpa.free(records);
             const encoded = try backend.dev.UnitPieces.encode(ctx.gpa, &root_pieces);
             defer ctx.gpa.free(encoded);
@@ -19041,7 +19107,9 @@ const UnitImageGlueGenerator = struct {
         });
         const build_env = &self.build_env.?;
         try discoverRunDependencies(ctx, build_env, self.glue_spec, self.glue_spec, &reporter);
-        self.units = try lowerRunUnits(ctx, build_env, tables, target, self.glue_spec, &reporter, false);
+        // `make_glue` is pure, so nothing of a glue spec that runs can wait.
+        const checked = try checkRunUnits(ctx, build_env, tables, target, self.glue_spec, &reporter, false);
+        self.units = try lowerRunUnits(ctx, build_env, tables, target, &reporter, false, checked);
         const units = &self.units.?;
         const root_artifact = units.root_artifact;
 

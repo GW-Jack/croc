@@ -471,7 +471,8 @@ pub const Constants = struct {
     /// has the running-set operations.
     /// 227: `erased_reuse_none` joins the low-level operations.
     /// 228: `task_hand` joins them.
-    pub const CACHE_VERSION = 228;
+    /// 229: a module records whether it refers to `Shared.update!`.
+    pub const CACHE_VERSION = 229;
 };
 
 /// Configuration for the Roc cache system.

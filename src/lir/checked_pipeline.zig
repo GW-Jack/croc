@@ -218,6 +218,9 @@ pub const TargetConfig = struct {
     /// checked modules; a `Tasks` build starts every `provides` root as a
     /// task (design.md "Records And The Task").
     concurrency_mode: base.ConcurrencyMode = .none,
+    /// A `.boxy` program that may pause, which lowering finds from the checked
+    /// modules (design.md "Boxy Procedures That May Suspend").
+    boxy_runs_tasks: bool = false,
     /// The consumer's actual code provider, declared before producer lowering.
     /// Reuse checking workers for generic post-check tasks when available.
     post_check_executor: ?base.post_check_task_executor.Executor = null,
@@ -2329,7 +2332,7 @@ fn finishLoweredOutput(
     // The procedure-local rewrites read which procedures may suspend
     // (design.md "Suspendability"), so the marks are committed first.
     var suspension_marks_scope = PassStepScope.begin(target.timing, .suspension_marks);
-    try SuspensionMarks.run(allocator, &lowered.lir_result.store, target.concurrency_mode);
+    try SuspensionMarks.run(allocator, &lowered.lir_result.store, target.concurrency_mode, target.boxy_runs_tasks);
     try DeclineReuse.run(allocator, &lowered.lir_result.store);
     suspension_marks_scope.end();
     var local_pass_metrics: LirPassParallelMetrics = .{};
@@ -2423,6 +2426,7 @@ fn finishLoweredOutput(
             .procs = result.root_procs.items,
             .provided = provided,
             .mode = target.concurrency_mode,
+            .boxy_runs_tasks = target.boxy_runs_tasks,
         });
     }
     continuation_scope.end();
@@ -2603,6 +2607,7 @@ pub const PreparedBoxy = struct {
         const allocator = self.allocator;
         // A module's object doesn't hold its program's mode.
         const concurrency_mode = if (target.boxy_unit == null) concurrencyModeOf(self.modules) else .none;
+        const runs_tasks = target.boxy_unit == null and (concurrency_mode.hasTasks() or updatesMayWait(self.modules));
         var boxy_timing_scope = PipelineStageScope.begin(target.timing, .boxy_lowering);
         var boxy_detail: ?BoxyTiming = if (Timing.detailOf(target.timing)) |timing| .{ .std_io = timing.std_io } else null;
         var output = try postcheck.Boxy.run(allocator, .{
@@ -2619,6 +2624,7 @@ pub const PreparedBoxy = struct {
             .stored_functions = target.boxy_stored_functions,
             .function_unit = target.boxy_function_unit,
             .concurrency_mode = concurrency_mode,
+            .runs_tasks = runs_tasks,
             .unit = if (target.boxy_unit) |unit| .{ .module = unit } else .program,
             .timing = if (boxy_detail) |*detail| detail else null,
         });
@@ -2639,6 +2645,7 @@ pub const PreparedBoxy = struct {
         output = undefined;
         var finish_target = target;
         finish_target.concurrency_mode = concurrency_mode;
+        finish_target.boxy_runs_tasks = runs_tasks;
         var program = try finishLoweredOutput(allocator, self.roots.requests.len, finish_target, &lowered, &frozen);
         program.boxy_functions = retained;
         return program;
@@ -2653,6 +2660,16 @@ fn concurrencyModeOf(modules: CheckedModuleSet) base.ConcurrencyMode {
     for (modules.root.relation_modules) |view| if (view.module_env.concurrency_mode != .none) return view.module_env.concurrency_mode;
     for (modules.imports) |view| if (view.module_env.concurrency_mode != .none) return view.module_env.concurrency_mode;
     return .none;
+}
+
+/// Whether a module of the program refers to `Shared.update!`, so that its
+/// updates may wait (design.md "Boxy Procedures That May Suspend", "Which
+/// programs without tasks.").
+pub fn updatesMayWait(modules: CheckedModuleSet) bool {
+    if (modules.root.module.moduleEnvConst().refers_to_shared_update) return true;
+    for (modules.root.relation_modules) |view| if (view.module_env.refers_to_shared_update) return true;
+    for (modules.imports) |view| if (view.module_env.refers_to_shared_update) return true;
+    return false;
 }
 
 /// Validate the checked boundary for a `.boxy` build and collect its requests,

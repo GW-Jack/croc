@@ -79,6 +79,9 @@ pub const Roots = struct {
     /// started as a task, whether or not it may suspend, so the host's
     /// signature depends only on the mode.
     mode: ConcurrencyMode = .none,
+    /// A Boxy program that may pause (design.md "Boxy Procedures That May
+    /// Suspend").
+    boxy_runs_tasks: bool = false,
 
     pub const none: Roots = .{ .procs = &.{}, .provided = &.{} };
 };
@@ -131,7 +134,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
     // Rewrites since the marks were committed may have dropped an erased
     // class's only suspending procedure (design.md "Erased Calls That May
     // Suspend").
-    try SuspensionMarks.run(allocator, store, roots.mode);
+    try SuspensionMarks.run(allocator, store, roots.mode, roots.boxy_runs_tasks);
     // A promoted loop's `group_next` is a park site, so promotion comes
     // before any procedure's sites are found.
     try RunningSetPromotion.run(allocator, store, layouts, roots.mode);
@@ -163,7 +166,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
         errdefer sites.deinit();
         try plans.append(allocator, .{ .proc = proc_id, .sites = sites, .task = undefined });
     }
-    if (plans.items.len == 0 and !roots.mode.hasTasks()) return;
+    if (plans.items.len == 0 and !roots.mode.hasTasks() and !roots.boxy_runs_tasks) return;
 
     // The task: a hidden argument after the explicit ones, passed on at
     // every site to a procedure. A hosted site takes it in the host's
@@ -184,7 +187,10 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
         for (plan.sites.sites) |site| {
             switch (SiteStmt.at(store, site.call)) {
                 .park, .dyn => {},
-                .call => |call| if (!isHosted(store, call.proc)) try appendLocal(store, &store.getCFStmtPtr(site.call).assign_call.args, plan.task),
+                .call => |call| if (!isHosted(store, call.proc)) {
+                    if (store.getProcSpecImmediate(call.proc).abi == .erased_record) invariant("a site calls an erased procedure directly", .{});
+                    try appendLocal(store, &store.getCFStmtPtr(site.call).assign_call.args, plan.task);
+                },
                 // Without tasks a call passes none (`handErased`).
                 .erased => |call| if (roots.mode.hasTasks()) {
                     var data = store.stmtRow(call.data);
@@ -323,7 +329,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
         }
     }
 
-    try SuspensionMarks.run(allocator, store, roots.mode);
+    try SuspensionMarks.run(allocator, store, roots.mode, roots.boxy_runs_tasks);
     if (builtin.mode == .debug) try verify(allocator, store, layouts);
 }
 
@@ -695,7 +701,7 @@ fn handErased(allocator: Allocator, store: *LirStore, shells: *const std.Dynamic
             if (seen.isSet(@backingInt(stmt_id))) continue;
             seen.set(@backingInt(stmt_id));
             const stmt = store.getCFStmtImmediate(stmt_id).*;
-            if (stmt == .assign_call_erased and store.stmtRow(stmt.assign_call_erased.data).suspension_site) try calls.append(allocator, stmt_id);
+            if (siteClosure(store, stmt) != null) try calls.append(allocator, stmt_id);
             try body_clone.appendSuccessors(store, &work, stmt_id, allocator);
         }
         for (calls.items) |stmt_id| {
@@ -703,7 +709,7 @@ fn handErased(allocator: Allocator, store: *LirStore, shells: *const std.Dynamic
             const origin = store.stmtOrigin(stmt_id);
             const unit = try store.addLocal(.{ .layout_idx = .zst });
             try appendLocal(store, &store.getProcSpecPtr(proc_id).frame_locals, unit);
-            const closure = store.stmtRow(stmt.assign_call_erased.data).closure;
+            const closure = siteClosure(store, stmt).?;
             const call = try store.addCFStmt(stmt, origin);
             try store.replaceCFStmt(stmt_id, .{ .assign_low_level = .{
                 .target = unit,
@@ -714,6 +720,18 @@ fn handErased(allocator: Allocator, store: *LirStore, shells: *const std.Dynamic
             } }, origin);
         }
     }
+}
+
+/// The function value a suspension site calls, when `stmt` is one that calls
+/// through the erased ABI.
+fn siteClosure(store: *const LirStore, stmt: LIR.CFStmt) ?LocalId {
+    const site = SiteStmt.of(stmt) orelse return null;
+    if (!site.isMarked(store)) return null;
+    return switch (site) {
+        .call, .park => null,
+        .erased => |call| store.stmtRow(call.data).closure,
+        .dyn => |dyn| store.stmtRow(dyn.data).call_erased.closure,
+    };
 }
 
 /// The hidden arguments a statement reads.
@@ -2044,7 +2062,7 @@ const Fixture = struct {
             .body = .some(body),
             .ret_layout = .u64,
         }, .none);
-        try SuspensionMarks.run(testing.allocator, &self.store, .none);
+        try SuspensionMarks.run(testing.allocator, &self.store, .none, false);
         return id;
     }
 
@@ -2569,6 +2587,14 @@ test "without tasks a shell reads the running task, which calls hand it, and an 
 }
 
 test "a Boxy erased procedure reads its task, tests the pending flag after its erased site and keeps its arguments" {
+    for ([_]Roots{ .none, .{ .procs = &.{}, .provided = &.{}, .mode = .tasks, .boxy_runs_tasks = true }, .{ .procs = &.{}, .provided = &.{}, .boxy_runs_tasks = true } }) |roots| {
+        try expectBoxyErasedProc(roots);
+    }
+}
+
+/// Without tasks, the procedure asks for its task and hands it to what it
+/// calls.
+fn expectBoxyErasedProc(roots: Roots) (Allocator.Error || error{ TestExpectedEqual, TestUnexpectedResult })!void {
     var f = try Fixture.init();
     defer f.deinit();
     f.store.runtime_contract = .boxy;
@@ -2594,13 +2620,24 @@ test "a Boxy erased procedure reads its task, tests the pending flag after its e
     const g = try f.addProc(&.{}, &.{g_value}, g_call);
     f.store.getProcSpecPtr(g).effect_free = true;
 
-    try run(testing.allocator, &f.store, &f.layouts, .none);
+    try run(testing.allocator, &f.store, &f.layouts, roots);
 
     // task = task_current(); t = closure(); switch task_ready(task)
     try testing.expectEqual(@as(usize, 3), f.store.getLocalSpan(f.spec(e).args).len);
     const read = f.at(f.spec(e).body.get().?).assign_low_level;
     try testing.expectEqual(LIR.LowLevel.task_current, read.op);
-    const call = f.at(read.next).dyn;
+    const asks = roots.mode == .none;
+    try testing.expectEqual(asks, f.spec(e).asks_task);
+    try testing.expect(!f.spec(g).asks_task and !f.spec(h).asks_task);
+    const call_at = if (asks) hand: {
+        const hand = f.at(read.next).assign_low_level;
+        try testing.expectEqual(LIR.LowLevel.task_hand, hand.op);
+        const hand_args = try f.locals(hand.args);
+        defer testing.allocator.free(hand_args);
+        try testing.expectEqualSlices(LocalId, &.{ closure, read.target }, hand_args);
+        break :hand hand.next;
+    } else read.next;
+    const call = f.at(call_at).dyn;
     try testing.expectEqual(closure, f.store.stmtRow(call.data).call_erased.closure);
     const flag = f.at(call.next).assign_low_level;
     try testing.expectEqual(LIR.LowLevel.task_ready, flag.op);

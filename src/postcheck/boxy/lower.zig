@@ -70,10 +70,12 @@ pub const Input = struct {
     stored_functions: bool = false,
     /// Only a demanded compiler-only unit has persistent capture/type metadata.
     function_unit: ?[32]u8 = null,
-    /// The concurrency mode of the program's platform. With tasks, calls that
-    /// may have effects are suspension sites (design.md "Boxy Procedures That
-    /// May Suspend").
+    /// The concurrency mode of the program's platform.
     concurrency_mode: base.ConcurrencyMode = .none,
+    /// The program may pause: its platform has tasks, or its updates may wait.
+    /// Calls that may have effects are suspension sites then (design.md "Boxy
+    /// Procedures That May Suspend").
+    runs_tasks: bool = false,
     /// What this lowering emits: one program, or one module's object.
     unit: Unit = .program,
     /// Receives step durations and worker counts when detailed timing is
@@ -2049,10 +2051,9 @@ pub const Program = struct {
     /// What a call of the `Shared` helper `helper` is in this program (design.md
     /// "Shared State", "Under Boxy."), or null where the call is an ordinary one.
     pub fn sharedStateCall(self: *const Program, helper: base.RunningSetHelper) ?SharedStateCall {
-        const mode = self.input.concurrency_mode;
-        if (!mode.hasTasks()) return null;
+        if (!self.input.runs_tasks) return null;
         return switch (helper) {
-            .cell_lock => if (mode == .parallel_tasks) .{ .op = .cell_lock } else null,
+            .cell_lock => if (self.input.concurrency_mode == .parallel_tasks) .{ .op = .cell_lock } else null,
             .cell_wait => .{ .op = .cell_wait },
             .cell_settle => .{ .op = .cell_settle },
             .cell_tracked => .tracked,
@@ -2064,14 +2065,15 @@ pub const Program = struct {
         };
     }
 
-    /// The template a program uses for `template`: in a build with tasks, a
+    /// The template a program uses for `template`: in one that may pause, a
     /// running-set helper's task form (design.md "Plans And Concurrent
-    /// Loops", "Promotion."), and otherwise `template` itself.
+    /// Loops", "Promotion."), and otherwise `template` itself. Without tasks a
+    /// crash ends the program, so `run_supervised!` keeps its form.
     fn taskFormTemplate(self: *const Program, module_index: ModuleIndex, template: checked_names.CheckedProcedureTemplateId) checked_names.CheckedProcedureTemplateId {
-        if (!self.input.concurrency_mode.hasTasks()) return template;
+        if (!self.input.runs_tasks) return template;
         const templates = self.module(module_index).view.checked_procedure_templates.templates.items();
         const form = templates[@backingInt(template)].running_set_helper.taskForm();
-        if (form == .none) return template;
+        if (form == .none or (form == .task_supervised and !self.input.concurrency_mode.hasTasks())) return template;
         for (templates, 0..) |candidate, index| {
             if (candidate.running_set_helper == form) return @fromBackingInt(@intCast(index));
         }

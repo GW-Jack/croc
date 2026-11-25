@@ -577,7 +577,7 @@ const Fixture = struct {
             .body = .some(body),
             .ret_layout = .u64,
         }, .none);
-        try SuspensionMarks.run(testing.allocator, &self.store, .none);
+        try SuspensionMarks.run(testing.allocator, &self.store, .none, false);
         return id;
     }
 };

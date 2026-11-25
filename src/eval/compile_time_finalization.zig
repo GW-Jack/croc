@@ -507,6 +507,14 @@ pub const ProgramSession = struct {
         self.* = undefined;
     }
 
+    /// The runtime consumer, declared as the root of per-module units, lowers
+    /// the whole program instead (design.md "Per-Module Output").
+    pub fn lowerWhole(self: *ProgramSession) void {
+        const target = if (self.runtime_target) |*declared| declared else finalizationInvariant("check-only session has no runtime consumer");
+        std.debug.assert(target.specialization_strategy == .boxy);
+        target.boxy_unit = null;
+    }
+
     pub fn takeRuntime(
         self: *ProgramSession,
         allocator: Allocator,

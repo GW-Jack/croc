@@ -224,7 +224,7 @@ pub fn pausingProgram(f: *Fixture, hosted_ret: layout.Idx, add: bool) TaskOpsTes
         .body = .some(site),
         .ret_layout = .u64,
     }, .none);
-    try lir.SuspensionMarks.run(allocator, &f.store, .none);
+    try lir.SuspensionMarks.run(allocator, &f.store, .none, false);
     var roots = [_]LIR.LirProcSpecId{g};
     try lir.ContinuationPass.run(allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .mode = .tasks });
     return roots[0];
@@ -270,7 +270,7 @@ pub fn pausingTwiceProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
         .body = .some(first),
         .ret_layout = .u64,
     }, .none);
-    try lir.SuspensionMarks.run(allocator, &f.store, .none);
+    try lir.SuspensionMarks.run(allocator, &f.store, .none, false);
     var roots = [_]LIR.LirProcSpecId{g};
     try lir.ContinuationPass.run(allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .mode = .tasks });
     return roots[0];
@@ -325,7 +325,7 @@ pub fn pausingNestedProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
         } }, .test_fixture)),
         .ret_layout = .u64,
     }, .none);
-    try lir.SuspensionMarks.run(allocator, &f.store, .none);
+    try lir.SuspensionMarks.run(allocator, &f.store, .none, false);
     var roots = [_]LIR.LirProcSpecId{g};
     try lir.ContinuationPass.run(allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .mode = .tasks });
     return roots[0];
@@ -458,7 +458,7 @@ pub fn pausingErasedProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
         .body = .some(body),
         .ret_layout = .u64,
     }, .none);
-    try lir.SuspensionMarks.run(allocator, &f.store, .none);
+    try lir.SuspensionMarks.run(allocator, &f.store, .none, false);
     var roots = [_]LIR.LirProcSpecId{g};
     try lir.ContinuationPass.run(allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .mode = .tasks });
     return roots[0];
@@ -1008,7 +1008,7 @@ fn parkingProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
     }, .none);
     f.locals.clearRetainingCapacity();
 
-    try lir.SuspensionMarks.run(f.allocator, &f.store, .none);
+    try lir.SuspensionMarks.run(f.allocator, &f.store, .none, false);
     var roots = [_]LIR.LirProcSpecId{g};
     try lir.ContinuationPass.run(f.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .mode = .tasks });
     try indexJoinPoints(f);
@@ -1378,7 +1378,7 @@ pub fn promotionProgram(f: *Fixture, background: [3]bool, body: LoopBody, releas
     }, .none);
     f.locals.clearRetainingCapacity();
 
-    try lir.SuspensionMarks.run(f.allocator, &f.store, .none);
+    try lir.SuspensionMarks.run(f.allocator, &f.store, .none, false);
     var roots = [_]LIR.LirProcSpecId{g};
     try lir.ContinuationPass.run(f.allocator, &f.store, &f.layouts, .{ .procs = &roots, .provided = &.{true}, .mode = .tasks });
     try indexJoinPoints(f);
@@ -1547,7 +1547,7 @@ pub fn supervisedProgram(f: *Fixture) TaskOpsTestError!LIR.LirProcSpecId {
     }, .none);
     f.locals.clearRetainingCapacity();
 
-    try lir.SuspensionMarks.run(f.allocator, &f.store, .tasks);
+    try lir.SuspensionMarks.run(f.allocator, &f.store, .tasks, false);
     try std.testing.expectEqual(LIR.Suspends.may, f.store.getProcSpec(supervised).suspends);
     try std.testing.expectEqual(LIR.Suspends.never, f.store.getProcSpec(entry).suspends);
     var roots = [_]LIR.LirProcSpecId{g};

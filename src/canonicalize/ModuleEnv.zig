@@ -1246,6 +1246,10 @@ module_role: ModuleRole,
 /// A platform module's `concurrency` mode; `none` for every other module and
 /// for a platform whose mode canonicalization rejected.
 concurrency_mode: base.ConcurrencyMode,
+/// Whether checking found a reference to `Shared.update!` in this module, by
+/// name or as a method; false in the Builtin module (design.md "Boxy Procedures
+/// That May Suspend", "Which programs without tasks.").
+refers_to_shared_update: bool,
 /// All the definitions in the module (populated by canonicalization)
 all_defs: CIR.Def.Span,
 /// Module-global value definitions: top-level values, associated items, and
@@ -1768,6 +1772,7 @@ pub fn initCIRFields(self: *Self, module_name: []const u8) Allocator.Error!void 
     self.module_kind = .module; // Placeholder - set to actual kind during header canonicalization
     self.module_role = .user;
     self.concurrency_mode = .none;
+    self.refers_to_shared_update = false;
     self.all_defs = .{ .span = .{ .start = 0, .len = 0 } };
     self.global_value_defs = .{ .span = .{ .start = 0, .len = 0 } };
     self.top_level_value_defs = .{ .span = .{ .start = 0, .len = 0 } };
@@ -1823,6 +1828,7 @@ pub fn initWithSourceDigest(
         .module_kind = .module, // Placeholder - set to actual kind during header canonicalization
         .module_role = .user,
         .concurrency_mode = .none,
+        .refers_to_shared_update = false,
         .all_defs = .{ .span = .{ .start = 0, .len = 0 } },
         .global_value_defs = .{ .span = .{ .start = 0, .len = 0 } },
         .top_level_value_defs = .{ .span = .{ .start = 0, .len = 0 } },
@@ -4494,6 +4500,7 @@ pub const Serialized = extern struct {
     module_kind: ModuleKind.Serialized,
     module_role: ModuleRole,
     concurrency_mode: base.ConcurrencyMode,
+    refers_to_shared_update: bool,
     all_defs: CIR.Def.Span,
     global_value_defs: CIR.Def.Span,
     top_level_value_defs: CIR.Def.Span,
@@ -4615,6 +4622,7 @@ pub const Serialized = extern struct {
         self.module_kind = ModuleKind.Serialized.encode(env.module_kind);
         self.module_role = env.module_role;
         self.concurrency_mode = env.concurrency_mode;
+        self.refers_to_shared_update = env.refers_to_shared_update;
         self.all_defs = env.all_defs;
         self.global_value_defs = env.global_value_defs;
         self.top_level_value_defs = env.top_level_value_defs;
@@ -4761,6 +4769,7 @@ pub const Serialized = extern struct {
             .module_kind = self.module_kind.decode(),
             .module_role = self.module_role,
             .concurrency_mode = self.concurrency_mode,
+            .refers_to_shared_update = self.refers_to_shared_update,
             .all_defs = self.all_defs,
             .global_value_defs = self.global_value_defs,
             .top_level_value_defs = self.top_level_value_defs,

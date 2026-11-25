@@ -1033,7 +1033,8 @@ rejected_value_annotations: collections.DenseMapUnmanaged(CIR.Pattern.Idx, void)
 /// shared monomorphic callee's scheme.
 rejected_default_exprs: collections.DenseMapUnmanaged(CIR.Expr.Idx, void) = .empty,
 /// Whether a name or a method call in this module refers to a function of
-/// `Shared`, so the module can have something for `shared_state_warnings`.
+/// `Shared`, so the module can have something for `shared_state_warnings`
+/// (`noteSharedOperation`).
 uses_shared_state: bool = false,
 /// Every accepted explicit nominal constructor backing relation, for the
 /// settled-state re-decision in `recheckNominalConstructorBackings`.
@@ -38891,7 +38892,7 @@ fn rejectRunningSetHelperDispatch(
     env: *Env,
     failure_expr: ?CIR.Expr.Idx,
 ) Allocator.Error!bool {
-    if (sharedOperationOfDef(lookup.env, lookup.binding.def_idx) != null) self.uses_shared_state = true;
+    self.noteSharedOperation(lookup.env, lookup.binding.def_idx);
     if (lookup.env.runningSetHelperForDef(lookup.binding.def_idx) == .none) return false;
     if (self.cir.module_role == .builtin) return false;
     if (self.loop_dispatch_iterables.get(constraint.fn_var) != null) return false;
@@ -63336,6 +63337,14 @@ fn sharedOperationOfDef(env: *const ModuleEnv, def_idx: CIR.Def.Idx) ?shared_sta
     return null;
 }
 
+/// Note that this module refers to a definition, where that is one of `Shared`:
+/// for `shared_state_warnings`, and `Shared.update!` for lowering.
+fn noteSharedOperation(self: *Self, env: *const ModuleEnv, def_idx: CIR.Def.Idx) void {
+    const operation = sharedOperationOfDef(env, def_idx) orelse return;
+    self.uses_shared_state = true;
+    if (operation == .update and self.cir.module_role != .builtin) self.cir.refers_to_shared_update = true;
+}
+
 /// The function of `Shared` that a checked call calls, by its name or as a
 /// method of a value whose type is `Shared`.
 pub fn sharedOperation(self: *Self, call_expr: CIR.Expr.Idx) Allocator.Error!?shared_state_warnings.Operation {
@@ -63389,7 +63398,7 @@ fn rejectRunningSetHelperUse(
     expr_var: Var,
     region: Region,
 ) Allocator.Error!bool {
-    if (sharedOperationOfDef(target_env, target_def_idx) != null) self.uses_shared_state = true;
+    self.noteSharedOperation(target_env, target_def_idx);
     if (target_env.runningSetHelperForDef(target_def_idx) == .none) return false;
     if (self.cir.module_role == .builtin) return false;
     _ = try self.problems.appendProblem(.{ .running_set_helper_use = .{ .region = region } });
