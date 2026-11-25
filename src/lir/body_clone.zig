@@ -132,11 +132,14 @@ pub fn firstFreshJoinPoint(store: *const LirStore) u32 {
     for (0..store.cfStmtCount()) |index| {
         const stmt = store.getCFStmtImmediate(@fromBackingInt(@intCast(index)));
         if (stmt.* != .join) continue;
-        const raw = @backingInt(stmt.join.id);
-        if (raw == std.math.maxInt(u32)) base.invariant("{s}", .{"join-point id space exhausted"});
-        next = @max(next, raw + 1);
+        next = @max(next, joinPointAfter(@backingInt(stmt.join.id)));
     }
     return next;
+}
+
+/// The join-point id after `raw`.
+fn joinPointAfter(raw: u32) u32 {
+    return std.math.add(u32, raw, 1) catch base.invariant("{s}", .{"join-point id space exhausted"});
 }
 
 /// A local reached by forwarding through `assign_ref .local` aliases, paired
@@ -164,16 +167,13 @@ pub const JoinParamIndex = struct {
 
     pub fn record(self: *JoinParamIndex, join: @FieldType(LIR.CFStmt, "join")) Allocator.Error!void {
         try self.params.put(join.id, join.params);
-        const raw = @backingInt(join.id);
-        if (raw == std.math.maxInt(u32)) base.invariant("{s}", .{"join-point id space exhausted"});
-        self.next_join_point = @max(self.next_join_point, raw + 1);
+        self.next_join_point = @max(self.next_join_point, joinPointAfter(@backingInt(join.id)));
     }
 
     /// Reserve an identity in the same domain used by subtree clones.
     pub fn freshJoinPoint(self: *JoinParamIndex) LIR.JoinPointId {
-        if (self.next_join_point == std.math.maxInt(u32)) base.invariant("{s}", .{"join-point id space exhausted"});
         const id: LIR.JoinPointId = @fromBackingInt(self.next_join_point);
-        self.next_join_point += 1;
+        self.next_join_point = joinPointAfter(self.next_join_point);
         return id;
     }
 
@@ -3062,6 +3062,7 @@ pub fn BodyCloner(comptime Rewriter: type) type {
                 .layouts = shape.layouts,
                 .slots = shape.slots,
                 .descriptors = try self.mapLocalSpan(shape.descriptors),
+                .boxable = shape.boxable,
             });
             try self.product_map.put(self.allocator, old, mapped);
             return mapped;
@@ -3114,9 +3115,8 @@ pub fn BodyCloner(comptime Rewriter: type) type {
                 if (self.join_params) |params| {
                     entry.value_ptr.* = params.freshJoinPoint();
                 } else {
-                    if (self.next_join_point == std.math.maxInt(u32)) base.invariant("{s}", .{"join-point id space exhausted"});
                     entry.value_ptr.* = @fromBackingInt(self.next_join_point);
-                    self.next_join_point += 1;
+                    self.next_join_point = joinPointAfter(self.next_join_point);
                 }
             }
             return entry.value_ptr.*;
@@ -3265,7 +3265,7 @@ test "subtree clone copies a suspend_save and its suspend_return" {
     const task = try store.addLocal(.{ .layout_idx = .opaque_ptr });
     const saved = try store.addLocal(.{ .layout_idx = .u64 });
     const resume_entry = try store.addProcSpec(.{
-        .name = .none,
+        .name = store.freshSyntheticSymbol(),
         .identity = LIR.ProcIdentity.forTest(3),
         .args = .empty(),
         .body = .none,

@@ -442,29 +442,34 @@ pub const Constants = struct {
     /// 205: selected data hoists carry their callable-slot proof and validation
     /// candidates survive until request eligibility is known.
     /// 206: absent optional ids and indices are stored as zero.
-    /// 207: module environments record the platform's concurrency mode.
-    /// 208: hosted lambdas and checked hosted procedures carry `suspending`.
-    /// 209: common idents include `Builtin.Concurrently`, and for-loop dispatch
+    /// 207: each module records the top-level value definition that owns each
+    /// of its nodes.
+    /// 208: remaining absences in backend, runtime and module data are explicit.
+    /// 209: each module records its numeral-node index.
+    /// 210: a default app records its `echo!` among its hosted definitions.
+    /// 211: module environments record the platform's concurrency mode.
+    /// 212: hosted lambdas and checked hosted procedures carry `suspending`.
+    /// 213: common idents include `Builtin.Concurrently`, and for-loop dispatch
     /// plans record the loop protocol.
-    /// 210: canonical IR has the `spawn` expression and its diagnostic.
-    /// 211: module environments record the Builtin running-set helper
+    /// 214: canonical IR has the `spawn` expression and its diagnostic.
+    /// 215: module environments record the Builtin running-set helper
     /// definitions, each `spawn`'s plan loop, and plan loops' dispatch.
-    /// 212: recorded running-set helpers include `run_supervised!`.
-    /// 213: `task_create_parallel` joins the low-level operations.
-    /// 214: Builtin has `Shared` and its cell operations.
-    /// 215: recorded running-set helpers include `cell_wait!` and
+    /// 216: recorded running-set helpers include `run_supervised!`.
+    /// 217: `task_create_parallel` joins the low-level operations.
+    /// 218: Builtin has `Shared` and its cell operations.
+    /// 219: recorded running-set helpers include `cell_wait!` and
     /// `cell_settle!`, whose operations join the low-level ones.
-    /// 216: `cell_lock!` and its operation join them.
-    /// 217: `task_run` and `task_run_end` join the low-level operations.
-    /// 218: recorded running-set helpers include `cleanup_push!` and
+    /// 220: `cell_lock!` and its operation join them.
+    /// 221: `task_run` and `task_run_end` join the low-level operations.
+    /// 222: recorded running-set helpers include `cleanup_push!` and
     /// `cleanup_pop!`, whose operations join the low-level ones.
-    /// 219: recorded running-set helpers include `cell_tracked!` and
+    /// 223: recorded running-set helpers include `cell_tracked!` and
     /// `cell_track!`, whose operation joins the low-level ones.
-    /// 220: common idents include the functions of `Shared`.
-    /// 221: `task_current` joins the low-level operations.
-    /// 222: recorded running-set helpers include their task forms, and Builtin
+    /// 224: common idents include the functions of `Shared`.
+    /// 225: `task_current` joins the low-level operations.
+    /// 226: recorded running-set helpers include their task forms, and Builtin
     /// has the running-set operations.
-    pub const CACHE_VERSION = 222;
+    pub const CACHE_VERSION = 226;
 };
 
 /// Configuration for the Roc cache system.

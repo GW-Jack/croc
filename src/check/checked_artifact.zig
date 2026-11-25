@@ -1802,8 +1802,8 @@ const CompileTimeRequestScheduler = struct {
         defer reached.deinit(self.allocator);
         var pending = std.ArrayList(u32).empty;
         defer pending.deinit(self.allocator);
-        var best: ?usize = null;
-        var best_count: usize = std.math.maxInt(usize);
+        const Best = struct { start: usize, count: usize };
+        var best: ?Best = null;
         for (self.emitted, 0..) |emitted, start| {
             if (emitted) continue;
             reached.reset();
@@ -1817,12 +1817,9 @@ const CompileTimeRequestScheduler = struct {
                     try pending.append(self.allocator, dependency);
                 }
             }
-            if (count < best_count) {
-                best = start;
-                best_count = count;
-            }
+            if (best == null or count < best.?.count) best = .{ .start = start, .count = count };
         }
-        return best orelse checkedArtifactInvariant("request scheduling looked for a group with every request emitted", .{});
+        return (best orelse checkedArtifactInvariant("request scheduling looked for a group with every request emitted", .{})).start;
     }
 
     fn buildEdges(self: *CompileTimeRequestScheduler) Allocator.Error!void {
@@ -4434,8 +4431,7 @@ const CheckedTypePairSet = struct {
 
     /// Add `pair`, reporting whether it was already present.
     fn insert(self: *CheckedTypePairSet, pair: CheckedTypeExactPair) Allocator.Error!bool {
-        const row_index = std.math.cast(u32, self.rows.items.len) orelse return error.OutOfMemory;
-        if (row_index == std.math.maxInt(u32)) return error.OutOfMemory;
+        const row_index = try collections.nextBiasedId(self.rows.items.len);
         try self.rows.ensureUnusedCapacity(self.first_by_left.allocator, 1);
         const head = try self.first_by_left.getOrPut(pair.left);
         const first: collections.OptionalU32 = if (head.found_existing) .some(head.value_ptr.*) else .none;
@@ -4946,6 +4942,9 @@ pub const CheckedTypeStore = struct {
     alias_row_pool: collections.SafeList(StoredAlias) = .{},
     nominal_row_pool: collections.SafeList(StoredNominal) = .{},
     nominal_declarations: collections.SafeList(CheckedNominalDeclaration) = .{},
+    /// Index of `nominal_declarations` by nominal type key. Stored with the
+    /// store.
+    nominal_declaration_index: collections.HashedProbeTable = .{},
     builtin_nominal_declarations: BuiltinNominalDeclarationIndex = empty_builtin_nominal_declarations,
     /// Flat pool of `CheckedTypeId`s for alias/nominal/function args, tuples,
     /// tag args, scheme generalized vars, and decl formal args.
@@ -5000,6 +4999,7 @@ pub const CheckedTypeStore = struct {
     const InheritedTables = struct {
         structural_roots: collections.HashedProbeTable.View = .empty,
         scheme_index: collections.HashedProbeTable.View = .empty,
+        nominal_declaration_index: collections.HashedProbeTable.View = .empty,
     };
     const ProjectedImportKey = struct { module: [32]u8, ty: CheckedTypeId };
 
@@ -5040,8 +5040,14 @@ pub const CheckedTypeStore = struct {
     /// Read-only views of this store's interning tables, for an overlay
     /// that extends it.
     fn tablesForOverlay(self: *const CheckedTypeStore) InheritedTables {
-        std.debug.assert(self.inherited_tables.structural_roots.cells.len == 0 and self.inherited_tables.scheme_index.cells.len == 0);
-        return .{ .structural_roots = self.structural_roots.view(), .scheme_index = self.scheme_index.view() };
+        std.debug.assert(self.inherited_tables.structural_roots.cells.len == 0 and
+            self.inherited_tables.scheme_index.cells.len == 0 and
+            self.inherited_tables.nominal_declaration_index.cells.len == 0);
+        return .{
+            .structural_roots = self.structural_roots.view(),
+            .scheme_index = self.scheme_index.view(),
+            .nominal_declaration_index = self.nominal_declaration_index.view(),
+        };
     }
 
     fn ownColumn(self: *CheckedTypeStore, allocator: Allocator, comptime column: BorrowedColumn) Allocator.Error!void {
@@ -5779,11 +5785,45 @@ pub const CheckedTypeStore = struct {
         self: *const CheckedTypeStore,
         nominal: canonical.NominalTypeKey,
     ) ?CheckedNominalDeclaration {
-        for (self.nominal_declarations.items()) |declaration| {
-            if (canonicalNominalTypeKeyEql(declaration.nominal, nominal)) return declaration;
-        }
-        return null;
+        const declarations = self.nominal_declarations.items();
+        const context = NominalDeclarationContext{ .declarations = declarations, .nominal = nominal };
+        const hash = nominalDeclarationHash(nominal);
+        const index = self.inherited_tables.nominal_declaration_index.find(hash, context) orelse
+            self.nominal_declaration_index.find(hash, context) orelse return null;
+        return declarations[index];
     }
+
+    /// Add `declaration`, whose id is the next declaration id and whose key
+    /// no declaration of the store has.
+    pub fn appendNominalDeclaration(
+        self: *CheckedTypeStore,
+        allocator: Allocator,
+        declaration: CheckedNominalDeclaration,
+    ) Allocator.Error!void {
+        std.debug.assert(@backingInt(declaration.id) == self.nominal_declarations.items().len);
+        std.debug.assert(self.nominalDeclaration(declaration.nominal) == null);
+        try self.ownColumn(allocator, .nominal_declarations);
+        _ = try self.nominal_declarations.append(allocator, declaration);
+        errdefer _ = self.nominal_declarations.pop();
+        try self.nominal_declaration_index.insertNew(allocator, nominalDeclarationHash(declaration.nominal), @backingInt(declaration.id));
+    }
+
+    fn nominalDeclarationHash(nominal: canonical.NominalTypeKey) u32 {
+        var hasher = std.hash.Wyhash.init(0x726f635f6e6f6d69);
+        std.hash.autoHash(&hasher, nominal.module);
+        std.hash.autoHash(&hasher, nominal.source_decl);
+        return @truncate(hasher.final());
+    }
+
+    /// Compares a nominal type key with a declaration's.
+    const NominalDeclarationContext = struct {
+        declarations: []const CheckedNominalDeclaration,
+        nominal: canonical.NominalTypeKey,
+
+        pub fn eql(self: NominalDeclarationContext, entry: u32) bool {
+            return canonicalNominalTypeKeyEql(self.declarations[entry].nominal, self.nominal);
+        }
+    };
 
     /// The declared name of `declaration`'s type, read from its declaration
     /// root's nominal payload. Display metadata only: nominal identity
@@ -5936,6 +5976,7 @@ pub const CheckedTypeStore = struct {
         // A loaded store's tables borrow the relocated buffer.
         self.structural_roots.deinit(allocator);
         self.scheme_index.deinit(allocator);
+        self.nominal_declaration_index.deinit(allocator);
         self.identity_origins.deinit(allocator);
         self.synthetic_variable_roots.deinit(allocator);
         self.projected_imports.deinit(allocator);
@@ -5974,13 +6015,14 @@ pub const CheckedTypeStore = struct {
         sealed_capabilities: SerializedSlice(sealed_type_view.SealedCapabilityRow) = .{},
         structural_roots: collections.HashedProbeTable.Serialized = .{},
         scheme_index: collections.HashedProbeTable.Serialized = .{},
+        nominal_declaration_index: collections.HashedProbeTable.Serialized = .{},
 
         comptime {
-            // 22 = 17 `SerializedSlice` fields + 3 for `var_names`
+            // 23 = 17 `SerializedSlice` fields + 3 for `var_names`
             // (`SerialStringInterner.Serialized` = 3 `SafeList` base pointers)
             // + 1 cell column per interning table. The count is the true total
             // fixups, independent of stored data size.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 22);
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 23);
         }
 
         /// A table indexes at most the entries of its column (a pairing's
@@ -5988,6 +6030,7 @@ pub const CheckedTypeStore = struct {
         pub fn validateShape(self: *const Serialized) error{CorruptArtifact}!void {
             if (self.structural_roots.len > self.roots.len) return error.CorruptArtifact;
             if (self.scheme_index.len > self.schemes.len) return error.CorruptArtifact;
+            if (self.nominal_declaration_index.len > self.nominal_declarations.len) return error.CorruptArtifact;
         }
 
         const Serde = artifact_serialize.SliceStoreSerde(CheckedTypeStore, @This());
@@ -7617,20 +7660,18 @@ fn appendCheckedNominalDeclarationFromPayload(
     const nominal = root_payload.nominal;
 
     const nominal_key = checkedNominalTypeKey(nominal);
-    for (declarations.items()) |existing| {
-        if (canonicalNominalTypeKeyEql(existing.nominal, nominal_key)) {
-            if (existing.backing == backing and
-                existing.context_len == context_len and
-                try checkedTypeRootKeySliceEql(store, existing.formalArgs(store), nominal.args) and
-                try checkedTypeRootKeySliceEql(store, existing.paddingFieldTypes(store), nominal.padding_field_types) and
-                checkedDeclaredFieldSliceEql(existing.declaredFields(store), nominal.declared_fields) and
-                try checkedNominalRecordFieldRootKeySliceEql(store, existing.declaredRecordFields(store), declared_record_fields))
-            {
-                indexBuiltinNominalDeclaration(store, nominal.builtin, existing.id);
-                return;
-            }
-            checkedArtifactInvariant("checked artifact attempted to publish conflicting nominal declarations", .{});
+    if (store.nominalDeclaration(nominal_key)) |existing| {
+        if (existing.backing == backing and
+            existing.context_len == context_len and
+            try checkedTypeRootKeySliceEql(store, existing.formalArgs(store), nominal.args) and
+            try checkedTypeRootKeySliceEql(store, existing.paddingFieldTypes(store), nominal.padding_field_types) and
+            checkedDeclaredFieldSliceEql(existing.declaredFields(store), nominal.declared_fields) and
+            try checkedNominalRecordFieldRootKeySliceEql(store, existing.declaredRecordFields(store), declared_record_fields))
+        {
+            indexBuiltinNominalDeclaration(store, nominal.builtin, existing.id);
+            return;
         }
+        checkedArtifactInvariant("checked artifact attempted to publish conflicting nominal declarations", .{});
     }
 
     // nominal.args / nominal.padding_field_types alias type_id_pool; copy before
@@ -7646,8 +7687,7 @@ fn appendCheckedNominalDeclarationFromPayload(
     const df = try store.appendPool(allocator, CheckedDeclaredField, declared_copy);
     const rf = try store.appendPool(allocator, CheckedNominalRecordField, declared_record_fields);
     const declaration_id: CheckedNominalDeclarationId = @fromBackingInt(@intCast(@as(u32, @intCast(declarations.items().len))));
-    try store.ownColumn(allocator, .nominal_declarations);
-    _ = try declarations.append(allocator, .{
+    try store.appendNominalDeclaration(allocator, .{
         .id = declaration_id,
         .nominal = nominal_key,
         .source_statement = nominal.source_decl,
@@ -11646,9 +11686,12 @@ pub const EntryWrapper = struct {
 /// Public `EntryWrapperTable` declaration.
 pub const EntryWrapperTable = struct {
     wrappers: collections.SafeList(EntryWrapper) = .{},
+    /// The wrapper of each compile-time root, indexed by root id.
+    by_root: collections.SafeList(OptionalId(canonical.EntryWrapperId)) = .{},
 
     pub const Serialized = extern struct {
         wrappers: SerializedSlice(EntryWrapper) = .{},
+        by_root: SerializedSlice(OptionalId(canonical.EntryWrapperId)) = .{},
         const Serde = artifact_serialize.SliceStoreSerde(EntryWrapperTable, @This());
         pub const serialize = Serde.serialize;
         pub const deserialize = Serde.deserialize;
@@ -11662,12 +11705,18 @@ pub const EntryWrapperTable = struct {
         checked_fn_root: CheckedTypeId,
     ) Allocator.Error!canonical.EntryWrapperId {
         const id: canonical.EntryWrapperId = @fromBackingInt(@intCast(@as(u32, @intCast(self.wrappers.items().len))));
+        const root_index = @backingInt(root);
+        if (root_index >= self.by_root.items().len) {
+            try self.by_root.appendNTimes(allocator, .none, root_index + 1 - self.by_root.items().len);
+        }
+        std.debug.assert(self.by_root.items()[root_index] == .none);
         _ = try self.wrappers.append(allocator, .{
             .id = id,
             .root = root,
             .template = template,
             .checked_fn_root = checked_fn_root,
         });
+        self.by_root.items()[root_index] = .some(id);
         return id;
     }
 
@@ -11676,10 +11725,10 @@ pub const EntryWrapperTable = struct {
     }
 
     pub fn lookupByRoot(self: *const EntryWrapperTable, root: ComptimeRootId) ?EntryWrapper {
-        for (self.wrappers.items()) |wrapper| {
-            if (wrapper.root == root) return wrapper;
-        }
-        return null;
+        const root_index = @backingInt(root);
+        if (root_index >= self.by_root.items().len) return null;
+        const id = self.by_root.items()[root_index].get() orelse return null;
+        return self.get(id);
     }
 
     pub const deinit = artifact_serialize.SliceStoreDeinit(@This()).deinit;
@@ -16991,8 +17040,7 @@ const EvidencePass = struct {
         var hasher = std.hash.Wyhash.init(0);
         for (entries) |entry| std.hash.autoHash(&hasher, entry);
         const bucket_key = hasher.final();
-        const row_index = std.math.cast(u32, self.callable_contracts.items.len) orelse return error.OutOfMemory;
-        if (row_index == std.math.maxInt(u32)) return error.OutOfMemory;
+        const row_index = try collections.nextBiasedId(self.callable_contracts.items.len);
         try self.callable_contracts.ensureUnusedCapacity(self.allocator, 1);
         const bucket = try self.callable_contract_buckets.getOrPut(self.allocator, bucket_key);
         const newest: collections.OptionalU32 = if (bucket.found_existing) .some(bucket.value_ptr.*) else .none;
@@ -22323,6 +22371,8 @@ fn publishLiteralArgumentRoots(
         /// The templates whose bodies hold each edge: a hoisted root's
         /// wrapper shares its edges with the template it was hoisted from.
         edge_templates: *std.ArrayListUnmanaged(std.ArrayListUnmanaged(u32)),
+        /// Each (edge, template) pair recorded in `edge_templates`.
+        edge_template_pairs: std.AutoHashMapUnmanaged(struct { edge: u32, template: u32 }, void) = .empty,
         stack: std.ArrayListUnmanaged(static_dispatch.EvidenceNodeId) = .empty,
         visited_derivations: collections.DenseMapUnmanaged(static_dispatch.GeneratedCodecDerivationId, void) = .empty,
         /// The substitutions composed through alias chains, which the edges
@@ -22343,8 +22393,8 @@ fn publishLiteralArgumentRoots(
                 try self.edge_templates.append(self.allocator, .empty);
             }
             const template = (edge.scope orelse return).template orelse return;
-            const list = &self.edge_templates.items[seen.value_ptr.*];
-            if (!sliceContains(u32, list.items, template)) try list.append(self.allocator, template);
+            const pair = try self.edge_template_pairs.getOrPut(self.allocator, .{ .edge = seen.value_ptr.*, .template = template });
+            if (!pair.found_existing) try self.edge_templates.items[seen.value_ptr.*].append(self.allocator, template);
         }
 
         /// The dispatch edges of `node_id` and of every node its evidence
@@ -22684,6 +22734,7 @@ fn publishLiteralArgumentRoots(
         .store = store,
         .names = names,
     };
+    defer collector.edge_template_pairs.deinit(allocator);
     defer collector.stack.deinit(allocator);
     defer collector.visited_derivations.deinit(allocator);
     defer {
@@ -24057,7 +24108,9 @@ fn copyPairingColumns(comptime T: type, source: T, allocator: Allocator) Allocat
         @memcpy(result, source);
         return result;
     } else if (comptime @typeInfo(T) == .@"struct") {
-        if (comptime @hasDecl(T, "fromBorrowedSlice") and @hasField(T, "length")) {
+        if (comptime @hasDecl(T, "copyForPairing")) {
+            return source.copyForPairing(allocator);
+        } else if (comptime @hasDecl(T, "fromBorrowedSlice") and @hasField(T, "length")) {
             artifact_serialize.assertRelocatablePod(std.meta.Child(T.Slice));
             return T.fromSlice(allocator, source.items());
         } else if (comptime @hasField(T, "items") and @hasField(T, "capacity")) {
@@ -25950,7 +26003,12 @@ fn valueFormWalk(allocator: Allocator, bodies: CheckedBodies, root: CIR.Expr.Idx
                     if (segment_data != .str_segment) return .other;
                 }
             },
-            .empty_list, .zero_argument_tag => {},
+            // A segment outside a string is a file imported as `Str`: a
+            // string literal of that one segment. Segments of a string are
+            // never walked.
+            .str_segment => if (checkedConcreteBuiltinForLiteralTarget(bodies.types, bodies.exprType(id)) != .str) return .other,
+            // A bytes literal's checked type is always `List(U8)`.
+            .empty_list, .zero_argument_tag, .bytes_literal => {},
             // An empty literal at a record type of optional fields builds
             // each field's slot as missing.
             .empty_record => if (!recordTypeIsClosedAndRequired(bodies.types, bodies.exprType(id), 0)) return .other,
@@ -25976,7 +26034,7 @@ fn valueFormWalk(allocator: Allocator, bodies: CheckedBodies, root: CIR.Expr.Idx
                 if (block.statements.len != 0) return .other;
                 try stack.append(allocator, block.final_expr);
             },
-            .str_segment, .bytes_literal, .lookup_required, .match_, .if_, .call, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .spawn, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level => return .other,
+            .lookup_required, .match_, .if_, .call, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .spawn, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level => return .other,
         }
     }
     return if (reads_constants) .reads_constants else .value_form;
@@ -26185,8 +26243,8 @@ pub fn appendValueFormConstReads(allocator: Allocator, bodies: CheckedBodies, ex
             .record => |record| for (record.fields) |field| try stack.append(allocator, bodies.recordFieldValue(field)),
             .nominal => |nominal| try stack.append(allocator, nominal.backing_expr),
             .block => |block| try stack.append(allocator, block.final_expr),
-            .numeral, .str, .empty_list, .zero_argument_tag, .empty_record => {},
-            .str_segment, .bytes_literal, .lookup_required, .match_, .if_, .call, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .spawn, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level => checkedArtifactInvariant("a value-form expression has a part that is not in value form", .{}),
+            .numeral, .str, .str_segment, .bytes_literal, .empty_list, .zero_argument_tag, .empty_record => {},
+            .lookup_required, .match_, .if_, .call, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .spawn, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level => checkedArtifactInvariant("a value-form expression has a part that is not in value form", .{}),
         }
     }
 }
@@ -26213,8 +26271,8 @@ pub fn valueFormValueExpr(bodies: CheckedBodies, expr: CIR.Expr.Idx) CIR.Expr.Id
 /// publication resolves them.
 fn valueFormCandidate(bodies: CheckedBodies, id: CIR.Expr.Idx) ?checked_bodies_mod.ExprData {
     switch (bodies.env.store.getExpr(id)) {
-        .e_num, .e_dec, .e_dec_small, .e_typed_int, .e_typed_frac, .e_str, .e_str_segment, .e_empty_list, .e_empty_record, .e_zero_argument_tag, .e_list, .e_tuple, .e_tag, .e_record, .e_nominal, .e_nominal_external, .e_block, .e_lookup_local, .e_lookup_external, .e_lookup_associated_resolved => {},
-        .e_frac_f32, .e_frac_f64, .e_num_from_numeral, .e_typed_num_from_numeral, .e_bytes_literal, .e_deferred_import_ref, .e_lookup_associated_local, .e_lookup_associated, .e_lookup_required, .e_match, .e_if, .e_call, .e_closure, .e_lambda, .e_binop, .e_unary_minus, .e_field_access, .e_method_call, .e_dispatch_call, .e_interpolation, .e_structural_eq, .e_structural_hash, .e_method_eq, .e_type_method_call, .e_type_dispatch_call, .e_tuple_access, .e_runtime_error, .e_crash, .e_dbg, .e_spawn, .e_expect_err, .e_expect, .e_ellipsis, .e_anno_only, .e_derived_method, .e_return, .e_break, .e_for, .e_hosted_lambda, .e_run_low_level => return null,
+        .e_num, .e_dec, .e_dec_small, .e_num_from_numeral, .e_typed_int, .e_typed_frac, .e_typed_num_from_numeral, .e_str, .e_str_segment, .e_bytes_literal, .e_empty_list, .e_empty_record, .e_zero_argument_tag, .e_list, .e_tuple, .e_tag, .e_record, .e_nominal, .e_nominal_external, .e_block, .e_lookup_local, .e_lookup_external, .e_lookup_associated_resolved => {},
+        .e_frac_f32, .e_frac_f64, .e_deferred_import_ref, .e_lookup_associated_local, .e_lookup_associated, .e_lookup_required, .e_match, .e_if, .e_call, .e_closure, .e_lambda, .e_binop, .e_unary_minus, .e_field_access, .e_method_call, .e_dispatch_call, .e_interpolation, .e_structural_eq, .e_structural_hash, .e_method_eq, .e_type_method_call, .e_type_dispatch_call, .e_tuple_access, .e_runtime_error, .e_crash, .e_dbg, .e_spawn, .e_expect_err, .e_expect, .e_ellipsis, .e_anno_only, .e_derived_method, .e_return, .e_break, .e_for, .e_hosted_lambda, .e_run_low_level => return null,
     }
     if (bodies.exprIsRetired(id)) return null;
     return bodies.exprData(id);
@@ -33662,11 +33720,11 @@ pub const CheckedModuleArtifact = struct {
             // + the recursive sum of every sub-store, including the `SafeList`/
             // interner base pointers (`canonical_names` = 23 via its interners,
             // `proc_bases` and `proc_base_index`; `checked_types` includes its
-            // `var_names` interner = 3 and its two interning tables).
+            // `var_names` interner = 3 and its three interning tables).
             // POD inline `key`/`source_hash`/`module_identity` contribute 0. Fixed at
             // compile time, independent of stored data size. Bodies are the module's
             // CIR, so no body column contributes a pointer.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 232);
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 234);
         }
 
         /// Every field but the inline POD `key`, `source_hash`, and
@@ -33943,7 +34001,6 @@ pub const CheckedModuleArtifact = struct {
     pub fn verifyReadyForCompileTimeLowering(self: *const CheckedModuleArtifact) void {
         if (builtin.mode != .debug) return;
 
-        std.debug.assert(self.module_identity.module_idx != std.math.maxInt(u32));
         std.debug.assert(self.checked_types.roots.items().len == self.checked_types.payloads.items().len);
         verifyRootRequestSubsets(self.root_requests);
 
@@ -35017,7 +35074,6 @@ pub const CheckedModuleArtifact = struct {
         self.compile_time_debug.validate(self.compile_time_roots.roots.items().len) catch checkedArtifactInvariant("compile-time debug observation has an invalid root or message range", .{});
         if (builtin.mode != .debug) return;
 
-        std.debug.assert(self.module_identity.module_idx != std.math.maxInt(u32));
         verifyRootRequestSubsets(self.root_requests);
         self.verifyMethodIntrinsicRuntimeTargets();
 
@@ -39458,7 +39514,7 @@ test "CheckedTypeStore: POD round-trip preserves payloads, tags, var names, rang
         .{ .padding = 0 },
     });
     const rf = try store.appendPool(gpa, CheckedNominalRecordField, &.{ .{ .named = field_name }, .{ .padding = a } });
-    _ = try store.nominal_declarations.append(gpa, .{
+    try store.appendNominalDeclaration(gpa, .{
         .id = nominal_declaration_id,
         .nominal = .{ .module = @as(canonical.ModuleIdentityId, @fromBackingInt(@intCast(15))), .source_decl = 16 },
         .source_statement = 16,
@@ -39888,8 +39944,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // `serialized_layout_version` only for semantic changes the structural hash
     // cannot observe, as documented at that discriminant.
     const golden: [32]u8 = .{
-        0xD9, 0x45, 0xF7, 0xA3, 0x54, 0x04, 0x5D, 0x51, 0xD1, 0xE9, 0xA9, 0xB5, 0x5D, 0xC9, 0xF6, 0xC1,
-        0x84, 0x69, 0x39, 0x08, 0xBF, 0xA3, 0xAE, 0xCB, 0xA9, 0x31, 0x4B, 0x86, 0x2F, 0x12, 0xB3, 0xAB,
+        0x7D, 0x51, 0x59, 0x68, 0x94, 0xB9, 0x71, 0xE6, 0xAC, 0xDB, 0xDA, 0xB5, 0x66, 0x3C, 0xF2, 0x39,
+        0x21, 0x47, 0x75, 0x17, 0x8B, 0xF9, 0xDA, 0xEB, 0xFE, 0x17, 0xA9, 0xB6, 0x87, 0xD1, 0x81, 0x56,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

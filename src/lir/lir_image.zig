@@ -110,34 +110,36 @@ pub const MAGIC: u32 = 0x52494c52; // "RLIR" in little-endian bytes.
 /// v84: procedure specs record whether they take a tail carry
 ///      (`tail_carry`).
 /// v85: absent optional ids and indices are stored as zero.
-/// v86: procedure specs record whether they may suspend (`suspends`), and
+/// v87: dynamic product shapes mark their boxable fields, and field takes
+///      record the recursion box they release.
+/// v88: procedure specs record whether they may suspend (`suspends`), and
 ///      call extras mark suspension sites (`suspension_site`).
-/// v87: `suspend_save` and `suspend_return` statements, and the
+/// v89: `suspend_save` and `suspend_return` statements, and the
 ///      `SuspendSaveData` row column.
-/// v88: procedure specs record which running-set helper they specialize
+/// v90: procedure specs record which running-set helper they specialize
 ///      (`running_set_helper`).
-/// v89: an operation's reference-count effect names the arguments and result
+/// v91: an operation's reference-count effect names the arguments and result
 ///      it makes host-visible.
-/// v90: procedure specs name the task record they are the code of
+/// v92: procedure specs name the task record they are the code of
 ///      (`task_record`), an operation names the procedure whose result it
 ///      loads (`result_of`), and an effect the arguments it makes a child
 ///      task's (`args_spawned`).
-/// v91: an effect names the arguments it stores others into
+/// v93: an effect names the arguments it stores others into
 ///      (`args_stored_into`).
-/// v92: the running-set helpers and the operations include `cell_wait` and
+/// v94: the running-set helpers and the operations include `cell_wait` and
 ///      `cell_settle`.
-/// v93: `cell_lock` joins them.
-/// v94: `task_run` and `task_run_end` join them.
-/// v95: `cleanup_push` and `cleanup_pop` join them.
-/// v96: `cell_tracked` and `cell_track` join them.
-/// v97: erased calls and erased procedures name their erased callable type
+/// v95: `cell_lock` joins them.
+/// v96: `task_run` and `task_run_end` join them.
+/// v97: `cleanup_push` and `cleanup_pop` join them.
+/// v98: `cell_tracked` and `cell_track` join them.
+/// v99: erased calls and erased procedures name their erased callable type
 ///      (`erased_class`), and erased calls mark suspension sites
 ///      (`suspension_site`).
-/// v98: the operations include `task_current`, `save`, `restore`, `take` and
+/// v100: the operations include `task_current`, `save`, `restore`, `take` and
 ///      `result_need`.
-/// v99: procedure specs record `effect_free`, and dynamic erased calls mark
+/// v101: procedure specs record `effect_free`, and dynamic erased calls mark
 ///      suspension sites.
-pub const FORMAT_VERSION: u32 = 99;
+pub const FORMAT_VERSION: u32 = 101;
 const StaticDataImage = @import("lir_image_static_data.zig").Schema(@This());
 
 /// Public `ImageError` declaration.
@@ -1319,10 +1321,10 @@ test "mapped frozen graph preserves explicit data callable and helper relocation
     try std.testing.expectEqual(layout_mod.Idx.str, viewed[0].relocations[2].rc_helper.?.layout_idx);
     const rows = try sliceFromRef(StaticDataImage.Export, memory.ptr, fixed.end_index, copied);
     const relocations = try sliceFromRef(StaticDataImage.Relocation, memory.ptr, fixed.end_index, rows[0].relocations);
-    relocations[2].rc_layout = @intCast(program.layouts.layoutCount());
+    relocations[2].rc_layout = .some(@intCast(program.layouts.layoutCount()));
     try std.testing.expectError(error.InvalidLirImage, StaticDataImage.view(allocator, memory.ptr, fixed.end_index, copied, @intCast(program.static_data_values.items.len), program.store.procSpecCount(), program.layouts.layoutCount(), 8));
-    relocations[2].rc_layout = @backingInt(layout_mod.Idx.str);
-    rows[0].value_id = 1;
+    relocations[2].rc_layout = .some(@backingInt(layout_mod.Idx.str));
+    rows[0].value_id = .some(1);
     try std.testing.expectError(error.InvalidLirImage, StaticDataImage.view(allocator, memory.ptr, fixed.end_index, copied, @intCast(program.static_data_values.items.len), program.store.procSpecCount(), program.layouts.layoutCount(), 8));
 }
 

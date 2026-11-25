@@ -62,15 +62,12 @@ pub fn SafeRange(comptime Idx: type) type {
         start: Idx,
         count: u32,
 
-        /// The `start` of every range built by `empty`. A list holds at most
-        /// `maxInt(u32)` rows, so no row has this index, and a range that
-        /// addresses no row still persists fully defined bytes (see design.md
-        /// "Fully Defined Persisted Bytes").
-        pub const empty_start: Idx = @fromBackingInt(std.math.maxInt(u32));
-
-        /// An empty range
+        /// An empty range: all zero bytes, so a range that addresses no row
+        /// persists fully defined bytes (see design.md "Fully Defined
+        /// Persisted Bytes") and zeroed storage holds empty ranges. Its start
+        /// is not an absence marker; only `count` says a range is empty.
         pub fn empty() Self {
-            return .{ .start = empty_start, .count = 0 };
+            return std.mem.zeroes(Self);
         }
 
         // Drop first elem from the span, if possible
@@ -396,6 +393,15 @@ pub fn SafeList(comptime T: type) type {
             const all = self.items();
             std.mem.copyBackwards(T, all[i + new_items.len ..], all[i..old_len]);
             @memcpy(all[i..][0..new_items.len], new_items);
+        }
+
+        /// `insert` into room the list already has.
+        pub fn insertAssumeCapacity(self: *SafeList(T), i: usize, item: T) void {
+            std.debug.assert(i <= self.length and self.length < self.capacity);
+            self.length += 1;
+            const all = self.items();
+            std.mem.copyBackwards(T, all[i + 1 ..], all[i .. all.len - 1]);
+            all[i] = item;
         }
 
         /// Remove and return the item at index `i`, moving every later item down by one.
@@ -1159,13 +1165,13 @@ test "SafeList iterator counts and visits its bounded domain" {
     try testing.expectEqual(@as(u32, 0), items.count());
 }
 
-test "SafeRange.empty has a defined start that addresses no row" {
-    // An empty range reaches persisted columns, so its start is a fixed index
-    // past every row a list can hold rather than an undefined placeholder.
+test "SafeRange.empty is all zero bytes" {
+    // An empty range reaches persisted columns, so its bytes are fully
+    // defined, and zeroed storage reads back as empty ranges.
     const Range = SafeList(u8).Range;
-    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), @backingInt(Range.empty().start));
-    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), @backingInt(SafeMultiList(struct { a: u8, b: u32 }).Range.empty().start));
-    try testing.expectEqual(Range.empty(), Range.empty());
+    try testing.expectEqual(std.mem.zeroes(Range), Range.empty());
+    try testing.expectEqual(@as(u32, 0), @backingInt(SafeMultiList(struct { a: u8, b: u32 }).Range.empty().start));
+    try testing.expect(Range.empty().isEmpty());
 }
 
 test "SafeList(u8) appendSlice" {
