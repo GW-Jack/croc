@@ -1116,6 +1116,19 @@ pub const RunningSetHelper = enum(u8) {
     run_supervised,
 };
 
+/// Which task record an erased callable is the code of. Only the task runtime
+/// calls such a procedure, with the record a statement of this program made,
+/// so the analysis of which counts are thread-confined follows values through
+/// the record (design.md "Thread-Confined Reference Counts").
+pub const TaskRecord = enum(u8) {
+    /// Not the code of a record, or of one the host starts (a root's).
+    none,
+    /// A child task's start record: the record's capture is the packed one.
+    child_start,
+    /// A resume entry: the record's captures are the saved values, in order.
+    resume_entry,
+};
+
 /// Where the erased calls a callee left pending are run. A tail call through
 /// an erased function value cannot replace its caller's frame, because the
 /// erased-call runtime sits between the two and the callee returns its result
@@ -1321,6 +1334,10 @@ pub const LowLevelExtra = struct {
     /// For `group_init`: the layout of an entry's result, which sizes the
     /// running set's slots and gives the drop for a result nobody takes.
     group_result: collections.OptionalId(layout.Idx) = .none,
+    /// For a `ptr_load` of a result the task runtime holds: the procedure that
+    /// returned it, or that a resume entry went on for. Absent once
+    /// reachability drops that procedure after ARC, which alone reads it.
+    result_of: collections.OptionalId(LirProcSpecId) = .none,
     /// Set on a list operation a `.boxy` generic body emits: its last
     /// argument is the `opaque_ptr` descriptor of the list's elements, which
     /// supplies the element width, alignment, and reference counting the
@@ -2156,6 +2173,9 @@ pub const LirProcSpec = struct {
     /// running-set helper, and kept by every copy of the procedure. Boxy
     /// sets none (design.md "Plans And Concurrent Loops", "Helper marks.").
     running_set_helper: RunningSetHelper = .none,
+    /// Set by the continuation pass on the erased callables it builds for
+    /// task records.
+    task_record: TaskRecord = .none,
     /// Tail-recursion rewrite applied by the TRMC pass, if any.
     tail_transform: TailTransform = .none,
     /// Set by ARC on every procedure that makes or receives a same-SCC tail

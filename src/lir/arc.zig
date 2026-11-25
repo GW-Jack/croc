@@ -66,6 +66,10 @@ pub const InsertOptions = struct {
     /// analysis proves confined. Optimized builds enable this; everything
     /// else emits only atomic count updates and skips the analysis.
     thread_confined_rc: bool = false,
+    /// Whether tasks of one tree can run at the same time, so a value handed
+    /// to a child task is shared between threads. Only the analysis
+    /// `thread_confined_rc` selects reads it.
+    parallel_tasks: bool = true,
     /// Prove values unique so a mutation can skip its runtime refcount check,
     /// preserving static values as immutable. Off, every mutation keeps
     /// its check, which answers the same question at runtime.
@@ -622,6 +626,7 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
         options.roots,
         options.consume_dead_boxes,
         options.thread_confined_rc,
+        options.parallel_tasks,
         uniqueness_options,
     );
     defer solution.deinit();
@@ -842,7 +847,7 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
             .sigs = all_sigs,
             .outcomes = solution.outcomes,
             .ret_conditions = solution.ret_conditions,
-        }, options.roots);
+        }, options.roots, options.parallel_tasks);
     }
     return .{ .deferred_erased_calls = deferred_erased_calls };
 }
@@ -1688,6 +1693,7 @@ const VariantTable = struct {
             // source does.
             .suspends = source_spec.suspends,
             .running_set_helper = source_spec.running_set_helper,
+            .task_record = source_spec.task_record,
             .tail_transform = source_spec.tail_transform,
             .tail_group = source_spec.tail_group,
             .tail_carry = source_spec.tail_carry,
@@ -8705,7 +8711,7 @@ test "RC exported field-take convention owns conditional partial consumers" {
         // paths, including the untouched residual field and early return.
         var diag: arc_certify.Diagnostic = .{};
         const sigs = [_]arc_sig.RcSig{.{ .borrowed_params = @intCast(borrowed) }};
-        try arc_certify.certifyStore(testing.allocator, &f.store, &f.layouts, .{ .sigs = &sigs }, &.{}, &diag);
+        try arc_certify.certifyStore(testing.allocator, &f.store, &f.layouts, .{ .sigs = &sigs }, &.{}, true, &diag);
     }
 }
 
@@ -13833,18 +13839,288 @@ test "RC atomicity: a value loaded from the host keeps atomic counts" {
     try f.expectRcAtomicity(private, .single_thread);
 }
 
-test "RC atomicity: the start record a task operation takes is named host-visible" {
-    const taking = [_]struct { op: LIR.LowLevel, arg: u6 }{
-        .{ .op = .task_create, .arg = 0 },
-        .{ .op = .task_create_parallel, .arg = 0 },
-        .{ .op = .group_push, .arg = 1 },
-        .{ .op = .group_spawn, .arg = 1 },
-    };
-    for (taking) |case| {
-        const effect = case.op.rcEffect();
-        try testing.expectEqual(@as(u64, 1) << case.arg, effect.args_host_visible);
+test "RC atomicity: a task operation names the start record it takes" {
+    for ([_]LIR.LowLevel{ .task_create, .task_create_parallel }) |op| {
+        const effect = op.rcEffect();
+        try testing.expectEqual(@as(u64, 1), effect.args_host_visible);
+        try testing.expectEqual(@as(u64, 0), effect.args_spawned);
         try testing.expectEqual(effect.consume_args, effect.args_host_visible);
     }
+    for ([_]LIR.LowLevel{ .group_push, .group_spawn }) |op| {
+        const effect = op.rcEffect();
+        try testing.expectEqual(@as(u64, 0), effect.args_host_visible);
+        try testing.expectEqual(@as(u64, 2), effect.args_spawned);
+        try testing.expectEqual(effect.consume_args, effect.args_spawned);
+    }
+}
+
+test "RC atomicity: an argument made a child task's is atomic only when tasks run in parallel" {
+    for ([_]bool{ false, true }) |parallel_tasks| {
+        var f = try ArcTest.init(testing.allocator);
+        defer f.deinit();
+        const list = try f.local(f.list_i64);
+        const alias = try f.local(f.list_i64);
+        const taken = try f.local(.i64);
+        const result = try f.local(.i64);
+
+        // list = []; alias = list; taken = op(list); expect(alias); ret 1
+        const ret = try f.ret(result);
+        const result_assign = try f.assignI64(result, 1, ret);
+        const use_alias = try f.expectStmt(alias, result_assign);
+        const take = try f.assignLowLevel(taken, &.{list}, .{
+            .may_retain_or_release = true,
+            .consume_args = 1,
+            .args_spawned = 1,
+        }, use_alias);
+        const alias_assign = try f.assignRefLocal(alias, list, take);
+        const body = try f.assignList(list, &.{}, alias_assign);
+        _ = try f.addProc(&.{}, body, .i64);
+
+        _ = try insert(&f.store, &f.layouts, .{ .thread_confined_rc = true, .parallel_tasks = parallel_tasks });
+        try f.expectRcAtomicity(list, if (parallel_tasks) .atomic else .single_thread);
+    }
+}
+
+/// A procedure that pauses with two lists saved, and the resume entry that
+/// reads them back and passes the first to a hosted procedure.
+const PausedLists = struct {
+    /// What the hosted procedure gets, when the fixture makes the entry.
+    const Passed = enum { nothing, first_list };
+
+    first: LIR.LocalId,
+    second: LIR.LocalId,
+    read_first: LIR.LocalId,
+    read_second: LIR.LocalId,
+
+    fn build(f: *ArcTest, passed: Passed) error{OutOfMemory}!PausedLists {
+        const hosted = try f.store.addProcSpec(.{
+            .name = f.store.freshSyntheticSymbol(),
+            .identity = LIR.ProcIdentity.forTest(11),
+            .args = try f.span(&.{}),
+            .body = .none,
+            .ret_layout = .i64,
+        }, .none);
+
+        // R(task, capture, reuse) = record = capture_load; a = record.0;
+        // b = record.1; hosted(a)?; expect(a); expect(b); ret 1
+        const capture = try f.local(.opaque_ptr);
+        const reuse = try f.local(try f.layouts.insertErasedCallable());
+        const record_layout = try f.layouts.putStructFields(&.{
+            .{ .index = 0, .layout = f.list_i64 },
+            .{ .index = 1, .layout = f.list_i64 },
+        });
+        const record = try f.local(record_layout);
+        const a = try f.local(f.list_i64);
+        const b = try f.local(f.list_i64);
+        const called = try f.local(.i64);
+        const value = try f.local(.i64);
+        const entry_ret = try f.ret(value);
+        var next = try f.assignI64(value, 1, entry_ret);
+        next = try f.expectStmt(b, next);
+        next = try f.expectStmt(a, next);
+        if (passed == .first_list) next = try f.store.addCFStmt(.{ .assign_call = .{
+            .target = called,
+            .proc = hosted,
+            .args = try f.span(&.{a}),
+            .next = next,
+        } }, .test_fixture);
+        next = try f.store.addCFStmt(.{ .assign_ref = .{ .target = b, .op = LIR.RefOp.field(record, 1), .next = next } }, .test_fixture);
+        next = try f.store.addCFStmt(.{ .assign_ref = .{ .target = a, .op = LIR.RefOp.field(record, 0), .next = next } }, .test_fixture);
+        next = try f.store.addLowLevelStmt(record, .erased_capture_load, &.{ capture, reuse }, next, .test_fixture);
+        const entry = try f.addProc(&.{ capture, reuse }, next, .i64);
+        {
+            const spec = f.store.getProcSpecPtr(entry);
+            spec.abi = .erased_callable;
+            spec.task_record = .resume_entry;
+            spec.erased_capture_arg = .some(capture);
+            spec.erased_reuse_arg = .some(reuse);
+            spec.erased_call_args = .some(try f.store.internErasedCallArgsPlan(&f.layouts, &.{}));
+        }
+
+        // f() = first = []; second = []; suspend_save R [first, second]; suspend_return
+        const task = try f.local(.opaque_ptr);
+        const first = try f.local(f.list_i64);
+        const second = try f.local(f.list_i64);
+        const pause = try f.store.addCFStmt(.{ .suspend_return = {} }, .test_fixture);
+        const save = try f.store.addCFStmt(.{ .suspend_save = .{
+            .task = task,
+            .data = try f.store.addStmtRow(LIR.SuspendSaveData, .{
+                .proc = entry,
+                .saved = try f.span(&.{ first, second }),
+                .capture_layout = record_layout,
+                .on_drop = .none,
+                .slot_drop = .none,
+            }),
+            .next = pause,
+        } }, .test_fixture);
+        const second_assign = try f.assignList(second, &.{}, save);
+        const body = try f.assignList(first, &.{}, second_assign);
+        _ = try f.addProc(&.{task}, body, .i64);
+        return .{ .first = first, .second = second, .read_first = a, .read_second = b };
+    }
+};
+
+fn visibleLocals(f: *ArcTest, roots: []const LIR.LirProcSpecId) error{OutOfMemory}!std.bit_set.DynamicBitSetUnmanaged {
+    const rc = try arc_solve.computeLocalContainsRefcounted(testing.allocator, &f.store, &f.layouts);
+    defer testing.allocator.free(rc);
+    var pinned = try arc_solve.computePinnedProcs(testing.allocator, &f.store, roots);
+    defer pinned.deinit(testing.allocator);
+    return arc_solve.computeVisibility(testing.allocator, &f.store, rc, &pinned, false);
+}
+
+test "RC atomicity: values saved across a pause stay confined" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const paused = try PausedLists.build(&f, .nothing);
+    var visible = try visibleLocals(&f, &.{});
+    defer visible.deinit(testing.allocator);
+    for ([_]LIR.LocalId{ paused.first, paused.second, paused.read_first, paused.read_second }) |local| {
+        try testing.expect(!visible.isSet(@backingInt(local)));
+    }
+    _ = try insert(&f.store, &f.layouts, .{ .thread_confined_rc = true, .parallel_tasks = false });
+}
+
+test "RC atomicity: a saved value the resumed code gives the host is visible, and the others are not" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const paused = try PausedLists.build(&f, .first_list);
+    var visible = try visibleLocals(&f, &.{});
+    defer visible.deinit(testing.allocator);
+    try testing.expect(visible.isSet(@backingInt(paused.first)));
+    try testing.expect(visible.isSet(@backingInt(paused.read_first)));
+    try testing.expect(!visible.isSet(@backingInt(paused.second)));
+    try testing.expect(!visible.isSet(@backingInt(paused.read_second)));
+    _ = try insert(&f.store, &f.layouts, .{ .thread_confined_rc = true, .parallel_tasks = false });
+}
+
+test "RC atomicity: a resume entry returns what the procedure that saved it returns" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    // R() = made = []; ret made
+    const made = try f.local(f.list_i64);
+    const entry = try f.addProc(&.{}, try f.assignList(made, &.{}, try f.ret(made)), f.list_i64);
+    f.store.getProcSpecPtr(entry).task_record = .resume_entry;
+
+    // f() = kept = []; match c { 1 => ret kept, _ => suspend_save R []; suspend_return }
+    const task = try f.local(.opaque_ptr);
+    const c = try f.local(.i64);
+    const kept = try f.local(f.list_i64);
+    const pause = try f.store.addCFStmt(.{ .suspend_return = {} }, .test_fixture);
+    const save = try f.store.addCFStmt(.{ .suspend_save = .{
+        .task = task,
+        .data = try f.store.addStmtRow(LIR.SuspendSaveData, .{
+            .proc = entry,
+            .saved = .empty(),
+            .capture_layout = .zst,
+            .on_drop = .none,
+            .slot_drop = .none,
+        }),
+        .next = pause,
+    } }, .test_fixture);
+    const returns = try f.assignList(kept, &.{}, try f.ret(kept));
+    const body = try f.store.addCFStmt(.{ .switch_stmt = .{
+        .cond = c,
+        .branches = try f.store.addCFSwitchBranches(&.{.{ .value = 1, .body = returns }}),
+        .default_branch = save,
+    } }, .test_fixture);
+    const saver = try f.addProc(&.{ task, c }, body, f.list_i64);
+
+    // What the saver returns goes to the host, so what the entry makes does.
+    var visible = try visibleLocals(&f, &.{saver});
+    defer visible.deinit(testing.allocator);
+    try testing.expect(visible.isSet(@backingInt(kept)));
+    try testing.expect(visible.isSet(@backingInt(made)));
+    var confined = try visibleLocals(&f, &.{});
+    defer confined.deinit(testing.allocator);
+    try testing.expect(!confined.isSet(@backingInt(kept)));
+    try testing.expect(!confined.isSet(@backingInt(made)));
+}
+
+test "RC atomicity: a loaded result is what the procedure it names returned" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const made = try f.local(f.list_i64);
+    const maker = try f.addProc(&.{}, try f.assignList(made, &.{}, try f.ret(made)), f.list_i64);
+    const other = try f.local(f.list_i64);
+    _ = try f.addProc(&.{}, try f.assignList(other, &.{}, try f.ret(other)), f.list_i64);
+
+    // main(slot) = loaded = ptr_load(slot), which `maker` returned; ret loaded
+    const slot = try f.local(try f.layouts.insertPtr(f.list_i64));
+    const loaded = try f.local(f.list_i64);
+    const load = try f.store.addTaskResultLoad(loaded, slot, maker, try f.ret(loaded), .test_fixture);
+    const main = try f.addProc(&.{slot}, load, f.list_i64);
+
+    var visible = try visibleLocals(&f, &.{main});
+    defer visible.deinit(testing.allocator);
+    try testing.expect(visible.isSet(@backingInt(loaded)));
+    try testing.expect(visible.isSet(@backingInt(made)));
+    try testing.expect(!visible.isSet(@backingInt(other)));
+    var confined = try visibleLocals(&f, &.{});
+    defer confined.deinit(testing.allocator);
+    try testing.expect(!confined.isSet(@backingInt(loaded)));
+}
+
+test "RC atomicity: a child's start procedure loads the capture packed for it" {
+    for ([_]LIR.TaskRecord{ .none, .child_start }) |task_record| {
+        var f = try ArcTest.init(testing.allocator);
+        defer f.deinit();
+        const erased = try f.layouts.insertErasedCallable();
+        // S(capture, reuse) = list = capture_load; expect(list); ret 1
+        const capture = try f.local(.opaque_ptr);
+        const reuse = try f.local(erased);
+        const list = try f.local(f.list_i64);
+        const value = try f.local(.i64);
+        var next = try f.assignI64(value, 1, try f.ret(value));
+        next = try f.expectStmt(list, next);
+        next = try f.store.addLowLevelStmt(list, .erased_capture_load, &.{ capture, reuse }, next, .test_fixture);
+        const start = try f.addProc(&.{ capture, reuse }, next, .i64);
+        {
+            const spec = f.store.getProcSpecPtr(start);
+            spec.abi = .erased_callable;
+            spec.task_record = task_record;
+            spec.erased_capture_arg = .some(capture);
+            spec.erased_reuse_arg = .some(reuse);
+        }
+
+        // main() = packed_list = []; record = <S, packed_list>; expect(record); ret 1
+        const packed_list = try f.local(f.list_i64);
+        const record = try f.local(erased);
+        const result = try f.local(.i64);
+        next = try f.assignI64(result, 1, try f.ret(result));
+        next = try f.expectStmt(record, next);
+        next = try f.store.addCFStmt(.{ .assign_packed_erased_fn = .{
+            .target = record,
+            .data = try f.store.addStmtRow(LIR.PackedErasedFnData, .{
+                .proc = start,
+                .capture = .some(packed_list),
+                .capture_layout = .some(f.list_i64),
+                .on_drop = .none,
+            }),
+            .next = next,
+        } }, .test_fixture);
+        _ = try f.addProc(&.{}, try f.assignList(packed_list, &.{}, next), .i64);
+
+        var visible = try visibleLocals(&f, &.{});
+        defer visible.deinit(testing.allocator);
+        // A function value may be called from code the solver cannot see.
+        try testing.expectEqual(task_record == .none, visible.isSet(@backingInt(list)));
+        try testing.expect(!visible.isSet(@backingInt(packed_list)));
+
+        // What the child reads is what its record was given.
+        var rooted = try arcRootedCapture(&f, packed_list);
+        defer rooted.deinit(testing.allocator);
+        try testing.expectEqual(true, rooted.isSet(@backingInt(list)));
+    }
+}
+
+/// The visible locals once a procedure the host calls also passes `local` on.
+fn arcRootedCapture(f: *ArcTest, local: LIR.LocalId) error{OutOfMemory}!std.bit_set.DynamicBitSetUnmanaged {
+    const given = try f.local(f.list_i64);
+    const done = try f.local(.i64);
+    var next = try f.assignI64(done, 1, try f.ret(done));
+    next = try f.assignRefLocal(local, given, next);
+    const root = try f.addProc(&.{given}, next, .i64);
+    return visibleLocals(f, &.{root});
 }
 
 test "uniqueness: freshly built list consumed by a checked op elides the check" {
@@ -18536,7 +18812,7 @@ test "RC issue 13303 keeps a projected field live through its alias" {
         sig.* = .{ .borrowed_params = @intCast(proc.rc_borrowed_params) };
     }
     var diag: arc_certify.Diagnostic = .{};
-    arc_certify.certifyStore(testing.allocator, &f.store, &f.layouts, .{ .sigs = sigs }, &.{}, &diag) catch |err| {
+    arc_certify.certifyStore(testing.allocator, &f.store, &f.layouts, .{ .sigs = sigs }, &.{}, true, &diag) catch |err| {
         std.debug.print("{s}\n", .{diag.message()});
         return err;
     };
@@ -20964,7 +21240,7 @@ test "ARC dynamic product takes independently stored fields and preserves aliase
         try d.f.expectRc(param, 0, 0, 0);
         var diag: arc_certify.Diagnostic = .{};
         const sigs = [_]arc_sig.RcSig{.{}};
-        arc_certify.certifyStore(testing.allocator, &d.f.store, &d.f.layouts, .{ .sigs = &sigs }, &.{proc}, &diag) catch |err| {
+        arc_certify.certifyStore(testing.allocator, &d.f.store, &d.f.layouts, .{ .sigs = &sigs }, &.{proc}, true, &diag) catch |err| {
             std.debug.print("dynamic product certification failed: {any}\n", .{diag});
             return err;
         };
@@ -21022,7 +21298,7 @@ test "ARC erased argument products take fields and preserve prefix and scalar re
         try d.expectDynamicRcShape();
         var diag: arc_certify.Diagnostic = .{};
         const sigs = [_]arc_sig.RcSig{.all_owned};
-        arc_certify.certifyStore(testing.allocator, &d.f.store, &d.f.layouts, .{ .sigs = &sigs }, &.{proc}, &diag) catch |err| {
+        arc_certify.certifyStore(testing.allocator, &d.f.store, &d.f.layouts, .{ .sigs = &sigs }, &.{proc}, true, &diag) catch |err| {
             std.debug.print("erased argument product certification failed: {any}\n", .{diag});
             return err;
         };

@@ -48,7 +48,8 @@ const group_pending: u64 = 2;
 /// site, a running set's `group_next`, returns `group_pending`. A park
 /// site's resume runs `group_next` on the set again.
 const SiteKind = union(enum) {
-    procedure,
+    /// The procedure called.
+    procedure: ProcId,
     hosted,
     /// The loop id that names the running set.
     park: LocalId,
@@ -166,7 +167,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
         for (plan.sites.sites, 0..) |site, ordinal| {
             const stmt = SiteStmt.at(store, site.call);
             const kind: SiteKind = switch (stmt) {
-                .call => |call| if (isHosted(store, call.proc)) .hosted else .procedure,
+                .call => |call| if (isHosted(store, call.proc)) .hosted else .{ .procedure = call.proc },
                 .park => |op| .{ .park = GuardedList.at(store.getLocalSpan(op.args), 0) },
             };
             if (kind == .hosted) hosted_procs.set(@backingInt(stmt.call.proc));
@@ -197,6 +198,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
                     .args = .empty(),
                     .ret_layout = source.ret_layout,
                     .abi = .erased_callable,
+                    .task_record = .resume_entry,
                 }, store.procLoc(plan.proc));
                 try nameDerived(allocator, store, info.resume_entry.?, plan.proc, "resume", ordinal);
                 info.capture_layout = try captureLayout(allocator, store, layouts, site.live_after, target);
@@ -292,8 +294,9 @@ pub const Start = struct {
 /// Make the start procedure of `callee`, whose explicit arguments have
 /// `explicit` layouts. When `pass_task` holds, the call passes the task
 /// after them: `callee` may suspend, so the pass gives it the task, either
-/// already (a root) or after this (an entry's `run_entry!`).
-pub fn buildStart(allocator: Allocator, store: *LirStore, layouts: *layout.Store, callee: ProcId, explicit: []const layout.Idx, pass_task: bool) Allocator.Error!Start {
+/// already (a root) or after this (an entry's `run_entry!`). `task_record` says
+/// whether a child's record names it.
+pub fn buildStart(allocator: Allocator, store: *LirStore, layouts: *layout.Store, callee: ProcId, explicit: []const layout.Idx, pass_task: bool, task_record: LIR.TaskRecord) Allocator.Error!Start {
     const source = store.getProcSpecImmediate(callee).*;
     const origin = store.stmtOrigin(source.body.get().?);
     const capture_fields = try allocator.alloc(layout.StructField, explicit.len);
@@ -308,6 +311,7 @@ pub fn buildStart(allocator: Allocator, store: *LirStore, layouts: *layout.Store
         .args = .empty(),
         .ret_layout = source.ret_layout,
         .abi = .erased_callable,
+        .task_record = task_record,
     }, store.procLoc(callee));
     try nameDerived(allocator, store, start, callee, "start", null);
     var frame = std.ArrayList(LocalId).empty;
@@ -395,7 +399,7 @@ fn startRoot(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roo
     const arg_layouts = try allocator.alloc(layout.Idx, explicit.len);
     defer allocator.free(arg_layouts);
     for (explicit, arg_layouts) |arg, *arg_layout| arg_layout.* = store.getLocal(arg).layout_idx;
-    const start = try buildStart(allocator, store, layouts, root, arg_layouts, may_suspend);
+    const start = try buildStart(allocator, store, layouts, root, arg_layouts, may_suspend, .none);
     const erased = try layouts.insertErasedCallable();
 
     const entry = try store.addProcSpec(.{
@@ -731,9 +735,13 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
     } }, origin);
     var head = switch (info.kind) {
         .park => call,
-        .procedure, .hosted => blk: {
+        .procedure => |called| blk: {
+            const load = try store.addTaskResultLoad(result.?, address.?, called, call, origin);
+            break :blk try store.addLowLevelStmt(address.?, .task_result_buffer, &.{task}, load, origin);
+        },
+        .hosted => blk: {
             const load = try store.addHostVisibleLoad(result.?, address.?, call, origin);
-            break :blk try store.addLowLevelStmt(address.?, if (info.kind == .hosted) .task_hosted_slot else .task_result_buffer, &.{task}, load, origin);
+            break :blk try store.addLowLevelStmt(address.?, .task_hosted_slot, &.{task}, load, origin);
         },
     };
     if (fields.items.len > 0) {
@@ -1302,6 +1310,7 @@ fn pendingSave(store: *const LirStore, site: SiteStmt) ?CFStmtId {
 fn verifyResumeEntry(allocator: Allocator, store: *const LirStore, data: LIR.SuspendSaveData) Allocator.Error!ProcId {
     const entry = store.getProcSpecImmediate(data.proc);
     if (entry.abi != .erased_callable) invariant("a pending edge saves a procedure that is not an erased callable", .{});
+    if (entry.task_record != .resume_entry) invariant("a pending edge saves a procedure that is not a resume entry", .{});
     const entry_args = store.getLocalSpan(entry.args);
     if (GuardedList.borrowLen(entry_args) != 3) invariant("a resume entry does not take the task, its capture and its reuse input", .{});
     const task = GuardedList.at(entry_args, 0);
@@ -1319,7 +1328,8 @@ fn verifyResumeEntry(allocator: Allocator, store: *const LirStore, data: LIR.Sus
             },
             .assign_low_level => |op| {
                 if (op.op == .ptr_load) {
-                    if (!store.stmtRow(op.rc_effect).result_host_visible) invariant("a resume entry loads its call's result without marking it host-visible", .{});
+                    const named = store.stmtRowOrDefault(op.extra).result_of.get() != null;
+                    if (store.stmtRow(op.rc_effect).result_host_visible == named) invariant("a resume entry loads its call's result without naming where it came from", .{});
                     result = op.target;
                 }
                 at = op.next;
@@ -1697,7 +1707,9 @@ test "a resume entry reads its capture and the result buffer and calls the conti
     try testing.expectEqual(LIR.LowLevel.task_result_buffer, address.op);
     const result = f.at(address.next).assign_low_level;
     try testing.expectEqual(LIR.LowLevel.ptr_load, result.op);
-    try testing.expect(f.store.stmtRow(result.rc_effect).result_host_visible);
+    try testing.expect(!f.store.stmtRow(result.rc_effect).result_host_visible);
+    try testing.expectEqual(f.seed, f.store.stmtRowOrDefault(result.extra).result_of.get().?);
+    try testing.expectEqual(LIR.TaskRecord.resume_entry, spec.task_record);
     const call = f.at(result.next).assign_call;
     try testing.expectEqual(c, call.proc);
     const call_args = try f.locals(call.args);

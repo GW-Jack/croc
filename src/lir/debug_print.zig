@@ -44,6 +44,7 @@ pub fn writeProc(
     if (proc.tail_carry) try writer.writeAll(" tail_carry");
     if (proc.suspends == .may) try writer.writeAll(" suspends=may");
     if (proc.running_set_helper != .none) try writer.print(" running_set_helper={s}", .{@tagName(proc.running_set_helper)});
+    if (proc.task_record != .none) try writer.print(" task_record={s}", .{@tagName(proc.task_record)});
     try writer.writeAll("\n");
 
     if (proc.body.get()) |body| {

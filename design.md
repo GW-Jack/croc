@@ -29187,9 +29187,9 @@ The analysis is one more monotone bit per local in the ARC solver, over
 edges the solver already walks:
 
 - seeds: parameters and returns of pinned procs (roots, hosted procs,
-  erased-callable procs, procs whose address escapes), values saved across a
-  suspension, and the arguments and results that a low-level op's `RcEffect`
-  names as host-visible
+  erased-callable procs other than the code of a task record, procs whose
+  address escapes), and the arguments and results that a low-level op's
+  `RcEffect` names as host-visible
 - pure same-value aliases, in both directions
 - containment, in both directions: aggregate and capture operands link to
   the constructed value, and payload reads link to their source—storing a
@@ -29223,18 +29223,47 @@ sharing mask they name a boundary, not an edge: the value crosses into or out
 of code the solver cannot see, as it does at a hosted call.
 
 - `args_host_visible`: the op hands these arguments to such code.
-  `task_create`, `group_push` and `group_spawn` set it for the start record
-  they take. A record is an erased callable the task runtime drops or starts
-  later, from whichever thread resumes the task, so everything it captures is
-  visible to whatever else holds it.
+  `task_create` and `task_create_parallel` set it for a root's start record,
+  which holds what the host passed.
+- `args_spawned`: the op makes these arguments a child task's. `group_push` and
+  `group_spawn` set it for the start record they take. It is a seed in a
+  `ParallelTasks` program, where a child runs while its owner and siblings do,
+  and nothing in a `Tasks` program.
 - `result_host_visible`: the result came from such code. `ptr_load` reads many
   kinds of address, so this one belongs to the statement, not the operation.
   The continuation pass sets it when it loads a suspending hosted call's result
-  from the hosted slot and a paused call's result from the result buffer, and
-  running-set promotion sets it when it loads an arrived result or a crash
-  message. A host that keeps its own reference to a string it returned updates
+  from the hosted slot, and running-set promotion sets it when it loads a crash
+  message, which the runtime made. A host that keeps its own reference to a string it returned updates
   that string's count from another thread, whether the hosted call returned it
   directly or delivered it to the slot.
+
+A task is one thread of control, whichever threads resume it, and a resume
+happens after the pause before it. A value that only one task holds is therefore
+as confined when it waits in a record as when it stays in a frame, and the
+analysis follows it through the record:
+
+- A pending edge's saved value at position `i` is the field `i` that the resume
+  entry named by `suspend_save` reads (`LirProcSpec.task_record` is
+  `resume_entry`), and the same position of every other edge that saves that
+  entry. Positions are linked one by one, so a host-visible value live across a
+  pause does not make the others visible. The record itself is a seed: nothing
+  counts it except as a whole, and a release of the whole may reach a visible
+  field.
+- A resume entry returns what the procedure that saved it would have returned,
+  so the returns of the two are linked.
+- A child's start record is packed by `assign_packed_erased_fn`, and the start
+  procedure (`child_start`) loads its capture, which is the packed one.
+- A `ptr_load` of a result the runtime holds names the procedure that returned
+  it (`LowLevelExtra.result_of`): the callee of a paused call, or the start
+  procedure of an arrived child. Its target is linked to that procedure's
+  returns, as a direct call's is.
+
+The runtime is the only caller of a record's code, so those procedures' pinned
+parameters and returns are not seeds. A `Tasks` program therefore has no seed
+that a `None` program of the same shape lacks, apart from the host's own values
+and crash messages. The runtime's releases (of a cancelled task's record or a
+result nobody took) are atomic: they follow the last access by the code whose
+counts are plain, and one thread makes both or hands over between them.
 
 Emission attaches the chosen atomicity to each `incref`, `decref`, and
 `free` statement as explicit data; backends and the interpreter follow it

@@ -40,3 +40,44 @@ test "a procedure that may suspend returns an owned result" {
     try std.testing.expectEqual(lir.LIR.Suspends.may, after_fetch.suspends);
     try std.testing.expect(!after_fetch.ret_borrowed);
 }
+
+var list_counts: struct { plain: usize, atomic: usize } = .{ .plain = 0, .atomic = 0 };
+
+/// The counts of `List(U8)` values in `keep_list!` and what the continuation
+/// pass made from it.
+fn countListUpdates(store: *const lir.LirStore, layouts: *const layout.Store) harness.LowerToLirHarnessError!void {
+    list_counts = .{ .plain = 0, .atomic = 0 };
+    var stmts = std.ArrayList(lir.LIR.CFStmtId).empty;
+    defer stmts.deinit(std.testing.allocator);
+    for (0..store.getProcSpecs().len) |index| {
+        const proc_id: lir.LIR.LirProcSpecId = @fromBackingInt(@intCast(index));
+        const name = store.procDebugName(proc_id) orelse continue;
+        if (!std.mem.startsWith(u8, name, "keep_list!")) continue;
+        const body = store.getProcSpec(proc_id).body.get() orelse continue;
+        try lir.ArcSolve.collectProcStatements(std.testing.allocator, store, body, &stmts);
+        for (stmts.items) |stmt_id| {
+            const stmt = store.getCFStmt(stmt_id);
+            const value, const atomicity = if (stmt == .incref)
+                .{ stmt.incref.value, stmt.incref.atomicity }
+            else if (stmt == .decref)
+                .{ stmt.decref.value, stmt.decref.atomicity }
+            else
+                continue;
+            if (layouts.getLayout(store.getLocal(value).layout_idx).tag != .list) continue;
+            switch (atomicity) {
+                .single_thread => list_counts.plain += 1,
+                .atomic => list_counts.atomic += 1,
+            }
+        }
+    }
+}
+
+test "a list only one task holds is counted without atomics across its pauses" {
+    try harness.runAppPathLirInspection(
+        "test/postcheck/suspension_arc/app.roc",
+        .{ .inline_mode = .none, .thread_confined_rc = true },
+        countListUpdates,
+    );
+    try std.testing.expect(list_counts.plain > 0);
+    try std.testing.expectEqual(@as(usize, 0), list_counts.atomic);
+}

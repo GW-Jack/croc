@@ -118,7 +118,11 @@ pub const MAGIC: u32 = 0x52494c52; // "RLIR" in little-endian bytes.
 ///      (`running_set_helper`).
 /// v89: an operation's reference-count effect names the arguments and result
 ///      it makes host-visible.
-pub const FORMAT_VERSION: u32 = 89;
+/// v90: procedure specs name the task record they are the code of
+///      (`task_record`), an operation names the procedure whose result it
+///      loads (`result_of`), and an effect the arguments it makes a child
+///      task's (`args_spawned`).
+pub const FORMAT_VERSION: u32 = 90;
 const StaticDataImage = @import("lir_image_static_data.zig").Schema(@This());
 
 /// Public `ImageError` declaration.
@@ -881,6 +885,7 @@ test "persisted image bytes do not depend on what store memory held before" {
             .body = .some(ret),
             .ret_layout = .u64,
             .running_set_helper = .run_next,
+            .task_record = .resume_entry,
         };
         try lowered.root_procs.append(gpa, proc);
 
@@ -907,6 +912,7 @@ test "persisted image bytes do not depend on what store memory held before" {
         try std.testing.expectEqual(@as(?LIR.CFStmtId, ret), view.store.getProcSpecImmediate(proc).body.get());
         try std.testing.expectEqual(name, view.store.getProcSpecImmediate(proc).name);
         try std.testing.expectEqual(LIR.RunningSetHelper.run_next, view.store.getProcSpecImmediate(proc).running_set_helper);
+        try std.testing.expectEqual(LIR.TaskRecord.resume_entry, view.store.getProcSpecImmediate(proc).task_record);
         try std.testing.expectEqual(proc, view.root_procs[0]);
 
         images[built] = try gpa.alignedAlloc(u8, .@"16", fba.end_index);

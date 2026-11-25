@@ -415,7 +415,7 @@ const UniquenessFixture = struct {
         const rc = try testing.allocator.alloc(bool, self.fixture.store.localCount());
         defer testing.allocator.free(rc);
         @memset(rc, true);
-        return arc_solve.solveWithOptions(testing.allocator, &self.fixture.store, &self.fixture.layouts, rc, &.{}, true, true, .{
+        return arc_solve.solveWithOptions(testing.allocator, &self.fixture.store, &self.fixture.layouts, rc, &.{}, true, true, true, .{
             .executor = runner,
             .metrics = metrics,
         });

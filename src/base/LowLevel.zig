@@ -789,6 +789,9 @@ pub const LowLevel = enum(u16) {
     /// - `args_host_visible`: the op hands those arguments to code the ownership
     ///   solver cannot see, such as a task record another task or a host thread
     ///   drops. Host-visibility analysis seeds them.
+    /// - `args_spawned`: the op makes those arguments a child task's, which runs
+    ///   while its owner does in a `ParallelTasks` program. Host-visibility
+    ///   analysis seeds them in such a program.
     /// - `result_host_visible`: the result came from such code, so its
     ///   allocations may be held there too. Host-visibility analysis seeds it.
     ///
@@ -829,6 +832,9 @@ pub const LowLevel = enum(u16) {
         /// see. Host-visibility analysis seeds them (design.md "Thread-Confined
         /// Reference Counts").
         args_host_visible: u64 = 0,
+        /// Argument positions the op makes a child task's. Host-visibility
+        /// analysis seeds them in a program whose tasks run in parallel.
+        args_spawned: u64 = 0,
         /// The result came from code the ownership solver cannot see, so
         /// host-visibility analysis seeds it.
         result_host_visible: bool = false,
@@ -952,7 +958,7 @@ pub const LowLevel = enum(u16) {
         }
 
         /// Reads a value that code the ownership solver cannot see stored, such
-        /// as a hosted call's result or a child task's.
+        /// as a hosted call's result.
         pub fn loadsHostVisible() RcEffect {
             return .{ .result_host_visible = true };
         }
@@ -1357,11 +1363,11 @@ pub const LowLevel = enum(u16) {
         // Starting entries makes child tasks; ending, cancelling and
         // freeing a set drop start records and results nobody took.
         .group_init = byType(.{ .may_allocate = true }),
-        .group_push = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_1, .args_host_visible = arg_1 }),
+        .group_push = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_1, .args_spawned = arg_1 }),
         .group_start = byType(.{ .may_allocate = true, .may_retain_or_release = true }),
         .group_next = byType(.{ .may_allocate = true, .may_retain_or_release = true }),
         .group_arrival = byType(.none()),
-        .group_spawn = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_1, .args_host_visible = arg_1 }),
+        .group_spawn = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_1, .args_spawned = arg_1 }),
         .group_cancel = byType(.{ .may_retain_or_release = true }),
         .group_free = byType(.{ .may_retain_or_release = true }),
 

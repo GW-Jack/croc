@@ -121,7 +121,7 @@ fn describeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Store,
     if (GuardedList.borrowLen(store.getLocalSpan(spec.args)) != 1) invariant("run_entry! does not take exactly its entry before the continuation pass", .{});
     const item = store.getLocal(GuardedList.at(store.getLocalSpan(spec.args), 0)).layout_idx;
     const start = starts.get(entry) orelse blk: {
-        const made = try ContinuationPass.buildStart(allocator, store, layouts, entry, &.{item}, spec.suspends != .never);
+        const made = try ContinuationPass.buildStart(allocator, store, layouts, entry, &.{item}, spec.suspends != .never, .child_start);
         try starts.put(allocator, entry, made);
         break :blk made;
     };
@@ -294,7 +294,7 @@ const Promoter = struct {
         const ended_t = try self.local(t_layout);
         var arrived = try self.jumpWith(joined, called.target, arrived_t, origin);
         arrived = try self.call(arrived_t, loop.arrived, &.{ running, value }, arrived, origin);
-        arrived = try self.store.addHostVisibleLoad(value, slot, arrived, origin);
+        arrived = try self.store.addTaskResultLoad(value, slot, loop.start.proc, arrived, origin);
         arrived = try self.op(slot, .group_arrival, &.{id}, arrived, origin);
         var ended = try self.jumpWith(joined, called.target, ended_t, origin);
         ended = try self.call(ended_t, loop.ended, &.{running}, ended, origin);
@@ -395,7 +395,7 @@ fn promoteSupervised(allocator: Allocator, store: *LirStore, layouts: *layout.St
     const value = try b.local(child.result);
     var arrived = try store.addCFStmt(.{ .ret = .{ .value = value } }, origin);
     arrived = try b.op(try b.local(.zst), .group_free, &.{id}, arrived, origin);
-    arrived = try store.addHostVisibleLoad(value, slot, arrived, origin);
+    arrived = try store.addTaskResultLoad(value, slot, child.start.proc, arrived, origin);
     arrived = try b.op(slot, .group_arrival, &.{id}, arrived, origin);
 
     // It crashed.

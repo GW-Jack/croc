@@ -468,6 +468,14 @@ const Pass = struct {
                 data.proc = self.remapProc(data.proc);
                 packed_fn.data = try self.store.addStmtRow(LIR.PackedErasedFnData, data);
             },
+            .assign_low_level => |*assign| {
+                var extra = self.store.stmtRowOrDefault(assign.extra);
+                const returned_by = extra.result_of.get() orelse return;
+                // A load names the procedure for ARC only, so it keeps none
+                // alive; after ARC the base procedure may be gone.
+                extra.result_of = .of(self.maybeRemapProc(returned_by));
+                assign.extra = try self.store.addStmtRow(LIR.LowLevelExtra, extra);
+            },
             .suspend_save => |*save| {
                 var data = self.store.stmtRow(save.data);
                 data.proc = self.remapProc(data.proc);
@@ -491,7 +499,6 @@ const Pass = struct {
             .init_uninitialized,
             .assign_ref,
             .assign_call_erased,
-            .assign_low_level,
             .assign_list,
             .assign_struct,
             .assign_tag,

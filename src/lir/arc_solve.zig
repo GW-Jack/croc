@@ -814,7 +814,23 @@ const BindingFact = union(enum) {
 const VisibilityFact = union(enum) {
     link: struct { a: LIR.LocalId, b: LIR.LocalId },
     seed: LIR.LocalId,
+    /// `local` is what a task record holds in `slot`.
+    held: struct { slot: RecordSlot, local: LIR.LocalId },
+    /// `target` is what `proc` returned.
+    result: struct { target: LIR.LocalId, proc: LIR.LirProcSpecId },
+    /// A resume entry returns what `saver`, which saved it, would have.
+    continues: struct { entry: LIR.LirProcSpecId, saver: u32 },
 };
+
+/// A value in the task records one procedure is the code of: a saved value by
+/// its position, or a start record's whole capture as position 0.
+const RecordSlot = struct {
+    proc: LIR.LirProcSpecId,
+    index: u32,
+};
+
+/// The first holder seen of each record slot, so every later one joins it.
+const RecordSlots = std.AutoHashMapUnmanaged(RecordSlot, u32);
 
 const UniqueFact = union(enum) {
     /// A pure same-value alias definition at `stmt`.
@@ -924,6 +940,10 @@ const Solver = struct {
     consume_dead_boxes: bool,
     /// Run the host-visibility analysis. Off, every local is visible.
     thread_confined_rc: bool,
+    /// Whether a value handed to a child task is shared between threads.
+    parallel_tasks: bool,
+    /// While a resume entry is lifted, the record it loaded.
+    record_capture: ?LIR.LocalId = null,
     domain: *const ArcLocalDomain,
     sigs: []arc_sig.RcSig,
     pinned: std.bit_set.DynamicBitSetUnmanaged,
@@ -1001,7 +1021,7 @@ pub fn solve(
     roots: []const LIR.LirProcSpecId,
     consume_dead_boxes: bool,
 ) SolveError!Solution {
-    return solveWithOptions(allocator, store, layouts, rc_local, roots, consume_dead_boxes, true, .{});
+    return solveWithOptions(allocator, store, layouts, rc_local, roots, consume_dead_boxes, true, true, .{});
 }
 
 /// Solves ARC with optional component-parallel uniqueness execution.
@@ -1013,6 +1033,7 @@ pub fn solveWithOptions(
     roots: []const LIR.LirProcSpecId,
     consume_dead_boxes: bool,
     thread_confined_rc: bool,
+    parallel_tasks: bool,
     options: UniquenessOptions,
 ) SolveError!Solution {
     const local_count = store.localCount();
@@ -1028,6 +1049,7 @@ pub fn solveWithOptions(
         .rc_local = rc_local,
         .consume_dead_boxes = consume_dead_boxes,
         .thread_confined_rc = thread_confined_rc,
+        .parallel_tasks = parallel_tasks,
         .domain = &domain,
         .sigs = &.{},
         .pinned = .{},
@@ -1256,7 +1278,7 @@ pub fn solveWithOptions(
             try std.bit_set.DynamicBitSetUnmanaged.initFull(allocator, local_count);
         errdefer visible.deinit(allocator);
         if (builtin.mode == .debug and thread_confined_rc) {
-            var independently_visible = try computeVisibilityFromLift(allocator, store, rc_local, &solver.pinned, &solver.proc_stmts, &solver.proc_returns);
+            var independently_visible = try computeVisibilityFromLift(allocator, store, rc_local, &solver.pinned, parallel_tasks, &solver.proc_stmts, &solver.proc_returns);
             defer independently_visible.deinit(allocator);
             if (!visible.eql(independently_visible)) solveInvariant("typed visibility facts disagreed with independent LIR analysis");
         }
@@ -2399,6 +2421,7 @@ fn liftReachableStatements(solver: *Solver) SolveError!void {
             try solver.binding_facts.append(solver.allocator, .{ .fresh = GuardedList.at(params, param_index) });
         }
         const stmts = &solver.proc_stmts;
+        solver.record_capture = null;
         solver.stack.clearRetainingCapacity();
         try solver.stack.append(solver.allocator, body);
         while (solver.stack.pop()) |current| {
@@ -3140,6 +3163,27 @@ fn liftVisibilityLink(solver: *Solver, a: LIR.LocalId, b: LIR.LocalId) SolveErro
     try solver.visibility_facts.append(solver.allocator, .{ .link = .{ .a = a, .b = b } });
 }
 
+fn liftVisibilityFact(solver: *Solver, fact: VisibilityFact) SolveError!void {
+    if (!solver.thread_confined_rc) return;
+    try solver.visibility_facts.append(solver.allocator, fact);
+}
+
+fn liftRecordHolder(solver: *Solver, proc: LIR.LirProcSpecId, index: u32, local: LIR.LocalId) SolveError!void {
+    if (solver.domain.indexOf(local) == null) return;
+    try liftVisibilityFact(solver, .{ .held = .{ .slot = .{ .proc = proc, .index = index }, .local = local } });
+}
+
+/// Whether an operation reads the executing erased callable's captures, as
+/// lowering writes it or as ARC emits it for a callable that stays live.
+fn loadsErasedCapture(op: LIR.LowLevel) bool {
+    return op == .erased_capture_load or op == .erased_capture_load_borrowed;
+}
+
+/// The arguments an operation hands to code that another thread may run.
+fn argsMadeVisible(effect: LIR.LowLevel.RcEffect, parallel_tasks: bool) u64 {
+    return effect.args_host_visible | if (parallel_tasks) effect.args_spawned else 0;
+}
+
 fn liftVisibilitySeed(solver: *Solver, local: LIR.LocalId) SolveError!void {
     if (!solver.thread_confined_rc) return;
     if (solver.domain.indexOf(local) == null) return;
@@ -3168,10 +3212,11 @@ fn liftSharedStmtFacts(solver: *Solver, proc_index: u32, current: LIR.CFStmtId) 
         .suspend_save => |save_stmt| {
             const save = store.stmtRow(save_stmt.data);
             solver.address_taken.set(@backingInt(save.proc));
+            try liftVisibilityFact(solver, .{ .continues = .{ .entry = save.proc, .saver = proc_index } });
             const saved = store.getLocalSpan(save.saved);
             for (0..GuardedList.borrowLen(saved)) |index| {
                 const value = GuardedList.at(saved, index);
-                try liftVisibilitySeed(solver, value);
+                try liftRecordHolder(solver, save.proc, @intCast(index), value);
                 try solver.unique_facts.append(allocator, .{ .destroy = value });
             }
         },
@@ -3209,7 +3254,15 @@ fn liftSharedStmtFacts(solver: *Solver, proc_index: u32, current: LIR.CFStmtId) 
                     try liftVisibilityLink(solver, assign.target, assign.op.source);
                     try solver.unique_facts.append(allocator, .{ .alias = .{ .target = assign.target, .source = assign.op.source, .stmt = current } });
                 },
-                inline .field, .tag_payload, .tag_payload_struct => {
+                .field => {
+                    if (solver.record_capture == assign.op.source) {
+                        try liftRecordHolder(solver, @fromBackingInt(proc_index), assign.op.index, assign.target);
+                    } else {
+                        try liftVisibilityLink(solver, assign.target, assign.op.source);
+                    }
+                    try solver.unique_facts.append(allocator, .{ .read = assign.op.source });
+                },
+                inline .tag_payload, .tag_payload_struct => {
                     try liftVisibilityLink(solver, assign.target, assign.op.source);
                     try solver.unique_facts.append(allocator, .{ .read = assign.op.source });
                 },
@@ -3280,7 +3333,10 @@ fn liftSharedStmtFacts(solver: *Solver, proc_index: u32, current: LIR.CFStmtId) 
             try solver.binding_facts.append(allocator, .{ .fresh = assign_stmt.target });
             if (assign.capture.get()) |capture| try solver.binding_facts.append(allocator, .{ .demand = capture });
             if (assign.reuse.get()) |reuse| try solver.binding_facts.append(allocator, .{ .demand = reuse });
-            if (assign.capture.get()) |capture| try liftVisibilityLink(solver, assign_stmt.target, capture);
+            if (assign.capture.get()) |capture| {
+                try liftVisibilityLink(solver, assign_stmt.target, capture);
+                if (store.getProcSpecImmediate(assign.proc).task_record == .child_start) try liftRecordHolder(solver, assign.proc, 0, capture);
+            }
             if (assign.capture.get()) |capture| try solver.unique_facts.append(allocator, .{ .destroy = capture });
             if (assign.reuse.get()) |reuse| try solver.unique_facts.append(allocator, .{ .consume = .{ .local = reuse, .stmt = current } });
         },
@@ -3321,11 +3377,27 @@ fn liftSharedStmtFacts(solver: *Solver, proc_index: u32, current: LIR.CFStmtId) 
             }
             if (rc_effect.result_host_visible) try liftVisibilitySeed(solver, assign.target);
             for (0..@min(GuardedList.borrowLen(args), 64)) |position| {
-                if ((rc_effect.args_host_visible & (@as(u64, 1) << @as(u6, @intCast(position)))) == 0) continue;
+                if ((argsMadeVisible(rc_effect, solver.parallel_tasks) & (@as(u64, 1) << @as(u6, @intCast(position)))) == 0) continue;
                 try liftVisibilitySeed(solver, GuardedList.at(args, position));
             }
-            if (assign.op == .erased_capture_load) {
-                try liftVisibilitySeed(solver, assign.target);
+            if (store.stmtRowOrDefault(assign.extra).result_of.get()) |proc| {
+                try liftVisibilityFact(solver, .{ .result = .{ .target = assign.target, .proc = proc } });
+            }
+            if (loadsErasedCapture(assign.op)) {
+                switch (store.getProcSpecImmediate(@fromBackingInt(proc_index)).task_record) {
+                    .none => try liftVisibilitySeed(solver, assign.target),
+                    .child_start => {
+                        try liftRecordHolder(solver, @fromBackingInt(proc_index), 0, assign.target);
+                        try liftVisibilityLink(solver, assign.target, GuardedList.at(args, 1));
+                    },
+                    // The record is counted as a whole only atomically; its
+                    // values are each what the pending edges saved.
+                    .resume_entry => {
+                        try liftVisibilitySeed(solver, assign.target);
+                        try liftVisibilitySeed(solver, GuardedList.at(args, 1));
+                        solver.record_capture = assign.target;
+                    },
+                }
             } else {
                 const share_mask = rc_effect.result_aliases_consumed_args |
                     rc_effect.result_borrows_args |
@@ -3743,9 +3815,35 @@ fn computeVisibilityFromFacts(
 
     var seeds = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(allocator, arc_count);
     defer seeds.deinit(allocator);
+    var record_slots: RecordSlots = .empty;
+    defer record_slots.deinit(allocator);
     for (solver.visibility_facts.items) |fact| switch (fact) {
         .link => |link| sets.unite(domain.indexOf(link.a).?, domain.indexOf(link.b).?),
         .seed => |local| seeds.set(domain.indexOf(local).?),
+        .held => |held| {
+            const index = domain.indexOf(held.local).?;
+            const first = try record_slots.getOrPut(allocator, held.slot);
+            if (!first.found_existing) first.value_ptr.* = @intCast(index);
+            sets.unite(index, first.value_ptr.*);
+        },
+        .result => |result| {
+            const target = domain.indexOf(result.target) orelse continue;
+            if (solver.store.getProcSpecImmediate(result.proc).body == .none) {
+                seeds.set(target);
+                continue;
+            }
+            for (solver.proc_returns.of(@backingInt(result.proc))) |return_local| {
+                if (domain.indexOfRaw(return_local)) |returned| sets.unite(target, returned);
+            }
+        },
+        .continues => |continues| {
+            for (solver.proc_returns.of(@backingInt(continues.entry))) |entry_return| {
+                const entry_index = domain.indexOfRaw(entry_return) orelse continue;
+                for (solver.proc_returns.of(continues.saver)) |saver_return| {
+                    if (domain.indexOfRaw(saver_return)) |saver_index| sets.unite(entry_index, saver_index);
+                }
+            }
+        },
     };
 
     // Direct-call return flow depends only on the lifted call and return
@@ -3765,6 +3863,9 @@ fn computeVisibilityFromFacts(
     for (0..solver.store.procSpecCount()) |proc_index| {
         if (!solver.pinned.isSet(proc_index)) continue;
         const proc = solver.store.getProcSpecImmediate(@fromBackingInt(@intCast(@as(u32, @intCast(proc_index)))));
+        // Only the runtime calls the code of a record, with the record's own
+        // captures, and hands its result to the load that names it.
+        if (proc.task_record != .none) continue;
         const params = solver.store.getLocalSpan(proc.args);
         for (0..GuardedList.borrowLen(params)) |param_index| {
             if (domain.indexOf(GuardedList.at(params, param_index))) |index| seeds.set(index);
@@ -3798,8 +3899,9 @@ pub fn computeVisibility(
     store: *const LirStore,
     rc_local: []const bool,
     pinned: *const std.bit_set.DynamicBitSetUnmanaged,
+    parallel_tasks: bool,
 ) SolveError!std.bit_set.DynamicBitSetUnmanaged {
-    return computeVisibilityFromLift(allocator, store, rc_local, pinned, null, null);
+    return computeVisibilityFromLift(allocator, store, rc_local, pinned, parallel_tasks, null, null);
 }
 
 fn computeVisibilityFromLift(
@@ -3807,17 +3909,12 @@ fn computeVisibilityFromLift(
     store: *const LirStore,
     rc_local: []const bool,
     pinned: *const std.bit_set.DynamicBitSetUnmanaged,
+    parallel_tasks: bool,
     proc_stmts: ?*const ProcRows(LIR.CFStmtId),
     lifted_returns: ?*const ProcRows(u32),
 ) SolveError!std.bit_set.DynamicBitSetUnmanaged {
     const local_count = store.localCount();
     const proc_count = store.procSpecCount();
-
-    var reachable = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(allocator, store.cfStmtCount());
-    defer reachable.deinit(allocator);
-    if (proc_stmts) |by_proc| {
-        for (by_proc.items.items) |stmt| reachable.set(@backingInt(stmt));
-    }
 
     var visited = collections.DenseMap(LIR.CFStmtId, void).init(allocator);
     defer visited.deinit();
@@ -3834,12 +3931,17 @@ fn computeVisibilityFromLift(
     var sets = try collections.DisjointSets.init(allocator, local_count);
     defer sets.deinit(allocator);
 
-    // Per-proc return values, for linking call results to callee returns.
+    // Per-proc statements and return values, the latter for linking call
+    // results to callee returns.
+    var walked_stmts: ProcRows(LIR.CFStmtId) = .{};
+    defer walked_stmts.deinit(allocator);
+    if ((proc_stmts == null) != (lifted_returns == null)) solveInvariant("a visibility walk was given one of a lift's two inventories");
     var walked_returns: ProcRows(u32) = .{};
     defer walked_returns.deinit(allocator);
     const ret_values: *const ProcRows(u32) = if (lifted_returns) |returns_by_proc| returns_by_proc else walked: {
         for (0..proc_count) |proc_index| {
             try walked_returns.open(allocator);
+            try walked_stmts.open(allocator);
             const proc = store.getProcSpecImmediate(@fromBackingInt(@intCast(@as(u32, @intCast(proc_index)))));
             const body = proc.arcBody() orelse continue;
             visited.clearRetainingCapacity();
@@ -3848,7 +3950,7 @@ fn computeVisibilityFromLift(
             while (stack.pop()) |current| {
                 if (visited.contains(current)) continue;
                 try visited.put(current, {});
-                reachable.set(@backingInt(current));
+                try walked_stmts.append(allocator, current);
                 switch (store.getCFStmtImmediate(current).*) {
                     .ret => |ret_stmt| try walked_returns.append(allocator, @backingInt(ret_stmt.value)),
                     .init_uninitialized,
@@ -3889,6 +3991,7 @@ fn computeVisibilityFromLift(
             }
         }
         try walked_returns.close(allocator);
+        try walked_stmts.close(allocator);
         break :walked &walked_returns;
     };
 
@@ -3908,6 +4011,9 @@ fn computeVisibilityFromLift(
     for (0..store.procSpecCount()) |proc_index| {
         const proc = store.getProcSpecImmediate(@fromBackingInt(@intCast(@as(u32, @intCast(proc_index)))));
         if (!pinned.isSet(proc_index)) continue;
+        // Only the runtime calls the code of a record, with the record's own
+        // captures, and hands its result to the load that names it.
+        if (proc.task_record != .none) continue;
         const params = store.getLocalSpan(proc.args);
         for (0..GuardedList.borrowLen(params)) |param_index| {
             const param = GuardedList.at(params, param_index);
@@ -3928,15 +4034,34 @@ fn computeVisibilityFromLift(
         }
     }.go;
 
-    for (0..store.cfStmtCount()) |stmt_index| {
-        if (!reachable.isSet(stmt_index)) continue;
-        const stmt = store.getCFStmtImmediate(@fromBackingInt(@intCast(@as(u32, @intCast(stmt_index)))));
-        switch (stmt.*) {
-            // A saved value reaches the host through the task record.
+    // The values task records hold, joined across the statements that save or
+    // pack them and the procedures that read them back.
+    var record_slots: RecordSlots = .empty;
+    defer record_slots.deinit(allocator);
+    const holdInRecord = struct {
+        fn go(alloc: Allocator, all: *collections.DisjointSets, slots: *RecordSlots, rc: []const bool, slot: RecordSlot, local: u32) SolveError!void {
+            if (local >= rc.len or !rc[local]) return;
+            const first = try slots.getOrPut(alloc, slot);
+            if (!first.found_existing) first.value_ptr.* = local;
+            all.unite(local, first.value_ptr.*);
+        }
+    }.go;
+
+    const stmts_of: *const ProcRows(LIR.CFStmtId) = proc_stmts orelse &walked_stmts;
+    for (0..proc_count) |proc_index| {
+        const proc_id: LIR.LirProcSpecId = @fromBackingInt(@intCast(proc_index));
+        const task_record = store.getProcSpecImmediate(proc_id).task_record;
+        // A resume entry's loaded record, which dominates every read of it.
+        var record_capture: ?LIR.LocalId = null;
+        for (stmts_of.of(proc_index)) |stmt_id| switch (store.getCFStmtImmediate(stmt_id).*) {
             .suspend_save => |save_stmt| {
-                const saved = store.getLocalSpan(store.stmtRow(save_stmt.data).saved);
+                const save = store.stmtRow(save_stmt.data);
+                const saved = store.getLocalSpan(save.saved);
                 for (0..GuardedList.borrowLen(saved)) |index| {
-                    seedLocal(&visible, rc_local, @backingInt(GuardedList.at(saved, index)));
+                    try holdInRecord(allocator, &sets, &record_slots, rc_local, .{ .proc = save.proc, .index = @intCast(index) }, @backingInt(GuardedList.at(saved, index)));
+                }
+                for (ret_values.of(@backingInt(save.proc))) |entry_return| {
+                    for (ret_values.of(proc_index)) |saver_return| addEdge(&sets, rc_local, entry_return, saver_return);
                 }
             },
             .suspend_return => {},
@@ -3945,7 +4070,9 @@ fn computeVisibilityFromLift(
                 switch (assign.op.kind) {
                     .local => addEdge(&sets, rc_local, target, @backingInt(assign.op.source)),
                     inline .list_reinterpret, .nominal => addEdge(&sets, rc_local, target, @backingInt(assign.op.source)),
-                    .field => addEdge(&sets, rc_local, target, @backingInt(assign.op.source)),
+                    .field => if (record_capture == assign.op.source) {
+                        try holdInRecord(allocator, &sets, &record_slots, rc_local, .{ .proc = proc_id, .index = assign.op.index }, target);
+                    } else addEdge(&sets, rc_local, target, @backingInt(assign.op.source)),
                     .tag_payload => addEdge(&sets, rc_local, target, @backingInt(assign.op.source)),
                     .tag_payload_struct => addEdge(&sets, rc_local, target, @backingInt(assign.op.source)),
                     .discriminant => {},
@@ -3976,6 +4103,9 @@ fn computeVisibilityFromLift(
                 const assign = store.stmtRow(assign_stmt.data);
                 if (assign.capture.get()) |capture| {
                     addEdge(&sets, rc_local, @backingInt(assign_stmt.target), @backingInt(capture));
+                    if (store.getProcSpecImmediate(assign.proc).task_record == .child_start) {
+                        try holdInRecord(allocator, &sets, &record_slots, rc_local, .{ .proc = assign.proc, .index = 0 }, @backingInt(capture));
+                    }
                 }
             },
             .str_match => |str_match_stmt| {
@@ -4044,19 +4174,37 @@ fn computeVisibilityFromLift(
             },
             .assign_low_level => |assign| {
                 const target = @backingInt(assign.target);
-                if (assign.op == .erased_capture_load) {
+                if (loadsErasedCapture(assign.op)) {
+                    const owner = @backingInt(GuardedList.at(store.getLocalSpan(assign.args), 1));
                     // The loaded capture shares the callable's allocation
                     // through the executing frame, which value flow cannot
                     // see; erased-callable procs are pinned, so the capture
-                    // is host-visible by construction.
-                    seedLocal(&visible, rc_local, target);
+                    // is host-visible by construction. A task record's was
+                    // saved or packed by a statement of this program.
+                    switch (task_record) {
+                        .none => seedLocal(&visible, rc_local, target),
+                        .child_start => {
+                            try holdInRecord(allocator, &sets, &record_slots, rc_local, .{ .proc = proc_id, .index = 0 }, target);
+                            addEdge(&sets, rc_local, target, owner);
+                        },
+                        .resume_entry => {
+                            seedLocal(&visible, rc_local, target);
+                            seedLocal(&visible, rc_local, owner);
+                            record_capture = assign.target;
+                        },
+                    }
                     continue;
                 }
                 const effect = assign.op.arcInferenceRcEffect(store.stmtRow(assign.rc_effect));
                 const args = store.getLocalSpan(assign.args);
                 if (effect.result_host_visible) seedLocal(&visible, rc_local, target);
+                if (store.stmtRowOrDefault(assign.extra).result_of.get()) |returned_by| {
+                    if (store.getProcSpecImmediate(returned_by).body == .none) {
+                        seedLocal(&visible, rc_local, target);
+                    } else for (ret_values.of(@backingInt(returned_by))) |value| addEdge(&sets, rc_local, target, value);
+                }
                 for (0..@min(GuardedList.borrowLen(args), 64)) |position| {
-                    if ((effect.args_host_visible & (@as(u64, 1) << @as(u6, @intCast(position)))) == 0) continue;
+                    if ((argsMadeVisible(effect, parallel_tasks) & (@as(u64, 1) << @as(u6, @intCast(position)))) == 0) continue;
                     seedLocal(&visible, rc_local, @backingInt(GuardedList.at(args, position)));
                 }
                 const share_mask = effect.result_aliases_consumed_args |
@@ -4127,7 +4275,7 @@ fn computeVisibilityFromLift(
             .ret,
             .crash,
             => {},
-        }
+        };
     }
 
     // A component is visible exactly when it contains a visibility seed.

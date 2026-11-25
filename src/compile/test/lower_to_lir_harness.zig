@@ -189,6 +189,9 @@ pub const LirLoweringOptions = struct {
     inline_mode: lir.CheckedPipeline.InlineMode = .none,
     spec_constr_clone_inlining: lir.CheckedPipeline.SpecConstrCloneInlining = .all_calls,
     consume_dead_boxes: bool = false,
+    /// Count allocations the host can never touch without atomics, as optimized
+    /// builds do.
+    thread_confined_rc: bool = false,
     /// Restore eligible stored constants as internal readonly static values,
     /// the way a linked output does.
     include_internal_static_data: bool = false,
@@ -1273,6 +1276,7 @@ fn loweringTarget(opts: LirLoweringOptions) lir.CheckedPipeline.TargetConfig {
         .specialization_strategy = opts.specialization_strategy,
         .target_usize = opts.target_usize,
         .inline_mode = opts.inline_mode,
+        .thread_confined_rc = opts.thread_confined_rc,
         .spec_constr_clone_inlining = opts.spec_constr_clone_inlining,
         .prove_uniqueness = true,
         .consume_dead_boxes = opts.consume_dead_boxes,

@@ -2198,6 +2198,26 @@ pub fn addHostVisibleLoad(
     } }, origin);
 }
 
+/// Appends `target = ptr_load(address)` followed by `next`, for an address
+/// where the task runtime put a result `returned_by` returned.
+pub fn addTaskResultLoad(
+    self: *Self,
+    target: LocalId,
+    address: LocalId,
+    returned_by: lir_defs.LirProcSpecId,
+    next: CFStmtId,
+    origin: StmtOrigin,
+) Allocator.Error!CFStmtId {
+    return self.addCFStmt(.{ .assign_low_level = .{
+        .target = target,
+        .op = .ptr_load,
+        .rc_effect = try self.addRcEffect(lir_defs.LowLevel.ptr_load.rcEffect()),
+        .extra = try self.addStmtRow(lir_defs.LowLevelExtra, .{ .result_of = .some(returned_by) }),
+        .args = try self.addLocalSpan(&.{address}),
+        .next = next,
+    } }, origin);
+}
+
 /// Appends `target = op` (a `dyn` statement) followed by `next`.
 pub fn addDynStmt(
     self: *Self,

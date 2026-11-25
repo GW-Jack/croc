@@ -241,9 +241,10 @@ pub fn certifyStore(
     layouts: *const layout_mod.Store,
     sigs: arc_sig.SigTable,
     roots: []const LIR.LirProcSpecId,
+    parallel_tasks: bool,
     diag: *Diagnostic,
 ) CertifyError!void {
-    return certifyStoreWithWorkStats(allocator, store, layouts, sigs, roots, diag, null);
+    return certifyStoreWithWorkStats(allocator, store, layouts, sigs, roots, parallel_tasks, diag, null);
 }
 
 /// Deterministic work counters used by certifier complexity regression tests.
@@ -259,6 +260,7 @@ fn certifyStoreWithWorkStats(
     layouts: *const layout_mod.Store,
     sigs: arc_sig.SigTable,
     roots: []const LIR.LirProcSpecId,
+    parallel_tasks: bool,
     diag: *Diagnostic,
     work_stats: ?*CertifierWorkStats,
 ) CertifyError!void {
@@ -270,7 +272,7 @@ fn certifyStoreWithWorkStats(
     var maybe_uninitialized = try MaybeUninitializedConditions.init(allocator, store, diag);
     defer maybe_uninitialized.deinit();
 
-    try certifyRcAtomicity(allocator, store, rc_local, roots, diag);
+    try certifyRcAtomicity(allocator, store, rc_local, roots, parallel_tasks, diag);
     try certifyUniqueArgs(allocator, store, layouts, rc_local, sigs, diag);
 
     var certifier = Certifier.initStore(allocator, store, layouts, sigs, rc_local, &maybe_uninitialized, diag, work_stats);
@@ -462,11 +464,12 @@ fn certifyRcAtomicity(
     store: *const LirStore,
     rc_local: []const bool,
     roots: []const LIR.LirProcSpecId,
+    parallel_tasks: bool,
     diag: *Diagnostic,
 ) CertifyError!void {
     var pinned = try arc_solve.computePinnedProcs(allocator, store, roots);
     defer pinned.deinit(allocator);
-    var visible = try arc_solve.computeVisibility(allocator, store, rc_local, &pinned);
+    var visible = try arc_solve.computeVisibility(allocator, store, rc_local, &pinned, parallel_tasks);
     defer visible.deinit(allocator);
 
     for (0..store.cfStmtCount()) |stmt_index| {
@@ -623,9 +626,10 @@ pub fn certifyStoreOrPanic(
     layouts: *const layout_mod.Store,
     sigs: arc_sig.SigTable,
     roots: []const LIR.LirProcSpecId,
+    parallel_tasks: bool,
 ) Allocator.Error!void {
     var diag = Diagnostic{};
-    certifyStore(allocator, store, layouts, sigs, roots, &diag) catch |err| switch (err) {
+    certifyStore(allocator, store, layouts, sigs, roots, parallel_tasks, &diag) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Certification => if (comptime builtin.target.os.tag == .freestanding) {
             base.invariant("{s}", .{"ARC certification failed"});
@@ -7362,17 +7366,17 @@ const CertifyTest = struct {
     }
 
     fn certify(self: *CertifyTest) CertifyError!void {
-        return certifyStore(self.allocator, &self.store, &self.layouts, arc_sig.SigTable.all_owned, &.{}, &self.diag);
+        return certifyStore(self.allocator, &self.store, &self.layouts, arc_sig.SigTable.all_owned, &.{}, true, &self.diag);
     }
 
     fn certifyAndMeasureWork(self: *CertifyTest) CertifyError!CertifierWorkStats {
         var stats = CertifierWorkStats{};
-        try certifyStoreWithWorkStats(self.allocator, &self.store, &self.layouts, arc_sig.SigTable.all_owned, &.{}, &self.diag, &stats);
+        try certifyStoreWithWorkStats(self.allocator, &self.store, &self.layouts, arc_sig.SigTable.all_owned, &.{}, true, &self.diag, &stats);
         return stats;
     }
 
     fn certifyWith(self: *CertifyTest, sigs: arc_sig.SigTable) CertifyError!void {
-        return certifyStore(self.allocator, &self.store, &self.layouts, sigs, &.{}, &self.diag);
+        return certifyStore(self.allocator, &self.store, &self.layouts, sigs, &.{}, true, &self.diag);
     }
 
     fn certifyUniqueArgsOnly(self: *CertifyTest) CertifyError!void {

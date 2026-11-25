@@ -2434,6 +2434,7 @@ fn finishLoweredOutput(
         .prove_uniqueness = target.prove_uniqueness,
         .consume_dead_boxes = target.consume_dead_boxes,
         .thread_confined_rc = target.thread_confined_rc,
+        .parallel_tasks = target.concurrency_mode == .parallel_tasks,
         .post_check_executor = if (target.post_check_executor) |*executor| executor else null,
         .metrics_out = arc_metrics,
         .timing = if (arc_detail) |*detail| detail else null,
