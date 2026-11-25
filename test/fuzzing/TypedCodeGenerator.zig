@@ -640,9 +640,19 @@ fn writeExpr(self: *Self, expected: Type, context: ExprContext, depth: u8, visib
         try self.writeLeafExpr(typ, context, visible_methods);
         return;
     }
-    if (context.effectful and typ != .optional_record and self.reader.intRangeAtMost(u8, 0, 7) == 7) {
-        try self.writePlanLoopExpr(typ, context, depth - 1, visible_methods);
-        return;
+    if (context.effectful and typ != .optional_record) {
+        switch (self.reader.intRangeAtMost(u8, 0, 15)) {
+            0...12 => {},
+            13, 14 => {
+                try self.writePlanLoopExpr(typ, context, depth - 1, visible_methods);
+                return;
+            },
+            15 => {
+                try self.writeConcurrentCallExpr(typ, context, depth - 1, visible_methods);
+                return;
+            },
+            else => unreachable, // intRangeAtMost returns at most 15
+        }
     }
 
     switch (typ) {
@@ -1272,6 +1282,94 @@ fn writePlanLoopExpr(self: *Self, result_type: Type, context: ExprContext, depth
     try self.write("\n}");
 }
 
+/// A block that calls a function of the `Concurrent` module and takes a value
+/// of type `result_type` from what it returns. The call's type is written, so
+/// no entry's type depends on what the block is used for.
+fn writeConcurrentCallExpr(self: *Self, result_type: Type, context: ExprContext, depth: u8, visible_methods: usize) std.mem.Allocator.Error!void {
+    const returned = self.fresh(.value);
+    try self.write("{\n");
+    try self.writeSymbol(returned);
+    switch (self.reader.intRangeAtMost(u8, 0, 3)) {
+        0 => {
+            try self.write(" : ");
+            try self.writeType(result_type);
+            try self.write("\n");
+            try self.writeSymbol(returned);
+            try self.write(" = Concurrent.supervise!({ max_restarts: ");
+            try self.write(if (self.reader.boolean()) "0" else "2");
+            try self.write(" }, ");
+            try self.writeEntry(result_type, context, depth, visible_methods);
+            try self.write(")\n");
+            try self.writeSymbol(returned);
+        },
+        1 => {
+            try self.write(" : ");
+            try self.writeType(result_type);
+            try self.write("\n");
+            try self.writeSymbol(returned);
+            try self.write(" = Concurrent.race!(");
+            try self.writeEntry(result_type, context, depth, visible_methods);
+            try self.write(", ");
+            try self.writeEntryList(result_type, context, depth, visible_methods);
+            try self.write(")\n");
+            try self.writeSymbol(returned);
+        },
+        2 => {
+            const chosen_type = self.chooseType();
+            const other_type: Type = if (chosen_type == .optional_record) .record else chosen_type;
+            try self.write(" : (");
+            try self.writeType(result_type);
+            try self.write(", ");
+            try self.writeType(other_type);
+            try self.write(")\n");
+            try self.writeSymbol(returned);
+            try self.write(" = Concurrent.both!(");
+            try self.writeEntry(result_type, context, depth, visible_methods);
+            try self.write(", ");
+            try self.writeEntry(other_type, context, depth, visible_methods);
+            try self.write(")\nmatch ");
+            try self.writeSymbol(returned);
+            const first = self.fresh(.value);
+            try self.write(" {\n(");
+            try self.writeSymbol(first);
+            try self.write(", _) => ");
+            try self.writeSymbol(first);
+            try self.write("\n}");
+        },
+        3 => {
+            const first = self.fresh(.value);
+            try self.write(" : List(");
+            try self.writeType(result_type);
+            try self.write(")\n");
+            try self.writeSymbol(returned);
+            try self.write(" = Concurrent.all!(");
+            try self.writeEntryList(result_type, context, depth, visible_methods);
+            try self.write(")\nmatch List.first(");
+            try self.writeSymbol(returned);
+            try self.write(") {\nOk(");
+            try self.writeSymbol(first);
+            try self.write(") => ");
+            try self.writeSymbol(first);
+            try self.write("\nErr(_) => ");
+            try self.writeExpr(result_type, context, depth, visible_methods);
+            try self.write("\n}");
+        },
+        else => unreachable, // intRangeAtMost returns at most 3
+    }
+    try self.write("\n}");
+}
+
+/// A list of up to three entries of `item_type`.
+fn writeEntryList(self: *Self, item_type: Type, context: ExprContext, depth: u8, visible_methods: usize) std.mem.Allocator.Error!void {
+    try self.write("[");
+    const entry_count = self.reader.intRangeAtMost(u8, 0, 3);
+    for (0..entry_count) |index| {
+        if (index > 0) try self.write(", ");
+        try self.writeEntry(item_type, context, depth, visible_methods);
+    }
+    try self.write("]");
+}
+
 /// The start of a statement that makes the variable `symbol`.
 fn writeVariableStatement(self: *Self, symbol: Symbol) std.mem.Allocator.Error!void {
     try self.write("var $");
@@ -1285,13 +1383,9 @@ fn writePlan(self: *Self, item_type: Type, context: ExprContext, depth: u8, visi
     const part_count = self.reader.intRangeAtMost(u8, 1, 2);
     for (0..part_count) |part| {
         if (part > 0) try self.write(".concat(");
-        try self.write("List.concurrently([");
-        const entry_count = self.reader.intRangeAtMost(u8, 0, 3);
-        for (0..entry_count) |index| {
-            if (index > 0) try self.write(", ");
-            try self.writeEntry(item_type, context, depth, visible_methods);
-        }
-        try self.write("])");
+        try self.write("List.concurrently(");
+        try self.writeEntryList(item_type, context, depth, visible_methods);
+        try self.write(")");
         switch (self.reader.intRangeAtMost(u8, 0, 3)) {
             0 => {},
             1 => {
