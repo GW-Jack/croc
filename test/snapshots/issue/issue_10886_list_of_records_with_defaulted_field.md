@@ -678,7 +678,7 @@ nominal = Nominal.{
 												(e-num (value "789")))))))))))))
 	(d-let
 		(p-assign (ident "updated_record"))
-		(e-call (constraint-fn-var 1010)
+		(e-call (constraint-fn-var 1009)
 			(e-lookup-local
 				(p-assign (ident "replace_items")))
 			(e-record

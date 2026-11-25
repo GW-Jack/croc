@@ -112,7 +112,7 @@ NO CHANGE
 					(ty-lookup (name "U64") (builtin))))))
 	(d-let
 		(p-assign (ident "sum"))
-		(e-dispatch-call (method "plus") (constraint-fn-var 297)
+		(e-dispatch-call (method "plus") (constraint-fn-var 284)
 			(receiver
 				(e-field-access
 					(receiver
