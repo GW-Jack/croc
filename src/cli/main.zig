@@ -2213,16 +2213,11 @@ fn requirePlatformTargets(ctx: *CliCtx, build_env: *const BuildEnv, app_path: []
 }
 
 /// Reject a platform whose `concurrency` mode the chosen optimization level
-/// and lowering strategy do not support yet (design.md "What Implements It
-/// First"): `Tasks` runs under `.lss` on every backend, for every target,
-/// and `ParallelTasks` on all of them but the interpreter. Discovery read the
-/// mode from the platform header, so this runs before any lowering.
-fn requireSupportedConcurrency(
-    ctx: *CliCtx,
-    build_env: *const BuildEnv,
-    opt: cli_args.OptLevel,
-    strategy: base.SpecializationStrategy,
-) CliMainError!void {
+/// does not support yet (design.md "What Implements It First"): `Tasks` runs
+/// on every backend, for every target, and `ParallelTasks` on all of them but
+/// the interpreter. Discovery read the mode from the platform header, so this
+/// runs before any lowering.
+fn requireSupportedConcurrency(ctx: *CliCtx, build_env: *const BuildEnv, opt: cli_args.OptLevel) CliMainError!void {
     const mode = build_env.getPlatformConcurrencyMode() orelse return;
     const name = switch (mode) {
         .none => return,
@@ -2230,36 +2225,29 @@ fn requireSupportedConcurrency(
         .parallel_tasks => "ParallelTasks",
     };
     const interprets = opt == .interpreter;
-    if (tasksLower(mode, interprets, strategy)) return;
+    if (tasksLower(mode, interprets)) return;
     try renderProblem(ctx, .{ .unsupported_concurrency_lowering = .{
         .mode = name,
         .opt = @tagName(opt),
-        .specialize = switch (strategy) {
-            .lss => "yes",
-            .boxy => "no",
-        },
     } });
     return error.PlatformNotSupported;
 }
 
 /// Whether a program whose platform has `mode`, a mode with tasks, lowers
-/// under `strategy` for a backend that is the interpreter or not. The
-/// continuation pass needs lambda-set specialization; the interpreter, the
-/// dev backend, LLVM and wasm implement the task runtime (design.md
-/// "Backends"), but one interpreter runs no two resumes at once (design.md
-/// "Parallel Resumes").
-fn tasksLower(mode: base.ConcurrencyMode, interprets: bool, strategy: base.SpecializationStrategy) bool {
-    return strategy == .lss and !(mode == .parallel_tasks and interprets);
+/// on a backend that is the interpreter or not. The interpreter, the dev
+/// backend, LLVM and wasm implement the task runtime (design.md "Backends"),
+/// but one interpreter runs no two resumes at once (design.md "Parallel
+/// Resumes").
+fn tasksLower(mode: base.ConcurrencyMode, interprets: bool) bool {
+    return !(mode == .parallel_tasks and interprets);
 }
 
-test "modes with tasks lower only with lambda-set specialization, and ParallelTasks not on the interpreter" {
+test "ParallelTasks does not lower on the interpreter" {
     for ([_]base.ConcurrencyMode{ .tasks, .parallel_tasks }) |mode| {
-        try std.testing.expect(tasksLower(mode, false, .lss));
-        try std.testing.expect(!tasksLower(mode, false, .boxy));
-        try std.testing.expect(!tasksLower(mode, true, .boxy));
+        try std.testing.expect(tasksLower(mode, false));
     }
-    try std.testing.expect(tasksLower(.tasks, true, .lss));
-    try std.testing.expect(!tasksLower(.parallel_tasks, true, .lss));
+    try std.testing.expect(tasksLower(.tasks, true));
+    try std.testing.expect(!tasksLower(.parallel_tasks, true));
 }
 
 /// The host inputs a shim run links for its selected target, copied out of
@@ -2803,13 +2791,13 @@ fn rocRunSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, arg0: []const u8
 
         const platform = try requirePlatformTargets(ctx, &build_env, args.path);
         const selected = try selectRunPlatformTarget(ctx, platform.config, platform.root_file, args.target);
-        try requireSupportedConcurrency(ctx, &build_env, args.opt, currentRuntimeSpecializationStrategy(args.specialization_strategy, args.opt));
+        try requireSupportedConcurrency(ctx, &build_env, args.opt);
         build_env.setTarget(selected.target);
         build_env.setValidateTargetFilesForSelectedTarget(true);
 
         const specialization_strategy = currentRuntimeSpecializationStrategy(args.specialization_strategy, args.opt);
         switch (args.opt) {
-            .dev => if (unitImageRunApplies(args.opt, args.no_cache, specialization_strategy, selected.target)) {
+            .dev => if (unitImageRunApplies(args.opt, args.no_cache, specialization_strategy, selected.target) and modulesLowerApart(&build_env)) {
                 run_tables = RunUnitTables.init(ctx);
                 const tables = &run_tables.?;
                 run_units = try lowerRunUnits(ctx, &build_env, tables, selected.target, args.path, &reporter, args.watch);
@@ -5983,22 +5971,36 @@ fn rocInternalHotReloadDev(ctx: *CliCtx, raw_args: []const []const u8) CliMainEr
         break :blk null;
     };
 
-    if (source_rewrite == null and unitImageRunApplies(.dev, args.no_cache, args.specialization_strategy, selected_target)) {
-        return rebuildComposedRunImage(ctx, args, &shm, selected_target);
+    const synthetic_default_app = if (source_rewrite) |rewrite| SyntheticDefaultAppMapping.fromStaged(rewrite.source_path, &staged_owned.?) else null;
+    // The unit tables outlive the build environment, whose compile-time
+    // evaluation records into them.
+    var run_tables = RunUnitTables.init(ctx);
+    defer run_tables.deinit();
+    var build_env = try initRunBuildEnv(ctx, .{
+        .source_dir_override = if (source_rewrite) |rewrite| rewrite.source_dir_override else null,
+        .synthetic_default_app = synthetic_default_app,
+        .max_threads = args.max_threads,
+        .resolution_config = resolutionConfigFromLimits(args.resolve_limits),
+        .enable_checked_cache = !args.no_cache,
+        .reporter = null,
+        .specialization_strategy = args.specialization_strategy,
+    });
+    defer build_env.deinit();
+    const display_path = runDisplayPath(args.path, synthetic_default_app);
+    try discoverRunDependencies(ctx, &build_env, args.path, display_path, null);
+
+    if (source_rewrite == null and unitImageRunApplies(.dev, args.no_cache, args.specialization_strategy, selected_target) and modulesLowerApart(&build_env)) {
+        return rebuildComposedRunImage(ctx, args, &shm, selected_target, &build_env, &run_tables);
     }
 
-    var lowered_result = try lowerLirWithBuildEnv(
+    var lowered_result = try lowerDiscoveredLir(
         ctx,
+        &build_env,
         ctx.gpa,
         .{ .dev_run_image = .{ .target = selected_target, .hot_reload = true } },
-        args.path,
-        if (source_rewrite) |rewrite| rewrite.source_dir_override else null,
-        if (source_rewrite) |rewrite| SyntheticDefaultAppMapping.fromStaged(rewrite.source_path, &staged_owned.?) else null,
-        args.max_threads,
+        display_path,
         .dev,
         args.specialization_strategy,
-        resolutionConfigFromLimits(args.resolve_limits),
-        !args.no_cache,
         null,
     );
     defer lowered_result.deinit();
@@ -6051,9 +6053,7 @@ fn rocInternalHotReloadDev(ctx: *CliCtx, raw_args: []const []const u8) CliMainEr
 /// A hot-reload rebuild of a run composed from unit images: check the
 /// program, build its changed units, and compose the next generation into
 /// the allocation the parent chose.
-fn rebuildComposedRunImage(ctx: *CliCtx, args: HotReloadDevWorkerArgs, shm: *SharedMemoryAllocator, target: RocTarget) CliMainError!void {
-    var tables = RunUnitTables.init(ctx);
-    defer tables.deinit();
+fn rebuildComposedRunImage(ctx: *CliCtx, args: HotReloadDevWorkerArgs, shm: *SharedMemoryAllocator, target: RocTarget, build_env: *BuildEnv, tables: *RunUnitTables) CliMainError!void {
     // A rebuild's output is captured; it reports no progress.
     var reporter = progress.Reporter.init(.{
         .std_io = ctx.io.std_io,
@@ -6063,18 +6063,7 @@ fn rebuildComposedRunImage(ctx: *CliCtx, args: HotReloadDevWorkerArgs, shm: *Sha
         .is_tty = false,
     });
     defer reporter.deinit();
-    var build_env = try initRunBuildEnv(ctx, .{
-        .source_dir_override = null,
-        .synthetic_default_app = null,
-        .max_threads = args.max_threads,
-        .resolution_config = resolutionConfigFromLimits(args.resolve_limits),
-        .enable_checked_cache = true,
-        .reporter = null,
-        .specialization_strategy = .boxy,
-    });
-    defer build_env.deinit();
-    try discoverRunDependencies(ctx, &build_env, args.path, args.path, null);
-    var units = try lowerRunUnits(ctx, &build_env, &tables, target, args.path, &reporter, true);
+    var units = try lowerRunUnits(ctx, build_env, tables, target, args.path, &reporter, true);
     defer units.deinit(ctx.gpa);
 
     try writeHotReloadWatchPathsFile(ctx, args.watch_inputs_file, units.watch_inputs, null);
@@ -6772,6 +6761,15 @@ fn lowerDiscoveredLir(
         .watch_inputs_allocator = ctx.gpa,
         .counts = counts,
     };
+}
+
+/// Whether a `.boxy` program's modules may each lower to a unit of their
+/// own: the platform declares no tasks. A program with tasks lowers whole,
+/// since which procedures may suspend depends on code in other modules
+/// (design.md "Per-Module Output").
+fn modulesLowerApart(build_env: *const BuildEnv) bool {
+    const mode = build_env.getPlatformConcurrencyMode() orelse return true;
+    return !mode.hasTasks();
 }
 
 /// Whether a dev run composes its run image from unit images
@@ -10418,7 +10416,7 @@ fn resolveBuildCommandPlatform(
         try selectRunPlatformTarget(ctx, targets_config, platform_source, args.target)
     else
         try selectBuildPlatformTarget(ctx, targets_config, platform_source, args.target);
-    try requireSupportedConcurrency(ctx, build_env, args.opt, currentRuntimeSpecializationStrategy(args.specialization_strategy, args.opt));
+    try requireSupportedConcurrency(ctx, build_env, args.opt);
     return .{ platform_dir, selected };
 }
 
@@ -11538,7 +11536,8 @@ fn fastDevLinkFormat(target: RocTarget) ?fast_dev_link.Format {
 /// with a fast dev link format, on any compiler host, whose output file the
 /// link writes through the host's own system calls. Every other combination
 /// composes a program object and links it with LLD.
-fn fastDevLinkApplies(target: RocTarget, link_type: roc_target.OutputKind, args: cli_args.BuildArgs) bool {
+fn fastDevLinkApplies(target: RocTarget, link_type: roc_target.OutputKind, args: cli_args.BuildArgs, build_env: *const BuildEnv) bool {
+    if (!modulesLowerApart(build_env)) return false;
     if (args.opt != .dev or currentRuntimeSpecializationStrategy(args.specialization_strategy, args.opt) != .boxy) return false;
     if (fastDevLinkFormat(target) == null) return false;
     return switch (link_type) {
@@ -11553,7 +11552,8 @@ fn fastDevLinkApplies(target: RocTarget, link_type: roc_target.OutputKind, args:
 /// Compile-time evaluation keeps running native units, so such a build has
 /// two units per module: the native one compile-time evaluation runs and
 /// the wasm one for the link.
-fn wasmUnitsApply(target: RocTarget, args: cli_args.BuildArgs) bool {
+fn wasmUnitsApply(target: RocTarget, args: cli_args.BuildArgs, build_env: *const BuildEnv) bool {
+    if (!modulesLowerApart(build_env)) return false;
     if (args.opt != .dev or currentRuntimeSpecializationStrategy(args.specialization_strategy, args.opt) != .boxy) return false;
     return compile.boxy_unit.imageKind(target) == .wasm;
 }
@@ -11576,8 +11576,8 @@ const WasmUnits = struct {
 /// with LLD (`wasm_link.zig`): a build whose wasm units apply
 /// (`wasmUnitsApply`), on any compiler host, for any output: a module
 /// (`exe` or `shared`) or an archive.
-fn wasmFastLinkApplies(target: RocTarget, args: cli_args.BuildArgs) bool {
-    return wasmUnitsApply(target, args);
+fn wasmFastLinkApplies(target: RocTarget, args: cli_args.BuildArgs, build_env: *const BuildEnv) bool {
+    return wasmUnitsApply(target, args, build_env);
 }
 
 /// A wasm fast dev link in progress: the module's output file, created when
@@ -12412,14 +12412,14 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResu
     // A dev executable of a `.boxy` program for a target with a fast dev
     // link format is linked by a fast dev link, whose output file and host
     // job start before any compile work.
-    const fast_link: ?*FastDevLink = if (fastDevLinkApplies(target, link_type, args))
+    const fast_link: ?*FastDevLink = if (fastDevLinkApplies(target, link_type, args, &build_env))
         try FastDevLink.start(ctx, args, &build_env, platform_dir, target, link_type, final_output_path, build_scratch_dir)
     else
         null;
     defer if (fast_link) |fast| fast.deinit(ctx.gpa);
     // A `.boxy` dev build of a wasm target is linked by composing images,
     // whose output file and image job start before any compile work too.
-    const wasm_fast_link: ?*WasmFastLink = if (wasmFastLinkApplies(target, args))
+    const wasm_fast_link: ?*WasmFastLink = if (wasmFastLinkApplies(target, args, &build_env))
         try WasmFastLink.start(ctx, &build_env, platform_dir, target, link_type, final_output_path, args.no_cache)
     else
         null;
@@ -12438,7 +12438,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResu
     // "Caching Under `.boxy`"): the root program is the root unit, whose
     // calls into other modules compile against their objects' export
     // interfaces.
-    const boxy_units = runtime_strategy == .boxy and args.opt == .dev and target_arch != .wasm32;
+    const boxy_units = runtime_strategy == .boxy and args.opt == .dev and target_arch != .wasm32 and modulesLowerApart(&build_env);
     var boxy_interfaces: ?postcheck.Boxy.Lower.ExportInterfaces = if (boxy_units) postcheck.Boxy.Lower.ExportInterfaces.init(ctx.gpa, ctx.io.std_io) else null;
     defer if (boxy_interfaces) |*interfaces| interfaces.deinit();
     // Filled once checking has published every module; the root unit reads
@@ -12472,7 +12472,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResu
     const relation_artifacts = try build_env.collectRelationArtifactViews(ctx.gpa, root_artifact);
     defer ctx.gpa.free(relation_artifacts);
 
-    if (wasmUnitsApply(target, args)) {
+    if (wasmUnitsApply(target, args, &build_env)) {
         const units = try buildWasmUnits(ctx, args, &build_env, &reporter, root_artifact, imported_artifacts, relation_artifacts, target, resolved_targets_config);
         defer units.deinit(ctx.gpa);
         if (wasm_fast_link) |fast| {
@@ -17387,7 +17387,7 @@ fn rocTest(ctx: *CliCtx, args_in: cli_args.TestArgs, arg0: []const u8) CliMainEr
     };
     reporter.end();
     // `roc test` runs on this host.
-    try requireSupportedConcurrency(ctx, &build_env, args.opt, currentRuntimeSpecializationStrategy(args.specialization_strategy, args.opt));
+    try requireSupportedConcurrency(ctx, &build_env, args.opt);
 
     reporter.begin("Type Checking");
     build_env.compileDiscovered() catch |err| {

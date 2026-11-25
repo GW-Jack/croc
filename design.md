@@ -19317,6 +19317,14 @@ host allocation and free operations.
 
 #### Per-Module Output
 
+This section is about programs whose platform declares no tasks. One whose
+platform does lowers whole, as an optimized build does: which procedures may
+suspend depends on code in other modules (Boxy Procedures That May Suspend),
+and every template has its task forms. Its dev run, dev build and wasm dev
+build therefore read and file no unit for the program, and link it as an
+optimized build is linked. Compile-time evaluation has no task, so it still
+runs and files the units of each module, which are lowered without one.
+
 Everything Boxy emits for a module is a function of that module's checked
 checked module and its imports' checked modules, and of the target (pointer
 width, operating system, and CPU), the opt level, and the compiler version.
@@ -33417,8 +33425,9 @@ with such an entry records that its static data references code, and the shim
 holds a reference to it for the rest of the session once it accepts it, which
 keeps that image's code, data, and Boxy runtime alive.
 
-A `--specialize=no` dev run with a cache on a host whose units carry unit
-images (every 64-bit x86 or ARM host) composes its `RunImage` from
+A `--specialize=no` dev run of a program without tasks, with a cache, on a host
+whose units carry unit images (every 64-bit x86 or ARM host) composes its
+`RunImage` from
 unit images (Fast Dev Link) instead of lowering and
 compiling the whole program, for the first generation and every rebuild
 alike (`unitImageRunApplies`; every other run lowers the whole program).
@@ -35842,22 +35851,18 @@ and woken tasks, each with balanced allocations.
 
 ### What Implements It First
 
-The first implementation supports `concurrency: Tasks` under `.lss` on the
-interpreter, then on LLVM and the dev backend for native targets (Backends).
-Until the rest exists:
+`concurrency: Tasks` is supported under both strategies on the interpreter, the
+dev backend, LLVM and wasm (Backends). Until the rest exists:
 
 - a crash on a target without `src/sljmp`, including wasm, ends the process
   rather than its task;
-- the CLI reports `concurrency: Tasks` with `--specialize=no` (`.boxy`), or
-  on the dev backend or LLVM for a wasm target, as an unsupported option
-  combination. Discovery reads the mode from the platform header, and the
-  CLI checks it against the selected target, so `roc run`, `roc build` and
-  `roc test` report it before checking starts;
-- the CLI reports `concurrency: ParallelTasks` on the interpreter the same
-  way. One interpreter's state is not safe to use on two threads, so it
-  cannot run two resumes at once (Parallel Resumes);
+- the CLI reports `concurrency: ParallelTasks` on the interpreter as an
+  unsupported option combination. One interpreter's state is not safe to use
+  on two threads, so it cannot run two resumes at once (Parallel Resumes).
+  Discovery reads the mode from the platform header, so `roc run`, `roc build`
+  and `roc test` report it before checking starts;
 - the continuation pass stops with a not-yet-implemented panic, in every
-  build mode, when an erased-callable procedure that belongs to no class
+  build mode, when an `erased_callable` procedure that belongs to no class
   may suspend, other than a resume entry or start record: its erased callers
   have no task to pass it. The dev backend's not-yet-implemented panics are
   the precedent.

@@ -251,13 +251,11 @@ pub const CliProblem = union(enum) {
         opt: []const u8,
     },
 
-    /// The platform's `concurrency` mode is not supported under the chosen
-    /// optimization level and lowering strategy (design.md "What Implements
-    /// It First").
+    /// The platform's `concurrency` mode is not supported at the chosen
+    /// optimization level (design.md "What Implements It First").
     unsupported_concurrency_lowering: struct {
         mode: []const u8,
         opt: []const u8,
-        specialize: []const u8,
     },
 
     /// Compilation produced errors
@@ -1174,21 +1172,15 @@ fn createUnsupportedOptLevelReport(allocator: Allocator, info: anytype) Allocato
 fn createUnsupportedConcurrencyLoweringReport(allocator: Allocator, info: anytype) Allocator.Error!Report {
     const headline = try std.fmt.allocPrint(
         allocator,
-        "This app's platform uses `concurrency: {s}`, which is not supported with --opt={s} --specialize={s} yet.",
-        .{ info.mode, info.opt, info.specialize },
+        "This app's platform uses `concurrency: {s}`, which is not supported with --opt={s} yet.",
+        .{ info.mode, info.opt },
     );
     defer allocator.free(headline);
     var report = try Report.init(allocator, "Concurrency Not Supported Here", headline, .fatal);
 
-    try report.document.addText("For now, a platform with ");
-    try report.document.addAnnotated("concurrency: Tasks", .emphasized);
-    try report.document.addText(" or ");
-    try report.document.addAnnotated("concurrency: ParallelTasks", .emphasized);
-    try report.document.addText(" needs lambda-set specialization (");
-    try report.document.addAnnotated("--specialize=yes", .emphasized);
-    try report.document.addText("), and ParallelTasks an ");
+    try report.document.addText("For now, use another ");
     try report.document.addAnnotated("--opt", .emphasized);
-    try report.document.addText(" other than interpreter.");
+    try report.document.addText(" with such a platform.");
 
     return report;
 }
@@ -1856,13 +1848,12 @@ test "unsupported_opt_level generates correct report" {
 
 test "unsupported_concurrency_lowering names the option it needs" {
     const rendered = try renderPlainForTest(.{ .unsupported_concurrency_lowering = .{
-        .mode = "Tasks",
-        .opt = "speed",
-        .specialize = "no",
+        .mode = "ParallelTasks",
+        .opt = "interpreter",
     } });
     defer std.testing.allocator.free(rendered);
     // The report wraps its lines, so each needle fits within one.
-    for ([_][]const u8{ "`concurrency: Tasks`", "--opt=speed --specialize=no", "--specialize=yes" }) |needle| {
+    for ([_][]const u8{ "`concurrency: ParallelTasks`", "--opt=interpreter", "use another" }) |needle| {
         try std.testing.expect(std.mem.find(u8, rendered, needle) != null);
     }
 }
