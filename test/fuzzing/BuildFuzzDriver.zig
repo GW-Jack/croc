@@ -48,6 +48,8 @@ pub fn run(buf: [*]u8, len: isize, debug: bool, mode: Mode) void {
     }
     // Lower as an optimized build does, or as the interpreter's does.
     const optimized = reader.boolean();
+    // Both specialization strategies must lower any program.
+    const strategy: base.SpecializationStrategy = if (reader.boolean()) .boxy else .lss;
     if (reader.boolean()) module_generator.useHost();
     module_generator.generateModules() catch |err| switch (err) {
         error.OutOfMemory => @panic("OOM during shared typed module generation"),
@@ -74,7 +76,7 @@ pub fn run(buf: [*]u8, len: isize, debug: bool, mode: Mode) void {
     }
     const generated_files = generated_files_buf[0..file_count];
     if (debug) {
-        std.debug.print("Input length: {d}, bytes consumed: {d}, target: {s}, optimized: {}\n", .{ input.len, reader.position, @tagName(selected_target), optimized });
+        std.debug.print("Input length: {d}, bytes consumed: {d}, target: {s}, optimized: {}, strategy: {s}\n", .{ input.len, reader.position, @tagName(selected_target), optimized, @tagName(strategy) });
         FuzzHarness.printGeneratedFiles(generated_files);
     }
 
@@ -105,7 +107,7 @@ pub fn run(buf: [*]u8, len: isize, debug: bool, mode: Mode) void {
     const cwd = std.Io.Dir.cwd().realPathFileAlloc(fuzz_io, ".", gpa) catch @panic("failed to resolve cwd");
     defer gpa.free(cwd);
 
-    var build_env = BuildEnv.init(gpa, .single_threaded, 1, roc_target.RocTarget.detectNative(), cwd, fuzz_io, .lss) catch @panic("OOM during BuildEnv init");
+    var build_env = BuildEnv.init(gpa, .single_threaded, 1, roc_target.RocTarget.detectNative(), cwd, fuzz_io, strategy) catch @panic("OOM during BuildEnv init");
     defer build_env.deinit();
 
     build_env.discoverDependencies(abs_paths[app_index]) catch |err| switch (err) {
@@ -160,6 +162,7 @@ pub fn run(buf: [*]u8, len: isize, debug: bool, mode: Mode) void {
         .{ .requests = lir_roots },
         .{
             .target_usize = targetUsize(selected_target),
+            .specialization_strategy = strategy,
             .inline_mode = if (optimized) .wrappers else .none,
             .specialize_arc_modes = optimized,
             .prove_uniqueness = optimized,
