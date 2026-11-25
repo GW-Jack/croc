@@ -33790,8 +33790,8 @@ form only because an entry may suspend, so a program with a `group_next`
 has a body-less seed as well, unless the `group_next` is a supervised set's.
 In a `Tasks` build the `run_supervised!` specializations (Plans And Concurrent
 Loops, "Supervision.") are seeds too, before promotion as after it. A program
-with no seed skips the walk; a Debug compiler walks anyway and checks that no
-`group_next` is there. The fixpoint propagates from each seed to the callers that call it directly and commits
+with no seed and no mark to replace skips the walk; a Debug compiler walks
+anyway and checks that no `group_next` is there. The fixpoint propagates from each seed to the callers that call it directly and commits
 both marks on every procedure with a body, so a recomputation after rewrites
 replaces stale marks rather than adding to them. A clone of a call, such as a
 destination variant's, keeps the call's mark.
@@ -33812,14 +33812,16 @@ the runtime passes it the task.
 A class may suspend when one of its procedures may. Then all its procedures
 may, and every call through the class is a suspension site, recorded on its
 `ErasedCallData`. The fixpoint propagates over classes as it does over direct
-calls. Equal classes hold equal members, so a class with a suspending
-procedure holds it in every unit that computes the marks. A type whose
+calls. Only `.lss` sets classes, and a `.lss` program is emitted as one unit,
+so the fixpoint sees every procedure and call of a class. A type whose
 members are all pure has a class that never suspends, though its function
 type has the same Monotype form as an effectful one's.
 
 The marks are computed right after LIR construction, so the procedure-local
-rewrites can see them, and computed again from the rewritten LIR by the
-continuation pass, whose marks are the ones every later stage reads. The
+rewrites can see them. The continuation pass computes them again before it
+reads them, since dropping unreachable procedures may have taken a class's
+only suspending procedure, and again once it has rewritten every procedure;
+those marks are the ones every later stage reads. The
 rewrites that would break suspension leave procedures that may suspend
 alone:
 
@@ -33867,8 +33869,8 @@ outcome. The tail-drive pass marks every tail position of such a procedure
 `always`, so it never hands a pending erased call up and takes no caller's
 cell.
 
-When no hosted procedure is `suspending`, both computations commit `never`
-everywhere and walk nothing. A Debug compiler walks anyway and asserts that
+When no hosted procedure is `suspending`, every computation commits `never`
+everywhere and walks nothing. A Debug compiler walks anyway and asserts that
 it finds no suspension site.
 
 ### The Continuation Pass

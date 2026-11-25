@@ -124,6 +124,10 @@ const ProcPlan = struct {
 /// its place in `roots` goes to an entry that creates the task, or in a program
 /// without tasks runs it.
 pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots: Roots) Allocator.Error!void {
+    // Rewrites since the marks were committed may have dropped an erased
+    // class's only suspending procedure (design.md "Erased Calls That May
+    // Suspend").
+    try SuspensionMarks.run(allocator, store, roots.mode);
     // A promoted loop's `group_next` is a park site, so promotion comes
     // before any procedure's sites are found.
     try RunningSetPromotion.run(allocator, store, layouts, roots.mode);

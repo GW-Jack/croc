@@ -74,12 +74,13 @@ const ClassSet = std.AutoHashMapUnmanaged(LIR.ErasedClass, void);
 /// a build with tasks every `run_supervised` one (design.md "Shared State",
 /// "Waiting."; "Plans And Concurrent Loops", "Supervision.").
 pub fn run(allocator: Allocator, store: *LirStore, mode: ConcurrencyMode) Allocator.Error!void {
-    if (!anySeed(store, mode)) {
-        // Nothing can suspend: commit `never` without walking. A Debug
-        // compiler walks anyway and checks that no call is a site. Nor is
-        // there a `group_next`: a loop has the task form only when an entry
-        // may suspend, which needs a suspending procedure; nor a `cell_wait`,
-        // whose helper is a seed.
+    if (!anySeedOrMark(store, mode)) {
+        // Nothing can suspend and nothing is marked as if it could: commit
+        // `never` without walking. A Debug compiler walks anyway and checks
+        // that no call is a site. Nor is there a `group_next`: a loop has the
+        // task form only when an entry may suspend, which needs a suspending
+        // procedure, and the procedure that holds one stays marked; nor a
+        // `cell_wait`, whose helper is a seed.
         if (builtin.mode == .debug) {
             var walk = try walkBodies(allocator, store);
             defer walk.deinit(allocator);
@@ -144,12 +145,14 @@ fn seeds(proc: *const LIR.LirProcSpec, mode: ConcurrencyMode) bool {
     return mode.hasTasks() and proc.running_set_helper == .run_supervised;
 }
 
-/// Whether any body-less procedure is marked as one that may suspend, or this
-/// compilation holds a seed's body.
-fn anySeed(store: *const LirStore, mode: ConcurrencyMode) bool {
+/// Whether any procedure is marked as one that may suspend, or this
+/// compilation holds a seed's body. A marked procedure with a body need not be
+/// a seed, and its mark may be stale: an erased class that held a suspending
+/// procedure no longer may suspend once that procedure is gone.
+fn anySeedOrMark(store: *const LirStore, mode: ConcurrencyMode) bool {
     for (0..store.procSpecCount()) |index| {
         const proc = store.getProcSpecImmediate(@fromBackingInt(@as(u32, @intCast(index))));
-        if (proc.body.get() == null and proc.suspends == .may) return true;
+        if (proc.suspends == .may) return true;
         if (seeds(proc, mode)) return true;
     }
     return false;
@@ -603,6 +606,17 @@ test "a suspending procedure of an erased class makes the class's procedures and
     // Running again after a rewrite took the suspending call away replaces
     // the marks.
     store.getCFStmtPtr(suspending.call.?).assign_call.proc = quiet_member.proc;
+    try run(a, &store, .none);
+    try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(other.proc).suspends);
+    try testing.expect(!isErasedSite(&store, through.call));
+    try testing.expect(!isErasedSite(&store, caller.call));
+
+    // So does running again after one took the program's only seed away.
+    store.getCFStmtPtr(suspending.call.?).assign_call.proc = seed;
+    try run(a, &store, .none);
+    try testing.expect(isErasedSite(&store, caller.call));
+    store.getCFStmtPtr(suspending.call.?).assign_call.proc = quiet_member.proc;
+    store.getProcSpecPtr(seed).suspends = .never;
     try run(a, &store, .none);
     try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(other.proc).suspends);
     try testing.expect(!isErasedSite(&store, through.call));
