@@ -35390,6 +35390,14 @@ seven runs of 200,000 pauses) puts allocation at most of a pause:
 Each nested record costs about 40 ns under `malloc` and 12 ns under
 `cache`.
 
+**Measuring child tasks.** `bench_spawn.roc` times loops of 1, 4, 16 and 64
+entries that each pause once, and a loop whose body spawns one entry per
+arrival, against the same calls made in order with no loop. With a
+ReleaseFast compiler on LLVM (arm64 macOS, `malloc`, median of 11 runs), an
+entry costs 446 ns in a loop of one, where it pays for the running set alone,
+254 ns in a loop of 4, 222 ns of 16 and 205 ns of 64. A spawned entry costs
+247 ns, and the same call made in order 14 ns.
+
 A last-in, first-out buffer does not fit how records are released. One
 suspension pushes its records innermost first, and the resume reverses
 them so the innermost runs first. So within one suspension, records are
