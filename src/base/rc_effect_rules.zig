@@ -57,6 +57,7 @@ pub const Rule = enum {
     borrow_without_result_retain,
     unique_result_without_source,
     unique_result_that_is_retained,
+    store_without_stored_arg,
 
     /// What the row claimed, and why those claims cannot both hold.
     pub fn description(self: Rule) []const u8 {
@@ -74,6 +75,7 @@ pub const Rule = enum {
             .borrow_without_result_retain => "result_borrows_args names a lender, but without retain_result ARC never links the result to it and the borrow is silently dropped",
             .unique_result_without_source => "result_unique claims the result's outermost allocation has count 1, but the op neither allocates it (may_allocate) nor takes it out of a consumed argument (result_aliases_consumed_args)",
             .unique_result_that_is_retained => "retain_result means the result is read out of a structure that stays live, so its outermost allocation cannot also be uniquely owned",
+            .store_without_stored_arg => "args_stored_into names the memory an op stores its other consumed arguments into, so one of them must be consumed",
         };
     }
 };
@@ -124,6 +126,9 @@ pub fn violation(effect: RcEffect) ?Rule {
     if (effect.result_unique and effect.retain_result) {
         return .unique_result_that_is_retained;
     }
+    if (effect.args_stored_into != 0 and (effect.consume_args & ~effect.args_stored_into) == 0) {
+        return .store_without_stored_arg;
+    }
     return null;
 }
 
@@ -140,6 +145,7 @@ pub fn maskExceedsArgCount(effect: RcEffect, arg_count: usize) ?u6 {
         effect.retain_args |
         effect.result_borrows_args |
         effect.result_shares_args |
+        effect.args_stored_into |
         effect.args_host_visible |
         effect.args_spawned;
     if (named == 0) return null;
@@ -262,6 +268,7 @@ test "each rule rejects the row it names, and every rule is reachable" {
             .retain_result = true,
             .result_unique = true,
         } },
+        .{ .rule = .store_without_stored_arg, .effect = .{ .args_stored_into = 1 } },
     };
 
     // A rule with no row that breaks it is a rule that is not doing anything.

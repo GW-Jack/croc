@@ -272,7 +272,7 @@ fn certifyStoreWithWorkStats(
     var maybe_uninitialized = try MaybeUninitializedConditions.init(allocator, store, diag);
     defer maybe_uninitialized.deinit();
 
-    try certifyRcAtomicity(allocator, store, rc_local, roots, parallel_tasks, diag);
+    try certifyRcAtomicity(allocator, store, layouts, roots, parallel_tasks, diag);
     try certifyUniqueArgs(allocator, store, layouts, rc_local, sigs, diag);
 
     var certifier = Certifier.initStore(allocator, store, layouts, sigs, rc_local, &maybe_uninitialized, diag, work_stats);
@@ -462,14 +462,14 @@ fn certifyErasedCallArgsPlan(
 fn certifyRcAtomicity(
     allocator: Allocator,
     store: *const LirStore,
-    rc_local: []const bool,
+    layouts: *const layout_mod.Store,
     roots: []const LIR.LirProcSpecId,
     parallel_tasks: bool,
     diag: *Diagnostic,
 ) CertifyError!void {
     var pinned = try arc_solve.computePinnedProcs(allocator, store, roots);
     defer pinned.deinit(allocator);
-    var visible = try arc_solve.computeVisibility(allocator, store, rc_local, &pinned, parallel_tasks);
+    var visible = try arc_solve.computeVisibility(allocator, store, layouts, &pinned, parallel_tasks);
     defer visible.deinit(allocator);
 
     for (0..store.cfStmtCount()) |stmt_index| {

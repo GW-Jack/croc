@@ -122,7 +122,9 @@ pub const MAGIC: u32 = 0x52494c52; // "RLIR" in little-endian bytes.
 ///      (`task_record`), an operation names the procedure whose result it
 ///      loads (`result_of`), and an effect the arguments it makes a child
 ///      task's (`args_spawned`).
-pub const FORMAT_VERSION: u32 = 90;
+/// v91: an effect names the arguments it stores others into
+///      (`args_stored_into`).
+pub const FORMAT_VERSION: u32 = 91;
 const StaticDataImage = @import("lir_image_static_data.zig").Schema(@This());
 
 /// Public `ImageError` declaration.

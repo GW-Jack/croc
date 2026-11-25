@@ -13961,11 +13961,9 @@ const PausedLists = struct {
 };
 
 fn visibleLocals(f: *ArcTest, roots: []const LIR.LirProcSpecId) error{OutOfMemory}!std.bit_set.DynamicBitSetUnmanaged {
-    const rc = try arc_solve.computeLocalContainsRefcounted(testing.allocator, &f.store, &f.layouts);
-    defer testing.allocator.free(rc);
     var pinned = try arc_solve.computePinnedProcs(testing.allocator, &f.store, roots);
     defer pinned.deinit(testing.allocator);
-    return arc_solve.computeVisibility(testing.allocator, &f.store, rc, &pinned, false);
+    return arc_solve.computeVisibility(testing.allocator, &f.store, &f.layouts, &pinned, false);
 }
 
 test "RC atomicity: values saved across a pause stay confined" {
@@ -14034,6 +14032,90 @@ test "RC atomicity: a resume entry returns what the procedure that saved it retu
     defer confined.deinit(testing.allocator);
     try testing.expect(!confined.isSet(@backingInt(kept)));
     try testing.expect(!confined.isSet(@backingInt(made)));
+}
+
+/// Two lists, each stored in memory of its own and loaded back through a copy
+/// of its address.
+const AddressedLists = struct {
+    stored: [2]LIR.LocalId,
+    loaded: [2]LIR.LocalId,
+    body: LIR.CFStmtId,
+
+    fn build(f: *ArcTest, comptime memory: enum { slot, cell, caller_struct }) error{OutOfMemory}!AddressedLists {
+        const pair = try f.layouts.putStructFields(&.{.{ .index = 0, .layout = f.list_i64 }});
+        const held = if (memory == .caller_struct) pair else f.list_i64;
+        const ptr = try f.layouts.insertPtr(held);
+        var lists: AddressedLists = .{ .stored = undefined, .loaded = undefined, .body = try f.ret(try f.local(.i64)) };
+        for (&lists.stored, &lists.loaded) |*stored, *loaded| {
+            stored.* = try f.local(f.list_i64);
+            loaded.* = try f.local(held);
+            const address = try f.local(ptr);
+            const copy = try f.local(ptr);
+            const done = try f.local(.zst);
+            const load = try f.store.addLowLevelStmt(loaded.*, .ptr_load, &.{copy}, lists.body, .test_fixture);
+            switch (memory) {
+                // address = alloca; copy = address; *address = stored; loaded = *copy
+                .slot => {
+                    const write = try f.store.addLowLevelStmt(done, .ptr_store, &.{ address, stored.* }, load, .test_fixture);
+                    const alias = try f.assignRefLocal(copy, address, write);
+                    lists.body = try f.store.addLowLevelStmt(address, .ptr_alloca, &.{}, alias, .test_fixture);
+                },
+                // cell = box; copy = address of cell; *cell = stored; loaded = *copy
+                .cell => {
+                    const cell = try f.local(try f.layouts.insertBox(f.list_i64));
+                    const write = try f.store.addLowLevelStmt(done, .ptr_store, &.{ cell, stored.* }, load, .test_fixture);
+                    const cast = try f.store.addLowLevelStmt(copy, .ptr_cast, &.{cell}, write, .test_fixture);
+                    lists.body = try f.store.addLowLevelStmt(cell, .box_alloc_zeroed, &.{}, cast, .test_fixture);
+                },
+                // fill(out, list) = *out = { list }
+                // address = alloca; copy = address; fill(address, stored); loaded = *copy
+                .caller_struct => {
+                    const out = try f.local(ptr);
+                    const list = try f.local(f.list_i64);
+                    const result = try f.local(.i64);
+                    const write = try f.store.addCFStmt(.{ .store_struct = .{
+                        .dest = out,
+                        .struct_layout = pair,
+                        .fields = try f.span(&.{list}),
+                        .next = try f.assignI64(result, 1, try f.ret(result)),
+                    } }, .test_fixture);
+                    const fill = try f.addProc(&.{ out, list }, write, .i64);
+                    const call = try f.store.addCFStmt(.{ .assign_call = .{
+                        .target = try f.local(.i64),
+                        .proc = fill,
+                        .args = try f.span(&.{ address, stored.* }),
+                        .next = load,
+                    } }, .test_fixture);
+                    const alias = try f.assignRefLocal(copy, address, call);
+                    lists.body = try f.store.addLowLevelStmt(address, .ptr_alloca, &.{}, alias, .test_fixture);
+                },
+            }
+        }
+        return lists;
+    }
+};
+
+test "RC atomicity: a value loaded through an address is what was stored there" {
+    inline for (.{ .slot, .cell, .caller_struct }) |memory| {
+        var f = try ArcTest.init(testing.allocator);
+        defer f.deinit();
+        const lists = try AddressedLists.build(&f, memory);
+        // main(host) = stored0 = host, ...: the first list comes from the host.
+        const host = try f.local(f.list_i64);
+        const second = try f.assignList(lists.stored[1], &.{}, lists.body);
+        const first = try f.assignRefLocal(lists.stored[0], host, second);
+        const main = try f.addProc(&.{host}, first, .i64);
+
+        var visible = try visibleLocals(&f, &.{main});
+        defer visible.deinit(testing.allocator);
+        // caller_struct's two calls reach two procedures, so nothing joins
+        // the two lists' memory.
+        try testing.expect(visible.isSet(@backingInt(lists.loaded[0])));
+        try testing.expect(!visible.isSet(@backingInt(lists.stored[1])));
+        try testing.expect(!visible.isSet(@backingInt(lists.loaded[1])));
+        // The solver's facts and this walk must agree.
+        _ = try insert(&f.store, &f.layouts, .{ .roots = &.{main}, .thread_confined_rc = true });
+    }
 }
 
 test "RC atomicity: a loaded result is what the procedure it names returned" {

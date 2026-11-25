@@ -713,6 +713,24 @@ pub fn computeLocalContainsRefcounted(
     return contains;
 }
 
+/// Whether each local can lead to a counted allocation: it holds one, or it is
+/// the address of memory that does. Host visibility flows through exactly
+/// these; an address itself is never counted.
+fn computeLocalCarriesRefcounted(
+    allocator: Allocator,
+    store: *const LirStore,
+    layouts: *const layout_mod.Store,
+) SolveError![]bool {
+    const carries = try allocator.alloc(bool, store.localCount());
+    errdefer allocator.free(carries);
+    for (carries, 0..) |*carried, index| {
+        const held = layouts.getLayout(store.getLocal(@fromBackingInt(@intCast(index))).layout_idx);
+        const pointee = if (held.tag == .ptr) layouts.getLayout(held.getIdx()) else held;
+        carried.* = layouts.layoutContainsRefcounted(pointee);
+    }
+    return carries;
+}
+
 /// Dense module-wide domain of locals that participate in ARC equations.
 /// The producer-provided `rc_local` table is the exact membership rule; the
 /// reverse table expands the final solution to LocalId-indexed consumer data
@@ -945,6 +963,9 @@ const Solver = struct {
     /// While a resume entry is lifted, the record it loaded.
     record_capture: ?LIR.LocalId = null,
     domain: *const ArcLocalDomain,
+    /// The locals host visibility flows through. Empty without thread-confined
+    /// counts, whose solve records no visibility fact.
+    carriers: *const ArcLocalDomain,
     sigs: []arc_sig.RcSig,
     pinned: std.bit_set.DynamicBitSetUnmanaged,
     stability_pinned: std.bit_set.DynamicBitSetUnmanaged,
@@ -1041,6 +1062,10 @@ pub fn solveWithOptions(
     var domain = try ArcLocalDomain.init(allocator, rc_local);
     defer domain.deinit(allocator);
     const arc_local_count = domain.arc_to_local.len;
+    const carries: []const bool = if (thread_confined_rc) try computeLocalCarriesRefcounted(allocator, store, layouts) else &.{};
+    defer allocator.free(carries);
+    var carriers = try ArcLocalDomain.init(allocator, carries);
+    defer carriers.deinit(allocator);
 
     var solver = Solver{
         .allocator = allocator,
@@ -1051,6 +1076,7 @@ pub fn solveWithOptions(
         .thread_confined_rc = thread_confined_rc,
         .parallel_tasks = parallel_tasks,
         .domain = &domain,
+        .carriers = &carriers,
         .sigs = &.{},
         .pinned = .{},
         .stability_pinned = .{},
@@ -1278,7 +1304,7 @@ pub fn solveWithOptions(
             try std.bit_set.DynamicBitSetUnmanaged.initFull(allocator, local_count);
         errdefer visible.deinit(allocator);
         if (builtin.mode == .debug and thread_confined_rc) {
-            var independently_visible = try computeVisibilityFromLift(allocator, store, rc_local, &solver.pinned, parallel_tasks, &solver.proc_stmts, &solver.proc_returns);
+            var independently_visible = try computeVisibilityFromLift(allocator, store, carries, &solver.pinned, parallel_tasks, &solver.proc_stmts, &solver.proc_returns);
             defer independently_visible.deinit(allocator);
             if (!visible.eql(independently_visible)) solveInvariant("typed visibility facts disagreed with independent LIR analysis");
         }
@@ -3159,7 +3185,7 @@ fn noteDemand(solver: *Solver, local: LIR.LocalId) void {
 
 fn liftVisibilityLink(solver: *Solver, a: LIR.LocalId, b: LIR.LocalId) SolveError!void {
     if (!solver.thread_confined_rc or a == b) return;
-    if (solver.domain.indexOf(a) == null or solver.domain.indexOf(b) == null) return;
+    if (solver.carriers.indexOf(a) == null or solver.carriers.indexOf(b) == null) return;
     try solver.visibility_facts.append(solver.allocator, .{ .link = .{ .a = a, .b = b } });
 }
 
@@ -3169,7 +3195,7 @@ fn liftVisibilityFact(solver: *Solver, fact: VisibilityFact) SolveError!void {
 }
 
 fn liftRecordHolder(solver: *Solver, proc: LIR.LirProcSpecId, index: u32, local: LIR.LocalId) SolveError!void {
-    if (solver.domain.indexOf(local) == null) return;
+    if (solver.carriers.indexOf(local) == null) return;
     try liftVisibilityFact(solver, .{ .held = .{ .slot = .{ .proc = proc, .index = index }, .local = local } });
 }
 
@@ -3186,7 +3212,7 @@ fn argsMadeVisible(effect: LIR.LowLevel.RcEffect, parallel_tasks: bool) u64 {
 
 fn liftVisibilitySeed(solver: *Solver, local: LIR.LocalId) SolveError!void {
     if (!solver.thread_confined_rc) return;
-    if (solver.domain.indexOf(local) == null) return;
+    if (solver.carriers.indexOf(local) == null) return;
     try solver.visibility_facts.append(solver.allocator, .{ .seed = local });
 }
 
@@ -3399,6 +3425,13 @@ fn liftSharedStmtFacts(solver: *Solver, proc_index: u32, current: LIR.CFStmtId) 
                     },
                 }
             } else {
+                for (0..@min(GuardedList.borrowLen(args), 64)) |address| {
+                    if ((rc_effect.args_stored_into & (@as(u64, 1) << @as(u6, @intCast(address)))) == 0) continue;
+                    for (0..@min(GuardedList.borrowLen(args), 64)) |stored| {
+                        if ((rc_effect.consume_args & (@as(u64, 1) << @as(u6, @intCast(stored)))) == 0) continue;
+                        try liftVisibilityLink(solver, GuardedList.at(args, address), GuardedList.at(args, stored));
+                    }
+                }
                 const share_mask = rc_effect.result_aliases_consumed_args |
                     rc_effect.result_borrows_args |
                     rc_effect.retain_args |
@@ -3470,6 +3503,7 @@ fn liftSharedStmtFacts(solver: *Solver, proc_index: u32, current: LIR.CFStmtId) 
             for (0..GuardedList.borrowLen(fields)) |index| {
                 const field = GuardedList.at(fields, index);
                 try solver.binding_facts.append(allocator, .{ .demand = field });
+                try liftVisibilityLink(solver, assign.dest, field);
                 try solver.unique_facts.append(allocator, .{ .consume = .{ .local = field, .stmt = current } });
             }
         },
@@ -3477,6 +3511,7 @@ fn liftSharedStmtFacts(solver: *Solver, proc_index: u32, current: LIR.CFStmtId) 
             try solver.binding_facts.append(allocator, .{ .demand = assign.dest });
             if (assign.payload) |payload| {
                 try solver.binding_facts.append(allocator, .{ .demand = payload });
+                try liftVisibilityLink(solver, assign.dest, payload);
                 try solver.unique_facts.append(allocator, .{ .consume = .{ .local = payload, .stmt = current } });
             }
         },
@@ -3808,7 +3843,7 @@ fn computeVisibilityFromFacts(
     allocator: Allocator,
     solver: *const Solver,
 ) SolveError!std.bit_set.DynamicBitSetUnmanaged {
-    const domain = solver.domain;
+    const domain = solver.carriers;
     const arc_count = domain.arc_to_local.len;
     var sets = try collections.DisjointSets.init(allocator, arc_count);
     defer sets.deinit(allocator);
@@ -3897,17 +3932,19 @@ fn computeVisibilityFromFacts(
 pub fn computeVisibility(
     allocator: Allocator,
     store: *const LirStore,
-    rc_local: []const bool,
+    layouts: *const layout_mod.Store,
     pinned: *const std.bit_set.DynamicBitSetUnmanaged,
     parallel_tasks: bool,
 ) SolveError!std.bit_set.DynamicBitSetUnmanaged {
-    return computeVisibilityFromLift(allocator, store, rc_local, pinned, parallel_tasks, null, null);
+    const carries = try computeLocalCarriesRefcounted(allocator, store, layouts);
+    defer allocator.free(carries);
+    return computeVisibilityFromLift(allocator, store, carries, pinned, parallel_tasks, null, null);
 }
 
 fn computeVisibilityFromLift(
     allocator: Allocator,
     store: *const LirStore,
-    rc_local: []const bool,
+    carries: []const bool,
     pinned: *const std.bit_set.DynamicBitSetUnmanaged,
     parallel_tasks: bool,
     proc_stmts: ?*const ProcRows(LIR.CFStmtId),
@@ -4017,10 +4054,10 @@ fn computeVisibilityFromLift(
         const params = store.getLocalSpan(proc.args);
         for (0..GuardedList.borrowLen(params)) |param_index| {
             const param = GuardedList.at(params, param_index);
-            seedLocal(&visible, rc_local, @backingInt(param));
+            seedLocal(&visible, carries, @backingInt(param));
         }
         for (ret_values.of(proc_index)) |value| {
-            seedLocal(&visible, rc_local, value);
+            seedLocal(&visible, carries, value);
         }
     }
 
@@ -4058,23 +4095,23 @@ fn computeVisibilityFromLift(
                 const save = store.stmtRow(save_stmt.data);
                 const saved = store.getLocalSpan(save.saved);
                 for (0..GuardedList.borrowLen(saved)) |index| {
-                    try holdInRecord(allocator, &sets, &record_slots, rc_local, .{ .proc = save.proc, .index = @intCast(index) }, @backingInt(GuardedList.at(saved, index)));
+                    try holdInRecord(allocator, &sets, &record_slots, carries, .{ .proc = save.proc, .index = @intCast(index) }, @backingInt(GuardedList.at(saved, index)));
                 }
                 for (ret_values.of(@backingInt(save.proc))) |entry_return| {
-                    for (ret_values.of(proc_index)) |saver_return| addEdge(&sets, rc_local, entry_return, saver_return);
+                    for (ret_values.of(proc_index)) |saver_return| addEdge(&sets, carries, entry_return, saver_return);
                 }
             },
             .suspend_return => {},
             .assign_ref => |assign| {
                 const target = @backingInt(assign.target);
                 switch (assign.op.kind) {
-                    .local => addEdge(&sets, rc_local, target, @backingInt(assign.op.source)),
-                    inline .list_reinterpret, .nominal => addEdge(&sets, rc_local, target, @backingInt(assign.op.source)),
+                    .local => addEdge(&sets, carries, target, @backingInt(assign.op.source)),
+                    inline .list_reinterpret, .nominal => addEdge(&sets, carries, target, @backingInt(assign.op.source)),
                     .field => if (record_capture == assign.op.source) {
-                        try holdInRecord(allocator, &sets, &record_slots, rc_local, .{ .proc = proc_id, .index = assign.op.index }, target);
-                    } else addEdge(&sets, rc_local, target, @backingInt(assign.op.source)),
-                    .tag_payload => addEdge(&sets, rc_local, target, @backingInt(assign.op.source)),
-                    .tag_payload_struct => addEdge(&sets, rc_local, target, @backingInt(assign.op.source)),
+                        try holdInRecord(allocator, &sets, &record_slots, carries, .{ .proc = proc_id, .index = assign.op.index }, target);
+                    } else addEdge(&sets, carries, target, @backingInt(assign.op.source)),
+                    .tag_payload => addEdge(&sets, carries, target, @backingInt(assign.op.source)),
+                    .tag_payload_struct => addEdge(&sets, carries, target, @backingInt(assign.op.source)),
                     .discriminant => {},
                 }
             },
@@ -4083,28 +4120,36 @@ fn computeVisibilityFromLift(
                 const fields = store.getLocalSpan(assign.fields);
                 for (0..GuardedList.borrowLen(fields)) |index| {
                     const field = GuardedList.at(fields, index);
-                    addEdge(&sets, rc_local, @backingInt(assign.target), @backingInt(field));
+                    addEdge(&sets, carries, @backingInt(assign.target), @backingInt(field));
                 }
             },
             .assign_list => |assign| {
                 const elems = store.getLocalSpan(assign.elems);
                 for (0..GuardedList.borrowLen(elems)) |index| {
                     const elem = GuardedList.at(elems, index);
-                    addEdge(&sets, rc_local, @backingInt(assign.target), @backingInt(elem));
+                    addEdge(&sets, carries, @backingInt(assign.target), @backingInt(elem));
                 }
             },
             .assign_tag => |assign| {
                 if (assign.payload) |payload| {
-                    addEdge(&sets, rc_local, @backingInt(assign.target), @backingInt(payload));
+                    addEdge(&sets, carries, @backingInt(assign.target), @backingInt(payload));
                 }
             },
-            .store_struct, .store_tag => {},
+            .store_struct => |assign| {
+                const fields = store.getLocalSpan(assign.fields);
+                for (0..GuardedList.borrowLen(fields)) |index| {
+                    addEdge(&sets, carries, @backingInt(assign.dest), @backingInt(GuardedList.at(fields, index)));
+                }
+            },
+            .store_tag => |assign| {
+                if (assign.payload) |payload| addEdge(&sets, carries, @backingInt(assign.dest), @backingInt(payload));
+            },
             .assign_packed_erased_fn => |assign_stmt| {
                 const assign = store.stmtRow(assign_stmt.data);
                 if (assign.capture.get()) |capture| {
-                    addEdge(&sets, rc_local, @backingInt(assign_stmt.target), @backingInt(capture));
+                    addEdge(&sets, carries, @backingInt(assign_stmt.target), @backingInt(capture));
                     if (store.getProcSpecImmediate(assign.proc).task_record == .child_start) {
-                        try holdInRecord(allocator, &sets, &record_slots, rc_local, .{ .proc = assign.proc, .index = 0 }, @backingInt(capture));
+                        try holdInRecord(allocator, &sets, &record_slots, carries, .{ .proc = assign.proc, .index = 0 }, @backingInt(capture));
                     }
                 }
             },
@@ -4115,7 +4160,7 @@ fn computeVisibilityFromLift(
                     const step = GuardedList.at(steps, step_index);
                     switch (step.capture) {
                         .discard => {},
-                        .view => |local| addEdge(&sets, rc_local, @backingInt(local), @backingInt(str_match_stmt.source)),
+                        .view => |local| addEdge(&sets, carries, @backingInt(local), @backingInt(str_match_stmt.source)),
                     }
                 }
             },
@@ -4128,13 +4173,13 @@ fn computeVisibilityFromLift(
                         const step = GuardedList.at(steps, step_index);
                         switch (step.capture) {
                             .discard => {},
-                            .view => |local| addEdge(&sets, rc_local, @backingInt(local), @backingInt(str_match_set.source)),
+                            .view => |local| addEdge(&sets, carries, @backingInt(local), @backingInt(str_match_set.source)),
                         }
                     }
                 }
             },
             .set_local => |assign| {
-                addEdge(&sets, rc_local, @backingInt(assign.target), @backingInt(assign.value));
+                addEdge(&sets, carries, @backingInt(assign.target), @backingInt(assign.value));
             },
             .assign_call => |assign| {
                 const callee = store.getProcSpecImmediate(assign.proc);
@@ -4144,18 +4189,18 @@ fn computeVisibilityFromLift(
                     // host-visible.
                     for (0..GuardedList.borrowLen(args)) |arg_index| {
                         const arg = GuardedList.at(args, arg_index);
-                        seedLocal(&visible, rc_local, @backingInt(arg));
+                        seedLocal(&visible, carries, @backingInt(arg));
                     }
-                    seedLocal(&visible, rc_local, @backingInt(assign.target));
+                    seedLocal(&visible, carries, @backingInt(assign.target));
                 } else {
                     const params = store.getLocalSpan(callee.args);
                     for (0..GuardedList.borrowLen(args)) |position| {
                         const arg = GuardedList.at(args, position);
                         if (position >= params.len) break;
-                        addEdge(&sets, rc_local, @backingInt(arg), @backingInt(GuardedList.at(params, position)));
+                        addEdge(&sets, carries, @backingInt(arg), @backingInt(GuardedList.at(params, position)));
                     }
                     for (ret_values.of(@backingInt(assign.proc))) |value| {
-                        addEdge(&sets, rc_local, @backingInt(assign.target), value);
+                        addEdge(&sets, carries, @backingInt(assign.target), value);
                     }
                 }
             },
@@ -4163,14 +4208,14 @@ fn computeVisibilityFromLift(
                 const assign = store.stmtRow(assign_stmt.data);
                 // The callee is unknown; the boundary is treated like a
                 // pinned signature.
-                seedLocal(&visible, rc_local, @backingInt(assign.closure));
-                if (assign.reuse_source.get()) |reuse_source| seedLocal(&visible, rc_local, @backingInt(reuse_source));
+                seedLocal(&visible, carries, @backingInt(assign.closure));
+                if (assign.reuse_source.get()) |reuse_source| seedLocal(&visible, carries, @backingInt(reuse_source));
                 const args = store.getLocalSpan(assign.args);
                 for (0..GuardedList.borrowLen(args)) |arg_index| {
                     const arg = GuardedList.at(args, arg_index);
-                    seedLocal(&visible, rc_local, @backingInt(arg));
+                    seedLocal(&visible, carries, @backingInt(arg));
                 }
-                seedLocal(&visible, rc_local, @backingInt(assign_stmt.target));
+                seedLocal(&visible, carries, @backingInt(assign_stmt.target));
             },
             .assign_low_level => |assign| {
                 const target = @backingInt(assign.target);
@@ -4182,14 +4227,14 @@ fn computeVisibilityFromLift(
                     // is host-visible by construction. A task record's was
                     // saved or packed by a statement of this program.
                     switch (task_record) {
-                        .none => seedLocal(&visible, rc_local, target),
+                        .none => seedLocal(&visible, carries, target),
                         .child_start => {
-                            try holdInRecord(allocator, &sets, &record_slots, rc_local, .{ .proc = proc_id, .index = 0 }, target);
-                            addEdge(&sets, rc_local, target, owner);
+                            try holdInRecord(allocator, &sets, &record_slots, carries, .{ .proc = proc_id, .index = 0 }, target);
+                            addEdge(&sets, carries, target, owner);
                         },
                         .resume_entry => {
-                            seedLocal(&visible, rc_local, target);
-                            seedLocal(&visible, rc_local, owner);
+                            seedLocal(&visible, carries, target);
+                            seedLocal(&visible, carries, owner);
                             record_capture = assign.target;
                         },
                     }
@@ -4197,15 +4242,22 @@ fn computeVisibilityFromLift(
                 }
                 const effect = assign.op.arcInferenceRcEffect(store.stmtRow(assign.rc_effect));
                 const args = store.getLocalSpan(assign.args);
-                if (effect.result_host_visible) seedLocal(&visible, rc_local, target);
+                if (effect.result_host_visible) seedLocal(&visible, carries, target);
                 if (store.stmtRowOrDefault(assign.extra).result_of.get()) |returned_by| {
                     if (store.getProcSpecImmediate(returned_by).body == .none) {
-                        seedLocal(&visible, rc_local, target);
-                    } else for (ret_values.of(@backingInt(returned_by))) |value| addEdge(&sets, rc_local, target, value);
+                        seedLocal(&visible, carries, target);
+                    } else for (ret_values.of(@backingInt(returned_by))) |value| addEdge(&sets, carries, target, value);
                 }
                 for (0..@min(GuardedList.borrowLen(args), 64)) |position| {
                     if ((argsMadeVisible(effect, parallel_tasks) & (@as(u64, 1) << @as(u6, @intCast(position)))) == 0) continue;
-                    seedLocal(&visible, rc_local, @backingInt(GuardedList.at(args, position)));
+                    seedLocal(&visible, carries, @backingInt(GuardedList.at(args, position)));
+                }
+                for (0..@min(GuardedList.borrowLen(args), 64)) |address| {
+                    if ((effect.args_stored_into & (@as(u64, 1) << @as(u6, @intCast(address)))) == 0) continue;
+                    for (0..@min(GuardedList.borrowLen(args), 64)) |stored| {
+                        if ((effect.consume_args & (@as(u64, 1) << @as(u6, @intCast(stored)))) == 0) continue;
+                        addEdge(&sets, carries, @backingInt(GuardedList.at(args, address)), @backingInt(GuardedList.at(args, stored)));
+                    }
                 }
                 const share_mask = effect.result_aliases_consumed_args |
                     effect.result_borrows_args |
@@ -4217,7 +4269,7 @@ fn computeVisibilityFromLift(
                         if (position >= 64) break;
                         const bit = @as(u64, 1) << @as(u6, @intCast(position));
                         if ((share_mask & bit) == 0) continue;
-                        addEdge(&sets, rc_local, target, @backingInt(arg));
+                        addEdge(&sets, carries, target, @backingInt(arg));
                     }
                 } else if (effect.consume_args == 0) {
                     // The masks say nothing about this op; a refcounted
@@ -4225,7 +4277,7 @@ fn computeVisibilityFromLift(
                     // argument's allocation.
                     for (0..GuardedList.borrowLen(args)) |arg_index| {
                         const arg = GuardedList.at(args, arg_index);
-                        addEdge(&sets, rc_local, target, @backingInt(arg));
+                        addEdge(&sets, carries, target, @backingInt(arg));
                     }
                 }
             },
@@ -4242,19 +4294,19 @@ fn computeVisibilityFromLift(
                 };
                 switch (DynOps.ownership(op)) {
                     .none => {},
-                    .borrow_component => |base| addEdge(&sets, rc_local, @backingInt(dyn_stmt.target.?), @backingInt(base)),
-                    .alias => |source| addEdge(&sets, rc_local, @backingInt(dyn_stmt.target.?), @backingInt(source)),
+                    .borrow_component => |base| addEdge(&sets, carries, @backingInt(dyn_stmt.target.?), @backingInt(base)),
+                    .alias => |source| addEdge(&sets, carries, @backingInt(dyn_stmt.target.?), @backingInt(source)),
                     .construct, .borrow_operands => {
-                        const link: Link = .{ .sets = &sets, .rc = rc_local, .target = @backingInt(dyn_stmt.target.?) };
+                        const link: Link = .{ .sets = &sets, .rc = carries, .target = @backingInt(dyn_stmt.target.?) };
                         DynOps.Operands.of(op).each(store, &link, Link.visit) catch |err| switch (err) {};
                     },
                     .call_erased => {
                         // The callee is unknown; the boundary is treated
                         // like a pinned signature.
                         const call = op.call_erased;
-                        seedLocal(&visible, rc_local, @backingInt(call.closure));
-                        if (call.args) |args| seedLocal(&visible, rc_local, @backingInt(args));
-                        seedLocal(&visible, rc_local, @backingInt(dyn_stmt.target.?));
+                        seedLocal(&visible, carries, @backingInt(call.closure));
+                        if (call.args) |args| seedLocal(&visible, carries, @backingInt(args));
+                        seedLocal(&visible, carries, @backingInt(dyn_stmt.target.?));
                     },
                 }
             },
@@ -4284,7 +4336,7 @@ fn computeVisibilityFromLift(
     var seed_iter = visible.iterator(.{});
     while (seed_iter.next()) |index| visible_roots.set(sets.find(@intCast(index)));
     visible.unsetAll();
-    for (rc_local, 0..) |is_rc, index| {
+    for (carries, 0..) |is_rc, index| {
         if (is_rc and visible_roots.isSet(sets.find(@intCast(index)))) visible.set(index);
     }
 

@@ -29197,6 +29197,10 @@ edges the solver already walks:
   visible container is visible
 - direct-call argument-to-parameter and return-to-result relations, and the
   ordinary return-to-result relations
+- addresses: the address of memory that holds counted values is visible with
+  them, in both directions, so it links to the box it was cast from, to each
+  value a store puts there, to each load's result, and, like a value, to its
+  copies and to the parameters it is passed to
 - low-level ops, from explicit `RcEffect` data
 
 Bidirectional containment keeps every reachable-value tree uniformly
@@ -29217,6 +29221,15 @@ spreads further than strictly necessary, which only keeps counts atomic
 that could have been plain, never the reverse. The mask is explicit
 primitive data, exactly like the rest of `RcEffect`; the analysis never
 guesses an op's sharing from its name or shape.
+
+A store's result is nothing, so no mask about the result can describe it.
+`args_stored_into` names the arguments whose memory an op stores its consumed
+arguments into, and links the two.
+
+An address is not counted, so the analysis runs over more locals than the rest
+of the solver: those that hold counted values and those that address memory that
+does. The tail loop of a constructor builder, the slot a caller gives its callee
+for a result, and an updated box reach their contents through addresses alone.
 
 Two more fields of `RcEffect` carry the seeds that concurrency adds. Unlike a
 sharing mask they name a boundary, not an edge: the value crosses into or out

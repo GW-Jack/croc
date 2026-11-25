@@ -786,6 +786,9 @@ pub const LowLevel = enum(u16) {
     /// - `result_unique`: the result's outermost allocation has count 1 on
     ///   return, so ARC records a birth. A result that shares an argument's
     ///   outer allocation is never unique; interior sharing is irrelevant.
+    /// - `args_stored_into`: the op stores its consumed arguments into the
+    ///   memory those arguments hold or address. Host-visibility analysis links
+    ///   each to every argument stored.
     /// - `args_host_visible`: the op hands those arguments to code the ownership
     ///   solver cannot see, such as a task record another task or a host thread
     ///   drops. Host-visibility analysis seeds them.
@@ -828,6 +831,10 @@ pub const LowLevel = enum(u16) {
         /// outermost result—interior sharing described by
         /// `result_shares_args` is irrelevant to the outermost count.
         result_unique: bool = false,
+        /// Argument positions whose memory the op stores its consumed arguments
+        /// into. Host-visibility analysis links them to what is stored, in both
+        /// directions, since a later load reads the one out of the other.
+        args_stored_into: u64 = 0,
         /// Argument positions the op hands to code the ownership solver cannot
         /// see. Host-visibility analysis seeds them (design.md "Thread-Confined
         /// Reference Counts").
@@ -1347,7 +1354,7 @@ pub const LowLevel = enum(u16) {
 
         // The stored value's ownership transfers into the pointed-at structure.
         // A ptr address is never refcounted; a Box address is borrowed.
-        .ptr_store = byType(.consumesArgsRetainingArgs(arg_1, 0)),
+        .ptr_store = byType(.{ .may_retain_or_release = true, .consume_args = arg_1, .args_stored_into = arg_0 }),
 
         .ptr_alloca = byType(.none()),
         .ptr_load = byType(.none()),
