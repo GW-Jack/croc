@@ -642,13 +642,17 @@ fn writeExpr(self: *Self, expected: Type, context: ExprContext, depth: u8, visib
     }
     if (context.effectful and typ != .optional_record) {
         switch (self.reader.intRangeAtMost(u8, 0, 15)) {
-            0...12 => {},
-            13, 14 => {
+            0...11 => {},
+            12, 13 => {
                 try self.writePlanLoopExpr(typ, context, depth - 1, visible_methods);
                 return;
             },
-            15 => {
+            14 => {
                 try self.writeConcurrentCallExpr(typ, context, depth - 1, visible_methods);
+                return;
+            },
+            15 => {
+                try self.writeSharedExpr(typ, context, depth - 1, visible_methods);
                 return;
             },
             else => unreachable, // intRangeAtMost returns at most 15
@@ -1357,6 +1361,139 @@ fn writeConcurrentCallExpr(self: *Self, result_type: Type, context: ExprContext,
         else => unreachable, // intRangeAtMost returns at most 3
     }
     try self.write("\n}");
+}
+
+/// A block that makes shared state, uses it and takes a value of type
+/// `result_type` from a call on it. The state's type is written, so nothing
+/// outside the block decides it.
+fn writeSharedExpr(self: *Self, result_type: Type, context: ExprContext, depth: u8, visible_methods: usize) std.mem.Allocator.Error!void {
+    const chosen_type = self.chooseType();
+    const state_type: Type = if (chosen_type == .optional_record) .record else chosen_type;
+    const handle = self.fresh(.value);
+    const result = self.fresh(.value);
+
+    try self.write("{\n");
+    try self.writeSymbol(handle);
+    try self.write(" : Shared(");
+    try self.writeType(state_type);
+    try self.write(")\n");
+    try self.writeSymbol(handle);
+    try self.write(" = Shared.new!(");
+    try self.writeExpr(state_type, context, depth, visible_methods);
+    try self.write(")\n");
+
+    var body = context;
+    if (self.reader.boolean()) {
+        const state = self.fresh(.value);
+        try self.writeSymbol(state);
+        try self.write(" : ");
+        try self.writeType(state_type);
+        try self.write("\n");
+        try self.writeSymbol(state);
+        try self.write(" = ");
+        try self.writeSharedCall("get", handle);
+        try self.write(")\n");
+        body = extendContext(body, state, state_type);
+    }
+    if (self.reader.boolean()) {
+        try self.writeSharedCall("modify", handle);
+        try self.write(", ");
+        try self.writeNextState(state_type, context, depth, visible_methods);
+        try self.write(")\n");
+    }
+
+    try self.writeSymbol(result);
+    switch (self.reader.intRangeAtMost(u8, 0, 3)) {
+        0 => {
+            try self.write(" : ");
+            try self.writeType(result_type);
+            try self.write("\n");
+            try self.writeSymbol(result);
+            try self.write(" = ");
+            try self.writeSharedUpdate(handle, state_type, result_type, body, depth, visible_methods);
+            try self.write("\n");
+            try self.writeSymbol(result);
+        },
+        1, 2 => |choice| {
+            try self.write(" : ");
+            try self.writeType(result_type);
+            try self.write("\n");
+            try self.writeSymbol(result);
+            try self.write(" = ");
+            try self.writeSharedCall(if (choice == 1) "finally" else "on_failure", handle);
+            try self.write(", ");
+            try self.writeNextState(state_type, context, depth, visible_methods);
+            try self.write(", ");
+            try self.writeEntry(result_type, body, depth, visible_methods);
+            try self.write(")\n");
+            try self.writeSymbol(result);
+        },
+        3 => {
+            // Two tasks that hold the handle.
+            const first = self.fresh(.value);
+            try self.write(" : (");
+            try self.writeType(result_type);
+            try self.write(", {})\n");
+            try self.writeSymbol(result);
+            try self.write(" = Concurrent.both!(|| ");
+            try self.writeSharedUpdate(handle, state_type, result_type, body, depth, visible_methods);
+            try self.write(", || ");
+            try self.writeSharedCall("modify", handle);
+            try self.write(", ");
+            try self.writeNextState(state_type, body, depth, visible_methods);
+            try self.write("))\nmatch ");
+            try self.writeSymbol(result);
+            try self.write(" {\n(");
+            try self.writeSymbol(first);
+            try self.write(", _) => ");
+            try self.writeSymbol(first);
+            try self.write("\n}");
+        },
+        else => unreachable, // intRangeAtMost returns at most 3
+    }
+    try self.write("\n}");
+}
+
+/// The start of a call of `Shared.<name>!` with `handle` as its first argument.
+fn writeSharedCall(self: *Self, name: []const u8, handle: Symbol) std.mem.Allocator.Error!void {
+    try self.currentOutput().print(self.allocator, "Shared.{s}!(", .{name});
+    try self.writeSymbol(handle);
+}
+
+/// A pure function from a state to the next one.
+fn writeNextState(self: *Self, state_type: Type, context: ExprContext, depth: u8, visible_methods: usize) std.mem.Allocator.Error!void {
+    const state = self.fresh(.value);
+    try self.write("|");
+    try self.writeSymbol(state);
+    try self.write("| ");
+    try self.writeParenthesizedExpr(state_type, extendContext(pureContext(context), state, state_type), depth, visible_methods);
+}
+
+/// A call of `Shared.update!` whose function may set, keep or wait.
+fn writeSharedUpdate(self: *Self, handle: Symbol, state_type: Type, answer_type: Type, context: ExprContext, depth: u8, visible_methods: usize) std.mem.Allocator.Error!void {
+    const state = self.fresh(.value);
+    const body = extendContext(pureContext(context), state, state_type);
+    try self.writeSharedCall("update", handle);
+    try self.write(", |");
+    try self.writeSymbol(state);
+    try self.write("| ");
+    if (self.reader.boolean()) {
+        try self.write("if ");
+        try self.writeParenthesizedExpr(.bool, body, depth, visible_methods);
+        try self.write(" {\nWait\n} else ");
+    }
+    if (self.reader.boolean()) {
+        try self.write("if ");
+        try self.writeParenthesizedExpr(.bool, body, depth, visible_methods);
+        try self.write(" {\nKeep(");
+        try self.writeExpr(answer_type, body, depth, visible_methods);
+        try self.write(")\n} else ");
+    }
+    try self.write("{\nSet(");
+    try self.writeExpr(state_type, body, depth, visible_methods);
+    try self.write(", ");
+    try self.writeExpr(answer_type, body, depth, visible_methods);
+    try self.write(")\n})");
 }
 
 /// A list of up to three entries of `item_type`.
