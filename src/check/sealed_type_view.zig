@@ -154,6 +154,20 @@ pub const SealedTypeView = struct {
         };
     }
 
+    /// Whether `var_` is a function type checking proved pure. `payload` reads
+    /// a function type of unresolved effect, such as an unannotated function
+    /// that calls its argument, as pure too, and one use of it may be called
+    /// with a function that has effects.
+    pub fn pureFunction(self: SealedTypeView, var_: Var) bool {
+        const type_store = self.typeStore();
+        var current = var_;
+        while (true) switch (type_store.resolveVar(current).desc.content) {
+            .alias => |alias| current = type_store.getAliasBackingVar(alias),
+            .structure => |flat| return flat == .fn_pure,
+            .flex, .rigid, .field_presence, .err => return false,
+        };
+    }
+
     fn nameRow(self: SealedTypeView, ident: Ident.Idx) SealedNameRow {
         const index: usize = ident.idx;
         if (index >= self.names.len) invariant("a sealed checked type named an identifier publication never interned", .{});

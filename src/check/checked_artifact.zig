@@ -4031,6 +4031,16 @@ pub const CheckedTypeStoreView = struct {
         return self.sealedView().uncommittedTagTail(type_ids.asVar(id));
     }
 
+    /// Whether `id` is a source function type checking proved pure, which a
+    /// payload of kind `.pure` need not be (`SealedTypeView.pureFunction`). A
+    /// synthesized type's key folds the unresolved kind into the pure one, so
+    /// none counts. `.boxy` reads it to decide which procedures and calls may
+    /// suspend (design.md "Boxy Procedures That May Suspend").
+    pub fn pureFunction(self: *const CheckedTypeStoreView, id: CheckedTypeId) bool {
+        if (type_ids.isSynthesized(id)) return false;
+        return self.sealedView().pureFunction(type_ids.asVar(id));
+    }
+
     /// Materialize the public read-form payload for `id`. Slice fields alias the
     /// view's pools or the module's sealed solver store; no allocation.
     pub fn payload(self: *const CheckedTypeStoreView, id: CheckedTypeId) CheckedTypePayload {

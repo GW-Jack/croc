@@ -70,6 +70,10 @@ pub const Input = struct {
     stored_functions: bool = false,
     /// Only a demanded compiler-only unit has persistent capture/type metadata.
     function_unit: ?[32]u8 = null,
+    /// The concurrency mode of the program's platform. With tasks, calls that
+    /// may have effects are suspension sites (design.md "Boxy Procedures That
+    /// May Suspend").
+    concurrency_mode: base.ConcurrencyMode = .none,
     /// What this lowering emits: one program, or one module's object.
     unit: Unit = .program,
     /// Receives step durations and worker counts when detailed timing is
@@ -935,7 +939,17 @@ pub const TemplateKey = struct { module: ModuleIndex, template: checked_names.Ch
 
 /// A hosted procedure's external symbol and its slot in the host's dispatch
 /// table, or null when the platform's hosted section omits it.
-pub const HostedEntry = struct { symbol: []const u8, dispatch_index: ?u32 };
+pub const HostedEntry = struct {
+    symbol: []const u8,
+    dispatch_index: ?u32,
+    /// Declared `suspending`: the host may pause the calling task.
+    suspending: bool,
+
+    /// Its procedure's mark: the host may pause a task that calls it.
+    pub fn mark(self: HostedEntry) LIR.Suspends {
+        return if (self.suspending) .may else .never;
+    }
+};
 
 /// A worker and a type of its scope, keying `Program.row_node_reads`.
 const RowNodeRead = struct { worker: WorkerId, ty: TypeId };
@@ -3987,6 +4001,33 @@ pub const Program = struct {
         return id;
     }
 
+    /// Whether worker `id` runs to completion: the function it lowers is
+    /// pure, or it evaluates a value (design.md "Boxy Procedures That May
+    /// Suspend").
+    pub fn effectFree(self: *Program, id: WorkerId) bool {
+        const found = self.worker(id);
+        switch (found.key) {
+            .template => |template| {
+                const view = self.module(template.module);
+                const checked_template = view.view.checked_procedure_templates.get(template.template);
+                // A compile-time root's wrapper runs as no task.
+                if (checked_template.body == .entry_wrapper) return true;
+                return view.types().pureFunction(checked_template.checked_fn_root);
+            },
+            .lambda => |lambda| {
+                const view = self.module(lambda.module);
+                return view.types().pureFunction(view.bodies().exprType(lambda.expr));
+            },
+            .method_entry => |target| return self.effectFree(target),
+            .structural_map => |map| return !map.effectful,
+            // Only the host's entries run as tasks.
+            .root => return found.root_request.?.abi != .platform,
+            // Either calls a function value it has no checked type of.
+            .adapter, .callable_eval_entry => return false,
+            .default, .literal_thunk, .root_slot, .structural, .codec, .static_data, .inline_literal, .crash_dictionary, .convert => return true,
+        }
+    }
+
     pub fn worker(self: *Program, id: WorkerId) *Worker {
         return &self.workers.items[@backingInt(id)];
     }
@@ -5280,13 +5321,13 @@ fn initHosted(program: *Program) Allocator.Error!void {
             try program.hosted.put(allocator, .{ .module = root.index, .template = proc.template.template }, .{
                 .symbol = root.nameStore().externalSymbolNameText(proc.external_symbol_name),
                 .dispatch_index = null,
+                .suspending = proc.suspending,
             });
         }
         for (bindings) |binding| {
-            program.hosted.getPtr(.{ .module = root.index, .template = binding.template }).?.* = .{
-                .symbol = binding.symbol,
-                .dispatch_index = binding.dispatch_index,
-            };
+            const entry = program.hosted.getPtr(.{ .module = root.index, .template = binding.template }).?;
+            entry.symbol = binding.symbol;
+            entry.dispatch_index = binding.dispatch_index;
         }
         return;
     };
@@ -5305,6 +5346,7 @@ fn initHosted(program: *Program) Allocator.Error!void {
             try program.hosted.put(allocator, key, .{
                 .symbol = view.view.canonical_names.externalSymbolNameText(proc.external_symbol_name),
                 .dispatch_index = null,
+                .suspending = proc.suspending,
             });
             try by_def.put(allocator, .{ .module = view.index, .def = @backingInt(proc.def_idx) }, key);
             try ordered.append(allocator, .{ .key = key, .order = proc.orderKey(view.view.hosted_procs), .def = @backingInt(proc.def_idx), .digest = view.key.bytes });
@@ -5321,10 +5363,9 @@ fn initHosted(program: *Program) Allocator.Error!void {
             };
             const key = by_def.get(.{ .module = target.index, .def = @backingInt(binding.target_def) }) orelse
                 invariant("a hosted section names a function with no hosted declaration in scope");
-            program.hosted.getPtr(key).?.* = .{
-                .symbol = view.view.canonical_names.externalSymbolNameText(binding.external_symbol_name),
-                .dispatch_index = @intCast(index),
-            };
+            const entry = program.hosted.getPtr(key).?;
+            entry.symbol = view.view.canonical_names.externalSymbolNameText(binding.external_symbol_name);
+            entry.dispatch_index = @intCast(index);
         }
         return;
     }

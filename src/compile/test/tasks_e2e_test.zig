@@ -1,7 +1,7 @@
 //! Milestone 1, end to end (design.md "What Implements It First"): a
 //! program whose platform declares `concurrency: Tasks` and calls a
-//! `suspending` hosted function compiles under `.lss` and runs on the
-//! interpreter as a task. A host that pauses at every suspending call gives
+//! `suspending` hosted function compiles under `.lss` and `.boxy` and runs
+//! on the interpreter as a task. A host that pauses at every suspending call gives
 //! the same result and the same hosted-call trace as a host that finishes
 //! each at once, and neither leaves a live allocation. Cancelling before
 //! the first resume, or at each pause before or after the host finishes the
@@ -53,6 +53,9 @@ const crash_points = [_]CrashPoint{
     .{ .marker = "#between", .message = "crashed between the pauses", .fetches = 1 },
     .{ .marker = "#after", .message = "crashed after the last pause", .fetches = 2 },
 };
+
+const TargetUsize = @FieldType(harness.LirLoweringOptions, "target_usize");
+const Strategy = @FieldType(harness.LirLoweringOptions, "specialization_strategy");
 
 /// The task's `roc_task_resume`, as a host links it.
 const ResumeFn = task_test_host.ResumeFn;
@@ -927,24 +930,34 @@ fn runAllDev(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerTo
     };
 }
 
+/// Run `inspect` over the program lowered under each specialization strategy.
+fn runUnderEachStrategy(path: []const u8, target_usize: TargetUsize, inspect: harness.LoweredInspectFn) harness.LowerToLirHarnessError!void {
+    for ([_]Strategy{ .lss, .boxy }) |strategy| {
+        harness.runAppPathLoweredInspection(path, .{ .specialization_strategy = strategy, .target_usize = target_usize }, inspect) catch |err| {
+            std.log.err("{s} under .{s} failed: {s}", .{ path, @tagName(strategy), @errorName(err) });
+            return err;
+        };
+    }
+}
+
 test "a Tasks program pauses at every suspending call and gives the same result with no leaks" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, runAll);
+    try runUnderEachStrategy(app_path, .u64, runAll);
 }
 
 test "a Tasks program compiled by LLVM pauses and cancels as it does on the interpreter, with no leaks" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, runAllLlvm);
+    try runUnderEachStrategy(app_path, .u64, runAllLlvm);
 }
 
 test "a Tasks program compiled by the dev backend pauses and cancels as it does on the interpreter, with no leaks" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, runAllDev);
+    try runUnderEachStrategy(app_path, .u64, runAllDev);
 }
 
 test "a Tasks program compiled by the wasm backend pauses and cancels as it does on the interpreter, with no leaks" {
-    try harness.runAppPathLoweredInspection(app_path, .{ .specialization_strategy = .lss, .target_usize = .u32 }, runAllWasm);
+    try runUnderEachStrategy(app_path, .u32, runAllWasm);
 }
 
 /// The same program on a `ParallelTasks` platform, resumed by a host with one
@@ -955,41 +968,41 @@ const parallel_app_path = "test/postcheck/suspension_parallel/app.roc";
 
 test "a ParallelTasks program on one thread runs as a Tasks program does, on the interpreter's runtime" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(parallel_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, runAll);
+    try runUnderEachStrategy(parallel_app_path, .u64, runAll);
 }
 
 test "a ParallelTasks program on one thread runs as a Tasks program does, on LLVM" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(parallel_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, runAllLlvm);
+    try runUnderEachStrategy(parallel_app_path, .u64, runAllLlvm);
 }
 
 test "a ParallelTasks program on one thread runs as a Tasks program does, on the dev backend" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(parallel_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, runAllDev);
+    try runUnderEachStrategy(parallel_app_path, .u64, runAllDev);
 }
 
 test "a ParallelTasks program on one thread runs as a Tasks program does, on wasm" {
-    try harness.runAppPathLoweredInspection(parallel_app_path, .{ .specialization_strategy = .lss, .target_usize = .u32 }, runAllWasm);
+    try runUnderEachStrategy(parallel_app_path, .u32, runAllWasm);
 }
 
 test "a crash inside a Tasks program ends its task with CRASHED and its message, before, between and after its pauses" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     if (!builtins.task_crash_exit.available()) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(crash_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, crashAll);
+    try runUnderEachStrategy(crash_app_path, .u64, crashAll);
 }
 
 test "a crash inside a Tasks program compiled by LLVM ends its task as it does on the interpreter" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     if (!builtins.task_crash_exit.available()) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(crash_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, crashAllLlvm);
+    try runUnderEachStrategy(crash_app_path, .u64, crashAllLlvm);
 }
 
 test "a crash inside a Tasks program compiled by the dev backend ends its task as it does on the interpreter" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     if (!builtins.task_crash_exit.available()) return error.SkipZigTest;
     if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(crash_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, crashAllDev);
+    try runUnderEachStrategy(crash_app_path, .u64, crashAllDev);
 }
 
 /// A call that pauses returns a `Try` its caller reads only after the
@@ -1043,18 +1056,18 @@ fn tagResultLlvm(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.Low
 
 test "a pausing call may return a tag union, on the interpreter" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(tag_result_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, tagResultInterpreter);
+    try runUnderEachStrategy(tag_result_app_path, .u64, tagResultInterpreter);
 }
 
 test "a pausing call may return a tag union, on the dev backend" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(tag_result_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, tagResultDev);
+    try runUnderEachStrategy(tag_result_app_path, .u64, tagResultDev);
 }
 
 test "a pausing call may return a tag union, on LLVM" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    try harness.runAppPathLoweredInspection(tag_result_app_path, .{ .specialization_strategy = .lss, .target_usize = .u64 }, tagResultLlvm);
+    try runUnderEachStrategy(tag_result_app_path, .u64, tagResultLlvm);
 }
 
 // Sequential equivalence (design.md "Sequential equivalence"): a program's

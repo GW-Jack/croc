@@ -72,6 +72,10 @@ pub fn lowerWorker(program: *Program, id: WorkerId) Allocator.Error!void {
     program.worker(id).needs = try builder.finishNeeds();
 }
 
+/// Whether the function an erased call calls may have effects, from its
+/// checked type (design.md "Boxy Procedures That May Suspend").
+pub const CallEffects = enum { none, possible };
+
 /// One unit of pending lowering work on the builder's task stack.
 pub const Task = union(enum) {
     /// Lower an expression as its parent reads it: a row-coerced result
@@ -125,7 +129,7 @@ pub const Task = union(enum) {
     /// `adapt` is set for a callee storing record fields of its signature
     /// in presence slots: the types its scheme takes and the arguments'.
     finish_call: struct { callee: WorkerId, hidden: []Word, bound: []const TypeId, arg_types: []const TypeId, ret: TypeId, result: TypeId },
-    finish_erased_call: struct { fn_ty: TypeId, arg_count: u32, result: TypeId },
+    finish_erased_call: struct { fn_ty: TypeId, arg_count: u32, result: TypeId, effects: CallEffects },
     finish_low_level: struct { op: LIR.LowLevel, arg_count: u32, result: TypeId, arg_types: []const TypeId = &.{} },
     /// Return to the enclosing expression's source region.
     restore_region: base.Region,
@@ -232,7 +236,7 @@ pub const Task = union(enum) {
     /// its function value with them after its own scheme's words.
     /// `params` and `ret` are the procedure's signature, `arg_types` the
     /// call's arguments' types and `result` its result's.
-    finish_local_call: struct { closure: LocalId, words: []const Word, params: []const TypeId, ret: TypeId, arg_types: []const TypeId, result: TypeId },
+    finish_local_call: struct { closure: LocalId, words: []const Word, params: []const TypeId, ret: TypeId, arg_types: []const TypeId, result: TypeId, effects: CallEffects },
     /// Pop the arguments of a call of a local procedure only direct calls
     /// reach and call its worker `callee` with `captures`, the arguments
     /// (adapted from `arg_types` to `params` when `arg_types` is not empty),
@@ -598,6 +602,11 @@ pub const Builder = struct {
     /// Where the worker's body starts in the store: everything the builder
     /// appends from here on is the body's one chunk (`finishProc`).
     body_mark: LirStore.BodyMark,
+    /// Nothing in the procedure is a suspension site: its function is pure,
+    /// or the program has no tasks.
+    effect_free: bool,
+    /// Whether an erased call emitted so far is a suspension site.
+    has_sites: bool = false,
     frame_locals: std.ArrayList(LocalId) = .empty,
     binders: collections.DenseMapUnmanaged(BinderId, LocalId) = .empty,
     /// Where this worker's scope inputs are (`Tables.InputLayout`), once its
@@ -851,6 +860,7 @@ pub const Builder = struct {
             .view = program.module(worker.module),
             .env = env,
             .store = &program.result.store,
+            .effect_free = !program.input.concurrency_mode.hasTasks() or program.effectFree(id),
             .body_mark = program.result.store.bodyMark(),
             .tail_calls = lir_core.TailCallBuilder.init(program.allocator, worker.proc),
             .recipes = Tables.Recipes.init(program.allocator),
@@ -892,6 +902,11 @@ pub const Builder = struct {
         self.loops.deinit(self.allocator);
         self.values.deinit(self.allocator);
         self.tasks.deinit(self.allocator);
+    }
+
+    /// The effects a call of a function of checked type `ty` may have.
+    fn effectsOf(self: *const Builder, ty: checked.CheckedTypeId) CallEffects {
+        return if (self.view.types().pureFunction(ty)) .none else .possible;
     }
 
     pub fn currentWorker(self: *Builder) *lower.Worker {
@@ -2153,9 +2168,10 @@ pub const Builder = struct {
                                 proc.args = try self.store.addLocalSpan(params);
                                 proc.ret_layout = ret_layout;
                                 proc.hosted = .some(.{ .symbol = try self.store.insertString(hosted.symbol), .dispatch_index = dispatch_index });
+                                proc.suspends = hosted.mark();
                                 return;
                             }
-                            try self.callGenericExtern(hosted.symbol, dispatch_index, params, worker.params, worker.ret);
+                            try self.callGenericExtern(hosted, dispatch_index, params, worker.params, worker.ret);
                         } else {
                             // The platform's hosted section omits it: it has
                             // no host slot, as checking reported.
@@ -2240,7 +2256,7 @@ pub const Builder = struct {
     /// pointer whatever the variable is, so each value crosses as the bytes
     /// the calling Roc code holds, and the extern takes no descriptor
     /// (design.md "Host ABI").
-    fn callGenericExtern(self: *Builder, symbol: []const u8, dispatch_index: u32, params: []const LocalId, param_types: []const TypeId, ret_ty: TypeId) Allocator.Error!void {
+    fn callGenericExtern(self: *Builder, hosted: lower.HostedEntry, dispatch_index: u32, params: []const LocalId, param_types: []const TypeId, ret_ty: TypeId) Allocator.Error!void {
         const extern_args = try self.allocator.alloc(LocalId, params.len);
         defer self.allocator.free(extern_args);
         const extern_params = try self.allocator.alloc(LocalId, params.len);
@@ -2262,7 +2278,8 @@ pub const Builder = struct {
             .emission_unit = .isolated,
             .args = try self.store.addLocalSpan(extern_params),
             .ret_layout = ret_abi,
-            .hosted = .some(.{ .symbol = try self.store.insertString(symbol), .dispatch_index = dispatch_index }),
+            .hosted = .some(.{ .symbol = try self.store.insertString(hosted.symbol), .dispatch_index = dispatch_index }),
+            .suspends = hosted.mark(),
         }, base.SourceLoc.none);
         const result = try self.closedLocal(ret_abi);
         try self.emitLinear(.{ .assign_call = .{ .target = result, .proc = extern_proc, .args = try self.store.addLocalSpan(extern_args), .next = undefined } });
@@ -2345,6 +2362,8 @@ pub const Builder = struct {
         proc.args = try self.store.addLocalSpan(proc_args);
         proc.ret_layout = ret_layout;
         proc.dyn_result = .of(self.result_local);
+        proc.effect_free = self.effect_free and self.program.input.concurrency_mode.hasTasks();
+        if (self.has_sites) proc.suspends = .may;
         proc.frame_locals = try self.store.addLocalSpan(self.frame_locals.items);
         proc.join_points = try self.store.addJoinPointSpan(self.join_points.items);
         proc.body = .some(proc_body);
@@ -2577,7 +2596,7 @@ pub const Builder = struct {
             const arg = try self.erasedParamValue(record_param.?, worker.params, @intCast(index));
             value.* = try self.adaptValue(arg, param_ty, from_ty);
         }
-        const result = try self.emitErasedCall(inner, from, adapted, signature.ret);
+        const result = try self.emitErasedCall(inner, from, adapted, signature.ret, .possible);
         try self.pushValue(try self.adaptValue(result, signature.ret, worker.ret));
         try self.tasks.append(self.allocator, .ret);
         try self.run();
@@ -3000,7 +3019,7 @@ pub const Builder = struct {
                 try self.finishCall(alias.target, instance.hidden, instance.bound, worker.params, instance.ret, worker.ret);
             },
             .callable_eval => |eval| {
-                try self.tasks.append(self.allocator, .{ .finish_erased_call = .{ .fn_ty = fn_ty, .arg_count = @intCast(params.len), .result = worker.ret } });
+                try self.tasks.append(self.allocator, .{ .finish_erased_call = .{ .fn_ty = fn_ty, .arg_count = @intCast(params.len), .result = worker.ret, .effects = .possible } });
                 var index = params.len;
                 while (index > 0) {
                     index -= 1;
@@ -3152,7 +3171,7 @@ pub const Builder = struct {
             .ret = try store.variable(2 + map.arity),
             .effectful = map.effectful,
         } });
-        payloads[map.payload_index] = try self.emitErasedCall(transform, transform_ty, &.{payloads[map.payload_index]}, try store.variable(2 + map.arity));
+        payloads[map.payload_index] = try self.emitErasedCall(transform, transform_ty, &.{payloads[map.payload_index]}, try store.variable(2 + map.arity), if (map.effectful) .possible else .none);
         const mapped = try self.localOf(output_ty, .frame);
         try self.emitDyn(mapped, .{ .tag = .{ .desc = output_desc, .discriminant = try self.tagIndexIn(try self.inputWord(1), map.name), .payloads = try self.store.addLocalSpan(payloads) } });
         try self.pushValue(mapped);
@@ -3249,7 +3268,7 @@ pub const Builder = struct {
             .callable_eval => |binding| blk: {
                 const fn_ty = try self.program.store.intern(.{ .function = .{ .args = params, .ret = ret, .effectful = false } });
                 const value = try self.callableEvalValueAt(binding, fn_ty);
-                break :blk try self.emitErasedCall(value, fn_ty, values, ret);
+                break :blk try self.emitErasedCall(value, fn_ty, values, ret, .possible);
             },
             .structural_map => |map| blk: {
                 try self.structuralMapBranches(map, values[0], values[1], params[0], ret);
@@ -3459,7 +3478,7 @@ pub const Builder = struct {
                 const iterator_ty = try self.convert(plan.iterator_ty);
                 const list = try self.buildList(try self.convert(plan.interpolationSite().seed_list_ty), values);
                 const iterator = try self.emitDispatch(plan.iter.resolution, plan.iter.callable_ty, &.{list}, iterator_ty);
-                try self.pushValue(try self.emitErasedCall(call.assembler, call.assembler_ty, &.{iterator}, call.result));
+                try self.pushValue(try self.emitErasedCall(call.assembler, call.assembler_ty, &.{iterator}, call.result, .none));
             },
             .finish_str_from_parts => |call| {
                 const values = try self.popValues(call.count);
@@ -3488,7 +3507,7 @@ pub const Builder = struct {
                     },
                 }
             },
-            .finish_local_call => |call| try self.finishLocalCall(call.closure, call.words, call.params, call.ret, call.arg_types, call.result),
+            .finish_local_call => |call| try self.finishLocalCall(call.closure, call.words, call.params, call.ret, call.arg_types, call.result, call.effects),
             .finish_direct_local_call => |call| {
                 self.hand_on_armed = call.hand_on;
                 try self.finishDirectLocalCall(call.callee, call.captures, call.inputs, call.params, call.arg_types, call.ret, call.result);
@@ -3704,7 +3723,7 @@ pub const Builder = struct {
                 // `dbg` evaluates to `{}`.
                 try self.pushValue(try self.unitValue());
             },
-            .finish_erased_call => |call| try self.finishErasedCall(call.fn_ty, call.arg_count, call.result),
+            .finish_erased_call => |call| try self.finishErasedCall(call.fn_ty, call.arg_count, call.result, call.effects),
             .finish_tuple => |expr| try self.finishTuple(expr),
             .finish_tag => |expr| try self.finishTag(expr, null),
             .finish_tag_at => |at| try self.finishTag(at.expr, at.ty),
@@ -4855,7 +4874,7 @@ pub const Builder = struct {
         const index = self.ownLiteralRequirementIndex(node) orelse invariantFmt("a literal whose conversion depends on its instance has no literal_requirement in its scope (worker {s} #{d}, module {d}, expr {d}, alias scopes {d}, foreign {?}, literal scopes {d}, frames {?})", .{ @tagName(self.currentWorker().key), @backingInt(self.worker_id), @backingInt(self.module), node, self.alias_scopes.items.len, self.foreign_scopes, self.currentWorker().literal_scopes.len, self.thunk_frames });
         const thunk = try self.literalThunkLocal(try self.scopeLiteral(.{ .depth = 0, .index = index }));
         const fn_ty = try self.program.store.intern(.{ .function = .{ .args = &.{}, .ret = lit_ty, .effectful = false } });
-        try self.pushValue(try self.emitErasedCall(thunk, fn_ty, &.{}, lit_ty));
+        try self.pushValue(try self.emitErasedCall(thunk, fn_ty, &.{}, lit_ty, .none));
     }
 
     /// The local holding `word`, the thunk of the literal being lowered. A
@@ -6722,11 +6741,12 @@ pub const Builder = struct {
             .ret = ret,
             .arg_types = arg_types,
             .result = try self.exprType(expr_id),
+            .effects = self.effectsOf(self.bodies().exprType(call.func)),
         } });
         try self.pushExprsReversed(call.args);
     }
 
-    pub fn finishLocalCall(self: *Builder, closure: LocalId, word_values: []const Word, params: []const TypeId, ret: TypeId, arg_types: []const TypeId, result_ty: TypeId) Allocator.Error!void {
+    pub fn finishLocalCall(self: *Builder, closure: LocalId, word_values: []const Word, params: []const TypeId, ret: TypeId, arg_types: []const TypeId, result_ty: TypeId, effects: CallEffects) Allocator.Error!void {
         const words = try self.materializeAll(word_values);
         defer self.allocator.free(words);
         const args = try self.popValues(@intCast(params.len));
@@ -6735,7 +6755,7 @@ pub const Builder = struct {
         // are its own scheme's (design.md "Field Kinds").
         for (args, arg_types, params) |*arg, arg_ty, param_ty| arg.* = try self.adaptValue(arg.*, arg_ty, param_ty);
         if (words.len == 0 and args.len == 1 and self.canPassUnaryArgument(closure, args[0])) {
-            const target = try self.callErased(closure, args[0], ret);
+            const target = try self.callErased(closure, args[0], ret, effects);
             return self.pushValue(try self.adaptValue(target, ret, result_ty));
         }
         const desc = try self.argsDesc(@intCast(words.len), try self.descWords(params));
@@ -6744,7 +6764,7 @@ pub const Builder = struct {
         const fields = try std.mem.concat(self.allocator, LocalId, &.{ words, args });
         defer self.allocator.free(fields);
         try self.emitDyn(record, .{ .record = .{ .desc = desc, .fields = try self.store.addLocalSpan(fields) } });
-        const target = try self.callErased(closure, record, ret);
+        const target = try self.callErased(closure, record, ret, effects);
         try self.pushValue(try self.adaptValue(target, ret, result_ty));
     }
 
@@ -7374,7 +7394,7 @@ pub const Builder = struct {
         const call_fn = try self.valueType(call.func);
         if (callee == .callable_eval) {
             const eval = callee.callable_eval;
-            try self.push(.{ .finish_erased_call = .{ .fn_ty = call_fn, .arg_count = @intCast(call.args.len), .result = try self.exprType(expr_id) } });
+            try self.push(.{ .finish_erased_call = .{ .fn_ty = call_fn, .arg_count = @intCast(call.args.len), .result = try self.exprType(expr_id), .effects = self.effectsOf(self.bodies().exprType(call.func)) } });
             try self.pushExprsReversed(call.args);
             try self.push(.{ .restore_callable_eval = .{ .module = eval.module, .template = eval.template, .ty = call_fn, .use = call.func } });
             return;
@@ -7399,7 +7419,7 @@ pub const Builder = struct {
     /// A call of a function value: evaluate the function, then its
     /// arguments, then call through the erased-callable ABI.
     pub fn lowerValueCall(self: *Builder, expr_id: ExprId, call: @FieldType(bodies_mod.ExprData, "call")) Allocator.Error!void {
-        try self.push(.{ .finish_erased_call = .{ .fn_ty = try self.valueType(call.func), .arg_count = @intCast(call.args.len), .result = try self.exprType(expr_id) } });
+        try self.push(.{ .finish_erased_call = .{ .fn_ty = try self.valueType(call.func), .arg_count = @intCast(call.args.len), .result = try self.exprType(expr_id), .effects = self.effectsOf(self.bodies().exprType(call.func)) } });
         try self.pushExprsReversed(call.args);
         try self.push(.{ .expr = call.func });
     }
@@ -9192,7 +9212,7 @@ pub const Builder = struct {
                             try self.push(.{ .finish_low_level = .{ .op = .bool_not, .arg_count = 1, .result = result_ty } });
                         },
                     }
-                    try self.push(.{ .finish_erased_call = .{ .fn_ty = fn_ty, .arg_count = @intCast(operands.len), .result = if (call_plan.result_mode == .equality) try self.program.store.primitive(.bool) else result_ty } });
+                    try self.push(.{ .finish_erased_call = .{ .fn_ty = fn_ty, .arg_count = @intCast(operands.len), .result = if (call_plan.result_mode == .equality) try self.program.store.primitive(.bool) else result_ty, .effects = self.effectsOf(call_plan.callable_ty) } });
                     var index = operands.len;
                     while (index > 0) {
                         index -= 1;
@@ -9211,7 +9231,7 @@ pub const Builder = struct {
                             try self.push(.{ .finish_low_level = .{ .op = .bool_not, .arg_count = 1, .result = result_ty } });
                         },
                     }
-                    try self.push(.{ .finish_erased_call = .{ .fn_ty = fn_ty, .arg_count = @intCast(operands.len), .result = if (call_plan.result_mode == .equality) try self.program.store.primitive(.bool) else result_ty } });
+                    try self.push(.{ .finish_erased_call = .{ .fn_ty = fn_ty, .arg_count = @intCast(operands.len), .result = if (call_plan.result_mode == .equality) try self.program.store.primitive(.bool) else result_ty, .effects = self.effectsOf(call_plan.callable_ty) } });
                     var index = operands.len;
                     while (index > 0) {
                         index -= 1;
@@ -9276,7 +9296,7 @@ pub const Builder = struct {
                     // A derived map is a call of its dictionary.
                     const fn_ty = try self.convert(call_plan.callable_ty);
                     const dict = try self.structuralMapDictionary(plan, derivation == .map_effectful, fn_ty);
-                    try self.push(.{ .finish_erased_call = .{ .fn_ty = fn_ty, .arg_count = @intCast(operands.len), .result = result_ty } });
+                    try self.push(.{ .finish_erased_call = .{ .fn_ty = fn_ty, .arg_count = @intCast(operands.len), .result = result_ty, .effects = if (derivation == .map_effectful) .possible else .none } });
                     var index = operands.len;
                     while (index > 0) {
                         index -= 1;
@@ -9306,7 +9326,7 @@ pub const Builder = struct {
                     .function => |function| function.ret,
                     .primitive, .empty_record, .record, .tuple, .tag_union, .list, .box, .nominal, .variable => invariant("a dispatch's callable type is not a function type"),
                 };
-                try self.push(.{ .finish_erased_call = .{ .fn_ty = fn_ty, .arg_count = @intCast(operands.len), .result = call_result } });
+                try self.push(.{ .finish_erased_call = .{ .fn_ty = fn_ty, .arg_count = @intCast(operands.len), .result = call_result, .effects = self.effectsOf(call_plan.callable_ty) } });
                 var index = operands.len;
                 while (index > 0) {
                     index -= 1;
@@ -9867,15 +9887,15 @@ pub const Builder = struct {
 
     /// Pop a function value's arguments and the function value, and call it
     /// through the uniform erased-callable ABI.
-    pub fn finishErasedCall(self: *Builder, fn_ty: TypeId, arg_count: u32, result_ty: TypeId) Allocator.Error!void {
+    pub fn finishErasedCall(self: *Builder, fn_ty: TypeId, arg_count: u32, result_ty: TypeId, effects: CallEffects) Allocator.Error!void {
         const args = try self.popValues(arg_count);
         defer self.allocator.free(args);
         const closure = self.popValue();
-        try self.pushValue(try self.emitErasedCall(closure, fn_ty, args, result_ty));
+        try self.pushValue(try self.emitErasedCall(closure, fn_ty, args, result_ty, effects));
     }
 
     /// Call the erased callable `closure` of type `fn_ty` with `args`.
-    pub fn emitErasedCall(self: *Builder, closure: LocalId, fn_ty: TypeId, args: []const LocalId, result_ty: TypeId) Allocator.Error!LocalId {
+    pub fn emitErasedCall(self: *Builder, closure: LocalId, fn_ty: TypeId, args: []const LocalId, result_ty: TypeId, effects: CallEffects) Allocator.Error!LocalId {
         const params = switch (self.program.store.get(fn_ty)) {
             .function => |function| self.program.store.span(function.args),
             .primitive, .empty_record, .record, .tuple, .tag_union, .list, .box, .nominal, .variable => invariant("a called value's type is not a function type"),
@@ -9901,8 +9921,8 @@ pub const Builder = struct {
             .function => |function| function.ret,
             .primitive, .empty_record, .record, .tuple, .tag_union, .list, .box, .nominal, .variable => unreachable, // checked above
         };
-        if (ret == result_ty) return try self.callErased(closure, record, result_ty);
-        return try self.adaptValue(try self.callErased(closure, record, ret), ret, result_ty);
+        if (ret == result_ty) return try self.callErased(closure, record, result_ty, effects);
+        return try self.adaptValue(try self.callErased(closure, record, ret, effects), ret, result_ty);
     }
 
     /// One complete argument has exactly the argument block's size and
@@ -9918,7 +9938,9 @@ pub const Builder = struct {
 
     /// Call the erased callable `closure` with the complete argument block
     /// `record` (possibly a single value), for a result of `result_ty`.
-    pub fn callErased(self: *Builder, closure: LocalId, record: ?LocalId, result_ty: TypeId) Allocator.Error!LocalId {
+    pub fn callErased(self: *Builder, closure: LocalId, record: ?LocalId, result_ty: TypeId, effects: CallEffects) Allocator.Error!LocalId {
+        const site = effects == .possible and !self.effect_free;
+        if (site) self.has_sites = true;
         const target = try self.localOf(result_ty, .frame);
         // ARC transfers the callable's allocation into the call when it dies
         // there. A call whose result holds one erased-callable slot can
@@ -9929,6 +9951,7 @@ pub const Builder = struct {
             .args = record,
             .reuse_source = .some(closure),
             .result_reuse = try self.program.converter().erasedResultSlots(result_ty) == .single,
+            .suspension_site = site,
         } });
         return target;
     }
@@ -11495,11 +11518,11 @@ pub const Builder = struct {
                 const node = table.evidenceNode(direct.evidence);
                 if (node.target.kind == .local_proc) {
                     const fn_ty = try self.dispatchCallable(resolution, callable_ty);
-                    return try self.emitErasedCall(try self.localMethodValue(node, fn_ty), fn_ty, args, result_ty);
+                    return try self.emitErasedCall(try self.localMethodValue(node, fn_ty), fn_ty, args, result_ty, self.effectsOf(callable_ty));
                 }
                 if (node.target.kind == .callable_binding) {
                     const fn_ty = try self.dispatchCallable(resolution, callable_ty);
-                    return try self.emitErasedCall(try self.callableBindingMethodValue(node.target.kind.callable_binding, fn_ty), fn_ty, args, result_ty);
+                    return try self.emitErasedCall(try self.callableBindingMethodValue(node.target.kind.callable_binding, fn_ty), fn_ty, args, result_ty, self.effectsOf(callable_ty));
                 }
                 const callee = try self.methodTargetWorker(node.target);
                 const subst = table.site_substitutions.items()[node.subst.start..][0..node.subst.len];
@@ -11521,7 +11544,7 @@ pub const Builder = struct {
             },
             .evidence_dependent => |dependent| {
                 const fn_ty = try self.scopeInterface(dependent.index);
-                return try self.emitErasedCall(try self.materialize(try self.scopeDictionary(dependent.index)), fn_ty, args, result_ty);
+                return try self.emitErasedCall(try self.materialize(try self.scopeDictionary(dependent.index)), fn_ty, args, result_ty, self.effectsOf(callable_ty));
             },
             .checked_error, .@"unreachable" => {
                 try self.emitDispatchCrash(if (resolution == .checked_error) .checked_error else .unreachable_value);

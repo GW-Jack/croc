@@ -2549,6 +2549,8 @@ pub const PreparedBoxy = struct {
     pub fn lower(self: *const PreparedBoxy, target: TargetConfig) LowerResourceError!LoweredProgram {
         std.debug.assert(target.specialization_strategy == .boxy);
         const allocator = self.allocator;
+        // A module's object doesn't hold its program's mode.
+        const concurrency_mode = if (target.boxy_unit == null) concurrencyModeOf(self.modules) else .none;
         var boxy_timing_scope = PipelineStageScope.begin(target.timing, .boxy_lowering);
         var boxy_detail: ?BoxyTiming = if (Timing.detailOf(target.timing)) |timing| .{ .std_io = timing.std_io } else null;
         var output = try postcheck.Boxy.run(allocator, .{
@@ -2564,6 +2566,7 @@ pub const PreparedBoxy = struct {
             .compile_time = target.boxy_compile_time,
             .stored_functions = target.boxy_stored_functions,
             .function_unit = target.boxy_function_unit,
+            .concurrency_mode = concurrency_mode,
             .unit = if (target.boxy_unit) |unit| .{ .module = unit } else .program,
             .timing = if (boxy_detail) |*detail| detail else null,
         });
@@ -2582,7 +2585,9 @@ pub const PreparedBoxy = struct {
         const retained = output.retained;
         errdefer if (retained) |kept| kept.deinit();
         output = undefined;
-        var program = try finishLoweredOutput(allocator, self.roots.requests.len, target, &lowered, &frozen);
+        var finish_target = target;
+        finish_target.concurrency_mode = concurrency_mode;
+        var program = try finishLoweredOutput(allocator, self.roots.requests.len, finish_target, &lowered, &frozen);
         program.boxy_functions = retained;
         return program;
     }

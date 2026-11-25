@@ -903,7 +903,7 @@ pub fn dispatch(b: *Builder, call_plan: static_dispatch.StaticDispatchCallPlan, 
     const family = try familyFor(b.program, b.module, id);
     const fn_ty = try b.convert(call_plan.callable_ty);
     const constructor = try b.materialize(try constructorAt(b, family, id, fn_ty));
-    try b.push(.{ .finish_erased_call = .{ .fn_ty = fn_ty, .arg_count = 1, .result = result_ty } });
+    try b.push(.{ .finish_erased_call = .{ .fn_ty = fn_ty, .arg_count = 1, .result = result_ty, .effects = .none } });
     try b.pushOperand(operands[0], operand_types[0]);
     try b.pushValue(constructor);
 }
@@ -981,7 +981,7 @@ pub fn lowerIntrinsic(b: *Builder, intrinsic: checked.IntrinsicId, params: []con
     var gen: Gen = .{ .b = b, .family = .none, .piece = .none };
     const result = switch (intrinsic) {
         // A spec is the erased callable that parses its union's tags.
-        .parse_tag_union => try b.emitErasedCall(params[0], try b.program.store.intern(.{ .function = .{ .args = worker.params[1..2], .ret = worker.ret, .effectful = false } }), params[1..2], worker.ret),
+        .parse_tag_union => try b.emitErasedCall(params[0], try b.program.store.intern(.{ .function = .{ .args = worker.params[1..2], .ret = worker.ret, .effectful = false } }), params[1..2], worker.ret, .none),
         .field_names_rename_fields => try gen.renameFields(params[0], params[1], worker.params[1], worker.ret),
         .field_names_shortest_name => try gen.nameBound(params[0], worker.params[0], .shortest),
         .field_names_longest_name => try gen.nameBound(params[0], worker.params[0], .longest),
@@ -1343,7 +1343,7 @@ const Gen = struct {
             .forwarded => |forwarded| {
                 const value = try self.localValue(forwarded.local);
                 const ret_ty = fnRet(program_, forwarded.fn_ty);
-                return .{ .value = try b.emitErasedCall(value, forwarded.fn_ty, args, ret_ty), .ty = ret_ty };
+                return .{ .value = try b.emitErasedCall(value, forwarded.fn_ty, args, ret_ty, .none), .ty = ret_ty };
             },
             .checked_error => |fn_ty| {
                 const ret_ty = fnRet(program_, fn_ty);
@@ -1357,7 +1357,7 @@ const Gen = struct {
                 if (callable.local) |index| {
                     const value = try self.localValue(index);
                     const ret_ty = fnRet(program_, callable.fn_ty);
-                    return .{ .value = try b.emitErasedCall(value, callable.fn_ty, args, ret_ty), .ty = ret_ty };
+                    return .{ .value = try b.emitErasedCall(value, callable.fn_ty, args, ret_ty, .none), .ty = ret_ty };
                 }
                 const template = switch (node.target.kind) {
                     .procedure => |procedure| procedure.template,
@@ -1366,7 +1366,7 @@ const Gen = struct {
                     .callable_binding => |binding| {
                         const value = try b.callableBindingMethodValue(binding, callable.fn_ty);
                         const ret_ty = fnRet(program_, callable.fn_ty);
-                        return .{ .value = try b.emitErasedCall(value, callable.fn_ty, args, ret_ty), .ty = ret_ty };
+                        return .{ .value = try b.emitErasedCall(value, callable.fn_ty, args, ret_ty, .none), .ty = ret_ty };
                     },
                     .local_proc => invariant("a generated codec's local procedure call has no local value"),
                     .structural => invariant("a generated codec call's callable evidence names a structural target"),
@@ -1666,7 +1666,7 @@ const Gen = struct {
             .custom => |resolved| {
                 const encoder = try self.callResolved(resolved, &.{self.encoding});
                 const runtime = functionOf(program_, encoder.ty);
-                const written = try self.b.emitErasedCall(encoder.value, encoder.ty, &.{ value, state }, runtime.ret);
+                const written = try self.b.emitErasedCall(encoder.value, encoder.ty, &.{ value, state }, runtime.ret, .none);
                 return try self.injectTry(written, runtime.ret, ret_ty);
             },
             .list => |list_ty| return try self.encodeList(list_ty, list_ty, value, state, ret_ty),
@@ -1786,7 +1786,7 @@ const Gen = struct {
         const thunk = try self.packCallback(thunk_worker, &.{value}, &.{value_ty});
         const args = try std.mem.concat(self.b.allocator, LocalId, &.{ &.{state}, leading, &.{thunk} });
         defer self.b.allocator.free(args);
-        const written = try self.b.emitErasedCall(body.writer, body.writer_ty, args, fnRet(program_, body.writer_ty));
+        const written = try self.b.emitErasedCall(body.writer, body.writer_ty, args, fnRet(program_, body.writer_ty), .none);
         return try self.unwrap(written, fnRet(program_, body.writer_ty), .{ .ret = body.ret_ty });
     }
 
@@ -2055,7 +2055,7 @@ const Gen = struct {
             .custom => |resolved| {
                 const parser = try self.callResolved(resolved, &.{self.encoding});
                 const runtime = functionOf(program_, parser.ty);
-                const result = try self.b.emitErasedCall(parser.value, parser.ty, &.{state}, runtime.ret);
+                const result = try self.b.emitErasedCall(parser.value, parser.ty, &.{state}, runtime.ret, .none);
                 try self.ret(try self.injectTry(result, runtime.ret, ret_ty));
             },
             .list => |list_ty| try self.parseCounted(.{ .list = program_.store.get(list_ty).list }, list_ty, state, ret_ty, null),
@@ -2679,7 +2679,7 @@ const Gen = struct {
             const payload_types = try self.b.allocator.dupe(TypeId, program_.store.span(tag_info.payloads));
             defer self.b.allocator.free(payload_types);
             const count = try self.u64Value(payload_types.len);
-            const started = try self.b.emitErasedCall(start_fn.value, start_fn.ty, &.{ state, count }, fnRet(program_, start_fn.ty));
+            const started = try self.b.emitErasedCall(start_fn.value, start_fn.ty, &.{ state, count }, fnRet(program_, start_fn.ty), .none);
             var cursor = try self.unwrap(started, fnRet(program_, start_fn.ty), on_err);
             const payloads = try self.b.allocator.alloc(LocalId, payload_types.len);
             defer self.b.allocator.free(payloads);
@@ -2688,11 +2688,11 @@ const Gen = struct {
                 payload_value.* = parsed.value;
                 cursor = parsed.rest;
                 if (index + 1 < payload_types.len) {
-                    const separated = try self.b.emitErasedCall(next_fn.value, next_fn.ty, &.{ cursor, try self.u64Value(index + 1), count }, fnRet(program_, next_fn.ty));
+                    const separated = try self.b.emitErasedCall(next_fn.value, next_fn.ty, &.{ cursor, try self.u64Value(index + 1), count }, fnRet(program_, next_fn.ty), .none);
                     cursor = try self.unwrap(separated, fnRet(program_, next_fn.ty), on_err);
                 }
             }
-            const finished_try = try self.b.emitErasedCall(finish_fn.value, finish_fn.ty, &.{ cursor, count }, fnRet(program_, finish_fn.ty));
+            const finished_try = try self.b.emitErasedCall(finish_fn.value, finish_fn.ty, &.{ cursor, count }, fnRet(program_, finish_fn.ty), .none);
             const rest = try self.unwrap(finished_try, fnRet(program_, finish_fn.ty), on_err);
             try self.ret(try self.parsedOk(ret_ty, try self.b.buildTag(value_ty, tag_info.name, payloads), rest));
             self.b.hole = miss;
@@ -2742,7 +2742,7 @@ const Gen = struct {
             fn each(ctx: Context, gen: *Gen, handle: LocalId, acc: LocalId, _: LocalId) Allocator.Error!LocalId {
                 const handle_ty = gen.store().get(ctx.list_ty).list;
                 const old_name = (try gen.field(handle, handle_ty, "name")).value;
-                const renamed_name = try gen.b.emitErasedCall(ctx.rename, ctx.rename_ty, &.{old_name}, try gen.strTy());
+                const renamed_name = try gen.b.emitErasedCall(ctx.rename, ctx.rename_ty, &.{old_name}, try gen.strTy(), .none);
                 const index = (try gen.field(handle, handle_ty, "index")).value;
                 const renamed_handle = try gen.fieldHandleAt(handle_ty, index, renamed_name);
                 return gen.append(acc, ctx.list_ty, renamed_handle);
