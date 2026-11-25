@@ -13,7 +13,8 @@ const DynOp = LIR.DynOp;
 /// How an operation treats the ownership of its target and value operands
 /// (see `LIR.DynOp`).
 pub const Ownership = union(enum) {
-    /// No reference-counted value is read or produced: `frame_alloc`.
+    /// No reference-counted value is read or produced: `frame_alloc` and
+    /// `result_need`.
     none,
     /// The target borrows from `source` (a component address or a load of a
     /// component's bytes).
@@ -34,7 +35,7 @@ pub const Ownership = union(enum) {
 /// How `op` treats the ownership of its operands and target.
 pub fn ownership(op: DynOp) Ownership {
     return switch (op) {
-        .frame_alloc => .none,
+        .frame_alloc, .result_need => .none,
         // A table's words are static data, which the target holds as a
         // static-data literal read holds its value: a fresh owned unit of
         // image data. The table itself holds no unit.
@@ -45,7 +46,7 @@ pub fn ownership(op: DynOp) Ownership {
         .box_payload_addr => |payload| .{ .borrow_component = payload.box },
         .tag_payload_addr => |payload| .{ .borrow_component = payload.base },
         .view => |view| .{ .borrow_component = view.owner orelse view.address },
-        .tag_discriminant, .cell_exchange, .eq, .hash, .inspect, .adapt => .borrow_operands,
+        .tag_discriminant, .cell_exchange, .eq, .hash, .inspect, .adapt, .save, .restore, .take => .borrow_operands,
         .record, .record_update, .tag, .list, .box, .slot_alloc, .slot_store, .closure => .construct,
         .call_erased => .call_erased,
     };
@@ -177,6 +178,16 @@ pub const Operands = struct {
                 result.single(adapt.src);
                 result.single(adapt.plan);
             },
+            .save => |save| {
+                result.single(save.value);
+                result.single(save.desc);
+            },
+            .restore => |restore| result.single(restore.saved),
+            .take => |take| result.single(take.address),
+            .result_need => |need| {
+                result.single(need.task);
+                result.single(need.desc);
+            },
         }
         return result;
     }
@@ -217,7 +228,7 @@ pub fn constructedValues(store: *const LirStore, allocator: std.mem.Allocator, o
             try out.append(allocator, closure.capture);
             if (closure.reuse) |reuse| try out.append(allocator, reuse);
         },
-        .frame_alloc, .table_entry, .copy, .field_addr, .list_item_addr, .box_payload_addr, .tag_discriminant, .tag_payload_addr, .cell_exchange, .eq, .hash, .inspect, .call_erased, .view, .adapt => unreachable, // only construct operations consume value operands
+        .frame_alloc, .table_entry, .copy, .field_addr, .list_item_addr, .box_payload_addr, .tag_discriminant, .tag_payload_addr, .cell_exchange, .eq, .hash, .inspect, .call_erased, .view, .adapt, .save, .restore, .take, .result_need => unreachable, // only construct operations consume value operands
     }
 }
 
@@ -303,6 +314,10 @@ pub fn remapOperands(store: *LirStore, op: DynOp, context: anytype, comptime map
         .closure => |closure| .{ .closure = .{ .proc = closure.proc, .capture = try Remap.one(context, closure.capture), .reuse = try Remap.opt(context, closure.reuse), .reuse_unique = closure.reuse_unique, .frame = try Remap.opt(context, closure.frame) } },
         .view => |view| .{ .view = .{ .address = try Remap.one(context, view.address), .owner = try Remap.opt(context, view.owner) } },
         .adapt => |adapt| .{ .adapt = .{ .src = try Remap.one(context, adapt.src), .plan = try Remap.one(context, adapt.plan) } },
+        .save => |save| .{ .save = .{ .value = try Remap.one(context, save.value), .desc = try Remap.one(context, save.desc) } },
+        .restore => |restore| .{ .restore = .{ .saved = try Remap.one(context, restore.saved) } },
+        .take => |take| .{ .take = .{ .address = try Remap.one(context, take.address) } },
+        .result_need => |need| .{ .result_need = .{ .task = try Remap.one(context, need.task), .desc = try Remap.one(context, need.desc) } },
     };
 }
 

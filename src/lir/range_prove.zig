@@ -8148,6 +8148,7 @@ const Pass = struct {
             .task_set_pending,
             .task_hosted_slot,
             .task_result_buffer,
+            .task_current,
             .task_create,
             .task_create_parallel,
             .task_run,

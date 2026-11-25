@@ -3697,6 +3697,8 @@ fn liftDynStmtFacts(solver: *Solver, current: LIR.CFStmtId, target: ?LIR.LocalId
             try solver.binding_facts.append(allocator, .{ .fresh = defined });
             const lift: Lift = .{ .solver = solver, .target = defined };
             try DynOps.Operands.of(op).each(solver.store, &lift, Lift.borrowed);
+            // Any thread may have resumed the task that made the value.
+            if (op == .take) try liftVisibilitySeed(solver, defined);
         },
         .call_erased => {
             const defined = target orelse solveInvariant("ARC dyn erased call had no target");
@@ -4299,6 +4301,9 @@ fn computeVisibilityFromLift(
                     .construct, .borrow_operands => {
                         const link: Link = .{ .sets = &sets, .rc = carries, .target = @backingInt(dyn_stmt.target.?) };
                         DynOps.Operands.of(op).each(store, &link, Link.visit) catch |err| switch (err) {};
+                        // Any thread may have resumed the task that made
+                        // the value.
+                        if (op == .take) seedLocal(&visible, carries, @backingInt(dyn_stmt.target.?));
                     },
                     .call_erased => {
                         // The callee is unknown; the boundary is treated

@@ -691,6 +691,9 @@ pub const LowLevel = enum(u16) {
     task_hosted_slot,
     /// (task) -> Ptr(T): the address of the task's result buffer.
     task_result_buffer,
+    /// () -> task: the task whose code is running, or the idle task while
+    /// none runs (design.md "Boxy Procedures That May Suspend").
+    task_current,
     /// (start, root_result, hosted_slot_size, hosted_slot_alignment,
     /// result_buffer_size, result_buffer_alignment) -> task: a new task whose
     /// list holds the start record, which it takes, and whose root result
@@ -1413,6 +1416,7 @@ pub const LowLevel = enum(u16) {
         .task_set_pending = byType(.none()),
         .task_hosted_slot = byType(.none()),
         .task_result_buffer = byType(.none()),
+        .task_current = byType(.none()),
         .task_create = byType(.{ .may_retain_or_release = true, .consume_args = arg_0, .args_host_visible = arg_0 }),
         .task_create_parallel = byType(.{ .may_retain_or_release = true, .consume_args = arg_0, .args_host_visible = arg_0 }),
 

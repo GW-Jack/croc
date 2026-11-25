@@ -391,6 +391,57 @@ pub fn captureDrop(capture: ?[*]u8, ops: *RocOps) callconv(.c) void {
     decref(record_desc, record, ops);
 }
 
+/// Where the value starts in the capture of a saved value (`save`): after its
+/// descriptor's address, at the alignment any value may need.
+const saved_value_offset = 16;
+
+/// A value of type `desc` saved across a suspension, as an erased callable
+/// that is never called (`LIR.DynOp.save`). The value's references are copied.
+pub fn save(
+    desc: *const TypeDesc,
+    value: [*]u8,
+    on_drop: builtins.erased_callable.OnDropFn,
+    on_copy: builtins.rc_callback_abi.RcIncrefFn,
+    ops: *RocOps,
+) [*]u8 {
+    const erased = builtins.erased_callable;
+    const data = erased.allocate(&callSaved, on_drop, saved_value_offset + desc.size, ops);
+    erased.payloadPtr(data).on_copy = on_copy;
+    const capture = erased.capturePtr(data);
+    @as(**const TypeDesc, @ptrCast(@alignCast(capture))).* = desc;
+    copy(desc, capture + saved_value_offset, value);
+    incref(desc, value, 1, ops);
+    return data;
+}
+
+/// The value `saved` holds, copied into `dst` with references of its own.
+pub fn restore(saved: [*]u8, dst: [*]u8, ops: *RocOps) void {
+    const value = savedValue(builtins.erased_callable.capturePtr(saved));
+    copy(value.desc, dst, value.ptr);
+    incref(value.desc, value.ptr, 1, ops);
+}
+
+/// The `on_drop` of a saved value.
+pub fn savedDrop(capture: ?[*]u8, ops: *RocOps) callconv(.c) void {
+    const value = savedValue(capture.?);
+    decref(value.desc, value.ptr, ops);
+}
+
+/// Retain the references of an independent copy of a saved value.
+pub fn savedIncref(capture: ?[*]u8, count: isize, ops: *RocOps) void {
+    const value = savedValue(capture.?);
+    incref(value.desc, value.ptr, count, ops);
+}
+
+fn savedValue(capture: [*]u8) struct { desc: *const TypeDesc, ptr: [*]u8 } {
+    return .{ .desc = @as(**const TypeDesc, @ptrCast(@alignCast(capture))).*, .ptr = capture + saved_value_offset };
+}
+
+/// A saved value's function: nothing calls it.
+fn callSaved(ops: *RocOps, _: ?[*]u8, _: ?[*]const u8, _: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {
+    builtins.utils.builtinInvariant(ops, "a value saved across a suspension was called");
+}
+
 /// Retain the independently copied references of a dynamic capture record.
 pub fn captureIncref(capture: ?[*]u8, count: isize, ops: *RocOps) void {
     const record = capture.?;

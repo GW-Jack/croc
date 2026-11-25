@@ -1742,6 +1742,25 @@ pub const DynOp = union(enum) {
     /// Rows"); a conversion between two closed types is a static conversion
     /// worker instead.
     adapt: struct { src: LocalId, plan: LocalId },
+
+    // -- Suspension, made only by the continuation pass (design.md "Boxy
+    // Procedures That May Suspend") --
+
+    /// The dynamic value `value` (borrowed), which `desc` describes, saved
+    /// for a resume: an owned erased callable that is never called, whose
+    /// capture holds the descriptor and a copy of the value with references
+    /// of its own, which its `on_drop` releases.
+    save: struct { value: LocalId, desc: LocalId },
+    /// A copy, with references of its own, of the value `saved` (borrowed)
+    /// holds.
+    restore: struct { saved: LocalId },
+    /// The value at `address`, an `opaque_ptr` local into the result buffer
+    /// of a task, moved out of it.
+    take: struct { address: LocalId },
+    /// A record the pending edge is about to save in `task` writes a result
+    /// of the size and alignment `desc` gives, so the task's result buffer
+    /// needs room for it. Has no target.
+    result_need: struct { task: LocalId, desc: LocalId },
 };
 
 /// An integer operand of a dynamic operation: a value lowering knows, or a

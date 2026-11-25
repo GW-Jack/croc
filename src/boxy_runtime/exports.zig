@@ -107,6 +107,26 @@ pub fn roc_desc_capture_drop(capture: ?[*]u8, _: ?*RocOps) callconv(.c) void {
     walk.captureDrop(capture, ops());
 }
 
+/// The C-ABI form of `walk.save`.
+pub fn roc_desc_save(desc: *const TypeDesc, value: ?[*]u8) callconv(.c) [*]u8 {
+    return walk.save(desc, valuePtr(value), &roc_desc_saved_drop, &roc_desc_saved_copy, ops());
+}
+
+/// The C-ABI form of `walk.restore`.
+pub fn roc_desc_restore(saved: [*]u8, dst: ?[*]u8) callconv(.c) void {
+    walk.restore(saved, valuePtr(dst), ops());
+}
+
+/// The `Payload.on_drop` of a saved value.
+pub fn roc_desc_saved_drop(capture: ?[*]u8, _: ?*RocOps) callconv(.c) void {
+    walk.savedDrop(capture, ops());
+}
+
+/// Retain each reference in an independently copied saved value.
+pub fn roc_desc_saved_copy(capture: ?[*]u8, amount: isize) callconv(.c) void {
+    walk.savedIncref(capture, amount, ops());
+}
+
 /// Retain each reference in an independently copied dynamic capture record.
 pub fn roc_desc_capture_copy(capture: ?[*]u8, amount: isize) callconv(.c) void {
     walk.captureIncref(capture, amount, ops());

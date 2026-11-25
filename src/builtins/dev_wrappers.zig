@@ -1531,6 +1531,7 @@ pub fn roc_builtins_task_cancel(roc_task: *task.RocTask, abort: task.AbortFn, re
 /// innermost open set (`task.openGroup`).
 pub fn roc_builtins_group_init(loop_id: u64, entry_count: u64, limits_bytes: ?[*]const u8, limits_len: usize, root_limit: u64, traits: u8, slot_size: u64, slot_alignment: u64, result_drop: ?erased_callable.OnDropFn, owner: *task.RocTask) callconv(.c) void {
     const limits: []const u64 = if (limits_len == 0) &.{} else @as([*]const u64, @ptrCast(@alignCast(limits_bytes.?)))[0..limits_len];
+    task.requireTask(owner, in_process_host.ops());
     _ = task.groupInit(
         owner,
         loop_id,
@@ -1614,6 +1615,7 @@ pub fn roc_builtins_cell_lock(cell: *anyopaque) callconv(.c) void {
 /// `Wait`: the running `task`'s update of `cell` pauses it (design.md "Shared
 /// State", "Waiting."). Takes `probe`. Returns the park status, pending.
 pub fn roc_builtins_cell_wait(cell: *anyopaque, probe: [*]u8, owner: *task.RocTask) callconv(.c) u32 {
+    task.requireTask(owner, in_process_host.ops());
     task.cellWait(owner, cell, probe);
     return 2;
 }
@@ -1639,6 +1641,17 @@ pub fn roc_builtins_cleanup_push(cleanup: [*]u8) callconv(.c) void {
 /// The body returned: the cleanup pushed last is dropped.
 pub fn roc_builtins_cleanup_pop() callconv(.c) void {
     task.cleanupPop();
+}
+
+/// The task whose code is running, or the idle task while none runs.
+pub fn roc_builtins_task_current() callconv(.c) *task.RocTask {
+    return task.taskCurrent();
+}
+
+/// The record just saved in `waiting` writes a result of `size` bytes at
+/// `alignment`, which its descriptor gave.
+pub fn roc_builtins_task_need_result(waiting: *task.RocTask, size: usize, alignment: usize) callconv(.c) void {
+    waiting.needResult(size, alignment);
 }
 
 /// Enter the loaded dev-shim code image that contains the generated callsite.

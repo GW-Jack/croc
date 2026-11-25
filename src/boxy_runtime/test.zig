@@ -628,6 +628,42 @@ test "the shared capture drop releases a dynamic capture record" {
     try testing.expectEqual(baseline, env.allocations());
 }
 
+test "a value saved across a suspension is restored as often as asked and released with the saved value" {
+    var env = Env.init();
+    defer env.deinit();
+    const ops = env.ops();
+    const baseline = env.allocations();
+    const str = desc_mod.strDesc();
+    var value: Slot = .{};
+    value.write(0, RocStr, bigStr("a saved string long enough for the heap", ops));
+    const saved = walk.save(str, value.ptr(), &walk.savedDrop, &exports.roc_desc_saved_copy, ops);
+    try testing.expectEqual(baseline + 2, env.allocations());
+    // The saved value holds a reference of its own, and so does each restored.
+    walk.decref(str, value.ptr(), ops);
+    for (0..2) |_| {
+        var restored: Slot = .{};
+        walk.restore(saved, restored.ptr(), ops);
+        try testing.expectEqualStrings("a saved string long enough for the heap", @as(*const RocStr, @ptrCast(&restored.bytes)).asSlice());
+        walk.decref(str, restored.ptr(), ops);
+    }
+    try testing.expectEqual(baseline + 2, env.allocations());
+    erased_callable.decref(saved, ops);
+    try testing.expectEqual(baseline, env.allocations());
+}
+
+test "a saved value of no bytes is saved and restored" {
+    var env = Env.init();
+    defer env.deinit();
+    const ops = env.ops();
+    const unit = env.descs.args(&.{});
+    var value: Slot = .{};
+    const baseline = env.allocations();
+    const saved = walk.save(unit, value.ptr(), &walk.savedDrop, &exports.roc_desc_saved_copy, ops);
+    walk.restore(saved, value.ptr(), ops);
+    erased_callable.decref(saved, ops);
+    try testing.expectEqual(baseline, env.allocations());
+}
+
 test "list element callbacks and C entry points reach the entered host" {
     var env = Env.init();
     defer env.deinit();

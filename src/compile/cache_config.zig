@@ -461,7 +461,8 @@ pub const Constants = struct {
     /// 219: recorded running-set helpers include `cell_tracked!` and
     /// `cell_track!`, whose operation joins the low-level ones.
     /// 220: common idents include the functions of `Shared`.
-    pub const CACHE_VERSION = 220;
+    /// 221: `task_current` joins the low-level operations.
+    pub const CACHE_VERSION = 221;
 };
 
 /// Configuration for the Roc cache system.

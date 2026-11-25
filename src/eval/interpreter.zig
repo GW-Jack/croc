@@ -6727,8 +6727,10 @@ pub const Interpreter = struct {
                 const drop = try self.groupResultDrop(result_layout);
                 const root_limit = args[3].read(u64);
                 const traits = args[4].read(u8);
+                const owner = taskOf(self.readPointerInt(args[5]));
+                builtins.task.requireTask(owner, self.roc_env.currentRocOps());
                 _ = builtins.task.groupInit(
-                    taskOf(self.readPointerInt(args[5])),
+                    owner,
                     args[0].read(u64),
                     @intCast(args[1].read(u64)),
                     listItems(u64, valueToRocList(args[2])),
@@ -6771,6 +6773,7 @@ pub const Interpreter = struct {
             .cell_wait => blk: {
                 const probe = self.readBoxedDataPointer(args[1]) orelse
                     return self.invariantFailedError("LIR/interpreter invariant violated: cell_wait had no probe", .{});
+                builtins.task.requireTask(taskOf(self.readPointerInt(args[2])), self.roc_env.currentRocOps());
                 builtins.task.cellWait(taskOf(self.readPointerInt(args[2])), @ptrFromInt(self.readPointerInt(args[0])), probe);
                 const val = try self.alloc(ll.ret_layout);
                 val.write(u32, 2);
@@ -6796,6 +6799,7 @@ pub const Interpreter = struct {
                 builtins.task.cleanupPop();
                 break :blk Value.zst;
             },
+            .task_current => try self.pointerValue(ll.ret_layout, @intFromPtr(builtins.task.taskCurrent())),
             .cell_new, .cell_exchange => unreachable, // lowering to LIR replaces a cell operation with box and pointer operations
             .group_arrival => try self.pointerValue(ll.ret_layout, @intFromPtr(builtins.task.groupArrival(self.openGroup(args[0], args[1])))),
             .group_spawn => blk: {
@@ -8939,9 +8943,13 @@ pub const Interpreter = struct {
 
     fn execDyn(self: *LirInterpreter, frame: *Frame, stmt_id: CFStmtId, target_or_null: ?LocalId, op: LIR.DynOp) Error!void {
         if (op == .frame_alloc) return self.dynFrameAlloc(frame);
+        if (op == .result_need) {
+            const desc = try self.descAt(frame, op.result_need.desc);
+            return taskOf(try self.localWord(frame, op.result_need.task)).needResult(desc.size, desc.alignment);
+        }
         const target = try self.requireDynTarget(target_or_null, op);
         switch (op) {
-            .frame_alloc => unreachable, // handled above
+            .frame_alloc, .result_need => unreachable, // handled above
             .table_entry => |entry| {
                 const table: [*]const u8 = @ptrFromInt(try self.localWord(frame, entry.table));
                 const word = std.mem.readInt(usize, table[LIR.tableEntryOffset(entry.index, @sizeOf(usize))..][0..@sizeOf(usize)], builtin.cpu.arch.endian());
@@ -9113,6 +9121,22 @@ pub const Interpreter = struct {
                 try self.setLocalChecked(frame, stmt_id, target, try self.rocStrToValue(rendered, self.store.getLocal(target).layout_idx), false);
             },
             .view => |v| try self.setComponentTarget(frame, stmt_id, target, @ptrFromInt(try self.localWord(frame, v.address))),
+            .save => |s| {
+                const desc = try self.descAt(frame, s.desc);
+                const value = try self.localBytes(frame, s.value);
+                const saved = boxy.walk.save(desc, value, &boxy.walk.savedDrop, &boxy.exports.roc_desc_saved_copy, &self.roc_ops);
+                try self.setWordTarget(frame, stmt_id, target, @intFromPtr(saved));
+            },
+            .take => |take| {
+                const address: [*]u8 = @ptrFromInt(try self.localWord(frame, take.address));
+                boxy.walk.copy(try self.localDesc(frame, target), try self.dynAddress(frame, target), address);
+            },
+            .restore => |r| {
+                const saved: [*]u8 = @ptrFromInt(try self.localWord(frame, r.saved));
+                const dst = try self.targetStorage(frame, target);
+                boxy.walk.restore(saved, dst, &self.roc_ops);
+                try self.finishResultStorage(frame, stmt_id, target, dst);
+            },
             .adapt => |a| {
                 const plan = try self.planAt(frame, boxy.desc.AdaptPlan, a.plan);
                 const src = try self.localBytes(frame, a.src);

@@ -7043,8 +7043,8 @@ const Certifier = struct {
         self.dyn_operands.clearRetainingCapacity();
         try DynOps.Operands.of(op).appendAll(self.store, self.allocator, &self.dyn_operands);
         const ownership = DynOps.ownership(op);
-        if (target == null and op != .frame_alloc) return self.fail("dyn {s} has no target", .{@tagName(op)});
-        if (target != null and op == .frame_alloc) return self.fail("dyn frame_alloc has a target", .{});
+        if (target == null and op != .frame_alloc and op != .result_need) return self.fail("dyn {s} has no target", .{@tagName(op)});
+        if (target != null and (op == .frame_alloc or op == .result_need)) return self.fail("dyn {s} has a target", .{@tagName(op)});
         for (self.dyn_operands.items) |operand| _ = try self.requireLive(state, operand);
         switch (ownership) {
             .none => {

@@ -216,6 +216,26 @@ fn currentTask() ?*RocTask {
     return Scheduler.runningTask();
 }
 
+/// What `task_current` gives code no task runs: never pending.
+var idle_task: RocTask = .initial(undefined, &empty_buffer, .{
+    .hosted_slot_size = 0,
+    .hosted_slot_alignment = 1,
+    .result_buffer_size = 0,
+    .result_buffer_alignment = 1,
+}, &empty_buffer, &empty_buffer);
+
+/// `task_current`: the task whose code is running, or the idle task while
+/// none runs (design.md "Boxy Procedures That May Suspend").
+pub fn taskCurrent() *RocTask {
+    return currentTask() orelse &idle_task;
+}
+
+/// Code that no task runs was about to pause: a function value the host
+/// called, whose frames can't be saved.
+pub fn requireTask(task: *RocTask, ops: *RocOps) void {
+    if (task == &idle_task) ops.crash("A function called by the host can't wait for shared state or run concurrent code.");
+}
+
 /// Clear the running task for a hosted call and return it, so a crash in
 /// the host ends the process rather than the task: the host's frames sit
 /// between the task's resume and the crash, and the exit would skip them.
@@ -302,6 +322,16 @@ pub const RocTask = extern struct {
     hosted_slot_alignment: usize,
     result_buffer_size: usize,
     result_buffer_alignment: usize,
+    /// What `result_buffer` has room for: the program's size and alignment,
+    /// until a result whose size only its descriptor says needs more
+    /// (`needResult`). A task's children start from the program's.
+    result_room: usize,
+    result_room_alignment: usize,
+    /// The result buffer the record being called was given, once `needResult`
+    /// has replaced it, until that call returns.
+    replaced_result: ?[*]u8,
+    replaced_room: usize,
+    replaced_alignment: usize,
     ops: *RocOps,
     /// Where a crash in this task's resume jumps back to.
     crash_jmp: crash_exit.Buffer,
@@ -438,6 +468,11 @@ pub const RocTask = extern struct {
             .hosted_slot_alignment = buffers.hosted_slot_alignment,
             .result_buffer_size = buffers.result_buffer_size,
             .result_buffer_alignment = buffers.result_buffer_alignment,
+            .result_room = buffers.result_buffer_size,
+            .result_room_alignment = buffers.result_buffer_alignment,
+            .replaced_result = null,
+            .replaced_room = 0,
+            .replaced_alignment = 1,
             .ops = ops,
             .crash_jmp = undefined,
             .running_record = undefined,
@@ -702,6 +737,7 @@ pub const RocTask = extern struct {
                 if (crash_exit.save(&self.crash_jmp) != 0) return self.crashed();
             }
             self.call(entry.record, if (base == 0) self.root_result else self.result_buffer);
+            self.freeReplacedResult();
             if (self.scheduler == null) runningSlot().* = null;
             std.mem.reverse(Entry, self.entries[base..self.len]);
             self.releaseRecord(entry.record, entry.from_task);
@@ -758,6 +794,7 @@ pub const RocTask = extern struct {
     /// once they have reported.
     fn crashed(self: *RocTask) Status {
         self.endUpdate();
+        self.freeReplacedResult();
         self.releaseRecord(self.running_record, self.running_from_task);
         // The crash may have been an update's, which poisons its cell.
         probeEveryCell(self.tree != null);
@@ -1340,7 +1377,7 @@ pub const RocTask = extern struct {
         if (self.cell_table.capacity > 0) ops.dealloc(@ptrCast(self.cell_table.buckets), @alignOf(?*TrackedCell));
         if (self.status == .crashed) ops.dealloc(@ptrCast(@constCast(self.crash_message)), 1);
         freeBuffer(ops, self.hosted_slot, self.hosted_slot_size, self.hosted_slot_alignment);
-        freeBuffer(ops, self.result_buffer, self.result_buffer_size, self.result_buffer_alignment);
+        freeBuffer(ops, self.result_buffer, self.result_room, self.result_room_alignment);
         // Before the address can be another thread's new task.
         noteFreed(self, ops);
         ops.dealloc(@ptrCast(self), @alignOf(RocTask));
@@ -1355,6 +1392,32 @@ pub const RocTask = extern struct {
             .result_buffer_size = self.result_buffer_size,
             .result_buffer_alignment = self.result_buffer_alignment,
         };
+    }
+
+    /// A record about to be saved writes a result of `size` bytes at `alignment`.
+    /// The buffer holds nothing to keep: what the records already resumed
+    /// wrote there, the code now pausing took. But the record being called may
+    /// have been given it for its result, and code that pauses in a tail call
+    /// copies a result that is not there, so the buffer outlives that call.
+    pub fn needResult(self: *RocTask, size: usize, alignment: usize) void {
+        if (size <= self.result_room and alignment <= self.result_room_alignment) return;
+        if (self.replaced_result == null and self.result_room > 0) {
+            self.replaced_result = self.result_buffer;
+            self.replaced_room = self.result_room;
+            self.replaced_alignment = self.result_room_alignment;
+        } else {
+            freeBuffer(self.ops, self.result_buffer, self.result_room, self.result_room_alignment);
+        }
+        self.result_room = @max(size, self.result_room);
+        self.result_room_alignment = @max(alignment, self.result_room_alignment);
+        self.result_buffer = allocBuffer(self.ops, self.result_room, self.result_room_alignment);
+    }
+
+    /// The record that was being called has returned, or crashed.
+    fn freeReplacedResult(self: *RocTask) void {
+        const buffer = self.replaced_result orelse return;
+        self.replaced_result = null;
+        freeBuffer(self.ops, buffer, self.replaced_room, self.replaced_alignment);
     }
 
     fn call(self: *RocTask, record: [*]u8, ret: [*]u8) void {
@@ -2703,6 +2766,8 @@ const TestStep = extern struct {
     id: u8,
     /// Records this call saves before pausing, innermost first, or none.
     saves: [2]?[*]u8,
+    /// The sizes of the results it makes room for before it saves, or 0.
+    needs: [2]usize = .{ 0, 0 },
     /// Pause after saving, as a pending edge does.
     pauses: bool,
     /// What it writes through the result pointer.
@@ -2724,6 +2789,8 @@ const TestLog = struct {
     var results_written_to: [16]?[*]u8 = undefined;
     var drops: usize = 0;
     var slot_drops: usize = 0;
+    /// Calls whose result pointer was freed before they returned.
+    var results_lost: usize = 0;
     var aborts: usize = 0;
     var readies: usize = 0;
     /// What `crashDeep` would return; never written, since it crashes.
@@ -2733,6 +2800,7 @@ const TestLog = struct {
         call_count = 0;
         drops = 0;
         slot_drops = 0;
+        results_lost = 0;
         aborts = 0;
         readies = 0;
     }
@@ -2744,6 +2812,11 @@ fn testStepCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, 
     TestLog.calls[TestLog.call_count] = step.id;
     TestLog.results_written_to[TestLog.call_count] = ret;
     TestLog.call_count += 1;
+    for (step.needs) |size| if (size != 0) {
+        task.needResult(size, 8);
+        // The buffer this call was given is still there to write to.
+        if (task.replaced_result != ret) TestLog.results_lost += 1;
+    };
     for (step.saves) |save| if (save) |record| task.pushRecord(testMoveIntoTask(task, record), &testSlotDrop);
     if (step.crashes and step.crash_depth > 0) TestLog.deep_sink = @call(.never_inline, crashDeep, .{ ops, step.crash_depth, step.id });
     if (step.crashes) ops.crash("a record crashed");
@@ -2877,6 +2950,66 @@ test "records a resumed record saves go before the records still waiting" {
     try std.testing.expectEqual(@as(u8, 90), root[0]);
     task.free();
     try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
+}
+
+test "a result buffer that grows while a record runs keeps that record's until it returns or crashes" {
+    for ([_]bool{ false, true }) |crashes| {
+        if (crashes and !crash_exit.available()) continue;
+        var test_env = utils.TestEnv.init(std.testing.allocator);
+        defer test_env.deinit();
+        const ops = test_env.getOps();
+        TestLog.reset();
+        // Resumed, 2 makes room twice for the result of 4, which it saves,
+        // and pauses, or crashes instead.
+        const nested = testRecord(ops, .{ .id = 4, .saves = .{ null, null }, .pauses = false, .result = 0 });
+        const inner = testRecord(ops, .{ .id = 2, .saves = .{ nested, null }, .needs = .{ 64, 128 }, .pauses = true, .result = 0, .crashes = crashes });
+        const outer = testRecord(ops, .{ .id = 3, .saves = .{ null, null }, .pauses = false, .result = 0 });
+        var root: [1]u8 = .{0};
+        const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ inner, outer }, .pauses = true, .result = 0 }), &root, test_buffers);
+        try std.testing.expectEqual(Status.pending, task.resumeTask());
+        task.wake(&testReady);
+        if (crashes) {
+            try std.testing.expectEqual(Status.crashed, task.resumeTask());
+        } else {
+            try std.testing.expectEqual(Status.pending, task.resumeTask());
+            try std.testing.expectEqual(@as(usize, 128), task.result_room);
+            task.wake(&testReady);
+            try std.testing.expectEqual(Status.done, task.resumeTask());
+            // 4's result has the room it needs, and 2's had what there was.
+            try std.testing.expectEqual(@as(?[*]u8, task.result_buffer), TestLog.results_written_to[2]);
+            try std.testing.expect(TestLog.results_written_to[1] != TestLog.results_written_to[2]);
+        }
+        try std.testing.expectEqual(@as(usize, 0), TestLog.results_lost);
+        try std.testing.expectEqual(@as(?[*]u8, null), task.replaced_result);
+        task.free();
+        try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
+    }
+}
+
+test "room for a result the buffer already holds leaves the buffer alone" {
+    var test_env = utils.TestEnv.init(std.testing.allocator);
+    defer test_env.deinit();
+    const ops = test_env.getOps();
+    var root: [1]u8 = undefined;
+    const task = RocTask.create(ops, testRecord(ops, .{ .id = 1, .saves = .{ null, null }, .pauses = false, .result = 0 }), &root, test_buffers);
+    const buffer = task.result_buffer;
+    task.needResult(8, 8);
+    task.needResult(0, 1);
+    try std.testing.expectEqual(buffer, task.result_buffer);
+    // More room keeps the alignment there was, and the other way round.
+    task.needResult(4, 16);
+    try std.testing.expectEqual(@as(usize, 8), task.result_room);
+    task.needResult(100, 1);
+    try std.testing.expectEqual(@as(usize, 16), task.result_room_alignment);
+    task.freeReplacedResult();
+    try std.testing.expectEqual(Status.done, task.resumeTask());
+    task.free();
+    try std.testing.expectEqual(@as(usize, 0), test_env.getAllocationCount());
+}
+
+test "with no task running the current task is the idle one, which can't pause" {
+    try std.testing.expectEqual(&idle_task, taskCurrent());
+    try std.testing.expect(taskCurrent().ready());
 }
 
 test "a task reuses a released record's memory for its next record of that size class, and frees the rest with itself" {

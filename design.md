@@ -33889,6 +33889,79 @@ When no hosted procedure is `suspending`, every computation commits `never`
 everywhere and walks nothing. A Debug compiler walks anyway and asserts that
 it finds no suspension site.
 
+### Boxy Procedures That May Suspend
+
+Under `.boxy` a function value is called through one erased ABI, whatever it
+holds, and no class says which procedures a call can enter. So Boxy decides by
+checked type instead, and it only ever decides in programs whose platform has
+tasks.
+
+**Sites.** A dynamic erased call is a suspension site
+(`DynOp.call_erased.suspension_site`) when the checked type of the function it
+calls is not pure and neither is the procedure the call is in. Only a function
+type that checking sealed as pure (`fn_pure`) counts as pure: the kind of a
+function type nothing constrained is not, since code that fills it may have
+effects. A procedure whose own checked function is pure is *effect free*
+(`LirProcSpec.effect_free`), as are the entry wrappers that evaluate a value
+at compile time. An effect-free procedure runs to completion. Nothing in it is
+a site, so the marks never reach it, and what it calls through the erased ABI
+or directly never pauses, though its callee may be a procedure that suspends
+elsewhere. A worker generic over a function's effects is one procedure. It is
+not effect free, so it may suspend even where a caller passes it a pure
+function. A pure call of it never pauses, because a pure function value has no
+site.
+
+A dynamic erased call that is a site is a seed, and the marks go on from there
+over direct calls, stopping at effect-free procedures. A Boxy program with tasks
+is always walked, since its seeds are statements.
+
+**The task.** The erased ABI is unchanged, so a caller passes no task. A
+procedure with a Roc ABI takes it as under `.lss`; an erased one that may
+suspend reads it on entry with `task_current()`, which is the task whose code
+is running, or the *idle task* when none is: the host called a function value
+itself. An effect-free procedure reads it the same way to call a procedure
+that takes one, and so does a procedure with no site that holds a running-set
+operation. The idle task is static, never pending, and never made ready. A
+function value the host can call is pure (Explicit Inputs), so nothing that runs
+under the idle task asks to pause. `group_init` and `cell_wait` check that and
+crash, since the frames of the host's call couldn't be saved.
+
+An erased procedure needs no shell, since its signature doesn't change. After a
+site the caller reads the running task's pending flag, as after any other.
+
+**Dynamic values.** A value whose layout only its descriptor knows can't be a
+field of a record's capture, so the pass brackets it with operations that only
+it makes:
+
+- `save(value, desc)` is an owned erased callable that is never called. Its
+  capture is the descriptor, then a copy of the value with references of its
+  own, which the callable's drop releases. The record holds that callable;
+- `restore(saved)` is the value back, with references of its own, in the
+  resume entry's frame;
+- `take(address)` moves a call's dynamic result out of the task's result
+  buffer;
+- `result_need(task, desc)` makes room in the result buffer for a result of
+  `desc`'s size and alignment.
+
+A local's descriptor is live wherever the local is, so a record holds the
+descriptors of what it saves. A procedure's result descriptor is live at every
+site that is not a tail site. The resume entry of a procedure with a dynamic
+result is an `erased_record` procedure, and writes its result through the
+descriptor. ARC classes `save`, `restore` and `take` as it does `adapt`.
+
+The result buffer has the program's closed size until a dynamic result needs
+more. Every pending edge of a procedure with a dynamic result runs
+`result_need` first, so the buffer has room for what the record it is about to
+save will write. The runtime may replace the buffer there. Its contents were
+moved out when the resume began, but the record being called may have been
+given the old buffer as its own result pointer, and a tail call that pauses
+copies a result that is not there through it. So the old buffer outlives that
+call, and the runtime frees it once the record has returned or crashed. A child
+starts from the program's size, not from its parent's.
+
+**Whole programs.** A `.boxy` program with tasks lowers as one program
+(Per-Module Output), so the marks see every procedure.
+
 ### The Continuation Pass
 
 The continuation pass runs after `ReachableProcs` and before `ErasedOwner`,
