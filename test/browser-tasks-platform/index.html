@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Roc tasks in the browser</title>
+<pre id="log"></pre>
+<script type="module">
+  import { run } from "./host.mjs";
+
+  const log = (line) => document.getElementById("log").append(`${line}\n`);
+  const name = new URLSearchParams(location.search).get("app") ?? "app.wasm";
+  const module = await WebAssembly.compileStreaming(fetch(name));
+  const outcome = await run(module, { log });
+  log(outcome.result ?? outcome.status);
+</script>

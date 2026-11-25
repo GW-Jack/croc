@@ -34987,6 +34987,20 @@ pointer, and only a root's status ends the program. The host never cancels
 or frees a child, which only the runtime does, and resuming or waking one
 after its terminal status is using a freed task. Each breaks P8.
 
+**Browser hosts.** In JavaScript the event loop is the scheduler, and a hosted
+operation is a promise. test/browser-tasks-platform is the reference, a small
+wasm host and a scheduler in host.mjs. `roc_task_ready` puts the task on a queue
+that a microtask empties by resuming each, so Roc code runs on one thread (P10) and
+never inside a hosted call (P1). A `suspending` hosted function starts its promise
+and returns `ROC_PENDING`, and the promise's end writes `*out` and wakes the task
+(P3). An operation is kept by the task that waits on it, so `roc_task_abort`
+finds it, abandons it (a timer is cleared, a fetch gets its `AbortSignal`) and
+forgets it; a promise that settles after that finds nothing to do (P4). It starts
+no operation's own code during the hosted call, so a JavaScript exception never
+crosses a wasm frame but a crash's: wasm has no crash exit, so `roc_crashed` throws, the
+error ends the run, and the module's instance is never entered again. Nothing
+here needs threads, JavaScript promise integration or a transformed module.
+
 ### The Task Runtime
 
 **The wake word.** The pending flag is what compiled code tests, and

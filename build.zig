@@ -1600,6 +1600,7 @@ const PrintBuildSuccessStep = struct {
 const TestPlatformSteps = struct {
     wasm32: *Step,
     wasm32v1: *Step,
+    browser: *Step,
     /// For each of `all_test_platform_dirs`, the step producing that
     /// platform's host for the `roc` under test's own Roc target (and its
     /// `v1` twin), or null when `-Dplatform` filtered the platform out.
@@ -1816,6 +1817,15 @@ fn setupTestPlatforms(
         .bundle_compiler_rt = true,
         .dest_paths = &.{"test/concurrency-tasks/platform/targets/wasm32/host.wasm"},
     }));
+    // The browser reference host's wasm half.
+    const browser_host_step = buildAndCopyWasmHostObject(b, wasm_target, optimize, strip, omit_frame_pointer, .{
+        .name = "host",
+        .root_source_file = "test/browser-tasks-platform/platform/host.zig",
+        .imports = test_host_imports,
+        .bundle_compiler_rt = true,
+        .dest_paths = &.{"test/browser-tasks-platform/platform/targets/wasm32/host.wasm"},
+    });
+    prepared_hosts_step.dependOn(browser_host_step);
     const host_alloc_imports: []const std.Build.Module.Import = &.{
         .{ .name = "host_alloc", .module = roc_modules.host_alloc },
     };
@@ -1861,7 +1871,7 @@ fn setupTestPlatforms(
 
     b.getInstallStep().dependOn(prepared_hosts_step);
 
-    return .{ .wasm32 = wasm_host_step, .wasm32v1 = wasm_v1_host_step, .native = native_hosts };
+    return .{ .wasm32 = wasm_host_step, .wasm32v1 = wasm_v1_host_step, .browser = browser_host_step, .native = native_hosts };
 }
 
 /// Makes `roc_cache_dir` the whole environment of a cached `roc build` step.
@@ -4144,6 +4154,13 @@ pub fn build(b: *std.Build) void {
         _ = wasm_app_sources.addCopyFile(test_fixtures.output(test_platform_hosts.wasm32v1, "test/wasm/platform/targets/wasm32v1/host.wasm"), "reserved-low-memory-platform/targets/wasm32v1/host.wasm");
         wasm_app_sources.step.dependOn(wasm_host_step);
 
+        const browser_app_sources = b.addWriteFiles();
+        _ = browser_app_sources.addCopyDirectory(b.path("test/browser-tasks-platform"), ".", .{
+            .include_extensions = &.{".roc"},
+        });
+        _ = browser_app_sources.addCopyFile(test_fixtures.output(test_platform_hosts.browser, "test/browser-tasks-platform/platform/targets/wasm32/host.wasm"), "platform/targets/wasm32/host.wasm");
+        browser_app_sources.step.dependOn(test_platform_hosts.browser);
+
         const build_wasm_provided_callable_app = addWasmStaticLibAppBuild(b, roc_exe, build_roc_step, build_test_hosts_step, provided_callable_app_sources, "app.roc", &.{}, "app.wasm", "wasm32");
         build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_provided_callable_app.run.step);
 
@@ -4230,6 +4247,18 @@ pub fn build(b: *std.Build) void {
             for (wasm_static_lib_carts, wasm_static_lib_cart_outputs) |cart, wasm| {
                 const cart_run_args = cart.run_args orelse continue;
                 addWasmStaticLibRun(b, wasm_test_exe, wasm, cart_run_args, build_test_wasm_static_lib_runner_step, run_test_wasm_static_lib_step);
+            }
+
+            // The browser reference host, on Node's event loop.
+            for ([_][]const u8{ "dev", "speed" }) |opt| {
+                const run_browser_test = b.addSystemCommand(&.{"node"});
+                run_browser_test.addFileArg(b.path("test/browser-tasks-platform/browser.test.mjs"));
+                run_browser_test.addFileInput(b.path("test/browser-tasks-platform/host.mjs"));
+                for ([_][]const u8{ "app", "app_queue", "app_crash" }) |app| {
+                    const built = addWasmStaticLibAppBuild(b, roc_exe, build_roc_step, build_test_hosts_step, browser_app_sources, b.fmt("{s}.roc", .{app}), &.{ b.fmt("--opt={s}", .{opt}), "--specialize=yes" }, b.fmt("{s}.wasm", .{app}), "wasm32");
+                    run_browser_test.addFileArg(built.output);
+                }
+                run_test_wasm_static_lib_step.dependOn(&run_browser_test.step);
             }
         }
         run_wasm_test.step.dependOn(build_test_wasm_static_lib_runner_step);
