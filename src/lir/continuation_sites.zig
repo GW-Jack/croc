@@ -20,7 +20,9 @@
 //! that lowering marks one ("Boxy Procedures That May Suspend").
 //!
 //! Every mention of a dynamic local reads the locals that say what its bytes
-//! are: its descriptor, and its product's field descriptors.
+//! are: its descriptor, and its product's dynamic fields' descriptors. The
+//! descriptor of a field with a committed layout is read by nothing, and
+//! `prune_join_params` may have deleted its definition.
 //!
 //! A tail site is a call to a procedure (never a hosted one) or an erased
 //! call whose result the procedure returns unchanged: the next statements only copy it into
@@ -30,6 +32,7 @@
 const std = @import("std");
 const collections = @import("collections");
 const core = @import("lir_core");
+const layout = @import("layout");
 const body_clone = @import("body_clone.zig");
 const arc_liveness = @import("arc_liveness.zig");
 const invariant = @import("base").invariant;
@@ -155,12 +158,12 @@ pub const Sites = struct {
 
 /// Analyze `proc_id`, which has a body. A procedure without sites gets an
 /// empty list.
-pub fn analyze(allocator: Allocator, store: *const LirStore, proc_id: LIR.LirProcSpecId) Allocator.Error!Sites {
+pub fn analyze(allocator: Allocator, store: *const LirStore, layouts: *const layout.Store, proc_id: LIR.LirProcSpecId) Allocator.Error!Sites {
     var result = Sites{ .arena = std.heap.ArenaAllocator.init(allocator), .sites = &.{} };
     errdefer result.arena.deinit();
     const out = result.arena.allocator();
 
-    var builder = Builder{ .store = store, .allocator = allocator };
+    var builder = Builder{ .store = store, .layouts = layouts, .allocator = allocator };
     defer builder.deinit();
     const body = store.getProcSpecImmediate(proc_id).body.get() orelse invariant("continuation sites of a procedure without a body", .{});
     try builder.walk(body);
@@ -304,6 +307,7 @@ fn returnsUnchanged(
 /// statement and a bit per local it mentions.
 const Builder = struct {
     store: *const LirStore,
+    layouts: *const layout.Store,
     allocator: Allocator,
     stmts: std.ArrayList(CFStmtId) = .empty,
     node_of: collections.DenseMapUnmanaged(CFStmtId, u32) = .empty,
@@ -369,8 +373,12 @@ const Builder = struct {
         const dyn = info.dyn orelse return;
         try reads.append(self.allocator, try self.bitFor(dyn.desc));
         if (info.product == .none) return;
-        const descriptors = self.store.getLocalSpan(self.store.stmtRow(info.product).descriptors);
+        const shape = self.store.stmtRow(info.product);
+        const descriptors = self.store.getLocalSpan(shape.descriptors);
+        const field_layouts = self.store.getU32Span(shape.layouts);
         for (0..LirStore.GuardedList.borrowLen(descriptors)) |i| {
+            const field_layout: layout.Idx = @fromBackingInt(@intCast(LirStore.GuardedList.at(field_layouts, i)));
+            if (self.layouts.getLayout(field_layout).tag != .dynamic) continue;
             try reads.append(self.allocator, try self.bitFor(LirStore.GuardedList.at(descriptors, i)));
         }
     }
@@ -511,12 +519,15 @@ const SuspensionMarks = @import("suspension_marks.zig");
 
 const Fixture = struct {
     store: LirStore,
+    layouts: layout.Store,
     seed: LIR.LirProcSpecId,
     hosted: LIR.LirProcSpecId,
 
     fn init() Allocator.Error!Fixture {
         var store = LirStore.init(testing.allocator);
         errdefer store.deinit();
+        var layouts = try layout.Store.init(testing.allocator, .u64);
+        errdefer layouts.deinit();
         const seed = try store.addProcSpec(.{
             .name = store.freshSyntheticSymbol(),
             .identity = LIR.ProcIdentity.forTest(1),
@@ -533,10 +544,11 @@ const Fixture = struct {
             .suspends = .may,
             .hosted = .some(.{ .symbol = try store.insertString("roc_test_suspending"), .dispatch_index = 0 }),
         }, .none);
-        return .{ .store = store, .seed = seed, .hosted = hosted };
+        return .{ .store = store, .layouts = layouts, .seed = seed, .hosted = hosted };
     }
 
     fn deinit(self: *Fixture) void {
+        self.layouts.deinit();
         self.store.deinit();
     }
 
@@ -593,7 +605,7 @@ test "live values after a site are the ones read later, and a returned result is
     const first = try f.call(t, f.seed, build);
     const p = try f.addProc(&.{ x, y }, first);
 
-    var sites = try analyze(testing.allocator, &f.store, p);
+    var sites = try analyze(testing.allocator, &f.store, &f.layouts, p);
     defer sites.deinit();
     try testing.expectEqual(@as(usize, 2), sites.sites.len);
     const by_call = if (sites.sites[0].call == first) sites.sites else &[_]Site{ sites.sites[1], sites.sites[0] };
@@ -620,7 +632,7 @@ test "a result passed to a join that returns it is a tail site; one overwritten 
         const join = try f.stmt(.{ .join = .{ .id = join_id, .params = try f.store.addLocalSpan(&.{param}), .body = body, .remainder = call } });
         const p = try f.addProc(&.{y}, join);
 
-        var sites = try analyze(testing.allocator, &f.store, p);
+        var sites = try analyze(testing.allocator, &f.store, &f.layouts, p);
         defer sites.deinit();
         try testing.expectEqual(@as(usize, 1), sites.sites.len);
         try testing.expectEqual(!overwrite, sites.sites[0].tail);
@@ -637,7 +649,7 @@ test "a hosted site is never a tail site" {
     const call = try f.call(t, f.hosted, ret);
     const p = try f.addProc(&.{}, call);
 
-    var sites = try analyze(testing.allocator, &f.store, p);
+    var sites = try analyze(testing.allocator, &f.store, &f.layouts, p);
     defer sites.deinit();
     try testing.expectEqual(@as(usize, 1), sites.sites.len);
     try testing.expect(!sites.sites[0].tail);
@@ -665,7 +677,7 @@ test "a join's retained locals are live at a site before a jump to it" {
     } });
     const p = try f.addProc(&.{r}, join);
 
-    var sites = try analyze(testing.allocator, &f.store, p);
+    var sites = try analyze(testing.allocator, &f.store, &f.layouts, p);
     defer sites.deinit();
     try testing.expectEqual(@as(usize, 1), sites.sites.len);
     try expectLive(&.{ r, t }, sites.sites[0]);
@@ -690,9 +702,37 @@ test "a value read after a loop's back edge is live at a site inside the loop" {
     const join = try f.stmt(.{ .join = .{ .id = join_id, .params = try f.store.addLocalSpan(&.{acc}), .body = call, .remainder = init_acc } });
     const p = try f.addProc(&.{acc0}, join);
 
-    var sites = try analyze(testing.allocator, &f.store, p);
+    var sites = try analyze(testing.allocator, &f.store, &f.layouts, p);
     defer sites.deinit();
     try testing.expectEqual(@as(usize, 1), sites.sites.len);
     try testing.expect(!sites.sites[0].tail);
     try expectLive(&.{ acc, t }, sites.sites[0]);
+}
+
+test "a dynamic product's live descriptors are its own and its dynamic fields'" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    f.store.runtime_contract = .boxy;
+    const dynamic = try f.layouts.dynamicLayout();
+    const desc = try f.store.addLocal(.{ .layout_idx = .opaque_ptr });
+    const closed_desc = try f.store.addLocal(.{ .layout_idx = .opaque_ptr });
+    const open_desc = try f.store.addLocal(.{ .layout_idx = .opaque_ptr });
+    const product = try f.store.addStmtRow(LIR.ProductShape, .{
+        .layouts = try f.store.addU32Span(&.{ @backingInt(layout.Idx.u64), @backingInt(dynamic) }),
+        .slots = try f.store.addU32Span(&.{ 0, 0, 1 }),
+        .descriptors = try f.store.addLocalSpan(&.{ closed_desc, open_desc }),
+    });
+    const value = try f.store.addLocal(.{ .layout_idx = dynamic, .dyn = .{ .desc = desc, .storage = .param }, .product = product });
+    const t = try f.local();
+    const field = try f.local();
+    // t = seed(); field = value[0]; ret field
+    const ret = try f.stmt(.{ .ret = .{ .value = field } });
+    const read = try f.stmt(.{ .assign_ref = .{ .target = field, .op = LIR.RefOp.field(value, 0), .next = ret } });
+    const call_id = try f.call(t, f.seed, read);
+    const p = try f.addProc(&.{ desc, open_desc, value }, call_id);
+
+    var sites = try analyze(testing.allocator, &f.store, &f.layouts, p);
+    defer sites.deinit();
+    try testing.expectEqual(@as(usize, 1), sites.sites.len);
+    try expectLive(&.{ desc, open_desc, value }, sites.sites[0]);
 }

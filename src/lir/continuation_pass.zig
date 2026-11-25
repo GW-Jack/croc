@@ -158,7 +158,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
             // Implements It First").
             .erased_callable => std.debug.panic("not yet implemented: an erased callable outside every class that may suspend", .{}),
         }
-        var sites = try ContinuationSites.analyze(allocator, store, proc_id);
+        var sites = try ContinuationSites.analyze(allocator, store, layouts, proc_id);
         errdefer sites.deinit();
         try plans.append(allocator, .{ .proc = proc_id, .sites = sites, .task = undefined });
     }
@@ -310,7 +310,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
     }
 
     try SuspensionMarks.run(allocator, store, roots.mode);
-    if (builtin.mode == .debug) try verify(allocator, store);
+    if (builtin.mode == .debug) try verify(allocator, store, layouts);
 }
 
 /// Pass the task that is running to what needs one in code that holds none: a
@@ -1702,7 +1702,7 @@ fn buildContinuation(
 /// procedure declares one join identity in two statements, which a
 /// continuation's copies of its enclosing joins could. Paths that share a
 /// tail, such as a loop's `break` and its normal end, reach one declaration.
-fn verify(allocator: Allocator, store: *const LirStore) Allocator.Error!void {
+fn verify(allocator: Allocator, store: *const LirStore, layouts: *const layout.Store) Allocator.Error!void {
     var continuations = try std.DynamicBitSetUnmanaged.initEmpty(allocator, store.procSpecCount());
     defer continuations.deinit(allocator);
     {
@@ -1736,7 +1736,7 @@ fn verify(allocator: Allocator, store: *const LirStore) Allocator.Error!void {
         const proc_id: ProcId = @fromBackingInt(@intCast(index));
         const proc = store.getProcSpecImmediate(proc_id);
         if (proc.body.get() == null or proc.suspends == .never) continue;
-        var sites = try ContinuationSites.analyze(allocator, store, proc_id);
+        var sites = try ContinuationSites.analyze(allocator, store, layouts, proc_id);
         defer sites.deinit();
         for (sites.sites) |site| {
             const stmt = SiteStmt.at(store, site.call);
@@ -2640,7 +2640,7 @@ fn verifyRecordMissingAValue() Allocator.Error!void {
     data.saved = .empty();
     const dropped = try f.store.addStmtRow(LIR.SuspendSaveData, data);
     f.store.getCFStmtPtr(edge).suspend_save.data = dropped;
-    try verify(testing.allocator, &f.store);
+    try verify(testing.allocator, &f.store, &f.layouts);
 }
 
 test "a provides root that may suspend is started as a task by an entry that takes its place" {

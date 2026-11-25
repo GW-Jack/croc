@@ -33953,7 +33953,9 @@ it makes:
   `desc`'s size and alignment.
 
 A local's descriptor is live wherever the local is, so a record holds the
-descriptors of what it saves. A procedure's result descriptor is live at every
+descriptors of what it saves. So are its product's descriptors of dynamic
+fields. Those of fields with a committed layout are read by nothing, and their
+definitions may have been deleted as dead. A procedure's result descriptor is live at every
 site that is not a tail site. The resume entry of a procedure with a dynamic
 result is an `erased_record` procedure, and writes its result through the
 descriptor. ARC classes `save`, `restore` and `take` as it does `adapt`.
