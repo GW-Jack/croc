@@ -36620,6 +36620,14 @@ entry costs 446 ns in a loop of one, where it pays for the running set alone,
 254 ns in a loop of 4, 222 ns of 16 and 205 ns of 64. A spawned entry costs
 247 ns, and the same call made in order 14 ns.
 
+**Measuring shared state.** `bench_shared.roc` times updates of one piece of
+state. With the same setup on the reference Tasks platform, a `get!` costs
+1.2 ns, a `modify!` or an `update!` of a `U64` 1.9 ns, and a `modify!` that
+appends to a list 4.8 ns. A pause costs 18.5 ns, and one with a `modify!` after
+it 20 ns. Two tasks that wait for each other at every update cost 56 ns per
+update. State that can't hold a handle to itself is not tracked, and costs the
+same with the compiler before tracking.
+
 A last-in, first-out buffer does not fit how records are released. One
 suspension pushes its records innermost first, and the resume reverses
 them so the innermost runs first. So within one suspension, records are
