@@ -1,6 +1,7 @@
 ## A glue script for generating a Rust source file with hosted function bindings.
 app [make_glue] { pf: platform glue }
 
+import pf.ConcurrencyMode
 import pf.Types
 import pf.File
 import pf.RecordFieldInfo
@@ -26,11 +27,7 @@ make_glue : List(Types) -> Try(List(File), Str)
 make_glue = |types_list| {
 	input = GlueInput.from_types(types_list)
 	type_table = TypeTable.from_list(input.types)
-	tasks = match input.concurrency {
-		Tasks => Bool.True
-		NoConcurrency => Bool.False
-	}
-	rust_content = generate_rust_file(input.hosted_functions, type_table, input.provides_entries, tasks)
+	rust_content = generate_rust_file(input.hosted_functions, type_table, input.provides_entries, input.concurrency)
 
 	Ok([{ name: "roc_platform_abi.rs", content: rust_content }])
 }
@@ -883,8 +880,13 @@ generate_payload_struct_decl_rust = |doc, struct_name, type_table, duplicate_nam
 # =============================================================================
 
 ## Generate the complete Rust source file
-generate_rust_file : List(HostedFunctionInfo), TypeTable, List(ProvidesEntry), Bool -> Str
-generate_rust_file = |hosted_functions, type_table, provides_list, tasks| {
+generate_rust_file : List(HostedFunctionInfo), TypeTable, List(ProvidesEntry), ConcurrencyMode -> Str
+generate_rust_file = |hosted_functions, type_table, provides_list, concurrency| {
+	tasks = match concurrency {
+		Tasks => Bool.True
+		ParallelTasks => Bool.True
+		NoConcurrency => Bool.False
+	}
 	duplicate_names = duplicate_type_names(type_table)
 	preferred_names = preferred_type_names_rust(hosted_functions, provides_list, type_table, duplicate_names)
 
@@ -912,7 +914,7 @@ generate_rust_file = |hosted_functions, type_table, provides_list, tasks| {
 		.concat("\n")
 		.concat(generate_runtime_symbol_externs_rust)
 		.concat("\n")
-		.concat(if tasks { generate_task_symbol_externs_rust.concat("\n") } else { "" })
+		.concat(generate_task_symbol_externs_rust(concurrency))
 		.concat(generate_hosted_symbol_externs_rust(hosted_functions, type_table, duplicate_names, preferred_names, tasks))
 		.concat("\n")
 		.concat(generate_host_helpers_rust)
@@ -3067,12 +3069,32 @@ generate_runtime_symbol_externs_rust =
 	\\}
 	\\
 
-## A `Tasks` platform's task ABI (design.md "Host Contract", "Glue").
-generate_task_symbol_externs_rust : Str
-generate_task_symbol_externs_rust =
+## The task ABI of a platform whose mode has tasks (design.md "Host Contract",
+## "Glue").
+generate_task_symbol_externs_rust : ConcurrencyMode -> Str
+generate_task_symbol_externs_rust = |concurrency|
+	match concurrency {
+		NoConcurrency => ""
+		Tasks => generate_shared_task_symbol_externs_rust.concat("\n")
+		ParallelTasks => generate_shared_task_symbol_externs_rust.concat(generate_parallel_task_symbol_externs_rust).concat("\n")
+	}
+
+generate_parallel_task_symbol_externs_rust : Str
+generate_parallel_task_symbol_externs_rust =
+	\\
+	\\#[allow(improper_ctypes)]
+	\\unsafe extern "C" {
+	\\    // The host defines this. It returns the address of the calling thread's running task, a
+	\\    // pointer that is null when the thread starts.
+	\\    pub fn roc_task_thread_slot() -> *mut *mut RocTask;
+	\\}
+	\\
+
+generate_shared_task_symbol_externs_rust : Str
+generate_shared_task_symbol_externs_rust =
 	\\// Tasks
 	\\//
-	\\// The platform declares `concurrency: Tasks`. A provided procedure returns its task, and a
+	\\// The platform's concurrency mode has tasks. A provided procedure returns its task, and a
 	\\// suspending hosted function returns `RocPoll::Pending` when it finishes later: the host then
 	\\// writes its result once and calls `roc_task_wake` once.
 	\\

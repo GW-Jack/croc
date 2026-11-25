@@ -2131,6 +2131,13 @@ const wasm_static_lib_carts = [_]WasmStaticLibCart{
     .{ .app = "release_excess_capacity_static_lib_app.roc", .options = &.{"--opt=speed"}, .output = "release_excess_capacity_speed_static_lib_app.wasm", .run_args = &.{ "--expected", "ok", "--assert-alloc-balanced" } },
 };
 
+/// The platforms whose glue declares the task ABI (design.md "Glue"), one for
+/// each mode with tasks. Each language's lock is in `lock_dir`.
+const glue_task_platforms = [_]struct { name: []const u8, platform_dir: []const u8, lock_dir: []const u8 }{
+    .{ .name = "tasks", .platform_dir = "test/tasks-platform/platform", .lock_dir = "test/glue/tasks-abi" },
+    .{ .name = "parallel-tasks", .platform_dir = "test/parallel-tasks-platform/platform", .lock_dir = "test/glue/parallel-tasks-abi" },
+};
+
 pub fn build(b: *std.Build) void {
     test_fixtures = .{ .b = b };
 
@@ -3018,7 +3025,9 @@ pub fn build(b: *std.Build) void {
         _ = glue_inputs.addCopyDirectory(b.path("test/fx/platform"), "test/fx/platform", .{ .include_extensions = &.{".roc"} });
         _ = glue_inputs.addCopyDirectory(b.path("test/glue/layout-probe"), "test/glue/layout-probe", .{ .include_extensions = &.{".roc"} });
         _ = glue_inputs.addCopyDirectory(b.path("test/glue/tag-union-layouts"), "test/glue/tag-union-layouts", .{ .include_extensions = &.{".roc"} });
-        _ = glue_inputs.addCopyDirectory(b.path("test/tasks-platform/platform"), "test/tasks-platform/platform", .{ .include_extensions = &.{".roc"} });
+        for (glue_task_platforms) |tasks| {
+            _ = glue_inputs.addCopyDirectory(b.path(tasks.platform_dir), tasks.platform_dir, .{ .include_extensions = &.{".roc"} });
+        }
         const glue_root = glue_inputs.getDirectory();
         // Every `roc glue` run here follows `build_roc_step`, for the reason
         // given at `addWasmStaticLibAppBuild`: a run hashes `roc` by its
@@ -3041,16 +3050,15 @@ pub fn build(b: *std.Build) void {
         const zig_union_layouts_dir = run_zig_union_layouts.addOutputDirectoryArg("glue-zig-union-layouts");
         run_zig_union_layouts.addFileArg(glue_root.path(b, "test/glue/tag-union-layouts/main.roc"));
 
-        // A `concurrency: Tasks` platform, whose glue declares the task ABI
-        // (design.md "Glue"). Each language has its own lock in
-        // test/glue/tasks-abi.
-        const tasks_platform = "test/tasks-platform/platform/main.roc";
-        const run_zig_tasks_glue = b.addRunArtifact(roc_exe);
-        run_zig_tasks_glue.step.dependOn(build_roc_step);
-        run_zig_tasks_glue.addArgs(&.{ "glue", "--no-cache" });
-        run_zig_tasks_glue.addFileArg(glue_root.path(b, "src/glue/src/ZigGlue.roc"));
-        const zig_tasks_glue_dir = run_zig_tasks_glue.addOutputDirectoryArg("glue-zig-tasks");
-        run_zig_tasks_glue.addFileArg(glue_root.path(b, tasks_platform));
+        var zig_tasks_glue_dirs: [glue_task_platforms.len]std.Build.LazyPath = undefined;
+        for (glue_task_platforms, &zig_tasks_glue_dirs) |tasks, *dir| {
+            const run_zig_tasks_glue = b.addRunArtifact(roc_exe);
+            run_zig_tasks_glue.step.dependOn(build_roc_step);
+            run_zig_tasks_glue.addArgs(&.{ "glue", "--no-cache" });
+            run_zig_tasks_glue.addFileArg(glue_root.path(b, "src/glue/src/ZigGlue.roc"));
+            dir.* = run_zig_tasks_glue.addOutputDirectoryArg(b.fmt("glue-zig-{s}", .{tasks.name}));
+            run_zig_tasks_glue.addFileArg(glue_root.path(b, b.fmt("{s}/main.roc", .{tasks.platform_dir})));
+        }
 
         const lock_targets = [_]struct { name: []const u8, target: std.Build.ResolvedTarget }{
             .{ .name = "x64_linux", .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }) },
@@ -3089,19 +3097,21 @@ pub fn build(b: *std.Build) void {
             });
             build_check_glue_abi_step.dependOn(&union_lock_obj.step);
 
-            const tasks_lock_obj = b.addObject(.{
-                .name = b.fmt("glue_zig_tasks_abi_{s}", .{lock_target.name}),
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("test/glue/tasks-abi/compile_lock.zig"),
-                    .target = lock_target.target,
-                    .optimize = optimize,
-                }),
-            });
-            tasks_lock_obj.root_module.addImport("builtins", roc_modules.builtins);
-            tasks_lock_obj.root_module.addAnonymousImport("glue_abi", .{
-                .root_source_file = zig_tasks_glue_dir.path(b, "roc_platform_abi.zig"),
-            });
-            build_check_glue_abi_step.dependOn(&tasks_lock_obj.step);
+            for (glue_task_platforms, zig_tasks_glue_dirs) |tasks, dir| {
+                const tasks_lock_obj = b.addObject(.{
+                    .name = b.fmt("glue_zig_{s}_abi_{s}", .{ tasks.name, lock_target.name }),
+                    .root_module = b.createModule(.{
+                        .root_source_file = b.path(b.fmt("{s}/compile_lock.zig", .{tasks.lock_dir})),
+                        .target = lock_target.target,
+                        .optimize = optimize,
+                    }),
+                });
+                tasks_lock_obj.root_module.addImport("builtins", roc_modules.builtins);
+                tasks_lock_obj.root_module.addAnonymousImport("glue_abi", .{
+                    .root_source_file = dir.path(b, "roc_platform_abi.zig"),
+                });
+                build_check_glue_abi_step.dependOn(&tasks_lock_obj.step);
+            }
         }
 
         const run_c_glue_abi = b.addRunArtifact(roc_exe);
@@ -3111,12 +3121,15 @@ pub fn build(b: *std.Build) void {
         const c_glue_abi_dir = run_c_glue_abi.addOutputDirectoryArg("glue-c-abi");
         run_c_glue_abi.addFileArg(glue_root.path(b, "test/glue/layout-probe/main.roc"));
 
-        const run_c_tasks_glue = b.addRunArtifact(roc_exe);
-        run_c_tasks_glue.step.dependOn(build_roc_step);
-        run_c_tasks_glue.addArgs(&.{ "glue", "--no-cache" });
-        run_c_tasks_glue.addFileArg(glue_root.path(b, "src/glue/src/CGlue.roc"));
-        const c_tasks_glue_dir = run_c_tasks_glue.addOutputDirectoryArg("glue-c-tasks");
-        run_c_tasks_glue.addFileArg(glue_root.path(b, tasks_platform));
+        var c_tasks_glue_dirs: [glue_task_platforms.len]std.Build.LazyPath = undefined;
+        for (glue_task_platforms, &c_tasks_glue_dirs) |tasks, *dir| {
+            const run_c_tasks_glue = b.addRunArtifact(roc_exe);
+            run_c_tasks_glue.step.dependOn(build_roc_step);
+            run_c_tasks_glue.addArgs(&.{ "glue", "--no-cache" });
+            run_c_tasks_glue.addFileArg(glue_root.path(b, "src/glue/src/CGlue.roc"));
+            dir.* = run_c_tasks_glue.addOutputDirectoryArg(b.fmt("glue-c-{s}", .{tasks.name}));
+            run_c_tasks_glue.addFileArg(glue_root.path(b, b.fmt("{s}/main.roc", .{tasks.platform_dir})));
+        }
 
         const run_rust_glue_abi = b.addRunArtifact(roc_exe);
         run_rust_glue_abi.step.dependOn(build_roc_step);
@@ -3174,24 +3187,26 @@ pub fn build(b: *std.Build) void {
             _ = compile_c_lock.addOutputFileArg(b.fmt("c-abi-lock-{s}.o", .{lock_target.name}));
             run_check_glue_abi_step.dependOn(&compile_c_lock.step);
 
-            const compile_c_tasks_lock = b.addSystemCommand(&.{
-                "zig",
-                "cc",
-                "-target",
-                lock_target.triple,
-                "-std=c11",
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-                "-c",
-            });
-            if (lock_target.simd128) compile_c_tasks_lock.addArg("-msimd128");
-            compile_c_tasks_lock.addArg("-I");
-            compile_c_tasks_lock.addDirectoryArg(c_tasks_glue_dir);
-            compile_c_tasks_lock.addFileArg(b.path("test/glue/tasks-abi/compile_lock.c"));
-            compile_c_tasks_lock.addArg("-o");
-            _ = compile_c_tasks_lock.addOutputFileArg(b.fmt("c-tasks-abi-lock-{s}.o", .{lock_target.name}));
-            run_check_glue_abi_step.dependOn(&compile_c_tasks_lock.step);
+            for (glue_task_platforms, c_tasks_glue_dirs) |tasks, dir| {
+                const compile_c_tasks_lock = b.addSystemCommand(&.{
+                    "zig",
+                    "cc",
+                    "-target",
+                    lock_target.triple,
+                    "-std=c11",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-c",
+                });
+                if (lock_target.simd128) compile_c_tasks_lock.addArg("-msimd128");
+                compile_c_tasks_lock.addArg("-I");
+                compile_c_tasks_lock.addDirectoryArg(dir);
+                compile_c_tasks_lock.addFileArg(b.path(b.fmt("{s}/compile_lock.c", .{tasks.lock_dir})));
+                compile_c_tasks_lock.addArg("-o");
+                _ = compile_c_tasks_lock.addOutputFileArg(b.fmt("c-{s}-abi-lock-{s}.o", .{ tasks.name, lock_target.name }));
+                run_check_glue_abi_step.dependOn(&compile_c_tasks_lock.step);
+            }
         }
 
         const run_rust_union_layouts = b.addRunArtifact(roc_exe);
@@ -3205,16 +3220,19 @@ pub fn build(b: *std.Build) void {
         _ = rust_union_lock_files.addCopyFile(rust_union_layouts_dir.path(b, "roc_platform_abi.rs"), "roc_platform_abi.rs");
         const rust_union_lock_source = rust_union_lock_files.addCopyFile(b.path("test/glue/tag-union-layouts/compile_lock.rs"), "compile_lock.rs");
 
-        const run_rust_tasks_glue = b.addRunArtifact(roc_exe);
-        run_rust_tasks_glue.step.dependOn(build_roc_step);
-        run_rust_tasks_glue.addArgs(&.{ "glue", "--no-cache" });
-        run_rust_tasks_glue.addFileArg(glue_root.path(b, "src/glue/src/RustGlue.roc"));
-        const rust_tasks_glue_dir = run_rust_tasks_glue.addOutputDirectoryArg("glue-rust-tasks");
-        run_rust_tasks_glue.addFileArg(glue_root.path(b, tasks_platform));
+        var rust_tasks_lock_sources: [glue_task_platforms.len]std.Build.LazyPath = undefined;
+        for (glue_task_platforms, &rust_tasks_lock_sources) |tasks, *source| {
+            const run_rust_tasks_glue = b.addRunArtifact(roc_exe);
+            run_rust_tasks_glue.step.dependOn(build_roc_step);
+            run_rust_tasks_glue.addArgs(&.{ "glue", "--no-cache" });
+            run_rust_tasks_glue.addFileArg(glue_root.path(b, "src/glue/src/RustGlue.roc"));
+            const rust_tasks_glue_dir = run_rust_tasks_glue.addOutputDirectoryArg(b.fmt("glue-rust-{s}", .{tasks.name}));
+            run_rust_tasks_glue.addFileArg(glue_root.path(b, b.fmt("{s}/main.roc", .{tasks.platform_dir})));
 
-        const rust_tasks_lock_files = b.addWriteFiles();
-        _ = rust_tasks_lock_files.addCopyFile(rust_tasks_glue_dir.path(b, "roc_platform_abi.rs"), "roc_platform_abi.rs");
-        const rust_tasks_lock_source = rust_tasks_lock_files.addCopyFile(b.path("test/glue/tasks-abi/compile_lock.rs"), "compile_lock.rs");
+            const rust_tasks_lock_files = b.addWriteFiles();
+            _ = rust_tasks_lock_files.addCopyFile(rust_tasks_glue_dir.path(b, "roc_platform_abi.rs"), "roc_platform_abi.rs");
+            source.* = rust_tasks_lock_files.addCopyFile(b.path(b.fmt("{s}/compile_lock.rs", .{tasks.lock_dir})), "compile_lock.rs");
+        }
 
         const native_arch = target.result.cpu.arch;
         const native_rust_target: ?[]const u8 = switch (roc_target.classifyOs(target.result.os.tag)) {
@@ -3264,23 +3282,25 @@ pub fn build(b: *std.Build) void {
             _ = compile_rust_union_lock.addOutputFileArg(b.fmt("rust-union-layouts-{s}.rmeta", .{lock_target.name}));
             run_check_glue_abi_step.dependOn(&compile_rust_union_lock.step);
 
-            const compile_rust_tasks_lock = b.addSystemCommand(&.{
-                "rustc",
-                "--edition=2021",
-                "-D",
-                "warnings",
-                "--crate-type=lib",
-                "--emit=metadata",
-                "--cfg",
-                "no_roc_std_helpers",
-                "--target",
-                lock_target.triple,
-            });
-            if (lock_target.simd128) compile_rust_tasks_lock.addArgs(&.{ "-C", "target-feature=+simd128" });
-            compile_rust_tasks_lock.addFileArg(rust_tasks_lock_source);
-            compile_rust_tasks_lock.addArg("-o");
-            _ = compile_rust_tasks_lock.addOutputFileArg(b.fmt("rust-tasks-abi-lock-{s}.rmeta", .{lock_target.name}));
-            run_check_glue_abi_step.dependOn(&compile_rust_tasks_lock.step);
+            for (glue_task_platforms, rust_tasks_lock_sources) |tasks, source| {
+                const compile_rust_tasks_lock = b.addSystemCommand(&.{
+                    "rustc",
+                    "--edition=2021",
+                    "-D",
+                    "warnings",
+                    "--crate-type=lib",
+                    "--emit=metadata",
+                    "--cfg",
+                    "no_roc_std_helpers",
+                    "--target",
+                    lock_target.triple,
+                });
+                if (lock_target.simd128) compile_rust_tasks_lock.addArgs(&.{ "-C", "target-feature=+simd128" });
+                compile_rust_tasks_lock.addFileArg(source);
+                compile_rust_tasks_lock.addArg("-o");
+                _ = compile_rust_tasks_lock.addOutputFileArg(b.fmt("rust-{s}-abi-lock-{s}.rmeta", .{ tasks.name, lock_target.name }));
+                run_check_glue_abi_step.dependOn(&compile_rust_tasks_lock.step);
+            }
         }
     }
 

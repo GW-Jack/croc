@@ -1,6 +1,7 @@
 ## A glue script for generating a C header file.
 app [make_glue] { pf: platform glue }
 
+import pf.ConcurrencyMode
 import pf.Types
 import pf.File
 import pf.TypeRepr
@@ -23,11 +24,7 @@ make_glue : List(Types) -> Try(List(File), Str)
 make_glue = |types_list| {
 	input = GlueInput.from_types(types_list)
 	type_table = TypeTable.from_list(input.types)
-	tasks = match input.concurrency {
-		Tasks => Bool.True
-		NoConcurrency => Bool.False
-	}
-	header_content = generate_c_header(input.hosted_functions, type_table, input.provides_entries, tasks)
+	header_content = generate_c_header(input.hosted_functions, type_table, input.provides_entries, input.concurrency)
 
 	Ok([{ name: "roc_platform_abi.h", content: header_content }])
 }
@@ -569,8 +566,13 @@ expect name_to_c_field_ident("struct") == "struct_field"
 # Header Generation
 # =============================================================================
 
-generate_c_header : List(HostedFunctionInfo), TypeTable, List(ProvidesEntry), Bool -> Str
-generate_c_header = |hosted_functions, type_table, provides_list, tasks| {
+generate_c_header : List(HostedFunctionInfo), TypeTable, List(ProvidesEntry), ConcurrencyMode -> Str
+generate_c_header = |hosted_functions, type_table, provides_list, concurrency| {
+	tasks = match concurrency {
+		Tasks => Bool.True
+		ParallelTasks => Bool.True
+		NoConcurrency => Bool.False
+	}
 	duplicate_records = duplicate_record_names(type_table)
 	duplicate_tags = duplicate_tag_union_names(type_table)
 	preferred_names = preferred_type_names_c(hosted_functions, provides_list, type_table, duplicate_records, duplicate_tags)
@@ -598,7 +600,7 @@ generate_c_header = |hosted_functions, type_table, provides_list, tasks| {
 		.concat(args_structs)
 		.concat("\n")
 		.concat(runtime_symbol_decls)
-		.concat(if tasks { task_symbol_decls } else { "" })
+		.concat(task_symbol_decls(concurrency))
 		.concat(hosted_symbol_decls)
 		.concat(provided_symbol_decls)
 		.concat(hosted_functions_registry(hosted_fn_fields))
@@ -1148,13 +1150,28 @@ runtime_symbol_decls =
 		"/* The host defines these linker symbols. Compiled Roc code calls them directly. */\n\n#if defined(__GNUC__) || defined(__clang__)\n#define ROC_RETURNS_NONNULL __attribute__((returns_nonnull))\n#else\n#define ROC_RETURNS_NONNULL\n#endif\n\n/* Returns `length` bytes aligned to `alignment`. Never returns NULL: Roc writes through\n   the result without checking it, so a host that cannot allocate must stop the Roc\n   program and not return, exactly as roc_crashed does. */\nROC_RETURNS_NONNULL void* roc_alloc(size_t length, size_t alignment);\nvoid roc_dealloc(void* ptr, size_t alignment);\n/* Never returns NULL, under the same rule as roc_alloc. */\nROC_RETURNS_NONNULL void* roc_realloc(void* ptr, size_t new_length, size_t alignment);\nvoid roc_dbg(const uint8_t* bytes, size_t len);\nvoid roc_expect_failed(const uint8_t* bytes, size_t len);\nvoid roc_crashed(const uint8_t* bytes, size_t len);\n",
 	)
 
-## Declarations for a `Tasks` platform's task ABI (design.md "Host Contract",
-## "Glue").
-task_symbol_decls : Str
-task_symbol_decls =
+## Declarations for the task ABI of a platform whose mode has tasks (design.md
+## "Host Contract", "Glue").
+task_symbol_decls : ConcurrencyMode -> Str
+task_symbol_decls = |concurrency|
+	match concurrency {
+		NoConcurrency => ""
+		Tasks => shared_task_symbol_decls
+		ParallelTasks => shared_task_symbol_decls.concat(parallel_task_symbol_decls)
+	}
+
+parallel_task_symbol_decls : Str
+parallel_task_symbol_decls =
+	section(
+		"Parallel Tasks",
+		"/* The host defines this. It returns the address of the calling thread's running task, a\n   pointer that is null when the thread starts. */\nRocTask** roc_task_thread_slot(void);\n",
+	)
+
+shared_task_symbol_decls : Str
+shared_task_symbol_decls =
 	section(
 		"Tasks",
-		"/* The platform declares `concurrency: Tasks`. A provided procedure returns its task, and a\n   suspending hosted function returns ROC_PENDING when it finishes later: the host then writes\n   its result once and calls roc_task_wake once. */\n\ntypedef struct RocTask RocTask;\n\ntypedef enum { ROC_READY = 0, ROC_PENDING = 1 } RocPoll;\n\ntypedef enum {\n    ROC_TASK_PENDING = 0,\n    ROC_TASK_DONE = 1,\n    ROC_TASK_CANCELLED = 2,\n    ROC_TASK_CRASHED = 3\n} RocTaskStatus;\n\nROC_STATIC_ASSERT(sizeof(RocPoll) == 4, \"RocPoll must be 32 bits\");\nROC_STATIC_ASSERT(sizeof(RocTaskStatus) == 4, \"RocTaskStatus must be 32 bits\");\n\n/* The program defines these. */\nRocTaskStatus roc_task_resume(RocTask* task);\nvoid roc_task_wake(RocTask* task);\nvoid roc_task_cancel(RocTask* task);\nvoid roc_task_free(RocTask* task);\nconst uint8_t* roc_task_crash_message(RocTask* task, size_t* len);\n\n/* The host defines these. */\nvoid roc_task_ready(RocTask* task);\nvoid roc_task_abort(RocTask* task);\n",
+		"/* The platform's concurrency mode has tasks. A provided procedure returns its task, and a\n   suspending hosted function returns ROC_PENDING when it finishes later: the host then writes\n   its result once and calls roc_task_wake once. */\n\ntypedef struct RocTask RocTask;\n\ntypedef enum { ROC_READY = 0, ROC_PENDING = 1 } RocPoll;\n\ntypedef enum {\n    ROC_TASK_PENDING = 0,\n    ROC_TASK_DONE = 1,\n    ROC_TASK_CANCELLED = 2,\n    ROC_TASK_CRASHED = 3\n} RocTaskStatus;\n\nROC_STATIC_ASSERT(sizeof(RocPoll) == 4, \"RocPoll must be 32 bits\");\nROC_STATIC_ASSERT(sizeof(RocTaskStatus) == 4, \"RocTaskStatus must be 32 bits\");\n\n/* The program defines these. */\nRocTaskStatus roc_task_resume(RocTask* task);\nvoid roc_task_wake(RocTask* task);\nvoid roc_task_cancel(RocTask* task);\nvoid roc_task_free(RocTask* task);\nconst uint8_t* roc_task_crash_message(RocTask* task, size_t* len);\n\n/* The host defines these. */\nvoid roc_task_ready(RocTask* task);\nvoid roc_task_abort(RocTask* task);\n",
 	)
 
 ## The C type of a pointer to a value of `type_id`: `void*` when the type has

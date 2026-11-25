@@ -4412,7 +4412,7 @@ fn constructTypesRocList(
     writer.writeTagDiscriminant(concurrency_slot.ptr, concurrency_slot.layout_idx, switch (concurrency) {
         .none => writer.tagIndex("ConcurrencyMode", "NoConcurrency"),
         .tasks => writer.tagIndex("ConcurrencyMode", "Tasks"),
-        .parallel_tasks => unreachable, // checking rejects ParallelTasks as not implemented (Can.setPlatformConcurrencyMode)
+        .parallel_tasks => writer.tagIndex("ConcurrencyMode", "ParallelTasks"),
     });
     writer.writeField(types_base, allocated.elem_layout, "Types", "modules", RocList, buildRocList(writer, collected_modules, modules_slot.layout_idx, writeModuleTypeInfo));
     writer.writeField(types_base, allocated.elem_layout, "Types", "provides_entries", RocList, buildRocList(writer, provides_entries, provides_slot.layout_idx, writeProvidesEntry));
@@ -5271,7 +5271,7 @@ const GlueProtocolLock = struct {
                 .{ .name = "concurrency", .type = .concurrency_mode },         .{ .name = "modules", .type = .list_module_info },
                 .{ .name = "provides_entries", .type = .list_provides_entry }, .{ .name = "types", .type = .list_type_info },
             }),
-            .concurrency_mode => try self.tagUnion(idx, "ConcurrencyMode", &.{ .{ .name = "NoConcurrency", .type = .unit }, .{ .name = "Tasks", .type = .unit } }),
+            .concurrency_mode => try self.tagUnion(idx, "ConcurrencyMode", &.{ .{ .name = "NoConcurrency", .type = .unit }, .{ .name = "ParallelTasks", .type = .unit }, .{ .name = "Tasks", .type = .unit } }),
             .provides_entry => try self.record(idx, "ProvidesEntry", &.{ .{ .name = "exported", .type = .provided_export }, .{ .name = "ffi_symbol", .type = .str_ }, .{ .name = "name", .type = .str_ } }),
             .provided_export => try self.tagUnion(idx, "ProvidedExport", &.{ .{ .name = "ProvidedData", .type = .u64_ }, .{ .name = "ProvidedProcedure", .type = .function_signature } }),
             .function_signature => try self.record(idx, "FunctionSignature", &.{ .{ .name = "args", .type = .list_u64 }, .{ .name = "ret", .type = .u64_ } }),
@@ -5386,7 +5386,7 @@ test "glue platform schema lock rejects field rename addition and type mutation"
     const io = std.testing.io;
     const mutations = [_]struct { path: []const u8, source: []const u8 }{
         .{ .path = "Types.roc", .source = "import ConcurrencyMode\nimport ModuleTypeInfo\nimport TypeInfo\nimport ProvidesEntry\nTypes := { concurrency : ConcurrencyMode, modules : List(ModuleTypeInfo), provides_entries : List(ProvidesEntry), types : List(TypeInfo), added : U64 }" },
-        .{ .path = "ConcurrencyMode.roc", .source = "ConcurrencyMode := [NoConcurrency, Tasks, ParallelTasks]" },
+        .{ .path = "ConcurrencyMode.roc", .source = "ConcurrencyMode := [NoConcurrency, Tasks]" },
         .{ .path = "HostedFunctionInfo.roc", .source = "import RecordFieldInfo\nHostedFunctionInfo := { arg_fields : List(RecordFieldInfo), arg_type_ids : List(U64), ffi_symbol : Str, index : U64, name : Str, ret_fields : List(RecordFieldInfo), ret_type_id : U64, suspending : U64, type_str : Str }" },
         .{ .path = "ProvidesEntry.roc", .source = "import ProvidedExport\nProvidesEntry := { exported : ProvidedExport, ffi_symbol : Str, name : Str, type_id : U64 }" },
         .{ .path = "ProvidedExport.roc", .source = "import FunctionSignature\nProvidedExport := [ProvidedData(U32), ProvidedProcedure(FunctionSignature)]" },

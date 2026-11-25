@@ -25,6 +25,8 @@ comptime {
     lockRuntimeCalls();
     lockHostedShapes();
     lockProvidedShape();
+    if (@hasDecl(abi, shim_symbols.roc_task_thread_slot))
+        @compileError("generated glue for a Tasks platform declares a thread slot");
 }
 
 /// `Generated` is a 32-bit C enum with exactly `Canonical`'s tags, in order

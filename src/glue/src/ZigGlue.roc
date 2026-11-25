@@ -1,6 +1,7 @@
 ## A glue script for generating a Zig source file with hosted function bindings.
 app [make_glue] { pf: platform glue }
 
+import pf.ConcurrencyMode
 import pf.Types
 import pf.File
 import pf.RecordFieldInfo
@@ -26,11 +27,7 @@ make_glue : List(Types) -> Try(List(File), Str)
 make_glue = |types_list| {
 	input = GlueInput.from_types(types_list)
 	type_table = TypeTable.from_list(input.types)
-	tasks = match input.concurrency {
-		Tasks => Bool.True
-		NoConcurrency => Bool.False
-	}
-	zig_content = generate_zig_file(input.hosted_functions, type_table, input.provides_entries, tasks)
+	zig_content = generate_zig_file(input.hosted_functions, type_table, input.provides_entries, input.concurrency)
 
 	Ok([{ name: "roc_platform_abi.zig", content: zig_content }])
 }
@@ -1945,8 +1942,13 @@ expect lowercase_first("") == ""
 # =============================================================================
 
 ## Generate the complete Zig source file
-generate_zig_file : List(HostedFunctionInfo), TypeTable, List(ProvidesEntry), Bool -> Str
-generate_zig_file = |hosted_functions, type_table, provides_list, tasks| {
+generate_zig_file : List(HostedFunctionInfo), TypeTable, List(ProvidesEntry), ConcurrencyMode -> Str
+generate_zig_file = |hosted_functions, type_table, provides_list, concurrency| {
+	tasks = match concurrency {
+		Tasks => Bool.True
+		ParallelTasks => Bool.True
+		NoConcurrency => Bool.False
+	}
 	duplicate_names = duplicate_type_names(type_table)
 	preferred_names = preferred_type_names_zig(hosted_functions, provides_list, type_table, duplicate_names)
 
@@ -1979,7 +1981,7 @@ generate_zig_file = |hosted_functions, type_table, provides_list, tasks| {
 		.concat("\n")
 		.concat(generate_runtime_symbol_externs)
 		.concat("\n")
-		.concat(if tasks { generate_task_symbol_externs.concat("\n") } else { "" })
+		.concat(generate_task_symbol_externs(concurrency))
 		.concat(generate_hosted_symbol_externs(hosted_functions, type_table, duplicate_names, preferred_names, tasks))
 		.concat("\n")
 		.concat(generate_host_helpers)
@@ -2517,12 +2519,29 @@ generate_runtime_symbol_externs =
 	\\pub extern fn roc_crashed(bytes: [*]const u8, len: usize) callconv(.c) void;
 	\\
 
-## A `Tasks` platform's task ABI (design.md "Host Contract", "Glue").
-generate_task_symbol_externs : Str
-generate_task_symbol_externs =
+## The task ABI of a platform whose mode has tasks (design.md "Host Contract",
+## "Glue").
+generate_task_symbol_externs : ConcurrencyMode -> Str
+generate_task_symbol_externs = |concurrency|
+	match concurrency {
+		NoConcurrency => ""
+		Tasks => generate_shared_task_symbol_externs.concat("\n")
+		ParallelTasks => generate_shared_task_symbol_externs.concat(generate_parallel_task_symbol_externs).concat("\n")
+	}
+
+generate_parallel_task_symbol_externs : Str
+generate_parallel_task_symbol_externs =
+	\\
+	\\// The host defines this. It returns the address of the calling thread's running task, a
+	\\// pointer that is null when the thread starts.
+	\\pub extern fn roc_task_thread_slot() callconv(.c) *?*RocTask;
+	\\
+
+generate_shared_task_symbol_externs : Str
+generate_shared_task_symbol_externs =
 	\\// Tasks
 	\\//
-	\\// The platform declares `concurrency: Tasks`. A provided procedure returns its task, and a
+	\\// The platform's concurrency mode has tasks. A provided procedure returns its task, and a
 	\\// suspending hosted function returns `.pending` when it finishes later: the host then
 	\\// writes its result once and calls `roc_task_wake` once.
 	\\

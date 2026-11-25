@@ -35121,9 +35121,9 @@ host of a mode with tasks must define both, and a `ParallelTasks` host
 
 **Glue.** Glue's input carries the platform's mode and each hosted
 function's marker, both from checking, never from a type's shape:
-`Types.concurrency` is `NoConcurrency` or `Tasks`, from the platform
-header, and `HostedFunctionInfo.suspending` is the declaration's
-`suspending` marker. For a `Tasks` platform, every template:
+`Types.concurrency` is `NoConcurrency`, `Tasks` or `ParallelTasks`, from the
+platform header, and `HostedFunctionInfo.suspending` is the declaration's
+`suspending` marker. For a platform whose mode has tasks, every template:
 
 - declares `RocTask` as a handle the host never looks inside;
 - declares `RocPoll` (`ROC_READY` 0, `ROC_PENDING` 1) and `RocTaskStatus`
@@ -35137,13 +35137,16 @@ header, and `HostedFunctionInfo.suspending` is the declaration's
   unchanged;
 - declares the program's `roc_task_resume`, `roc_task_wake`,
   `roc_task_cancel`, `roc_task_free` and `roc_task_crash_message`, and the
-  host's `roc_task_ready` and `roc_task_abort`.
+  host's `roc_task_ready` and `roc_task_abort`;
+- for a `ParallelTasks` platform, declares the host's `roc_task_thread_slot`
+  (Parallel Resumes), returning a pointer to a `RocTask *`.
 
 A hosted function without the marker is declared as in a platform of any
-other mode. A platform of another mode gets none of this, so its glue is
-unchanged. The glue ABI locks compile each language's bindings for a
-`Tasks` platform on that language's lock targets, and the Zig lock checks
-the declared values and signatures against the runtime's own definitions.
+other mode. A platform without tasks gets none of this, so its glue is
+unchanged. The glue ABI locks compile each language's bindings for a `Tasks`
+platform and a `ParallelTasks` one on that language's lock targets, and the
+Zig locks check the declared values and signatures against the runtime's own
+definitions.
 
 A host keeps these obligations. Breaking one is undefined behavior, like a
 `roc_alloc` that returns null; the conformance harness (The Task Runtime)
@@ -35611,7 +35614,7 @@ its target is known. So the host keeps one pointer per thread, null when the
 thread starts, and returns its address:
 
 ```c
-void **roc_task_thread_slot(void);   /* host, ParallelTasks only */
+RocTask **roc_task_thread_slot(void);   /* host, ParallelTasks only */
 ```
 
 The resume hands the function to the runtime, as it does `roc_task_ready`.

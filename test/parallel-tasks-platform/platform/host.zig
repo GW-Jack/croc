@@ -245,7 +245,7 @@ fn taskReady(task: *RocTask) callconv(.c) void {
     g_ready.push(task);
 }
 
-/// `void **roc_task_thread_slot(void)`.
+/// `RocTask **roc_task_thread_slot(void)`.
 fn taskThreadSlot() callconv(.c) *?*RocTask {
     return &thread_task;
 }
