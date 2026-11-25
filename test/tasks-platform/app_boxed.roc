@@ -48,6 +48,48 @@ later = |name| Box.box(
 	},
 )
 
+# The same with a helper that pauses between its call and the box it returns,
+# and one that only computes.
+by_hand! : Str, U64, U64 => Box((U64 => Str))
+by_hand! = |name, millis, depth| {
+	Sleep.millis!(millis)
+	if (depth == 0) {
+		Box.box(
+			|n| {
+				Sleep.millis!(n)
+				"${name}by hand ${(millis + n).to_str()}"
+			},
+		)
+	} else {
+		Stdout.line!("down to ${depth.to_str()}")
+		by_hand!(name, millis, depth - 1)
+	}
+}
+
+by_rule : Str, U64, U64 -> Box((U64 => Str))
+by_rule = |name, millis, depth|
+	if (depth == 0)
+		Box.box(
+			|n| {
+				Sleep.millis!(n)
+				"${name}by rule ${(millis + n).to_str()}"
+			},
+		)
+	else
+		by_rule("${name}.", millis, depth - 1)
+
+helped : Bool, Str -> Box((U64 => Box((U64 => Str))))
+helped = |hand, name|
+	if (hand)
+		Box.box(|millis| by_hand!(name, millis, 2))
+	else
+		Box.box(
+			|millis| {
+				Sleep.millis!(millis)
+				by_rule(name, millis, 2)
+			},
+		)
+
 # Constants that hold boxed effectful functions.
 pause : Box((U64 => U64))
 pause = Box.box(
@@ -105,6 +147,15 @@ main! = || {
 	outer! = Box.unbox(later("a name too long to be a small string "))
 	inner! = Box.unbox(outer!(2))
 	Stdout.line!(inner!("and a suffix"))
+
+	for hand in [True, False] {
+		# Called twice, so the first call can't have the box's allocation.
+		make! = Box.unbox(helped(hand, "a name too long to be a small string "))
+		first! = Box.unbox(make!(1))
+		second! = Box.unbox(make!(2))
+		Stdout.line!(first!(1))
+		Stdout.line!(second!(1))
+	}
 
 	wait! = Box.unbox(pause)
 	Stdout.line!("paused ${wait!(3).to_str()}, doubled ${apply_pure(double, 21).to_str()}")

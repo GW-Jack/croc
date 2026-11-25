@@ -34367,6 +34367,14 @@ alone:
 - TRMC does not apply its modulo-cons transformation to such a procedure,
   since its hole pointers are frame addresses (`ptr_alloca`). Plain tail-call
   elimination still applies.
+- No such procedure packs into its reuse input or hands it on (see
+  Destination-Passing Results and Allocation Reuse). The input is null when its
+  caller declined reuse, and a null erased callable is valid only there, never
+  in a record. Right after the marks, `DeclineReuse` takes the input out of
+  each Roc-ABI destination variant that may suspend and the argument out of
+  every call to it. An erased callable that may suspend keeps the input, which
+  its ABI gives it, and reads only its captures through it. A call from either
+  to a destination variant that never suspends passes `erased_reuse_none()`.
 - No value is maybe-uninitialized (`JoinExtra`'s
   `maybe_uninitialized_params`) where it is live across a suspension site.
   Only LIR construction makes one, from a derived record parser's
@@ -34543,9 +34551,8 @@ the marks at its end.
 **Erased procedures.** The pass first splits every erased-callable procedure
 whose class may suspend, whether or not its own body holds a site. The body
 becomes a Roc-ABI procedure of its own. It takes the explicit arguments, then
-the capture record in place of the load that read it, then the reuse argument
-when its body packs a callable into it. The erased procedure keeps its
-identity and its place in every packing, and becomes a *shell*:
+the capture record in place of the load that read it. The erased procedure
+keeps its identity and its place in every packing, and becomes a *shell*:
 
 ```text
 E(args, task, capture, reuse):

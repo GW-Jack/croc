@@ -2747,7 +2747,12 @@ pub const Interpreter = struct {
                         self.conformanceSnapshotResult(obs, value, ret_layout);
                         rc_conformance.endStatement(obs);
                     }
-                    try self.setLocalChecked(frame, current, assign.target, value, assign.op == .box_alloc_zeroed);
+                    if (assign.op == .erased_reuse_none) {
+                        // Null is valid only as the reuse input it is passed as.
+                        frame.setLocal(assign.target, value);
+                    } else {
+                        try self.setLocalChecked(frame, current, assign.target, value, assign.op == .box_alloc_zeroed);
+                    }
                     current = assign.next;
                 },
                 .assign_list => |assign| {
@@ -6812,6 +6817,7 @@ pub const Interpreter = struct {
                 builtins.task.cleanupPop();
                 break :blk Value.zst;
             },
+            .erased_reuse_none => try self.pointerValue(ll.ret_layout, 0),
             .task_current => try self.pointerValue(ll.ret_layout, @intFromPtr(builtins.task.taskCurrent())),
             .cell_new, .cell_exchange => unreachable, // lowering to LIR replaces a cell operation with box and pointer operations
             .group_arrival => try self.pointerValue(ll.ret_layout, @intFromPtr(builtins.task.groupArrival(self.openGroup(args[0], args[1])))),

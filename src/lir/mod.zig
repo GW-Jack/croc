@@ -80,6 +80,9 @@ test "LIR image tests" {
 pub const ImmortalLocals = @import("immortal_locals.zig");
 /// Decides where erased calls left pending by a tail call are run.
 pub const TailDrive = @import("tail_drive.zig");
+/// Keeps reuse inputs out of procedures that may suspend.
+pub const DeclineReuse = @import("decline_reuse.zig");
+/// Commits which procedures may suspend and which calls are suspension sites.
 pub const SuspensionMarks = @import("suspension_marks.zig");
 pub const ContinuationSites = @import("continuation_sites.zig");
 pub const ContinuationPass = @import("continuation_pass.zig");
@@ -177,6 +180,7 @@ test "lir tests" {
     std.testing.refAllDecls(Program);
     std.testing.refAllDecls(ReachableProcs);
     std.testing.refAllDecls(CheckedPipeline);
+    std.testing.refAllDecls(DeclineReuse);
     std.testing.refAllDecls(SuspensionMarks);
     std.testing.refAllDecls(RunningSetPromotion);
     std.testing.refAllDecls(ContinuationSites);

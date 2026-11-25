@@ -14,6 +14,7 @@ const core = @import("lir_core");
 const Arc = @import("arc.zig");
 const ImmortalLocals = @import("immortal_locals.zig");
 const TailDrive = @import("tail_drive.zig");
+const DeclineReuse = @import("decline_reuse.zig");
 const SuspensionMarks = @import("suspension_marks.zig");
 const FrameCallables = @import("frame_callables.zig");
 const ProcPasses = @import("proc_passes.zig");
@@ -2318,6 +2319,7 @@ fn finishLoweredOutput(
     // (design.md "Suspendability"), so the marks are committed first.
     var suspension_marks_scope = PassStepScope.begin(target.timing, .suspension_marks);
     try SuspensionMarks.run(allocator, &lowered.lir_result.store, target.concurrency_mode);
+    try DeclineReuse.run(allocator, &lowered.lir_result.store);
     suspension_marks_scope.end();
     var local_pass_metrics: LirPassParallelMetrics = .{};
     var pass_target = target;

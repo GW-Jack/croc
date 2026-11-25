@@ -139,7 +139,8 @@ pub const MAGIC: u32 = 0x52494c52; // "RLIR" in little-endian bytes.
 ///      `result_need`.
 /// v101: procedure specs record `effect_free`, and dynamic erased calls mark
 ///      suspension sites.
-pub const FORMAT_VERSION: u32 = 101;
+/// v102: the operations include `erased_reuse_none`.
+pub const FORMAT_VERSION: u32 = 102;
 const StaticDataImage = @import("lir_image_static_data.zig").Schema(@This());
 
 /// Public `ImageError` declaration.

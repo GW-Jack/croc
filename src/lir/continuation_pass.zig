@@ -658,45 +658,46 @@ fn splitErased(allocator: Allocator, store: *LirStore, layouts: *layout.Store) A
     return shells;
 }
 
-/// What an erased-callable procedure's body does with its hidden arguments.
-const HiddenUses = struct {
-    /// The `erased_capture_load` of its capture record, when it has one.
-    load: ?CFStmtId = null,
-    /// Whether anything but the load reads the reuse argument.
-    reuse: bool = false,
+/// The hidden arguments a statement reads.
+const HiddenReads = struct {
+    capture: LocalId,
+    reuse: LocalId,
+    reads_capture: bool = false,
+    reads_reuse: bool = false,
 
-    const Reads = struct { capture: LocalId, reuse: LocalId, reads_capture: bool = false, reads_reuse: bool = false };
-
-    fn note(reads: *Reads, local: LocalId) void {
-        if (local == reads.capture) reads.reads_capture = true;
-        if (local == reads.reuse) reads.reads_reuse = true;
-    }
-
-    fn of(allocator: Allocator, store: *const LirStore, body: CFStmtId, capture: LocalId, reuse: LocalId) Allocator.Error!HiddenUses {
-        var uses = HiddenUses{};
-        var seen = try std.DynamicBitSetUnmanaged.initEmpty(allocator, store.cfStmtCount());
-        defer seen.deinit(allocator);
-        var work = std.ArrayList(CFStmtId).empty;
-        defer work.deinit(allocator);
-        try work.append(allocator, body);
-        while (work.pop()) |stmt_id| {
-            if (seen.isSet(@backingInt(stmt_id))) continue;
-            seen.set(@backingInt(stmt_id));
-            const stmt = store.getCFStmtImmediate(stmt_id).*;
-            var reads = Reads{ .capture = capture, .reuse = reuse };
-            body_clone.forEachStmtRead(store, stmt, &reads, note);
-            if (stmt == .assign_low_level and stmt.assign_low_level.op == .erased_capture_load) {
-                if (!reads.reads_capture or uses.load != null) invariant("an erased callable does not load its own capture once", .{});
-                uses.load = stmt_id;
-            } else {
-                if (reads.reads_capture) invariant("an erased callable reads its capture pointer outside its capture load", .{});
-                if (reads.reads_reuse) uses.reuse = true;
-            }
-            try body_clone.appendSuccessors(store, &work, stmt_id, allocator);
-        }
-        return uses;
+    fn note(self: *HiddenReads, local: LocalId) void {
+        if (local == self.capture) self.reads_capture = true;
+        if (local == self.reuse) self.reads_reuse = true;
     }
 };
+
+/// The `erased_capture_load` of an erased-callable procedure's capture record,
+/// when it has one. It is the one statement that reads a hidden argument of a
+/// procedure that may suspend, since such a procedure's reuse input is declined
+/// (`DeclineReuse`).
+fn captureLoad(allocator: Allocator, store: *const LirStore, body: CFStmtId, capture: LocalId, reuse: LocalId) Allocator.Error!?CFStmtId {
+    var load: ?CFStmtId = null;
+    var seen = try std.DynamicBitSetUnmanaged.initEmpty(allocator, store.cfStmtCount());
+    defer seen.deinit(allocator);
+    var work = std.ArrayList(CFStmtId).empty;
+    defer work.deinit(allocator);
+    try work.append(allocator, body);
+    while (work.pop()) |stmt_id| {
+        if (seen.isSet(@backingInt(stmt_id))) continue;
+        seen.set(@backingInt(stmt_id));
+        const stmt = store.getCFStmtImmediate(stmt_id).*;
+        var reads = HiddenReads{ .capture = capture, .reuse = reuse };
+        body_clone.forEachStmtRead(store, stmt, &reads, HiddenReads.note);
+        if (stmt == .assign_low_level and stmt.assign_low_level.op == .erased_capture_load) {
+            if (!reads.reads_capture or load != null) invariant("an erased callable does not load its own capture once", .{});
+            load = stmt_id;
+        } else if (reads.reads_capture or reads.reads_reuse) {
+            invariant("an erased callable that may suspend reads a hidden argument outside its capture load", .{});
+        }
+        try body_clone.appendSuccessors(store, &work, stmt_id, allocator);
+    }
+    return load;
+}
 
 fn splitShell(allocator: Allocator, store: *LirStore, layouts: *layout.Store, shell: ProcId) Allocator.Error!void {
     const source = store.getProcSpecImmediate(shell).*;
@@ -704,7 +705,7 @@ fn splitShell(allocator: Allocator, store: *LirStore, layouts: *layout.Store, sh
     const origin = store.stmtOrigin(body);
     const capture = source.erased_capture_arg.get() orelse invariant("an erased callable has no capture argument", .{});
     const reuse = source.erased_reuse_arg.get() orelse invariant("an erased callable has no reuse argument", .{});
-    const uses = try HiddenUses.of(allocator, store, body, capture, reuse);
+    const load = try captureLoad(allocator, store, body, capture, reuse);
     const source_args = try copyLocals(allocator, store, source.args);
     defer allocator.free(source_args);
     if (source_args.len < 2 or source_args[source_args.len - 2] != capture or source_args[source_args.len - 1] != reuse) {
@@ -723,22 +724,21 @@ fn splitShell(allocator: Allocator, store: *LirStore, layouts: *layout.Store, sh
         const frame = try copyLocals(allocator, store, source.frame_locals);
         defer allocator.free(frame);
         for (frame) |local| {
-            if (local == capture or (local == reuse and !uses.reuse)) continue;
+            if (local == capture or local == reuse) continue;
             try inner_frame.append(allocator, local);
         }
     }
-    const record_layout: ?layout.Idx = if (uses.load) |load| store.getLocal(store.getCFStmtImmediate(load).assign_low_level.target).layout_idx else null;
-    if (uses.load) |load_id| {
-        const load = store.getCFStmtImmediate(load_id).assign_low_level;
+    const record_layout: ?layout.Idx = if (load) |load_id| store.getLocal(store.getCFStmtImmediate(load_id).assign_low_level.target).layout_idx else null;
+    if (load) |load_id| {
+        const read = store.getCFStmtImmediate(load_id).assign_low_level;
         const param = try freshLocal(store, &inner_frame, allocator, record_layout.?);
         try inner_args.append(allocator, param);
         try store.replaceCFStmt(load_id, .{ .assign_ref = .{
-            .target = load.target,
+            .target = read.target,
             .op = LIR.RefOp.local(param),
-            .next = load.next,
+            .next = read.next,
         } }, store.stmtOrigin(load_id));
     }
-    if (uses.reuse) try inner_args.append(allocator, reuse);
     std.mem.sort(LocalId, inner_frame.items, {}, localLessThan);
 
     var inner_spec = source;
@@ -770,7 +770,6 @@ fn splitShell(allocator: Allocator, store: *LirStore, layouts: *layout.Store, sh
     try shell_args.appendSlice(allocator, &.{ shell_capture, shell_reuse });
     const record: ?LocalId = if (record_layout) |layout_idx| try freshLocal(store, &frame, allocator, layout_idx) else null;
     if (record) |local| try call_args.append(allocator, local);
-    if (uses.reuse) try call_args.append(allocator, shell_reuse);
     try call_args.append(allocator, task);
     const value = try freshLocal(store, &frame, allocator, source.ret_layout);
 
@@ -1736,6 +1735,7 @@ fn verify(allocator: Allocator, store: *const LirStore, layouts: *const layout.S
         const proc_id: ProcId = @fromBackingInt(@intCast(index));
         const proc = store.getProcSpecImmediate(proc_id);
         if (proc.body.get() == null or proc.suspends == .never) continue;
+        if (proc.abi == .roc and proc.erased_reuse_arg != .none) invariant("a procedure that may suspend takes a reuse input", .{});
         var sites = try ContinuationSites.analyze(allocator, store, layouts, proc_id);
         defer sites.deinit();
         for (sites.sites) |site| {

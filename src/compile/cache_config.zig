@@ -469,7 +469,8 @@ pub const Constants = struct {
     /// 225: `task_current` joins the low-level operations.
     /// 226: recorded running-set helpers include their task forms, and Builtin
     /// has the running-set operations.
-    pub const CACHE_VERSION = 226;
+    /// 227: `erased_reuse_none` joins the low-level operations.
+    pub const CACHE_VERSION = 227;
 };
 
 /// Configuration for the Roc cache system.
