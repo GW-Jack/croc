@@ -1066,8 +1066,11 @@ test "a pausing call may return a tag union, on LLVM" {
 const plan_loop_tasks_path = "test/postcheck/plan_loops_tasks/app.roc";
 const plan_loop_none_path = "test/postcheck/plan_loops_none/app.roc";
 const plan_loop_cases = [_][]const u8{
-    "basic", "limits", "spawn", "background", "break", "return", "try", "nested", "children", "after_break", "supervise",
+    "basic", "limits", "spawn", "background", "break", "return", "try", "nested", "children", "after_break", "supervise", "shared",
 };
+/// The cases that wait on shared state, which run only under the queue
+/// schedule.
+const waiting_cases = [_][]const u8{ "shared_wait", "shared_wait_body" };
 
 /// What a run of one case gave: its result, and the hosted calls it made.
 const CaseOutcome = struct {
@@ -1348,7 +1351,7 @@ fn recordQueueRuns(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.L
 }
 
 fn recordQueue(lowered: *const lir.CheckedPipeline.LoweredProgram) E2eError!void {
-    for (plan_loop_cases) |name| {
+    for (plan_loop_cases ++ waiting_cases) |name| {
         for ([_]task_test_host.Mode{ .ready, .pause }) |mode| {
             const resumes = try recordQueueRun(lowered, name, mode, null);
             var cancel_after: u32 = 0;

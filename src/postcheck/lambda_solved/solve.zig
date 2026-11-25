@@ -3550,6 +3550,8 @@ const Solver = struct {
             .group_spawn,
             .group_cancel,
             .group_free,
+            .cell_wait,
+            .cell_settle,
             => Common.invariantFmt("low-level op {s} reached Lambda Solved", .{@tagName(op)}),
             // No value of these flows from an operand into the result, because
             // their results hold no function: numbers, strings, and byte lists,

@@ -34278,14 +34278,23 @@ continuation pass *promotes* some loops to the task form. Backends see only
 the result and never decide a form.
 
 A loop is *task-form* when the `run_next!` specialization it calls may
-suspend. Otherwise it is *sequential*. `run_next!` calls `run_entry!`, and a
+suspend, or when the procedure that holds it may wait on shared state. Otherwise
+it is *sequential*. `run_next!` calls `run_entry!`, and a
 spawned function joins the entries' list and so goes through the same
-`run_entry!`, so this holds exactly when an entry or a spawned function may
+`run_entry!`, so the first holds exactly when an entry or a spawned function may
 suspend. SuspensionMarks already decides it, and no new fixpoint is needed:
 the procedure holding the loop calls `run_next!`, so it may already suspend,
 and so may every procedure whose loop's entries call it. Loops whose entries
-share a lambda set share these specializations, so the form belongs to the
-specialization. A `None` build has no `suspending` procedure, so all its
+share a lambda set share these specializations, so for this reason the form
+belongs to the specialization.
+
+The second is for a loop whose entries can't suspend and whose body waits
+(Shared State, Waiting), or runs another loop whose entries do. What it waits
+for may be an update by an entry that the sequential form would run only after
+the body goes on. A procedure *may wait* when it calls a `cell_wait!`
+specialization or a procedure that may wait; `SuspensionMarks.mayWait` finds
+them. A suspending hosted call is no wait: it finishes whatever other tasks do,
+and the entries run after it. A `None` build has no `suspending` procedure, so all its
 loops are sequential.
 
 *Sequential form.* No task and no runtime call. The operations are ordinary
@@ -34517,7 +34526,7 @@ other task ran meanwhile:
 - `Set(new, r)` stores `new`, then wakes waiters, and returns `r`;
 - `Keep(r)` leaves the state as it was and returns `r`;
 - `Wait` leaves the state as it was and pauses the task. The update runs again
-  after another task's update stores to the cell.
+  after other tasks' updates stored a state for which it would not.
 
 `get!` is an update that keeps and returns the state, and `modify!` one that
 sets it. `f` is pure, so it can't suspend, perform an effect or use a handle.
@@ -34525,8 +34534,8 @@ While `f` runs the cell is empty: the state was moved out of it. So a state
 nothing else holds changes in place.
 
 **Poison.** An update or a cleanup that crashes leaves its cell empty, which
-is what poisons it. Every later update of the cell crashes, and every task
-waiting on it is readied so that it crashes too. Nothing can test for
+is what poisons it. Every later update of the cell crashes, and the tasks waiting
+on it are woken so that they crash too. Nothing can test for
 poison or clear it. So `[Held(s), Moved]` is the whole of a cell's state, and
 an update that finds it `Moved` crashes with `shared state was poisoned when
 an update crashed`.
@@ -34554,29 +34563,72 @@ two are the dynamic operations `box` and `cell_exchange`.
 `update!` is ordinary Builtin Roc over them:
 
 ```text
-update! = |cell, f| match take!(cell) {
-    Moved => crash "..."
-    Held(state) => match f(state) {
-        Set(new, r) => { put!(cell, new); r }
-        Keep(r) => { put!(cell, state); r }
-        Wait => { put!(cell, state); wait!(cell, f); update!(cell, f) }
+update! = |Cell(cell), f| {
+    state = take!(cell)            # cell_exchange(cell, Moved), or the poison crash
+    match f(state) {
+        Set(new, r) => { cell_exchange!(cell, Held(new)); cell_settle!(cell, True); r }
+        Keep(r) => { cell_exchange!(cell, Held(state)); cell_settle!(cell, False); r }
+        Wait => {
+            cell_exchange!(cell, Held(state))
+            cell_wait!(cell, Box.box(|| probe!(cell, f)))
+            update!(Cell(cell), f)
+        }
     }
 }
 ```
+
+`get!` and `modify!` are written the same way without a `Wait`, so a call of
+either is never a suspension site.
 
 Where `f` is inlined, a path that ends in `Set` no longer uses `state`, so
 ARC moves it into `new` and a unique state changes in place. Where `f` is
 called, `state` is live across the call and a `Set` copies it. Making the
 first case independent of inlining is the update form below.
 
-**Waiting.** A `Wait` parks the task at a suspension site on the cell. Waiters
-are kept oldest first. After a `Set` the runtime *probes* them in that order:
-it calls each waiter's function on the new state to learn whether it
-would answer `Wait`, and readies the first that would not. The readied
-waiter carries the wake. If it ends without storing (it answers `Keep` or
-`Wait`, crashes or is cancelled), the runtime probes on from it, so no wake
-is lost. A waiter readied again keeps its place. A probe that crashes counts as
-one that would not wait. Cancelling a parked waiter takes it off the list.
+**Waiting.** A `Wait` parks the task at a suspension site on the cell. After a
+`Set` the runtime *probes* the cell's waiters, oldest first: it calls each
+one's probe to learn whether its update would still answer `Wait`, and wakes
+the first whose would not. The woken waiter *carries* the wake. Probing stops
+there, and at a waiter that already carries one. The waiter's update then runs
+from the start, and one of these follows:
+- it answers `Set`: the waiter leaves the cell, and the store probes from the
+  oldest;
+- it answers `Keep`: the waiter leaves, and the waiters after it are probed;
+- it answers `Wait` again: the waiter keeps its place and carries no wake, and
+  the waiters after it are probed;
+- its task is cancelled or crashes: the waiter leaves, and the waiters after it
+  are probed. A crash also probes the oldest waiter of every cell, since it may
+  have poisoned one.
+
+So a wake is never lost (V7): where a waiter's update would go on, that waiter
+or an older one carries a wake. A cancelled waiter is taken off its cell when
+its task finishes; until then probing passes over it.
+
+A probe is the update's other half, a boxed `() => U8` that captures the cell
+and `f`. It moves the state out of the cell and puts it straight back, then
+calls `f` on it, and answers 0 for `Wait` and 1 for anything else. A poisoned
+cell answers 1, and so does a probe that crashes: the crash exit of the waiter's
+own task, which is free while it is parked, brings control back to the runtime.
+So the crash happens in the waiter's update, on its own task, and never in the
+task whose store ran the probe. Because the state is back in its cell before
+`f` runs, a crashed probe takes nothing with it.
+
+The waiters are the program's, not the cell's: a fixed table keyed by the cell's
+address holds them, so a cell that no task waits on has no room for waiters and
+`cell_settle` on it reads one word. A task waits on at most one cell, so its
+place in the table is in the task. A waiter's probe holds its cell.
+
+Two Builtin helpers, marked as the running-set helpers are, stand for the
+runtime:
+- `cell_wait!(cell, probe)` in Builtin crashes with the deadlock message;
+- `cell_settle!(cell, stored)` in Builtin does nothing.
+
+In a build with tasks the continuation pass replaces their bodies with the
+low-level operations `cell_wait(cell, probe, task) -> status` and
+`cell_settle(cell, stored)`. `cell_wait` is a park site beside `group_next`: it
+always returns the pending status, its resume entry calls its continuation with
+no second run, and the code after it never reads the status. A `cell_wait!`
+specialization is a seed of the suspension marks.
 
 **Programs without tasks.** A program none of whose updates can reach `Wait`
 runs as Plans And Concurrent Loops says, on one stack. A `None` program that
@@ -34610,10 +34662,10 @@ descendants are gone.
 | V10 | A probe answers as the update would, and an update puts back on `Keep` and `Wait` the state it was given |
 
 **What is built.** `new!`, `update!`, `get!` and `modify!` on every backend and
-both strategies, with poison, in `None` and `Tasks` programs. An update's
-function answers `Set` or `Keep`: its type has no `Wait` until waiting is
-built. Waiting, cleanups, holder sets, cells in `ParallelTasks` programs and the
-update and probe forms come in that order.
+both strategies, with poison, in `None` and `Tasks` programs, and waiting in
+`Tasks` programs. A `Wait` in a `None` program crashes with the deadlock message.
+Schedulers for `None` programs, cleanups, holder sets, cells in `ParallelTasks`
+programs and the update and probe forms come in that order.
 
 ### Host Contract
 
@@ -35595,7 +35647,8 @@ compiled away in release builds.
   crash passes through the loop's exit sequence. A running set is used only
   by its own loop's four operations. The certifier checks both on LIR.
 - **Loop forms.** A loop is task-form exactly when its `entry_call`, or a
-  function its body spawns, may suspend. A sequential loop's `next` is no
+  function its body spawns, may suspend, or the procedure that holds it may
+  wait on shared state. A sequential loop's `next` is no
   suspension site.
 - **Sequential equivalence.** A `None` build's results and effects equal
   a `Tasks` build's when the host finishes every hosted call in place and

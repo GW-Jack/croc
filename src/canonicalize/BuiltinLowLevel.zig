@@ -114,6 +114,8 @@ pub const running_set_helper_names = [_]struct { name: []const u8, helper: base.
     .{ .name = "Builtin.Concurrently.run_arrived", .helper = .run_arrived },
     .{ .name = "Builtin.Concurrently.run_ended", .helper = .run_ended },
     .{ .name = "Builtin.Concurrently.run_supervised!", .helper = .run_supervised },
+    .{ .name = "Builtin.Concurrently.cell_wait!", .helper = .cell_wait },
+    .{ .name = "Builtin.Concurrently.cell_settle!", .helper = .cell_settle },
 };
 
 /// Record which Builtin definitions are the running-set helpers, matched by

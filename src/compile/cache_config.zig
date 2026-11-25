@@ -452,7 +452,9 @@ pub const Constants = struct {
     /// 212: recorded running-set helpers include `run_supervised!`.
     /// 213: `task_create_parallel` joins the low-level operations.
     /// 214: Builtin has `Shared` and its cell operations.
-    pub const CACHE_VERSION = 214;
+    /// 215: recorded running-set helpers include `cell_wait!` and
+    /// `cell_settle!`, whose operations join the low-level ones.
+    pub const CACHE_VERSION = 215;
 };
 
 /// Configuration for the Roc cache system.

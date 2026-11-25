@@ -1593,6 +1593,18 @@ pub fn roc_builtins_group_free(loop_id: u64, owner: *task.RocTask) callconv(.c) 
     task.groupFree(task.openGroup(owner, loop_id));
 }
 
+/// `Wait`: the running `task`'s update of `cell` pauses it (design.md "Shared
+/// State", "Waiting."). Takes `probe`. Returns the park status, pending.
+pub fn roc_builtins_cell_wait(cell: *anyopaque, probe: [*]u8, owner: *task.RocTask) callconv(.c) u32 {
+    task.cellWait(owner, cell, probe);
+    return 2;
+}
+
+/// An update of `cell` answered without a `Wait`; `stored` when with `Set`.
+pub fn roc_builtins_cell_settle(cell: *anyopaque, stored: bool) callconv(.c) void {
+    task.cellSettle(cell, stored);
+}
+
 /// Enter the loaded dev-shim code image that contains the generated callsite.
 pub fn roc_builtins_hot_reload_enter() callconv(.c) ?*anyopaque {
     if (comptime @hasDecl(@import("root"), "roc_hot_reload_enter")) {

@@ -12,7 +12,8 @@
 //! task while no entry has reported, and its resume runs it again (design.md
 //! "Child Tasks"). Its loop id, which names the set, is among its live
 //! values even where the code after it never reads the id, since the resume
-//! reads it.
+//! reads it. A `cell_wait` is the other park site: it always parks, and its
+//! resume goes straight on to the code after it ("Shared State").
 //!
 //! A tail site is a call to a procedure (never a hosted one) whose result
 //! the procedure returns unchanged: the next statements only copy it into
@@ -35,7 +36,7 @@ const LocalId = LIR.LocalId;
 /// One suspension site and what the continuation pass needs about it.
 pub const Site = struct {
     /// The `assign_call` statement whose `CallExtra` marks it a site, or a
-    /// park site's `group_next`.
+    /// park site's `group_next` or `cell_wait`.
     call: CFStmtId,
     park: bool,
     tail: bool,
@@ -44,7 +45,8 @@ pub const Site = struct {
     live_after: []const LocalId,
 };
 
-/// A site's statement: a call, or a park site's `group_next`.
+/// A site's statement: a call, or a park site's `group_next` or
+/// `cell_wait`.
 pub const SiteStmt = union(enum) {
     call: @FieldType(LIR.CFStmt, "assign_call"),
     park: @FieldType(LIR.CFStmt, "assign_low_level"),
@@ -54,7 +56,7 @@ pub const SiteStmt = union(enum) {
     pub fn of(stmt: LIR.CFStmt) ?SiteStmt {
         return switch (stmt) {
             .assign_call => |call| .{ .call = call },
-            .assign_low_level => |op| if (op.op == .group_next) .{ .park = op } else null,
+            .assign_low_level => |op| if (op.op == .group_next or op.op == .cell_wait) .{ .park = op } else null,
             .init_uninitialized,
             .assign_ref,
             .assign_literal,
@@ -92,7 +94,7 @@ pub const SiteStmt = union(enum) {
 
     /// The statement `id`, which a site analysis found.
     pub fn at(store: *const LirStore, id: CFStmtId) SiteStmt {
-        return of(store.getCFStmtImmediate(id).*) orelse invariant("a suspension site is neither a call nor a running set's next", .{});
+        return of(store.getCFStmtImmediate(id).*) orelse invariant("a suspension site is neither a call nor a park site", .{});
     }
 
     pub fn target(self: SiteStmt) LocalId {
@@ -159,7 +161,7 @@ pub fn analyze(allocator: Allocator, store: *const LirStore, proc_id: LIR.LirPro
         // A park site's loop id, when the code after it doesn't keep it live.
         const loop_id: ?LocalId = switch (stmt) {
             .call => null,
-            .park => |op| LirStore.GuardedList.at(store.getLocalSpan(op.args), 0),
+            .park => |op| if (op.op == .group_next) LirStore.GuardedList.at(store.getLocalSpan(op.args), 0) else null,
         };
         const id_live = if (loop_id) |local| if (builder.bit_of.get(local)) |bit| row.isSet(bit) else false else true;
         const live = try out.alloc(LocalId, row.count() + @intFromBool(!id_live));

@@ -111,46 +111,12 @@ pub fn readyTask(_: *RocTask) callconv(.c) void {}
 /// A task with the fields the operations read and nothing the runtime uses:
 /// these tests run no records.
 fn bareTask(hosted_slot: [*]u8, result_buffer: [*]u8) RocTask {
-    return .{
-        .pending = 0,
-        .hosted_slot = hosted_slot,
-        .result_buffer = result_buffer,
-        .wake_word = 0,
-        .started = false,
-        .cancel_requested = false,
-        .aborted = false,
-        .ready_fn = null,
-        .abort_fn = null,
-        .status = .pending,
-        .root_result = undefined,
-        .entries = undefined,
-        .len = 0,
-        .capacity = 0,
+    return RocTask.initial(undefined, undefined, .{
         .hosted_slot_size = 0,
         .hosted_slot_alignment = 1,
         .result_buffer_size = 0,
         .result_buffer_alignment = 1,
-        .ops = undefined,
-        .crash_jmp = undefined,
-        .running_record = undefined,
-        .crash_message = undefined,
-        .crash_message_len = 0,
-        .running_from_task = false,
-        .record_cache = @splat(null),
-        .group = null,
-        .entry_index = 0,
-        .tree_index = 0,
-        .child_counter = 0,
-        .wait = null,
-        .open_groups = null,
-        .finishing = false,
-        .crashing = false,
-        .resume_claimed = false,
-        .tree = null,
-        .tree_lock = 0,
-        .host_next = null,
-        .host_abort = false,
-    };
+    }, hosted_slot, result_buffer);
 }
 
 test "task_ready reads the pending flag and task_set_pending sets it" {

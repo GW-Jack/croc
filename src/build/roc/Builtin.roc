@@ -4015,6 +4015,19 @@ Builtin :: [].{
 		run_supervised! : U64, (() => item) => item
 		run_supervised! = |_max_restarts, f| Concurrently.run_entry!(f)
 
+		# `Shared.update!`'s helpers. In a `Tasks` build the compiler replaces
+		# their bodies: the first pauses the task until a wake, when the probe
+		# would no longer answer 0, and the second wakes the waiters an update
+		# gave reason to. Where nothing can pause, an update that waits can never
+		# go on, and there are no waiters.
+		cell_wait! : Box(item), Box(() => U8) => {}
+		cell_wait! = |_cell, _probe| {
+			crash "deadlock: no task can ever change the shared state this task waits for"
+		}
+
+		cell_settle! : Box(item), Bool => {}
+		cell_settle! = |_cell, _stored| {}
+
 		run_arrived : Running(item), item -> (Running(item), [Arrived(item), Ended])
 		run_arrived = |running, arrived| (running, Arrived(arrived))
 
@@ -4091,33 +4104,50 @@ Builtin :: [].{
 
 		## Runs the function on the state, as if no other task ran meanwhile. `Set`
 		## replaces the state, `Keep` leaves it as it was, and each returns the
-		## answer it carries.
+		## answer it carries. `Wait` leaves the state as it was and pauses until
+		## other tasks have changed it so that the function no longer answers
+		## `Wait`; then the update starts again. Waiting updates go on in the order
+		## they began to wait.
 		##
-		## If the function crashes, so does every later use of this state.
-		update! : Shared(state), (state -> [Set(state, answer), Keep(answer)]) => answer
-		update! = |Cell(cell), transform|
-			match cell_exchange!(cell, Moved) {
-				Moved => crash "this shared state was poisoned when an update crashed"
-				Held(state) => match transform(state) {
-					Set(changed, answer) => {
-						_ = cell_exchange!(cell, Held(changed))
-						answer
-					}
-					Keep(answer) => {
-						_ = cell_exchange!(cell, Held(state))
-						answer
-					}
+		## If the function crashes, so does every later use of this state. If no
+		## task can ever change the state a `Wait` waits for, the program crashes.
+		update! : Shared(state), (state -> [Set(state, answer), Keep(answer), Wait]) => answer
+		update! = |Cell(cell), transform| {
+			state = cell_take!(cell)
+			match transform(state) {
+				Set(changed, answer) => {
+					_ = cell_exchange!(cell, Held(changed))
+					Concurrently.cell_settle!(cell, True)
+					answer
+				}
+				Keep(answer) => {
+					_ = cell_exchange!(cell, Held(state))
+					Concurrently.cell_settle!(cell, False)
+					answer
+				}
+				Wait => {
+					_ = cell_exchange!(cell, Held(state))
+					Concurrently.cell_wait!(cell, Box.box(|| cell_probe!(cell, transform)))
+					Shared.update!(Cell(cell), transform)
 				}
 			}
+		}
 
 		## Returns the state. Another task can change it at once, so to act on the
 		## state, decide inside an [Shared.update!].
 		get! : Shared(state) => state
-		get! = |shared| Shared.update!(shared, |state| Keep(state))
+		get! = |Cell(cell)| {
+			state = cell_take!(cell)
+			_ = cell_exchange!(cell, Held(state))
+			state
+		}
 
 		## Replaces the state with what the function returns for it.
 		modify! : Shared(state), (state -> state) => {}
-		modify! = |shared, transform| Shared.update!(shared, |state| Set(transform(state), {}))
+		modify! = |Cell(cell), transform| {
+			_ = cell_exchange!(cell, Held(transform(cell_take!(cell))))
+			Concurrently.cell_settle!(cell, True)
+		}
 	}
 
 	## A type has a default sort order when its module provides
@@ -28323,6 +28353,34 @@ cell_new! : item => Box(item)
 # Implemented by the compiler: puts the item in the cell and returns the one
 # that was there
 cell_exchange! : Box(item), item => item
+
+# A shared cell's state, moved out of it
+cell_take! : Box([Held(state), Moved]) => state
+cell_take! = |cell|
+	match cell_exchange!(cell, Moved) {
+		Held(state) => state
+		Moved => {
+			crash "this shared state was poisoned when an update crashed"
+		}
+	}
+
+# Whether a waiting update would go on now: 0 when it would answer `Wait`, and
+# 1 when it would answer anything else or crash because the cell is poisoned.
+# The state is back in its cell before the function runs, so a crash in it
+# takes nothing.
+cell_probe! : Box([Held(state), Moved]), (state -> [Set(state, answer), Keep(answer), Wait]) => U8
+cell_probe! = |cell, transform|
+	match cell_exchange!(cell, Moved) {
+		Held(state) => {
+			_ = cell_exchange!(cell, Held(state))
+			match transform(state) {
+				Set(_, _) => 1
+				Keep(_) => 1
+				Wait => 0
+			}
+		}
+		Moved => 1
+	}
 
 # Implemented by the compiler, does not perform bounds checks
 list_get_unsafe : List(item), U64 -> item

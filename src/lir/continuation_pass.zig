@@ -40,19 +40,26 @@ const roc_ready: u64 = 0;
 
 /// The status a running set's `group_next` returns while no entry has
 /// reported and some still run: the task is parked on the set (design.md
-/// "Child Tasks"). 0 is an arrival and 1 the end.
-const group_pending: u64 = 2;
+/// "Child Tasks"). 0 is an arrival and 1 the end. A `cell_wait` always
+/// returns it.
+const park_pending: u64 = 2;
 
 /// How a site pauses. A procedure sets the task's pending flag before it
 /// returns, a `suspending` hosted procedure returns a `RocPoll`, and a park
-/// site, a running set's `group_next`, returns `group_pending`. A park
-/// site's resume runs `group_next` on the set again.
+/// site, a running set's `group_next` or a `cell_wait`, returns
+/// `park_pending`. A running set's resume runs `group_next` on the set again,
+/// and a wait's goes straight on.
 const SiteKind = union(enum) {
     /// The procedure called.
     procedure: ProcId,
     hosted,
     /// The loop id that names the running set.
-    park: LocalId,
+    running_set: LocalId,
+    cell,
+
+    fn parks(self: SiteKind) bool {
+        return self == .running_set or self == .cell;
+    }
 };
 
 /// The program's roots, parallel to `program.Result.root_procs`. The pass
@@ -168,7 +175,7 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, roots
             const stmt = SiteStmt.at(store, site.call);
             const kind: SiteKind = switch (stmt) {
                 .call => |call| if (isHosted(store, call.proc)) .hosted else .{ .procedure = call.proc },
-                .park => |op| .{ .park = GuardedList.at(store.getLocalSpan(op.args), 0) },
+                .park => |op| if (op.op == .cell_wait) .cell else .{ .running_set = GuardedList.at(store.getLocalSpan(op.args), 0) },
             };
             if (kind == .hosted) hosted_procs.set(@backingInt(stmt.call.proc));
             const target = stmt.target();
@@ -472,7 +479,7 @@ fn passTaskToRunningSets(allocator: Allocator, store: *LirStore, proc: ProcId, t
         if (seen.isSet(@backingInt(stmt_id))) continue;
         seen.set(@backingInt(stmt_id));
         const stmt = store.getCFStmtImmediate(stmt_id).*;
-        if (stmt == .assign_low_level and stmt.assign_low_level.op.namesRunningSet()) {
+        if (stmt == .assign_low_level and stmt.assign_low_level.op.takesTask()) {
             try appendLocal(store, &store.getCFStmtPtr(stmt_id).assign_low_level.args, task);
         }
         try body_clone.appendSuccessors(store, &work, stmt_id, allocator);
@@ -554,7 +561,7 @@ const Occurrence = struct {
     /// The site's live values, in the order of `SiteInfo.live_after`.
     live: []const LocalId,
     /// The call, without the task at a hosted site; at a park site, no
-    /// procedure and `group_next`'s arguments.
+    /// procedure and the operation's arguments.
     proc: ?ProcId,
     args: LIR.LocalSpan,
     extra: LIR.StmtRowId(LIR.CallExtra),
@@ -594,15 +601,16 @@ fn pendingEdge(store: *LirStore, info: SiteInfo, occurrence: Occurrence, origin:
 /// site, with `ready` as the code that runs when nothing paused. A
 /// procedure site keeps its call and tests the pending flag after it; a
 /// hosted site reads the slot's address, calls the host, and branches on
-/// the `RocPoll`; a park site keeps its `group_next` and branches on the
+/// the `RocPoll`; a park site keeps its operation and branches on the
 /// status.
 fn siteHead(store: *LirStore, layouts: *layout.Store, sink: anytype, info: SiteInfo, occurrence: Occurrence, ready: CFStmtId, origin: LIR.StmtOrigin) Allocator.Error!LIR.CFStmt {
     const edge = try pendingEdge(store, info, occurrence, origin);
-    if (info.kind == .park) {
+    if (info.kind.parks()) {
+        const op: LIR.LowLevel = if (info.kind == .cell) .cell_wait else .group_next;
         return .{ .assign_low_level = .{
             .target = occurrence.target,
-            .op = .group_next,
-            .rc_effect = try store.addRcEffect(LIR.LowLevel.group_next.rcEffect()),
+            .op = op,
+            .rc_effect = try store.addRcEffect(op.rcEffect()),
             .args = occurrence.args,
             .next = try parkBranch(store, sink, occurrence.task, occurrence.target, edge, ready, origin),
         } };
@@ -658,14 +666,15 @@ fn siteHead(store: *LirStore, layouts: *layout.Store, sink: anytype, info: SiteI
     } };
 }
 
-/// A park site's branch on `status`: `group_pending` sets the task's
-/// pending flag and takes `edge`; an arrival or the end goes on to `ready`.
+/// A park site's branch on `status`: `park_pending` sets the task's
+/// pending flag and takes `edge`; an arrival or the end goes on to `ready`,
+/// which a `cell_wait` never reaches here.
 fn parkBranch(store: *LirStore, sink: anytype, task: LocalId, status: LocalId, edge: CFStmtId, ready: CFStmtId, origin: LIR.StmtOrigin) Allocator.Error!CFStmtId {
     const unit = try sink.newLocal(.zst);
     const pending = try store.addLowLevelStmt(unit, .task_set_pending, &.{task}, edge, origin);
     return store.addCFStmt(.{ .switch_stmt = .{
         .cond = status,
-        .branches = try store.addCFSwitchBranches(&.{.{ .value = group_pending, .body = pending }}),
+        .branches = try store.addCFSwitchBranches(&.{.{ .value = park_pending, .body = pending }}),
         .default_branch = ready,
     } }, origin);
 }
@@ -679,9 +688,10 @@ fn rewriteSite(store: *LirStore, layouts: *layout.Store, sink: *FrameSink, info:
 }
 
 /// `R(f, k)`: load the saved values and the call's result, then call
-/// `C(f, k)` with them and the task. A park site has no result to load: `R`
-/// calls the site's retry (`buildParkRetry`) with the saved values and the
-/// task.
+/// `C(f, k)` with them and the task. A park site has no result to load: a
+/// running set's `R` calls the site's retry (`buildParkRetry`) with the saved
+/// values and the task, and a wait's calls `C(f, k)` with them, which never
+/// reads the status.
 fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Store, info: SiteInfo, origin: LIR.StmtOrigin) Allocator.Error!void {
     const entry = info.resume_entry.?;
     const ret_layout = store.getProcSpecImmediate(entry).ret_layout;
@@ -703,8 +713,8 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
     const capture = try fresh.local(.opaque_ptr);
     const reuse = try fresh.local(try layouts.insertErasedCallable());
     const result_layout = store.getLocal(info.target).layout_idx;
-    const result: ?LocalId = if (info.kind == .park) null else try fresh.local(result_layout);
-    const address: ?LocalId = if (info.kind == .park) null else try fresh.local(try layouts.insertPtr(result_layout));
+    const result: ?LocalId = if (info.kind.parks()) null else try fresh.local(result_layout);
+    const address: ?LocalId = if (info.kind.parks()) null else try fresh.local(try layouts.insertPtr(result_layout));
     const value = try fresh.local(ret_layout);
 
     var fields = std.ArrayList(LocalId).empty;
@@ -713,6 +723,7 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
     defer call_args.deinit(allocator);
     for (info.live_after) |live| {
         if (live == info.target) {
+            if (info.kind == .cell) invariant("a wait on shared state has a status the code after it reads", .{});
             if (result) |loaded| call_args.appendAssumeCapacity(loaded);
         } else {
             const field = try fresh.local(store.getLocal(live).layout_idx);
@@ -723,8 +734,8 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
     call_args.appendAssumeCapacity(task);
 
     const callee = switch (info.kind) {
-        .park => try buildParkRetry(allocator, store, info, origin),
-        .procedure, .hosted => info.continuation.?,
+        .running_set => try buildParkRetry(allocator, store, info, origin),
+        .procedure, .hosted, .cell => info.continuation.?,
     };
     const ret = try store.addCFStmt(.{ .ret = .{ .value = value } }, origin);
     const call = try store.addCFStmt(.{ .assign_call = .{
@@ -734,7 +745,7 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
         .next = ret,
     } }, origin);
     var head = switch (info.kind) {
-        .park => call,
+        .running_set, .cell => call,
         .procedure => |called| blk: {
             const load = try store.addTaskResultLoad(result.?, address.?, called, call, origin);
             break :blk try store.addLowLevelStmt(address.?, .task_result_buffer, &.{task}, load, origin);
@@ -774,9 +785,9 @@ fn buildResumeEntry(allocator: Allocator, store: *LirStore, layouts: *layout.Sto
     spec.shapes = spec.shapes.merged(store.shapes);
 }
 
-/// A park site's retry `P(f, k)`, which its resume entry `R` calls with the
+/// A running set's retry `P(f, k)`, which its resume entry `R` calls with the
 /// saved values and the task: run `group_next` again on the saved set, and
-/// while it is still `group_pending`, save the same values with `R` and
+/// while it is still `park_pending`, save the same values with `R` and
 /// return; otherwise call `C(f, k)` with the status as the site's result.
 /// `R` runs no park site of its own because `suspend_return` stays in
 /// Roc-ABI procedures (design.md "Backends"): an erased-ABI procedure stores
@@ -810,7 +821,7 @@ fn buildParkRetry(allocator: Allocator, store: *LirStore, info: SiteInfo, origin
             const param = try freshLocal(store, &frame, allocator, store.getLocal(saved).layout_idx);
             try params.append(allocator, param);
             live.appendAssumeCapacity(param);
-            if (saved == info.kind.park) loop_id = param;
+            if (saved == info.kind.running_set) loop_id = param;
         }
     }
     const task = try freshLocal(store, &frame, allocator, .opaque_ptr);
@@ -1276,7 +1287,7 @@ fn pendingSave(store: *const LirStore, site: SiteStmt) ?CFStmtId {
         const next = store.getCFStmtImmediate(op.next).*;
         if (next != .switch_stmt or next.switch_stmt.cond != op.target) return null;
         const branches = store.getCFSwitchBranches(next.switch_stmt.branches);
-        if (GuardedList.borrowLen(branches) != 1 or GuardedList.at(branches, 0).value != group_pending) return null;
+        if (GuardedList.borrowLen(branches) != 1 or GuardedList.at(branches, 0).value != park_pending) return null;
         const pending = store.getCFStmtImmediate(GuardedList.at(branches, 0).body).*;
         if (pending != .assign_low_level or pending.assign_low_level.op != .task_set_pending) return null;
         if (store.getCFStmtImmediate(pending.assign_low_level.next).* != .suspend_save) return null;

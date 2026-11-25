@@ -6732,6 +6732,18 @@ pub const Interpreter = struct {
                 val.write(u32, status);
                 break :blk val;
             },
+            .cell_wait => blk: {
+                const probe = self.readBoxedDataPointer(args[1]) orelse
+                    return self.invariantFailedError("LIR/interpreter invariant violated: cell_wait had no probe", .{});
+                builtins.task.cellWait(taskOf(self.readPointerInt(args[2])), @ptrFromInt(self.readPointerInt(args[0])), probe);
+                const val = try self.alloc(ll.ret_layout);
+                val.write(u32, 2);
+                break :blk val;
+            },
+            .cell_settle => blk: {
+                builtins.task.cellSettle(@ptrFromInt(self.readPointerInt(args[0])), args[1].read(u8) != 0);
+                break :blk Value.zst;
+            },
             .cell_new, .cell_exchange => unreachable, // lowering to LIR replaces a cell operation with box and pointer operations
             .group_arrival => try self.pointerValue(ll.ret_layout, @intFromPtr(builtins.task.groupArrival(self.openGroup(args[0], args[1])))),
             .group_spawn => blk: {

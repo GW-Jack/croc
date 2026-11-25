@@ -1097,8 +1097,8 @@ pub const Suspends = enum(u8) {
 /// sequential form calls these helpers; the continuation pass finds a loop's
 /// calls by this mark and the loop id each call passes first, and promotes
 /// a loop whose entries may suspend to the task form. In a `Tasks` build it
-/// also promotes the body of every `run_supervised`. It never matches a
-/// helper by name or body.
+/// also promotes the body of every `run_supervised`, `cell_wait` and
+/// `cell_settle`. It never matches a helper by name or body.
 pub const RunningSetHelper = enum(u8) {
     none,
     run_create,
@@ -1114,6 +1114,10 @@ pub const RunningSetHelper = enum(u8) {
     /// `Concurrent.supervise!`'s helper: runs a function once, or in a
     /// `Tasks` build as a child task that is restarted when it crashes.
     run_supervised,
+    /// `Shared.update!`'s helpers (design.md "Shared State", "Waiting."):
+    /// where an update answers `Wait`, and where one answers without it.
+    cell_wait,
+    cell_settle,
 };
 
 /// Which task record an erased callable is the code of. Only the task runtime

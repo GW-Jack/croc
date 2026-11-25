@@ -6,7 +6,8 @@
 //! procedure, and a cached body's producer committed its own. A procedure
 //! with a body may suspend when it calls one that may, directly, or when it
 //! holds a running set's `group_next`, which parks the task while no entry
-//! has reported (design.md "Child Tasks"). Erased calls are never sites
+//! has reported (design.md "Child Tasks"), or a `cell_wait`, which parks it
+//! until a wake ("Shared State"). Erased calls are never sites
 //! here; the continuation pass rejects an erased-callable procedure that may
 //! suspend.
 //!
@@ -31,7 +32,7 @@ const DirectCall = struct {
 };
 
 /// Every direct call in every procedure body, and the procedures whose
-/// bodies hold a `group_next`.
+/// bodies hold a `group_next` or a `cell_wait`.
 const Walk = struct {
     calls: std.ArrayList(DirectCall),
     parks: std.bit_set.DynamicBitSetUnmanaged,
@@ -46,14 +47,15 @@ const Walk = struct {
 /// every direct call.
 ///
 /// `mode` is the platform's: in a build with tasks every `run_supervised`
-/// specialization is a seed (design.md "Plans And Concurrent Loops",
-/// "Supervision.").
+/// and `cell_wait` specialization is a seed (design.md "Plans And Concurrent
+/// Loops", "Supervision."; "Shared State", "Waiting.").
 pub fn run(allocator: Allocator, store: *LirStore, mode: ConcurrencyMode) Allocator.Error!void {
     if (!anySeed(store, mode)) {
         // Nothing can suspend: commit `never` without walking. A Debug
         // compiler walks anyway and checks that no call is a site. Nor is
         // there a `group_next`: a loop has the task form only when an entry
-        // may suspend, which needs a suspending procedure.
+        // may suspend, which needs a suspending procedure; nor a `cell_wait`,
+        // whose helper is a seed.
         if (builtin.mode == .debug) {
             var walk = try walkBodies(allocator, store);
             defer walk.deinit(allocator);
@@ -62,7 +64,7 @@ pub fn run(allocator: Allocator, store: *LirStore, mode: ConcurrencyMode) Alloca
                     invariant("suspension marks found a site with no suspending procedure", .{});
                 }
             }
-            if (walk.parks.count() != 0) invariant("suspension marks found a running set's next with no suspending procedure", .{});
+            if (walk.parks.count() != 0) invariant("suspension marks found a running set's next or a wait on shared state with no suspending procedure", .{});
         }
         for (0..store.procSpecCount()) |index| {
             const proc = store.getProcSpecPtr(@fromBackingInt(@as(u32, @intCast(index))));
@@ -76,7 +78,7 @@ pub fn run(allocator: Allocator, store: *LirStore, mode: ConcurrencyMode) Alloca
     const calls = &walk.calls;
     if (mode.hasTasks()) {
         for (0..store.procSpecCount()) |index| {
-            if (supervises(store.getProcSpecImmediate(@fromBackingInt(@as(u32, @intCast(index)))))) walk.parks.set(index);
+            if (seeds(store.getProcSpecImmediate(@fromBackingInt(@as(u32, @intCast(index)))))) walk.parks.set(index);
         }
     }
     var may = try maySuspend(allocator, store, calls.items, &walk.parks);
@@ -97,25 +99,27 @@ pub fn run(allocator: Allocator, store: *LirStore, mode: ConcurrencyMode) Alloca
     if (builtin.mode == .debug) try verify(allocator, store, calls.items, &walk.parks);
 }
 
-/// Whether a procedure is a `run_supervised` specialization this compilation
-/// has the body of; a cached one's producer committed its mark.
-fn supervises(proc: *const LIR.LirProcSpec) bool {
-    return proc.running_set_helper == .run_supervised and proc.body.get() != null;
+/// Whether a procedure is a `run_supervised` or `cell_wait` specialization
+/// this compilation has the body of; a cached one's producer committed its
+/// mark.
+fn seeds(proc: *const LIR.LirProcSpec) bool {
+    if (proc.running_set_helper != .run_supervised and proc.running_set_helper != .cell_wait) return false;
+    return proc.body.get() != null;
 }
 
 /// Whether any body-less procedure is marked as one that may suspend, or a
-/// build with tasks holds a `run_supervised` specialization.
+/// build with tasks holds a seed's body.
 fn anySeed(store: *const LirStore, mode: ConcurrencyMode) bool {
     for (0..store.procSpecCount()) |index| {
         const proc = store.getProcSpecImmediate(@fromBackingInt(@as(u32, @intCast(index))));
         if (proc.body.get() == null and proc.suspends == .may) return true;
-        if (mode.hasTasks() and supervises(proc)) return true;
+        if (mode.hasTasks() and seeds(proc)) return true;
     }
     return false;
 }
 
 /// Every direct call in every procedure body, and the procedures that hold
-/// a `group_next`.
+/// a `group_next` or a `cell_wait`.
 fn walkBodies(allocator: Allocator, store: *const LirStore) Allocator.Error!Walk {
     var calls = std.ArrayList(DirectCall).empty;
     errdefer calls.deinit(allocator);
@@ -138,7 +142,7 @@ fn walkBodies(allocator: Allocator, store: *const LirStore) Allocator.Error!Walk
                 .callee = @backingInt(stmt.assign_call.proc),
                 .stmt = stmt_id,
             });
-            if (stmt == .assign_low_level and stmt.assign_low_level.op == .group_next) parks.set(proc_index);
+            if (stmt == .assign_low_level and (stmt.assign_low_level.op == .group_next or stmt.assign_low_level.op == .cell_wait)) parks.set(proc_index);
             try body_clone.appendSuccessors(store, &work, stmt_id, allocator);
         }
     }
@@ -146,20 +150,45 @@ fn walkBodies(allocator: Allocator, store: *const LirStore) Allocator.Error!Walk
 }
 
 /// The procedures that may suspend: the seeds, the procedures that hold a
-/// `group_next` or supervise, and every procedure that directly calls one that may.
+/// park site or seed one, and every procedure that directly calls one that may.
 fn maySuspend(allocator: Allocator, store: *const LirStore, calls: []const DirectCall, parks: *const std.bit_set.DynamicBitSetUnmanaged) Allocator.Error!std.bit_set.DynamicBitSetUnmanaged {
-    const proc_count = store.procSpecCount();
-    var may = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(allocator, proc_count);
+    var may = try parks.clone(allocator);
     errdefer may.deinit(allocator);
+    for (0..store.procSpecCount()) |index| {
+        const proc = store.getProcSpecImmediate(@fromBackingInt(@as(u32, @intCast(index))));
+        if (proc.body.get() == null and proc.suspends == .may) may.set(index);
+    }
+    try addCallers(allocator, store, calls, &may);
+    return may;
+}
+
+/// The procedures that may wait on shared state (design.md "Plans And
+/// Concurrent Loops", "Two forms."): the `cell_wait` specializations, and every
+/// procedure that directly calls one that may. A body-less procedure that may
+/// suspend and isn't the host's is taken to. Run before the continuation pass
+/// promotes anything.
+pub fn mayWait(allocator: Allocator, store: *const LirStore) Allocator.Error!std.bit_set.DynamicBitSetUnmanaged {
+    var may = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(allocator, store.procSpecCount());
+    errdefer may.deinit(allocator);
+    for (0..store.procSpecCount()) |index| {
+        const proc = store.getProcSpecImmediate(@fromBackingInt(@as(u32, @intCast(index))));
+        if (proc.running_set_helper == .cell_wait or (proc.body.get() == null and proc.hosted.get() == null and proc.suspends == .may)) may.set(index);
+    }
+    if (may.count() == 0) return may;
+    var walk = try walkBodies(allocator, store);
+    defer walk.deinit(allocator);
+    try addCallers(allocator, store, walk.calls.items, &may);
+    return may;
+}
+
+/// Add to `may` every procedure that calls one in it, through any number of
+/// direct calls.
+fn addCallers(allocator: Allocator, store: *const LirStore, calls: []const DirectCall, may: *std.bit_set.DynamicBitSetUnmanaged) Allocator.Error!void {
+    const proc_count = store.procSpecCount();
     var pending = std.ArrayList(u32).empty;
     defer pending.deinit(allocator);
-    for (0..proc_count) |index| {
-        const proc = store.getProcSpecImmediate(@fromBackingInt(@as(u32, @intCast(index))));
-        if ((proc.body.get() == null and proc.suspends == .may) or parks.isSet(index)) {
-            may.set(index);
-            try pending.append(allocator, @intCast(index));
-        }
-    }
+    var seeded = may.iterator(.{});
+    while (seeded.next()) |index| try pending.append(allocator, @intCast(index));
     // Each callee's callers, as linked lists threaded through `calls`.
     const no_call = std.math.maxInt(u32);
     const first_caller = try allocator.alloc(u32, proc_count);
@@ -180,12 +209,11 @@ fn maySuspend(allocator: Allocator, store: *const LirStore, calls: []const Direc
             try pending.append(allocator, caller);
         }
     }
-    return may;
 }
 
 /// Debug check that the marks are complete: a call is a site exactly when
 /// its callee may suspend, and a procedure with a body may suspend exactly
-/// when it holds a site, a `group_next` being one.
+/// when it holds a site, `group_next` and `cell_wait` being ones.
 fn verify(allocator: Allocator, store: *const LirStore, calls: []const DirectCall, parks: *const std.bit_set.DynamicBitSetUnmanaged) Allocator.Error!void {
     var has_site = try parks.clone(allocator);
     defer has_site.deinit(allocator);
@@ -359,4 +387,48 @@ test "a running set's next makes its procedure suspend, and its callers" {
     try testing.expectEqual(LIR.Suspends.may, store.getProcSpecImmediate(caller.proc).suspends);
     try testing.expect(isSite(&store, caller.call.?));
     try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(leaf.proc).suspends);
+}
+
+test "a wait on shared state makes its helper suspend, and the helper's callers, only in a build with tasks" {
+    const a = testing.allocator;
+    for ([_]ConcurrencyMode{ .none, .tasks, .parallel_tasks }) |mode| {
+        var store = LirStore.init(a);
+        defer store.deinit();
+        const helper = try addRelay(&store, 1, null);
+        store.getProcSpecPtr(helper.proc).running_set_helper = .cell_wait;
+        const settle = try addRelay(&store, 2, null);
+        store.getProcSpecPtr(settle.proc).running_set_helper = .cell_settle;
+        const caller = try addRelay(&store, 3, helper.proc);
+        const settling = try addRelay(&store, 4, settle.proc);
+
+        try run(a, &store, mode);
+
+        const expected: LIR.Suspends = if (mode.hasTasks()) .may else .never;
+        try testing.expectEqual(expected, store.getProcSpecImmediate(helper.proc).suspends);
+        try testing.expectEqual(expected, store.getProcSpecImmediate(caller.proc).suspends);
+        try testing.expectEqual(mode.hasTasks(), isSite(&store, caller.call.?));
+        try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(settle.proc).suspends);
+        try testing.expectEqual(LIR.Suspends.never, store.getProcSpecImmediate(settling.proc).suspends);
+    }
+}
+
+test "a procedure that reaches a wait may wait, and one that only suspends may not" {
+    const a = testing.allocator;
+    var store = LirStore.init(a);
+    defer store.deinit();
+    const hosted = try addBodyless(&store, 1, .may);
+    const symbol = try store.insertString("roc_test_suspending");
+    store.getProcSpecPtr(hosted).hosted = .some(.{ .symbol = symbol, .dispatch_index = 0 });
+    const suspending = try addRelay(&store, 2, hosted);
+    const cached = try addBodyless(&store, 3, .may);
+    const calls_cached = try addRelay(&store, 4, cached);
+    const helper = try addRelay(&store, 5, null);
+    store.getProcSpecPtr(helper.proc).running_set_helper = .cell_wait;
+    const caller = try addRelay(&store, 6, helper.proc);
+    const outer = try addRelay(&store, 7, caller.proc);
+
+    var waits = try mayWait(a, &store);
+    defer waits.deinit(a);
+    for ([_]LIR.LirProcSpecId{ hosted, suspending.proc }) |proc| try testing.expect(!waits.isSet(@backingInt(proc)));
+    for ([_]LIR.LirProcSpecId{ cached, calls_cached.proc, helper.proc, caller.proc, outer.proc }) |proc| try testing.expect(waits.isSet(@backingInt(proc)));
 }

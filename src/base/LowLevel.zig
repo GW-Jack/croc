@@ -740,6 +740,16 @@ pub const LowLevel = enum(u16) {
     /// borrows, and return the one that was there, owned.
     cell_exchange,
 
+    // A `Tasks` program's waiting operations (design.md "Shared State",
+    // "Waiting."), which only the continuation pass makes, from the bodies of
+    // Builtin's two helpers. The pass appends the task to `cell_wait`.
+    /// (cell, probe, task) -> U32: the task's update of the cell, which it
+    /// borrows, answered `Wait`; takes the probe. Always the pending status.
+    cell_wait,
+    /// (cell, stored) -> {}: an update of the cell, which it borrows, answered
+    /// without a `Wait`; `stored` (`Bool`) when it was a `Set`.
+    cell_settle,
+
     /// Index into `builtins.simd.Op`. The SIMD entries are intentionally one
     /// contiguous, order-pinned block so the interpreter and compile-time
     /// evaluator share the semantic oracle's operation vocabulary without a
@@ -1041,6 +1051,12 @@ pub const LowLevel = enum(u16) {
     pub fn namesRunningSet(self: LowLevel) bool {
         return self == .group_init or self == .group_push or self == .group_start or self == .group_next or
             self == .group_arrival or self == .group_spawn or self == .group_cancel or self == .group_free;
+    }
+
+    /// Whether the continuation pass appends the procedure's task to this
+    /// operation's operands.
+    pub fn takesTask(self: LowLevel) bool {
+        return self.namesRunningSet() or self == .cell_wait;
     }
 
     /// Return the explicit RC metadata for this primitive. The masks identify
@@ -1389,6 +1405,9 @@ pub const LowLevel = enum(u16) {
 
         .cell_new = byLayout(.allocatesRetainingArgs(arg_0)).elements(&.{.layout}),
         .cell_exchange = byLayout(.consumesArgsRetainingArgs(arg_1, 0)).elements(&.{ .layout, .layout }),
+        // Either may run waiters' probes and drop one.
+        .cell_wait = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_1 }),
+        .cell_settle = byType(.{ .may_allocate = true, .may_retain_or_release = true }),
 
         .str_is_eq = byType(.none()),
         .str_is_eq_static_small = byType(.none()),

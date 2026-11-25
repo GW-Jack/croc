@@ -124,7 +124,9 @@ pub const MAGIC: u32 = 0x52494c52; // "RLIR" in little-endian bytes.
 ///      task's (`args_spawned`).
 /// v91: an effect names the arguments it stores others into
 ///      (`args_stored_into`).
-pub const FORMAT_VERSION: u32 = 91;
+/// v92: the running-set helpers and the operations include `cell_wait` and
+///      `cell_settle`.
+pub const FORMAT_VERSION: u32 = 92;
 const StaticDataImage = @import("lir_image_static_data.zig").Schema(@This());
 
 /// Public `ImageError` declaration.

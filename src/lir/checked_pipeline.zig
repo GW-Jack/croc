@@ -2715,7 +2715,7 @@ const RunningSetHelperScratch = struct {
                 try self.define(stmt.assign_ref.target, .{ .copy = stmt.assign_ref.op.source });
             } else if (stmt == .assign_call) {
                 switch (store.getProcSpec(stmt.assign_call.proc).running_set_helper) {
-                    .none, .run_entry, .run_arrived, .run_ended, .run_supervised => {},
+                    .none, .run_entry, .run_arrived, .run_ended, .run_supervised, .cell_wait, .cell_settle => {},
                     .run_create, .run_next, .run_spawn, .run_cancel => try self.calls.append(self.allocator, stmt_id),
                 }
             }

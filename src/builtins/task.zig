@@ -168,7 +168,8 @@ pub const host_calls = struct {
 /// Resumes").
 pub const ThreadSlotFn = *const fn () callconv(.c) *?*RocTask;
 
-/// The task whose resume is running, which a crash exits to. A `Tasks`
+/// The task whose resume is running, which a crash exits to, or the task
+/// whose probe is. A `Tasks`
 /// program's resumes never overlap (design.md "The Task Runtime"), so one
 /// pointer per process is enough.
 var running_serial: ?*RocTask = null;
@@ -192,6 +193,8 @@ pub fn crashRunning(msg: []const u8) void {
     if (!crash_exit.available()) return;
     // A crash while copying the message must reach the host, not loop.
     slot.* = null;
+    // A probe's crash is its answer (`RocTask.probe`), not the waiter's crash.
+    if (task.probing) crash_exit.jump(&task.crash_jmp);
     task.lockTree();
     task.takeCrash(msg);
     task.unlockTree();
@@ -309,6 +312,30 @@ pub const RocTask = extern struct {
     /// The group whose wake word the task is parked on, or null while it
     /// waits on its hosted operation (its own `wake_word`).
     wait: ?*Group,
+    /// Whether the wake word the task is parked on is `cell_word`.
+    waits_on_cell: bool,
+    /// The wake word of the task's wait on a cell of shared state:
+    /// `wake_parked` while it is parked there, and 1 once a wake came that no
+    /// resume has consumed.
+    cell_word: u32,
+    /// The cell the task waits on, from an update's `Wait` until an update of
+    /// the cell answers without one or the task ends; null otherwise (design.md
+    /// "Shared State", "Waiting"). The next three fields are set with it.
+    waited_cell: ?*anyopaque,
+    /// The probe of the update that waits, a boxed erased callable the task
+    /// holds a reference to.
+    waiting_probe: [*]u8,
+    /// The waiters before and after this one, oldest first, among the cells
+    /// that share its `CellWaiters`.
+    older_waiter: ?*RocTask,
+    newer_waiter: ?*RocTask,
+    /// Whether the task was readied by a wake its update has not yet answered.
+    carries_wake: bool,
+    /// Whether the task's probe is running, in another task's resume, and the
+    /// task that was running there.
+    probing: bool,
+    probe_goes_on: bool,
+    probe_outer: ?*RocTask,
     /// The innermost group the task's code has open; each holds the next
     /// one out (`Group.outer`).
     open_groups: ?*Group,
@@ -333,15 +360,12 @@ pub const RocTask = extern struct {
     host_next: ?*RocTask,
     host_abort: bool,
 
-    /// A task whose list holds `start`, the root's start record, and whose
-    /// outermost record writes to `root_result`. The host's first resume
-    /// runs it.
-    pub fn create(ops: *RocOps, start: [*]u8, root_result: [*]u8, buffers: BufferLayout) *RocTask {
-        const task: *RocTask = @ptrCast(@alignCast(ops.alloc(@alignOf(RocTask), @sizeOf(RocTask))));
-        task.* = .{
+    /// A task with no records, which has not run.
+    pub fn initial(ops: *RocOps, root_result: [*]u8, buffers: BufferLayout, hosted_slot: [*]u8, result_buffer: [*]u8) RocTask {
+        return .{
             .pending = 0,
-            .hosted_slot = allocBuffer(ops, buffers.hosted_slot_size, buffers.hosted_slot_alignment),
-            .result_buffer = allocBuffer(ops, buffers.result_buffer_size, buffers.result_buffer_alignment),
+            .hosted_slot = hosted_slot,
+            .result_buffer = result_buffer,
             .wake_word = 0,
             .started = false,
             .cancel_requested = false,
@@ -369,6 +393,16 @@ pub const RocTask = extern struct {
             .tree_index = 0,
             .child_counter = 0,
             .wait = null,
+            .waits_on_cell = false,
+            .cell_word = 0,
+            .waited_cell = null,
+            .waiting_probe = undefined,
+            .older_waiter = null,
+            .newer_waiter = null,
+            .carries_wake = false,
+            .probing = false,
+            .probe_goes_on = false,
+            .probe_outer = null,
             .open_groups = null,
             .finishing = false,
             .crashing = false,
@@ -378,6 +412,20 @@ pub const RocTask = extern struct {
             .host_next = null,
             .host_abort = false,
         };
+    }
+
+    /// A task whose list holds `start`, the root's start record, and whose
+    /// outermost record writes to `root_result`. The host's first resume
+    /// runs it.
+    pub fn create(ops: *RocOps, start: [*]u8, root_result: [*]u8, buffers: BufferLayout) *RocTask {
+        const task: *RocTask = @ptrCast(@alignCast(ops.alloc(@alignOf(RocTask), @sizeOf(RocTask))));
+        task.* = initial(
+            ops,
+            root_result,
+            buffers,
+            allocBuffer(ops, buffers.hosted_slot_size, buffers.hosted_slot_alignment),
+            allocBuffer(ops, buffers.result_buffer_size, buffers.result_buffer_alignment),
+        );
         task.push(.{ .record = start, .slot_drop = null, .from_task = false });
         forgetFreed(task);
         return task;
@@ -529,13 +577,13 @@ pub const RocTask = extern struct {
         // Readied: the parked bit of the word the task waited on is clear.
         // For its hosted operation the host's one completion is counted,
         // unless a cancel or a crash readied it; a group has at least one
-        // report waiting.
+        // report waiting, and a cell its one wake.
         self.lockTree();
         if (monitors and self.started) {
             const seen = @atomicLoad(u32, self.waitWord(), .monotonic);
             const readied = if (self.finishing or self.cancel_requested or self.crashing)
                 seen & wake_parked == 0
-            else if (self.wait != null)
+            else if (!self.waitsOnOperation())
                 seen & wake_parked == 0 and seen != 0
             else
                 seen == 1;
@@ -548,9 +596,9 @@ pub const RocTask = extern struct {
         // Consuming a hosted completion with acquire ordering makes the
         // hosted slot the host wrote visible. A group's reports stay queued
         // for `groupNext`.
-        const completed = self.started and self.wait == null and self.consumeCompletion();
+        const completed = self.started and self.waitsOnOperation() and self.consumeCompletion();
         self.started = true;
-        self.wait = null;
+        self.endWait();
         const ending = self.finishing or self.cancel_requested or self.crashing;
         self.unlockTree();
         if (ending) return self.finish(completed);
@@ -560,15 +608,16 @@ pub const RocTask = extern struct {
             self.len -= 1;
             const entry = self.entries[self.len];
             const base = self.len;
+            // Set on every target: a settled update finds its task there.
+            runningSlot().* = self;
             if (exits) {
                 // Kept in the task, since a crash exit restores no local.
                 self.running_record = entry.record;
                 self.running_from_task = entry.from_task;
-                runningSlot().* = self;
                 if (crash_exit.save(&self.crash_jmp) != 0) return self.crashed();
             }
             self.call(entry.record, if (base == 0) self.root_result else self.result_buffer);
-            if (exits) runningSlot().* = null;
+            runningSlot().* = null;
             std.mem.reverse(Entry, self.entries[base..self.len]);
             self.releaseRecord(entry.record, entry.from_task);
             if (self.pending != 0) switch (self.park()) {
@@ -591,9 +640,25 @@ pub const RocTask = extern struct {
     }
 
     /// The wake word of the task's wait source: its hosted operation's, or
-    /// the group's it waits on.
+    /// the group's or the cell's it waits on.
     fn waitWord(self: *RocTask) *u32 {
+        if (self.waits_on_cell) return &self.cell_word;
         return if (self.wait) |group| &group.word else &self.wake_word;
+    }
+
+    /// Whether the task's wait source is its hosted operation.
+    fn waitsOnOperation(self: *const RocTask) bool {
+        return self.wait == null and !self.waits_on_cell;
+    }
+
+    /// The task waits on its source no more. A group's reports stay queued,
+    /// and a cell's wake is consumed here: the update the task runs next
+    /// answers it.
+    fn endWait(self: *RocTask) void {
+        self.wait = null;
+        if (!self.waits_on_cell) return;
+        self.waits_on_cell = false;
+        @atomicStore(u32, &self.cell_word, 0, .monotonic);
     }
 
     /// Take the hosted operation's completion, if the host published one.
@@ -607,6 +672,8 @@ pub const RocTask = extern struct {
     /// once they have reported.
     fn crashed(self: *RocTask) Status {
         self.releaseRecord(self.running_record, self.running_from_task);
+        // The crash may have been an update's, which poisons its cell.
+        probeEveryCell();
         return self.finish(false);
     }
 
@@ -636,8 +703,8 @@ pub const RocTask = extern struct {
         self.releaseParallelResume();
         self.lockTree();
         if (self.cancel_requested or self.crashing) {
-            const operation = self.wait == null;
-            self.wait = null;
+            const operation = self.waitsOnOperation();
+            self.endWait();
             self.unlockTree();
             self.claimParallelResume();
             return if (operation) .ending_operation else .ending_wait;
@@ -655,8 +722,8 @@ pub const RocTask = extern struct {
             self.unlockTree();
             return true;
         };
-        const hosted = self.wait == null;
-        self.wait = null;
+        const hosted = self.waitsOnOperation();
+        self.endWait();
         self.unlockTree();
         if (hosted) {
             if (seen != 1) hostViolation(self.ops, "a task was woken more than once for one operation (P3)");
@@ -721,7 +788,7 @@ pub const RocTask = extern struct {
     /// task that isn't parked. The tree is locked.
     fn unpark(self: *RocTask, calls: *HostCalls) void {
         if (@cmpxchgStrong(u32, self.waitWord(), wake_parked, 0, .acq_rel, .monotonic) != null) return;
-        calls.add(self, self.wait == null);
+        calls.add(self, self.waitsOnOperation());
     }
 
     /// Claim the process's one running resume for this task, while the
@@ -777,6 +844,7 @@ pub const RocTask = extern struct {
                 self.len -= 1;
                 self.releaseRecord(self.entries[self.len].record, self.entries[self.len].from_task);
             }
+            self.leaveCell();
             self.pending = 0;
             var group = self.open_groups;
             while (group) |open| : (group = open.outer) open.cancelEntries(.all);
@@ -800,6 +868,56 @@ pub const RocTask = extern struct {
             if (last_taken) group.close();
         }
         return self.end(if (self.crashing) .crashed else .cancelled);
+    }
+
+    /// Take the task off the waiters of the cell it waits on, if it waits,
+    /// because it ended or its update answered without a `Wait`. If it
+    /// carried a wake it did not pass on, the waiters after it are probed.
+    fn leaveCell(self: *RocTask) void {
+        const cell = self.waited_cell orelse return;
+        const carried = self.carries_wake;
+        const next = self.newer_waiter;
+        self.removeWaiter();
+        if (carried) probeFrom(cell, next);
+    }
+
+    fn removeWaiter(self: *RocTask) void {
+        const waiters = cellWaiters(self.waited_cell.?);
+        if (self.older_waiter) |older| older.newer_waiter = self.newer_waiter else waiters.oldest = self.newer_waiter;
+        if (self.newer_waiter) |newer| newer.older_waiter = self.older_waiter else waiters.newest = self.older_waiter;
+        self.waited_cell = null;
+        self.older_waiter = null;
+        self.newer_waiter = null;
+        self.carries_wake = false;
+        erased_callable.decref(self.waiting_probe, self.ops);
+    }
+
+    /// Run the waiting task's probe, in the running task's resume: whether its
+    /// update would go on now, rather than answer `Wait`. A crash exit of the
+    /// waiter's own, whose buffer is free while it is parked, makes a crash
+    /// mean that it would, so that the update itself crashes.
+    noinline fn probe(self: *RocTask) bool {
+        // Kept in the task, since a crash exit restores no local.
+        self.probe_outer = runningSlot().*;
+        self.probe_goes_on = true;
+        self.probing = true;
+        runningSlot().* = self;
+        if (!crash_exit.available() or crash_exit.save(&self.crash_jmp) == 0) {
+            var answer: u8 = undefined;
+            var out_desc: ?*const anyopaque = null;
+            erased_callable.payloadPtr(self.waiting_probe).callable_fn_ptr(
+                self.ops,
+                @ptrCast(&answer),
+                null,
+                erased_callable.capturePtr(self.waiting_probe),
+                null,
+                &out_desc,
+            );
+            self.probe_goes_on = answer != 0;
+        }
+        self.probing = false;
+        runningSlot().* = self.probe_outer;
+        return self.probe_goes_on;
     }
 
     /// The task crashed, or one of its entries did, with `message` (design.md
@@ -834,6 +952,7 @@ pub const RocTask = extern struct {
     /// Free the task's memory.
     fn release(self: *RocTask) void {
         const ops = self.ops;
+        std.debug.assert(self.waited_cell == null); // rationale: `finish` and an update without a `Wait` leave the cell, and a task ends only after one
         for (&self.record_cache) |*list| {
             while (list.*) |record| {
                 list.* = recordNext(record).*;
@@ -884,6 +1003,100 @@ pub const RocTask = extern struct {
         self.capacity = capacity;
     }
 };
+
+/// The tasks waiting on the cells that share one entry of `cell_waiters`,
+/// oldest first.
+const CellWaiters = struct {
+    oldest: ?*RocTask = null,
+    newest: ?*RocTask = null,
+};
+
+/// Every waiting task, by the address of the cell it waits on. Cells that
+/// share an entry are told apart by address, so a cell needs no room for its
+/// waiters. A cell outlives its waiters, whose probes hold it.
+var cell_waiters: [256]CellWaiters = @splat(.{});
+
+fn cellWaiters(cell: *anyopaque) *CellWaiters {
+    const address = @intFromPtr(cell) >> 4;
+    return &cell_waiters[@as(u8, @truncate(address ^ (address >> 8) ^ (address >> 16)))];
+}
+
+/// `cell_wait`: the running `task`'s update of `cell` answered `Wait`, so the
+/// task pauses until a wake. It takes `probe`, a boxed erased callable. A task
+/// whose retried update waits again keeps its place, and passes on the wake
+/// it carried.
+pub fn cellWait(task: *RocTask, cell: *anyopaque, probe: [*]u8) void {
+    task.waits_on_cell = true;
+    if (task.waited_cell) |waited| {
+        std.debug.assert(waited == cell); // rationale: a readied waiter's code goes on with the update that waited
+        erased_callable.decref(task.waiting_probe, task.ops);
+        task.waiting_probe = probe;
+        if (!task.carries_wake) utils.builtinInvariant(task.ops, "a task waiting on shared state ran again without a wake");
+        task.carries_wake = false;
+        return probeFrom(cell, task.newer_waiter);
+    }
+    const waiters = cellWaiters(cell);
+    task.waited_cell = cell;
+    task.waiting_probe = probe;
+    task.older_waiter = waiters.newest;
+    task.newer_waiter = null;
+    if (waiters.newest) |newest| newest.newer_waiter = task else waiters.oldest = task;
+    waiters.newest = task;
+}
+
+/// `cell_settle`: an update of `cell` by the running code answered without a
+/// `Wait`, and `stored` a new state or put back the one it was given.
+pub fn cellSettle(cell: *anyopaque, stored: bool) void {
+    const waiters = cellWaiters(cell);
+    if (waiters.oldest == null) return;
+    const running = runningSlot().*;
+    if (running) |task| if (task.waited_cell != null) {
+        std.debug.assert(task.waited_cell.? == cell); // rationale: a readied waiter's code goes on with the update that waited
+        if (!stored) return task.leaveCell();
+        task.removeWaiter();
+    };
+    if (stored) probeFrom(cell, waiters.oldest);
+}
+
+/// Probe the waiters of `cell` from `first` on and wake the first that would
+/// not wait, stopping at one that already carries a wake: whichever of them
+/// ends without a store probes on from its successor, so no wake is lost. A
+/// poisoned cell's waiters all go on, each when the one before it crashed.
+fn probeFrom(cell: *anyopaque, first: ?*RocTask) void {
+    var calls: HostCalls = .{};
+    var next = first;
+    while (next) |waiter| {
+        next = waiter.newer_waiter;
+        if (waiter.waited_cell.? != cell) continue;
+        if (waiter.carries_wake) break;
+        // A task that runs no more of its code leaves the cell when it ends.
+        if (waiter.cancel_requested or waiter.crashing) continue;
+        if (!waiter.probe()) continue;
+        waiter.carries_wake = true;
+        const seen = @atomicRmw(u32, &waiter.cell_word, .Xchg, 1, .acq_rel);
+        if (seen & wake_parked != 0) calls.add(waiter, false);
+        break;
+    }
+    calls.make();
+}
+
+/// Probe the oldest waiter of every cell, which finds each poisoned one.
+fn probeEveryCell() void {
+    for (&cell_waiters) |*waiters| {
+        var next = waiters.oldest;
+        while (next) |waiter| : (next = waiter.newer_waiter) {
+            if (oldestOf(waiters, waiter.waited_cell.?) == waiter) probeFrom(waiter.waited_cell.?, waiter);
+        }
+    }
+}
+
+fn oldestOf(waiters: *const CellWaiters, cell: *anyopaque) ?*RocTask {
+    var next = waiters.oldest;
+    while (next) |waiter| : (next = waiter.newer_waiter) {
+        if (waiter.waited_cell.? == cell) return waiter;
+    }
+    return null;
+}
 
 /// Calls of the host's `roc_task_ready`, and `roc_task_abort` before it for
 /// a task whose operation is abandoned, that are due once the tree is

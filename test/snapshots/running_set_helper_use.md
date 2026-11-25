@@ -36,7 +36,7 @@ COMPILER ONLY FUNCTION - running_set_helper_use.md:9:20:9:48
 			(source-region (file "running_set_helper_use.md") (start 3 15) (end 3 38) (annotation error) (line-text "\tentry! = |f| Concurrently.run_entry!(f)"))
 			(line-break)
 			(line-break)
-			(reflow "The running-set functions of `Concurrently` run `for!` loops over plans and supervised functions, and only the compiler calls them. This use crashes if it runs.")))
+			(reflow "The running-set functions of `Concurrently` run `for!` loops over plans, supervised functions and waits on shared state, and only the compiler calls them. This use crashes if it runs.")))
 	(report
 		(severity runtime_error)
 		(title "Compiler Only Function")
@@ -47,7 +47,7 @@ COMPILER ONLY FUNCTION - running_set_helper_use.md:9:20:9:48
 			(source-region (file "running_set_helper_use.md") (start 6 11) (end 6 34) (annotation error) (line-text "\tnamed! = Concurrently.run_entry!"))
 			(line-break)
 			(line-break)
-			(reflow "The running-set functions of `Concurrently` run `for!` loops over plans and supervised functions, and only the compiler calls them. This use crashes if it runs.")))
+			(reflow "The running-set functions of `Concurrently` run `for!` loops over plans, supervised functions and waits on shared state, and only the compiler calls them. This use crashes if it runs.")))
 	(report
 		(severity runtime_error)
 		(title "Compiler Only Function")
@@ -58,7 +58,7 @@ COMPILER ONLY FUNCTION - running_set_helper_use.md:9:20:9:48
 			(source-region (file "running_set_helper_use.md") (start 9 20) (end 9 48) (annotation error) (line-text "\tsupervised! = |f| Concurrently.run_supervised!(1, f)"))
 			(line-break)
 			(line-break)
-			(reflow "The running-set functions of `Concurrently` run `for!` loops over plans and supervised functions, and only the compiler calls them. This use crashes if it runs."))))
+			(reflow "The running-set functions of `Concurrently` run `for!` loops over plans, supervised functions and waits on shared state, and only the compiler calls them. This use crashes if it runs."))))
 ~~~
 # TOKENS
 ~~~zig

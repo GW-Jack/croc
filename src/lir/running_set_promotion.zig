@@ -3,18 +3,21 @@
 //!
 //! Monotype lowers every concurrent loop to calls of the Builtin running-set
 //! helpers, its sequential form. A loop whose `run_next!` specialization may
-//! suspend is task-form: this rewrites each of its helper calls in place to
-//! running-set operations, which name the set by the loop's id. In a `Tasks`
-//! build it also replaces the body of each `run_supervised!` specialization
-//! with its restart loop ("Supervision."). The continuation pass runs this before it finds any sites, since a promoted
-//! `group_next` is a park site, and afterwards gives every operation its
-//! task.
+//! suspend, or whose procedure may wait on shared state, is task-form: this
+//! rewrites each of its helper calls in place to running-set operations, which
+//! name the set by the loop's id. In a `Tasks` build it also replaces the body of
+//! each `run_supervised!` specialization with its restart loop ("Supervision."),
+//! and those of the `cell_wait!` and `cell_settle!` specializations with their
+//! operations ("Shared State", "Waiting."). The continuation pass runs this
+//! before it finds any sites, since a promoted `group_next` is a park site, and
+//! afterwards gives every operation its task.
 
 const std = @import("std");
 const collections = @import("collections");
 const core = @import("lir_core");
 const layout = @import("layout");
 const body_clone = @import("body_clone.zig");
+const SuspensionMarks = @import("suspension_marks.zig");
 const ContinuationPass = @import("continuation_pass.zig");
 const base = @import("base");
 const invariant = base.invariant;
@@ -43,7 +46,8 @@ const Loop = struct {
 };
 
 /// Promote every task-form loop in the program (design.md "Promotion"), and
-/// in a `Tasks` build every `run_supervised!` specialization ("Supervision.").
+/// in a `Tasks` build every `run_supervised!`, `cell_wait!` and
+/// `cell_settle!` specialization ("Supervision."; "Shared State", "Waiting.").
 pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, mode: base.ConcurrencyMode) Allocator.Error!void {
     var loops = collections.DenseMapUnmanaged(ProcId, Loop).empty;
     defer loops.deinit(allocator);
@@ -52,6 +56,8 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, mode:
 
     // Start procedures are added below; none of them calls a helper.
     const proc_count = store.procSpecCount();
+    var waits = if (mode.hasTasks()) try SuspensionMarks.mayWait(allocator, store) else try std.bit_set.DynamicBitSetUnmanaged.initEmpty(allocator, proc_count);
+    defer waits.deinit(allocator);
     for (0..proc_count) |index| {
         const proc_id: ProcId = @fromBackingInt(@intCast(index));
         const proc = store.getProcSpecImmediate(proc_id);
@@ -62,12 +68,17 @@ pub fn run(allocator: Allocator, store: *LirStore, layouts: *layout.Store, mode:
         for (0..proc_count) |index| {
             const proc_id: ProcId = @fromBackingInt(@intCast(index));
             const proc = store.getProcSpecImmediate(proc_id);
-            if (proc.running_set_helper != .run_supervised or proc.body.get() == null) continue;
-            try promoteSupervised(allocator, store, layouts, &starts, proc_id);
+            if (proc.body.get() == null) continue;
+            switch (proc.running_set_helper) {
+                .run_supervised => try promoteSupervised(allocator, store, layouts, &starts, proc_id),
+                .cell_wait => try promoteCell(allocator, store, proc_id, .cell_wait),
+                .cell_settle => try promoteCell(allocator, store, proc_id, .cell_settle),
+                .none, .run_create, .run_next, .run_spawn, .run_cancel, .run_entry, .run_arrived, .run_ended => {},
+            }
         }
     }
-    if (loops.count() == 0) return;
-    for (0..proc_count) |index| try promoteIn(allocator, store, layouts, &loops, @fromBackingInt(@intCast(index)));
+    if (loops.count() == 0 and waits.count() == 0) return;
+    for (0..proc_count) |index| try promoteIn(allocator, store, layouts, &loops, &starts, waits.isSet(index), @fromBackingInt(@intCast(index)));
 }
 
 /// The helpers a task-form `run_next!` calls: exactly one specialization
@@ -86,7 +97,7 @@ fn describe(allocator: Allocator, store: *LirStore, layouts: *layout.Store, star
             .run_entry => &entry,
             .run_arrived => &arrived,
             .run_ended => &ended,
-            .none, .run_create, .run_next, .run_spawn, .run_cancel, .run_supervised => continue,
+            .none, .run_create, .run_next, .run_spawn, .run_cancel, .run_supervised, .cell_wait, .cell_settle => continue,
         };
         if (slot.*) |seen| {
             if (seen != callee) invariant("a run_next! specialization calls two specializations of one running-set helper", .{});
@@ -461,14 +472,40 @@ fn promoteSupervised(allocator: Allocator, store: *LirStore, layouts: *layout.St
     proc.frame_locals = try store.addLocalSpan(b.frame.items);
 }
 
+/// Replace the body of one `cell_wait!(cell, probe)` or
+/// `cell_settle!(cell, stored)` specialization with `op` on its arguments
+/// (design.md "Shared State", "Waiting."). Before, the one crashed and the
+/// other did nothing.
+fn promoteCell(allocator: Allocator, store: *LirStore, proc_id: ProcId, op: LIR.LowLevel) Allocator.Error!void {
+    const args = try ContinuationPass.copyLocals(allocator, store, store.getProcSpecImmediate(proc_id).args);
+    defer allocator.free(args);
+    if (args.len != 2) invariant("a shared-state helper does not take its cell and one more argument", .{});
+    const origin = store.stmtOrigin(store.getProcSpecImmediate(proc_id).body.get().?);
+    const unit = try store.addLocal(.{ .layout_idx = store.getProcSpecImmediate(proc_id).ret_layout });
+    const result = try store.addLocal(.{ .layout_idx = if (op == .cell_wait) .u32 else .zst });
+    const ret = try store.addCFStmt(.{ .ret = .{ .value = unit } }, origin);
+    const value = try store.addCFStmt(.{ .assign_struct = .{ .target = unit, .fields = .empty(), .next = ret } }, origin);
+    const head = try store.addLowLevelStmt(result, op, args, value, origin);
+    var frame = std.ArrayList(LocalId).empty;
+    defer frame.deinit(allocator);
+    try frame.appendSlice(allocator, args);
+    try frame.appendSlice(allocator, &.{ unit, result });
+    std.mem.sort(LocalId, frame.items, {}, localLessThan);
+    const proc = store.getProcSpecPtr(proc_id);
+    proc.body = .some(head);
+    proc.frame_locals = try store.addLocalSpan(frame.items);
+}
+
 fn localLessThan(_: void, a: LocalId, b: LocalId) bool {
     return @backingInt(a) < @backingInt(b);
 }
 
 /// Promote the task-form loops of one procedure: each call of a task-form
 /// `run_next!` names its loop's id, and the procedure's other helper calls
-/// with that id belong to the same loop.
-fn promoteIn(allocator: Allocator, store: *LirStore, layouts: *layout.Store, loops: *const collections.DenseMapUnmanaged(ProcId, Loop), proc_id: ProcId) Allocator.Error!void {
+/// with that id belong to the same loop. `may_wait` is whether the procedure
+/// may wait on shared state, which makes all its loops task-form. `loops` gains
+/// those that only this makes so.
+fn promoteIn(allocator: Allocator, store: *LirStore, layouts: *layout.Store, loops: *collections.DenseMapUnmanaged(ProcId, Loop), starts: *collections.DenseMapUnmanaged(ProcId, Start), may_wait: bool, proc_id: ProcId) Allocator.Error!void {
     if (store.getProcSpecImmediate(proc_id).body.get() == null) return;
     var stmts = try bodyStmts(allocator, store, proc_id);
     defer stmts.deinit(allocator);
@@ -491,7 +528,7 @@ fn promoteIn(allocator: Allocator, store: *LirStore, layouts: *layout.Store, loo
             try ids.define(allocator, stmt.assign_ref.target, .{ .copy = stmt.assign_ref.op.source });
         } else if (stmt == .assign_call) switch (store.getProcSpecImmediate(stmt.assign_call.proc).running_set_helper) {
             .run_create, .run_next, .run_spawn, .run_cancel => try calls.append(allocator, stmt_id),
-            .none, .run_entry, .run_arrived, .run_ended, .run_supervised => {},
+            .none, .run_entry, .run_arrived, .run_ended, .run_supervised, .cell_wait, .cell_settle => {},
         };
     }
 
@@ -500,7 +537,13 @@ fn promoteIn(allocator: Allocator, store: *LirStore, layouts: *layout.Store, loo
     defer task_form.deinit(allocator);
     for (calls.items) |stmt_id| {
         const assign = store.getCFStmtImmediate(stmt_id).assign_call;
-        const loop = loops.get(assign.proc) orelse continue;
+        const callee = store.getProcSpecImmediate(assign.proc);
+        if (callee.running_set_helper != .run_next or (callee.suspends == .never and !may_wait)) continue;
+        const loop = loops.get(assign.proc) orelse blk: {
+            const described = try describe(allocator, store, layouts, starts, assign.proc);
+            try loops.put(allocator, assign.proc, described);
+            break :blk described;
+        };
         try task_form.put(allocator, loopId(store, &ids, assign), loop);
     }
     if (task_form.count() == 0) return;
@@ -529,12 +572,12 @@ fn promoteIn(allocator: Allocator, store: *LirStore, layouts: *layout.Store, loo
                 try promoter.promoteCreate(stmt_id, loop);
             },
             .run_next => {
-                if (!loops.contains(assign.proc)) invariant("one loop id names a task-form and a sequential run_next!", .{});
+                if (store.getProcSpecImmediate(assign.proc).suspends == .never and !may_wait) invariant("one loop id names a task-form and a sequential run_next!", .{});
                 try promoter.promoteNext(stmt_id, loop);
             },
             .run_spawn => try promoter.promoteSpawn(stmt_id, loop),
             .run_cancel => try promoter.promoteCancel(stmt_id),
-            .none, .run_entry, .run_arrived, .run_ended, .run_supervised => unreachable, // `calls` holds only these four helpers' calls.
+            .none, .run_entry, .run_arrived, .run_ended, .run_supervised, .cell_wait, .cell_settle => unreachable, // `calls` holds only these four helpers' calls.
         }
     }
     var task_form_ids = task_form.keyIterator();

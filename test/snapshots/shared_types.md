@@ -13,6 +13,9 @@ take! = |list| list.update!(
 	},
 )
 
+acquire! : Shared(U64) => {}
+acquire! = |permits| permits.update!(|n| if n > 0 Set(n - 1, {}) else Wait)
+
 made! = || Shared.new!("state")
 
 read! = |shared| shared.get!()
@@ -21,14 +24,14 @@ effectful! : Shared(U64), (U64 => U64) => {}
 effectful! = |shared, f!| shared.modify!(f!)
 ~~~
 # EXPECTED
-TYPE MISMATCH - shared_types.md:14:27:14:27
+TYPE MISMATCH - shared_types.md:17:27:17:27
 # PROBLEMS
 ~~~clojure
 (reports
 	(report
 		(severity runtime_error)
 		(title "Type Mismatch")
-		(region (start 14 42) (end 14 44))
+		(region (start 17 42) (end 17 44))
 		(headline
 			(reflow "The")
 			(reflow " ")
@@ -37,8 +40,8 @@ TYPE MISMATCH - shared_types.md:14:27:14:27
 			(reflow "argument being passed to this function has the wrong type."))
 		(document
 			(source-underlines
-				(display (file "shared_types.md") (start 14 27) (end 14 45) (annotation dim) (line-text "effectful! = |shared, f!| shared.modify!(f!)"))
-				(underline (start 14 42) (end 14 44) (annotation error)))
+				(display (file "shared_types.md") (start 17 27) (end 17 45) (annotation dim) (line-text "effectful! = |shared, f!| shared.modify!(f!)"))
+				(underline (start 17 42) (end 17 44) (annotation error)))
 			(line-break)
 			(reflow "This argument has the type:")
 			(line-break)
@@ -79,6 +82,8 @@ OpenSquare,CloseSquare,OpFatArrow,UpperIdent,NoSpaceOpenRound,UpperIdent,NoSpace
 OpenSquare,LowerIdent,Comma,DoubleDot,KwAs,LowerIdent,CloseSquare,OpFatArrow,UpperIdent,NoSpaceOpenRound,LowerIdent,Comma,UpperIdent,NoSpaceOpenRound,LowerIdent,CloseRound,CloseRound,
 CloseCurly,Comma,
 CloseRound,
+LowerIdent,OpColon,UpperIdent,NoSpaceOpenRound,UpperIdent,CloseRound,OpFatArrow,OpenCurly,CloseCurly,
+LowerIdent,OpAssign,OpBar,LowerIdent,OpBar,LowerIdent,NoSpaceDotLowerIdent,NoSpaceOpenRound,OpBar,LowerIdent,OpBar,KwIf,LowerIdent,OpGreaterThan,Int,UpperIdent,NoSpaceOpenRound,LowerIdent,OpBinaryMinus,Int,Comma,OpenCurly,CloseCurly,CloseRound,KwElse,UpperIdent,CloseRound,
 LowerIdent,OpAssign,OpBar,OpBar,UpperIdent,NoSpaceDotLowerIdent,NoSpaceOpenRound,StringStart,StringPart,StringEnd,CloseRound,
 LowerIdent,OpAssign,OpBar,LowerIdent,OpBar,LowerIdent,NoSpaceDotLowerIdent,NoSpaceOpenRound,CloseRound,
 LowerIdent,OpColon,UpperIdent,NoSpaceOpenRound,UpperIdent,CloseRound,Comma,OpenRound,UpperIdent,OpFatArrow,UpperIdent,CloseRound,OpFatArrow,OpenCurly,CloseCurly,
@@ -135,6 +140,35 @@ EndOfFile,
 											(e-apply
 												(e-tag (raw "Ok"))
 												(e-ident (raw "first"))))))))))))
+		(s-type-anno (name "acquire!")
+			(ty-fn
+				(ty-apply
+					(ty (name "Shared"))
+					(ty (name "U64")))
+				(ty-record)))
+		(s-decl
+			(p-ident (raw "acquire!"))
+			(e-lambda
+				(args
+					(p-ident (raw "permits")))
+				(e-method-call (method ".update!")
+					(receiver
+						(e-ident (raw "permits")))
+					(args
+						(e-lambda
+							(args
+								(p-ident (raw "n")))
+							(e-if-then-else
+								(e-binop (op ">")
+									(e-ident (raw "n"))
+									(e-int (raw "0")))
+								(e-apply
+									(e-tag (raw "Set"))
+									(e-binop (op "-")
+										(e-ident (raw "n"))
+										(e-int (raw "1")))
+									(e-record))
+								(e-tag (raw "Wait"))))))))
 		(s-decl
 			(p-ident (raw "made!"))
 			(e-lambda
@@ -175,7 +209,23 @@ EndOfFile,
 ~~~
 # FORMATTED
 ~~~roc
-NO CHANGE
+take! : Shared(List(a)) => Try(a, [Empty])
+take! = |list| list.update!(
+	|items| match items {
+		[] => Keep(Err(Empty))
+		[first, .. as rest] => Set(rest, Ok(first))
+	},
+)
+
+acquire! : Shared(U64) => {}
+acquire! = |permits| permits.update!(|n| if (n > 0) Set(n - 1, {}) else Wait)
+
+made! = || Shared.new!("state")
+
+read! = |shared| shared.get!()
+
+effectful! : Shared(U64), (U64 => U64) => {}
+effectful! = |shared, f!| shared.modify!(f!)
 ~~~
 # CANONICALIZE
 ~~~clojure
@@ -185,7 +235,7 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-assign (ident "list")))
-			(e-dispatch-call (method "update!") (constraint-fn-var 331)
+			(e-dispatch-call (method "update!") (constraint-fn-var 363)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "list"))))
@@ -237,10 +287,48 @@ NO CHANGE
 					(ty-tag-union
 						(ty-tag-name (name "Empty")))))))
 	(d-let
+		(p-assign (ident "acquire!"))
+		(e-lambda
+			(args
+				(p-assign (ident "permits")))
+			(e-dispatch-call (method "update!") (constraint-fn-var 408)
+				(receiver
+					(e-lookup-local
+						(p-assign (ident "permits"))))
+				(args
+					(e-lambda
+						(args
+							(p-assign (ident "n")))
+						(e-if
+							(if-branches
+								(if-branch
+									(e-dispatch-call (method "is_gt") (constraint-fn-var 419)
+										(receiver
+											(e-lookup-local
+												(p-assign (ident "n"))))
+										(args
+											(e-num (value "0"))))
+									(e-tag (name "Set")
+										(args
+											(e-dispatch-call (method "minus") (constraint-fn-var 425)
+												(receiver
+													(e-lookup-local
+														(p-assign (ident "n"))))
+												(args
+													(e-num (value "1"))))
+											(e-empty_record)))))
+							(if-else
+								(e-tag (name "Wait"))))))))
+		(annotation
+			(ty-fn (effectful true)
+				(ty-apply (name "Shared") (builtin)
+					(ty-lookup (name "U64") (builtin)))
+				(ty-record))))
+	(d-let
 		(p-assign (ident "made!"))
 		(e-lambda
 			(args)
-			(e-call (constraint-fn-var 373)
+			(e-call (constraint-fn-var 440)
 				(e-lookup-external
 					(builtin))
 				(e-string
@@ -250,7 +338,7 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-assign (ident "shared")))
-			(e-dispatch-call (method "get!") (constraint-fn-var 381)
+			(e-dispatch-call (method "get!") (constraint-fn-var 448)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "shared"))))
@@ -277,11 +365,13 @@ NO CHANGE
 (inferred-types
 	(defs
 		(patt (type "Shared(List(a)) => Try(a, [Empty])"))
+		(patt (type "Shared(U64) => {}"))
 		(patt (type "() => Shared(state) where [state.from_quote : Str -> Try(state, [BadQuotedBytes(Str)])]"))
 		(patt (type "b -> c where [b.get! : b -> c]"))
 		(patt (type "Shared(U64), (U64 => U64) => {}")))
 	(expressions
 		(expr (type "Shared(List(a)) => Try(a, [Empty])"))
+		(expr (type "Shared(U64) => {}"))
 		(expr (type "() => Shared(state) where [state.from_quote : Str -> Try(state, [BadQuotedBytes(Str)])]"))
 		(expr (type "b -> c where [b.get! : b -> c]"))
 		(expr (type "Shared(U64), (U64 => U64) => {}"))))
