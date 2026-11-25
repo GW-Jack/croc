@@ -204,9 +204,16 @@ pub fn crashRunning(msg: []const u8) void {
     // A probe's crash is its answer (`RocTask.probe`), not the waiter's crash.
     if (task.probing) crash_exit.jump(&task.crash_jmp);
     task.lockTree();
-    task.takeCrash(msg);
+    if (task.finishing and task.crashing) task.addCleanupCrash(msg) else task.takeCrash(msg);
     task.unlockTree();
     crash_exit.jump(&task.crash_jmp);
+}
+
+/// The task whose resume the calling thread is running, or null outside one:
+/// in a hosted call, or in a root of a `None` program that isn't run by a task.
+fn currentTask() ?*RocTask {
+    if (runningSlot().*) |task| return task;
+    return Scheduler.runningTask();
 }
 
 /// Clear the running task for a hosted call and return it, so a crash in
@@ -369,6 +376,12 @@ pub const RocTask = extern struct {
     /// A root's lock over its tree (design.md "Parallel Resumes"): 0 free,
     /// 1 held.
     tree_lock: u32,
+    /// The cleanups of the `finally!` and `on_failure!` calls the task's code is
+    /// in, innermost last: boxed erased callables the task holds a reference to
+    /// (design.md "Shared State", "Cleanups.").
+    cleanups: [*][*]u8,
+    cleanups_len: usize,
+    cleanups_capacity: usize,
     /// The next task in a list of host calls due once the tree is unlocked
     /// (`HostCalls`), and whether this one's operation is abandoned first.
     host_next: ?*RocTask,
@@ -431,6 +444,9 @@ pub const RocTask = extern struct {
             .resume_claimed = false,
             .tree = null,
             .tree_lock = 0,
+            .cleanups = undefined,
+            .cleanups_len = 0,
+            .cleanups_capacity = 0,
             .host_next = null,
             .host_abort = false,
             .scheduler = null,
@@ -669,6 +685,7 @@ pub const RocTask = extern struct {
             };
         }
         if (self.open_groups != null) utils.builtinInvariant(self.ops, "a task's code finished with a concurrent loop still open");
+        if (self.cleanups_len != 0) utils.builtinInvariant(self.ops, "a task's code finished with a cleanup still pending");
         return self.end(.done);
     }
 
@@ -956,7 +973,48 @@ pub const RocTask = extern struct {
             self.claimParallelResume();
             if (last_taken) group.close();
         }
+        while (self.cleanups_len > 0) self.runCleanup();
         return self.end(if (self.crashing) .crashed else .cancelled);
+    }
+
+    /// Run the innermost cleanup left, once the task's descendants are gone. It
+    /// is a pure function's update of one cell, so it can't pause. A crash in it
+    /// poisons its cell as any update's does, and the task ends `crashed`.
+    noinline fn runCleanup(self: *RocTask) void {
+        self.cleanups_len -= 1;
+        if (self.scheduler == null) runningSlot().* = self;
+        if (self.scheduler != null or !crash_exit.available() or crash_exit.save(&self.crash_jmp) == 0) {
+            var answer: u8 = undefined;
+            var out_desc: ?*const anyopaque = null;
+            const cleanup = self.cleanups[self.cleanups_len];
+            erased_callable.payloadPtr(cleanup).callable_fn_ptr(self.ops, @ptrCast(&answer), null, erased_callable.capturePtr(cleanup), null, &out_desc);
+            if (self.scheduler == null) runningSlot().* = null;
+        } else {
+            self.endUpdate();
+            probeEveryCell(self.tree != null);
+        }
+        // Kept in the task, since a crash exit restores no local.
+        erased_callable.decref(self.cleanups[self.cleanups_len], self.ops);
+    }
+
+    fn pushCleanup(self: *RocTask, cleanup: [*]u8) void {
+        if (self.cleanups_len == self.cleanups_capacity) {
+            const capacity = if (self.cleanups_capacity == 0) 4 else self.cleanups_capacity * 2;
+            const raw = if (self.cleanups_capacity == 0)
+                self.ops.alloc(@alignOf([*]u8), capacity * @sizeOf([*]u8))
+            else
+                self.ops.realloc(@ptrCast(self.cleanups), capacity * @sizeOf([*]u8), @alignOf([*]u8));
+            self.cleanups = @ptrCast(@alignCast(raw));
+            self.cleanups_capacity = capacity;
+        }
+        self.cleanups[self.cleanups_len] = cleanup;
+        self.cleanups_len += 1;
+    }
+
+    fn popCleanup(self: *RocTask) void {
+        if (self.cleanups_len == 0) utils.builtinInvariant(self.ops, "a cleanup was popped that was never pushed");
+        self.cleanups_len -= 1;
+        erased_callable.decref(self.cleanups[self.cleanups_len], self.ops);
     }
 
     /// The task, if it waits on a cell: an update it runs is then the one that
@@ -1042,6 +1100,20 @@ pub const RocTask = extern struct {
         @atomicStore(bool, &self.crashing, true, .monotonic);
     }
 
+    /// A cleanup of a crashing task crashed with `message`, which joins the one
+    /// the task has. The tree is locked.
+    fn addCleanupCrash(self: *RocTask, message: []const u8) void {
+        const first = self.crash_message[0..self.crash_message_len];
+        const joint = "\na cleanup then crashed: ";
+        const copy: [*]u8 = @ptrCast(self.ops.alloc(1, first.len + joint.len + message.len));
+        @memcpy(copy[0..first.len], first);
+        @memcpy(copy[first.len..][0..joint.len], joint);
+        @memcpy(copy[first.len + joint.len ..][0..message.len], message);
+        self.ops.dealloc(@ptrCast(@constCast(self.crash_message)), 1);
+        self.crash_message = copy;
+        self.crash_message_len = first.len + joint.len + message.len;
+    }
+
     /// The task reached its terminal `status`. A child reports to its group
     /// and is freed before its resume returns (design.md "Child Tasks").
     fn end(self: *RocTask, status: Status) Status {
@@ -1069,6 +1141,7 @@ pub const RocTask = extern struct {
             }
         }
         if (self.capacity > 0) ops.dealloc(@ptrCast(self.entries), @alignOf(Entry));
+        if (self.cleanups_capacity > 0) ops.dealloc(@ptrCast(self.cleanups), @alignOf([*]u8));
         if (self.status == .crashed) ops.dealloc(@ptrCast(@constCast(self.crash_message)), 1);
         freeBuffer(ops, self.hosted_slot, self.hosted_slot_size, self.hosted_slot_alignment);
         freeBuffer(ops, self.result_buffer, self.result_buffer_size, self.result_buffer_alignment);
@@ -1240,7 +1313,7 @@ pub fn cellSettle(cell: *anyopaque, stored: bool) void {
     const running = runningSlot().*;
     var calls: HostCalls = .{};
     if (!waiters.empty()) {
-        const retried = if (running) |task| task.retriedWaiter() else Scheduler.retriedWaiter(cell);
+        const retried = if (currentTask()) |task| task.retriedWaiter() else null;
         if (retried) |task| {
             std.debug.assert(task.waited_cell.? == cell); // rationale: a readied waiter's code goes on with the update that waited
             if (stored) task.removeWaiter() else task.leaveLocked(&calls);
@@ -1249,6 +1322,21 @@ pub fn cellSettle(cell: *anyopaque, stored: bool) void {
     }
     waiters.unlockUpdate(running);
     calls.make();
+}
+
+/// `cleanup_push`: the running code is about to call the body of a `finally!`
+/// or `on_failure!`, whose `cleanup` runs if its task is cancelled or crashes
+/// before `cleanup_pop` (design.md "Shared State", "Cleanups."). Takes `cleanup`.
+pub fn cleanupPush(ops: *RocOps, cleanup: [*]u8) void {
+    const task = currentTask() orelse return erased_callable.decref(cleanup, ops);
+    task.pushCleanup(cleanup);
+}
+
+/// `cleanup_pop`: the body returned, so the cleanup the running code pushed last
+/// is dropped.
+pub fn cleanupPop() void {
+    const task = currentTask() orelse return;
+    task.popCleanup();
 }
 
 /// Probe the waiters of `cell` from `first` on and wake the first that would
@@ -2082,6 +2170,11 @@ const TaskHeap = struct {
     }
 };
 
+/// The runs of a `None` program that have not ended, each thread's later ones
+/// first, and the lock that guards the list.
+var innermost_run: ?*Scheduler = null;
+var runs_lock: SpinLock = .{};
+
 /// One run of a `None` program that can wait on shared state (design.md
 /// "Shared State", "Programs without tasks."): the host of its tasks, from
 /// `task_run`'s call of the root until it ends. Runs on several threads may
@@ -2093,6 +2186,8 @@ pub const Scheduler = struct {
     root: *RocTask,
     /// The task whose resume is running.
     running: ?*RocTask,
+    /// The run made before this one that has not ended, of any thread.
+    outer_run: ?*Scheduler,
     /// The tasks to resume: those readied, and of each group whose owner is
     /// waiting at its loop's next, the first entry that has not begun.
     readied: TaskHeap,
@@ -2106,7 +2201,8 @@ pub const Scheduler = struct {
     pub fn run(ops: *RocOps, start: [*]u8, buffer_size: usize, buffer_alignment: usize, result_size: usize, result_alignment: usize) [*]u8 {
         @atomicStore(?*const fn () void, &run_crashed, &crashed, .monotonic);
         const result = allocBuffer(ops, result_size, result_alignment);
-        var self = Scheduler{ .thread = crash_exit.threadId(), .root = undefined, .running = null, .readied = .{} };
+        var self = Scheduler{ .thread = crash_exit.threadId(), .root = undefined, .running = null, .outer_run = null, .readied = .{} };
+        self.enter();
         self.root = RocTask.create(ops, start, result, .{
             .hosted_slot_size = 0,
             .hosted_slot_alignment = 1,
@@ -2127,6 +2223,7 @@ pub const Scheduler = struct {
             } else if (task == self.root) break;
         }
         self.root.release();
+        self.leave();
         return result;
     }
 
@@ -2177,16 +2274,48 @@ pub const Scheduler = struct {
         }
     }
 
-    /// The running task of the calling thread's run, if it waits on `cell`: an
-    /// update it runs is then the one that waited, run again.
-    fn retriedWaiter(cell: *anyopaque) ?*RocTask {
-        const waiters = cellWaiters(cell);
-        var next_waiter = waiters.after(cell, null);
-        while (next_waiter) |waiter| : (next_waiter = waiters.after(cell, waiter)) {
-            const scheduler = waiter.scheduler orelse continue;
-            if (scheduler.running == waiter) return waiter;
+    /// The task the calling thread's innermost run is running, if it has a run.
+    fn runningTask() ?*RocTask {
+        // A program that has never made a run has no thread to ask for.
+        if (@atomicLoad(?*Scheduler, &innermost_run, .monotonic) == null) return null;
+        const thread = crash_exit.threadId();
+        runs_lock.lock();
+        defer runs_lock.unlock();
+        var next_run = innermost_run;
+        while (next_run) |made| : (next_run = made.outer_run) {
+            if (made.thread == thread) return made.running;
         }
         return null;
+    }
+
+    fn enter(self: *Scheduler) void {
+        runs_lock.lock();
+        defer runs_lock.unlock();
+        self.outer_run = innermost_run;
+        @atomicStore(?*Scheduler, &innermost_run, self, .monotonic);
+    }
+
+    /// Take `self` off the list of runs, and with it every later one of its
+    /// thread: a crash's host may have left those without an end.
+    fn leave(self: *Scheduler) void {
+        runs_lock.lock();
+        defer runs_lock.unlock();
+        unlinkRuns(self.thread, self);
+    }
+
+    /// Take the runs of `thread` off the list, up to `last` or all of them.
+    fn unlinkRuns(thread: u64, last: ?*Scheduler) void {
+        var kept: ?*Scheduler = null;
+        var next_run = innermost_run;
+        while (next_run) |made| {
+            next_run = made.outer_run;
+            if (made.thread != thread) {
+                kept = made;
+                continue;
+            }
+            if (kept) |later| later.outer_run = made.outer_run else @atomicStore(?*Scheduler, &innermost_run, made.outer_run, .monotonic);
+            if (made == last) return;
+        }
     }
 
     /// A crash with no running task. If the calling thread is running a probe
@@ -2207,6 +2336,9 @@ pub const Scheduler = struct {
             while (waiterOn(waiters.oldest, thread, false)) |task| waiters.unlink(task);
             waiters.list.unlock();
         }
+        runs_lock.lock();
+        unlinkRuns(thread, null);
+        runs_lock.unlock();
     }
 
     /// The first waiter from `first` on of a run on `thread`, one whose probe

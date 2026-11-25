@@ -23,6 +23,8 @@ pub const RunningSetHelper = enum(u8) {
     cell_lock,
     cell_wait,
     cell_settle,
+    cleanup_push,
+    cleanup_pop,
 };
 
 /// The loop id of every supervised set. Monotype mints it for no loop

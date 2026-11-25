@@ -37,6 +37,9 @@ const Step = struct {
     /// Whether the update's function crashes, instead of answering, for a
     /// value that is at least the threshold.
     log: ?u8 = null,
+    /// Whether the step is no update, but the start of a `finally!`, whose
+    /// cleanup is the step's update, or a return from one.
+    cleanup: enum(u8) { none, push, pop } = .none,
 };
 
 /// One task and its script.
@@ -64,6 +67,8 @@ const Host = struct {
     var log: [64]u8 = undefined;
     var log_len: usize = 0;
     var probes: usize = 0;
+    var message: [256]u8 = undefined;
+    var message_len: usize = 0;
 
     fn reset() void {
         head = 0;
@@ -86,6 +91,8 @@ const Host = struct {
         const status = runner.task.resumeFromHost(&readyTask, &abortTask);
         if (status == .pending) return;
         runner.ended = status;
+        message_len = runner.task.crash_message_len;
+        if (message_len > 0) @memcpy(message[0..message_len], runner.task.crash_message);
         runner.task.free();
     }
 
@@ -142,11 +149,45 @@ fn probeCall(ops: *RocOps, ret: ?[*]u8, _: ?[*]const u8, capture: ?[*]u8, _: ?[*
     ret.?[0] = @intFromBool(!waits);
 }
 
+/// What follows an update's function: the step's answer, and settling.
+fn answer(ops: *RocOps, step: *const Step, crash_message: []const u8) void {
+    if (step.answer == .crash) ops.crash(crash_message);
+    if (step.answer == .add) step.cell.value += step.amount;
+    step.cell.empty = false;
+    dev_wrappers.roc_builtins_cell_settle(step.cell, step.answer == .add);
+    if (step.log) |name| {
+        Host.log[Host.log_len] = name;
+        Host.log_len += 1;
+    }
+}
+
+/// `cell_cleanup!`.
+fn cleanupCall(ops: *RocOps, ret: ?[*]u8, _: ?[*]const u8, capture: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {
+    const step: *const Step = @as(*align(1) const *const Step, @ptrCast(capture.?)).*;
+    if (step.cell.empty) ops.crash("a cleanup's cell was poisoned");
+    step.cell.empty = true;
+    answer(ops, step, "a cleanup crashed");
+    ret.?[0] = 0;
+}
+
 fn scriptCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _: ?[*]u8, _: *?*const anyopaque) callconv(.c) void {
     const runner: *Runner = @as(*align(1) const *Runner, @ptrCast(capture.?)).*;
     const task: *RocTask = @as(*const *RocTask, @ptrCast(@alignCast(args.?))).*;
     while (runner.next < runner.steps.len) {
         const step = runner.steps[runner.next];
+        switch (step.cleanup) {
+            .none => {},
+            .push => {
+                dev_wrappers.roc_builtins_cleanup_push(allocCallable(ops, &cleanupCall, *const Step, &runner.steps[runner.next]));
+                runner.next += 1;
+                continue;
+            },
+            .pop => {
+                dev_wrappers.roc_builtins_cleanup_pop();
+                runner.next += 1;
+                continue;
+            },
+        }
         if (step.cell.empty) ops.crash("this cell was poisoned");
         step.cell.empty = true;
         if (step.cell.value < step.threshold) {
@@ -157,14 +198,7 @@ fn scriptCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _:
             task.pushRecord(scriptRecord(task, runner), null);
             return;
         }
-        if (step.answer == .crash) ops.crash("an update crashed");
-        if (step.answer == .add) step.cell.value += step.amount;
-        step.cell.empty = false;
-        dev_wrappers.roc_builtins_cell_settle(step.cell, step.answer == .add);
-        if (step.log) |name| {
-            Host.log[Host.log_len] = name;
-            Host.log_len += 1;
-        }
+        answer(ops, &step, "an update crashed");
         runner.next += 1;
     }
     @as(*align(1) u64, @ptrCast(ret.?)).* = runner.index;
@@ -394,6 +428,109 @@ fn expectNoneLeftParked(runners: []const Runner) error{TestUnexpectedResult}!voi
         const step = runner.waitingStep() orelse continue;
         try testing.expect(!step.cell.empty and step.cell.value < step.threshold);
     }
+}
+
+test "a cancelled task runs its cleanups innermost first, and their stores wake waiters" {
+    var env = utils.TestEnv.init(testing.allocator);
+    defer env.deinit();
+    var cell: Cell = .{};
+    var never: Cell = .{};
+    const hold = [_]Step{
+        .{ .cell = &cell, .amount = 1, .log = 'o', .cleanup = .push },
+        .{ .cell = &cell, .amount = 100, .log = 'x', .cleanup = .push },
+        .{ .cell = &cell, .cleanup = .pop },
+        .{ .cell = &cell, .amount = 10, .log = 'i', .cleanup = .push },
+        .{ .cell = &never, .threshold = 1 },
+    };
+    const take = [_]Step{.{ .cell = &cell, .threshold = 11, .amount = -11, .log = 't' }};
+    var runners = [_]Runner{ .{ .steps = &hold }, .{ .steps = &take } };
+    begin(env.getOps(), &runners);
+    for (&runners) |*runner| Host.resumeRunner(runner);
+    try expectLog("");
+    runners[0].task.cancel(&Host.abortTask, &Host.readyTask);
+    Host.drain(&runners);
+    try testing.expectEqual(Status.cancelled, runners[0].ended.?);
+    try testing.expectEqual(Status.done, runners[1].ended.?);
+    try expectLog("iot");
+    try testing.expectEqual(@as(usize, 0), env.getAllocationCount());
+}
+
+test "a crashed task runs its cleanups and keeps its message" {
+    if (!crash_exit.native) return error.SkipZigTest;
+    var env = utils.TestEnv.init(testing.allocator);
+    defer env.deinit();
+    var cell: Cell = .{};
+    var other: Cell = .{};
+    const steps = [_]Step{
+        .{ .cell = &cell, .amount = 1, .log = 'o', .cleanup = .push },
+        .{ .cell = &other, .answer = .crash },
+    };
+    var runners = [_]Runner{.{ .steps = &steps }};
+    begin(env.getOps(), &runners);
+    Host.resumeRunner(&runners[0]);
+    try testing.expectEqual(Status.crashed, runners[0].ended.?);
+    try testing.expectEqualStrings("an update crashed", Host.message[0..Host.message_len]);
+    try expectLog("o");
+    try testing.expectEqual(@as(usize, 0), env.getAllocationCount());
+}
+
+test "a cleanup's crash is a cancelled task's, poisons its cell, and leaves the other cleanups to run" {
+    if (!crash_exit.native) return error.SkipZigTest;
+    var env = utils.TestEnv.init(testing.allocator);
+    defer env.deinit();
+    var cell: Cell = .{};
+    var poisoned: Cell = .{};
+    var never: Cell = .{};
+    const hold = [_]Step{
+        .{ .cell = &cell, .amount = 1, .log = 'o', .cleanup = .push },
+        .{ .cell = &poisoned, .answer = .crash, .cleanup = .push },
+        .{ .cell = &never, .threshold = 1 },
+    };
+    const waits = [_]Step{.{ .cell = &poisoned, .threshold = 1 }};
+    var runners = [_]Runner{ .{ .steps = &hold }, .{ .steps = &waits } };
+    begin(env.getOps(), &runners);
+    for (&runners) |*runner| Host.resumeRunner(runner);
+    runners[0].task.cancel(&Host.abortTask, &Host.readyTask);
+    Host.resumeReady(&runners, 0);
+    try testing.expectEqual(Status.crashed, runners[0].ended.?);
+    try testing.expectEqualStrings("a cleanup crashed", Host.message[0..Host.message_len]);
+    try expectLog("o");
+    Host.drain(&runners);
+    try testing.expectEqual(Status.crashed, runners[1].ended.?);
+    try testing.expectEqualStrings("this cell was poisoned", Host.message[0..Host.message_len]);
+    try testing.expectEqual(@as(usize, 0), env.getAllocationCount());
+}
+
+test "the messages of cleanups that crash follow a crashed task's own" {
+    if (!crash_exit.native) return error.SkipZigTest;
+    var env = utils.TestEnv.init(testing.allocator);
+    defer env.deinit();
+    var cell: Cell = .{};
+    const steps = [_]Step{
+        .{ .cell = &cell, .amount = 1, .log = 'o', .cleanup = .push },
+        .{ .cell = &cell, .answer = .crash, .cleanup = .push },
+        .{ .cell = &cell, .answer = .crash },
+    };
+    var runners = [_]Runner{.{ .steps = &steps }};
+    begin(env.getOps(), &runners);
+    Host.resumeRunner(&runners[0]);
+    try testing.expectEqual(Status.crashed, runners[0].ended.?);
+    try testing.expectEqualStrings(
+        "an update crashed\na cleanup then crashed: a cleanup's cell was poisoned\na cleanup then crashed: a cleanup's cell was poisoned",
+        Host.message[0..Host.message_len],
+    );
+    try expectLog("");
+    try testing.expectEqual(@as(usize, 0), env.getAllocationCount());
+}
+
+test "a push outside any task drops its cleanup" {
+    var env = utils.TestEnv.init(testing.allocator);
+    defer env.deinit();
+    var cell: Cell = .{};
+    const step = Step{ .cell = &cell };
+    task_mod.cleanupPush(env.getOps(), allocCallable(env.getOps(), &cleanupCall, *const Step, &step));
+    try testing.expectEqual(@as(usize, 0), env.getAllocationCount());
+    task_mod.cleanupPop();
 }
 
 test "in random runs, no task is left parked whose update would go on, whatever order tasks run and end in" {

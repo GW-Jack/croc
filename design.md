@@ -34716,6 +34716,45 @@ pure and cannot wait, so a task that runs no more of its own code can still
 run one. A task's pending cleanups run innermost first, after its
 descendants are gone.
 
+```text
+finally! = |Cell(cell), cleanup, body| {
+    cleanup_push!(Box.box(|| cell_cleanup!(cell, cleanup)))
+    answer = body()
+    cleanup_pop!()
+    cell_cleanup!(cell, cleanup)
+    answer
+}
+```
+
+`cell_cleanup!` is the update `modify!` makes. `on_failure!` is `finally!` without
+the call of it. Leaving `body` early is only possible by returning from it, so a
+push and its pop are always paired, and a task's nest. The pop comes before
+the cleanup on a return, so a cleanup that crashes there doesn't run again.
+
+`cleanup_push!` and `cleanup_pop!` are marked Builtin helpers that do nothing.
+They keep that body where nothing can be cancelled and a crash ends the program:
+in a `None` program that can't wait. Elsewhere the continuation pass replaces
+the bodies with the low-level operations `cleanup_push(cleanup)` and
+`cleanup_pop()`. Neither is a suspension site. A push puts the boxed cleanup on a
+stack in the running task, which owns it; a pop drops the innermost. Code that
+no task runs, such as a root that can't suspend in a `None` program, can't be
+cancelled, so there both do nothing.
+
+Which task is running is the running-task pointer where a program's host
+resumes its tasks. A `None` program keeps none, so its scheduler's runs are in a
+list, and the running task is that of the innermost run on the calling thread.
+
+A task that runs no more of its own code releases its records, cancels its
+entries and waits for them to report. Then it runs its cleanups, with itself as
+the running task and with its crash exit, and ends. Nothing is live in its
+frames by then, and a cleanup's closure was made before the body began, so it
+doesn't depend on frames a crash left. A crash in a cleanup stores nothing and so
+poisons the cell, and the cleanups left still run. A task being cancelled then ends
+`crashed` instead, so a root whose host cancelled it may report either status. A
+task that is crashing keeps the first message and adds the cleanup's after it.
+In a `None` program a crash is the program's, in a cleanup as anywhere, so there
+cleanups run only for a cancel.
+
 **Invariants.**
 
 | | Invariant |
@@ -34734,8 +34773,8 @@ descendants are gone.
 **What is built.** `new!`, `update!`, `get!` and `modify!` on every backend and
 both strategies, with poison, and waiting under `.lss` in programs of every
 mode. Under `.boxy`, where only `None` programs compile, a `Wait` crashes with
-the deadlock message. Cleanups, holder sets and the update and probe forms come
-in that order.
+the deadlock message. Cleanups run where tasks do. Holder sets and the update and
+probe forms come in that order.
 
 ### Host Contract
 

@@ -128,7 +128,8 @@ pub const MAGIC: u32 = 0x52494c52; // "RLIR" in little-endian bytes.
 ///      `cell_settle`.
 /// v93: `cell_lock` joins them.
 /// v94: `task_run` and `task_run_end` join them.
-pub const FORMAT_VERSION: u32 = 94;
+/// v95: `cleanup_push` and `cleanup_pop` join them.
+pub const FORMAT_VERSION: u32 = 95;
 const StaticDataImage = @import("lir_image_static_data.zig").Schema(@This());
 
 /// Public `ImageError` declaration.

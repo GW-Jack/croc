@@ -4032,6 +4032,15 @@ Builtin :: [].{
 		cell_settle! : Box(item), Bool => {}
 		cell_settle! = |_cell, _stored| {}
 
+		# The helpers of `Shared.finally!` and `Shared.on_failure!`: the first makes
+		# the cleanup run if the task is cancelled or crashes before the second.
+		# Where there are no tasks nothing is cancelled, and a crash ends the program.
+		cleanup_push! : Box(() => U8) => {}
+		cleanup_push! = |_cleanup| {}
+
+		cleanup_pop! : () => {}
+		cleanup_pop! = || {}
+
 		run_arrived : Running(item), item -> (Running(item), [Arrived(item), Ended])
 		run_arrived = |running, arrived| (running, Arrived(arrived))
 
@@ -4152,6 +4161,31 @@ Builtin :: [].{
 		modify! = |Cell(cell), transform| {
 			_ = cell_exchange!(cell, Held(transform(cell_take!(cell))))
 			Concurrently.cell_settle!(cell, True)
+		}
+
+		## Calls `body` and returns its result. However `body` ends, the state is
+		## then replaced with what `cleanup` returns for it: when `body` returns,
+		## when its task is cancelled, and when it crashes. A task's cleanups run
+		## innermost first, after the tasks it started are gone. On a platform
+		## without tasks a crash ends the program, so `cleanup` doesn't run then.
+		finally! : Shared(state), (state -> state), (() => answer) => answer
+		finally! = |Cell(cell), cleanup, body| {
+			Concurrently.cleanup_push!(Box.box(|| cell_cleanup!(cell, cleanup)))
+			answer = body()
+			Concurrently.cleanup_pop!()
+			_ = cell_cleanup!(cell, cleanup)
+			answer
+		}
+
+		## Calls `body` and returns its result. If its task is cancelled in `body`,
+		## or `body` crashes, the state is then replaced with what `cleanup` returns
+		## for it, as [Shared.finally!] does.
+		on_failure! : Shared(state), (state -> state), (() => answer) => answer
+		on_failure! = |Cell(cell), cleanup, body| {
+			Concurrently.cleanup_push!(Box.box(|| cell_cleanup!(cell, cleanup)))
+			answer = body()
+			Concurrently.cleanup_pop!()
+			answer
 		}
 	}
 
@@ -28388,6 +28422,15 @@ cell_probe! = |cell, transform|
 		}
 		Moved => 1
 	}
+
+# The update that a cleanup makes. The runtime calls it through its box, for a
+# task that runs no more of its own code.
+cell_cleanup! : Box([Held(state), Moved]), (state -> state) => U8
+cell_cleanup! = |cell, cleanup| {
+	_ = cell_exchange!(cell, Held(cleanup(cell_take!(cell))))
+	Concurrently.cell_settle!(cell, True)
+	0
+}
 
 # Implemented by the compiler, does not perform bounds checks
 list_get_unsafe : List(item), U64 -> item

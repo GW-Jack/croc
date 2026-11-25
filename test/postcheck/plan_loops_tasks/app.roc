@@ -26,6 +26,8 @@ main! = |name| {
 		"supervise" => supervise!()
 		"supervise_crash" => supervise_crash!()
 		"shared" => shared!()
+		"cleanups" => cleanups!()
+		"cleanups_crash" => cleanups_crash!()
 		_ => "unknown"
 	}
 	Host.log!("end ${name}")
@@ -292,4 +294,62 @@ shared! = || {
 	}
 	Host.log!("logged ${log.get!().len().to_str()}")
 	Str.concat($joined, Str.join_with(log.get!(), ";"))
+}
+
+# Each entry holds a permit through its pause, and counts itself lost if it
+# doesn't come back from there. Leaving the loop cancels those that haven't.
+cleanups! : () => Str
+cleanups! = || {
+	permits = Shared.new!(3)
+	lost = Shared.new!([])
+	hold! : Str -> (() => Str)
+	hold! = |name| || {
+		permits.modify!(|n| n - 1)
+		permits.finally!(
+			|n| n + 1,
+			|| lost.on_failure!(
+				|names| names.append("${name}, whose name is too long to be small"),
+				|| Host.fetch!(name),
+			),
+		)
+	}
+	var $joined = ""
+	for! body in List.concurrently([hold!("a"), hold!("b")]) {
+		$joined = Str.concat($joined, body)
+	}
+	for! body in List.concurrently([hold!("c"), hold!("d"), hold!("e")]) {
+		$joined = Str.concat($joined, body)
+		break
+	}
+	"${$joined} ${permits.get!().to_str()} ${Str.join_with(lost.get!(), ";")}"
+}
+
+# Every run crashes inside two cleanups. The inner one's runs first, after the
+# run's entries are gone.
+cleanups_crash! : () => Str
+cleanups_crash! = || {
+	order = Shared.new!("")
+	tries : Shared(U64)
+	tries = Shared.new!(0)
+	result = Concurrent.supervise!(
+		{ max_restarts: 2 },
+		|| {
+			number = tries.update!(|n| Set(n + 1, n))
+			order.finally!(
+				|text| "${text}outer ${number.to_str()} ",
+				|| order.on_failure!(
+					|text| "${text}inner ${number.to_str()} ",
+					|| {
+						for! body in List.concurrently([work!("x"), || order.on_failure!(|text| "${text}entry ", work!("y"))]) {
+							if number < 2 and Str.count_utf8_bytes(body) > 0 {
+								crash "the body crashed"
+							}
+						}
+						"done "
+					},
+				),
+			)
+		},
+	)
+	Str.concat(result, order.get!())
 }

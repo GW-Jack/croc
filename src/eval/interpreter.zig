@@ -6771,6 +6771,16 @@ pub const Interpreter = struct {
                 builtins.task.cellSettle(@ptrFromInt(self.readPointerInt(args[0])), args[1].read(u8) != 0);
                 break :blk Value.zst;
             },
+            .cleanup_push => blk: {
+                const cleanup = self.readBoxedDataPointer(args[0]) orelse
+                    return self.invariantFailedError("LIR/interpreter invariant violated: cleanup_push had no cleanup", .{});
+                builtins.task.cleanupPush(self.roc_env.currentRocOps(), cleanup);
+                break :blk Value.zst;
+            },
+            .cleanup_pop => blk: {
+                builtins.task.cleanupPop();
+                break :blk Value.zst;
+            },
             .cell_new, .cell_exchange => unreachable, // lowering to LIR replaces a cell operation with box and pointer operations
             .group_arrival => try self.pointerValue(ll.ret_layout, @intFromPtr(builtins.task.groupArrival(self.openGroup(args[0], args[1])))),
             .group_spawn => blk: {

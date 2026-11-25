@@ -752,7 +752,7 @@ pub const LowLevel = enum(u16) {
 
     // Operations on cells in a program with tasks (design.md "Shared State"),
     // which only the continuation pass makes, from the bodies of Builtin's
-    // three helpers. The pass appends the task to `cell_wait`.
+    // five helpers. The pass appends the task to `cell_wait`.
     /// (cell) -> {}: an update is about to take the state of the cell, which it
     /// borrows; in a `ParallelTasks` program.
     cell_lock,
@@ -762,6 +762,11 @@ pub const LowLevel = enum(u16) {
     /// (cell, stored) -> {}: an update of the cell, which it borrows, answered
     /// without a `Wait`; `stored` (`Bool`) when it was a `Set`.
     cell_settle,
+    /// (cleanup) -> {}: the code that follows runs the body of a `finally!` or
+    /// `on_failure!`; takes the cleanup, a boxed function.
+    cleanup_push,
+    /// () -> {}: the body returned; drops the cleanup pushed last.
+    cleanup_pop,
 
     /// Index into `builtins.simd.Op`. The SIMD entries are intentionally one
     /// contiguous, order-pinned block so the interpreter and compile-time
@@ -1426,6 +1431,9 @@ pub const LowLevel = enum(u16) {
         // Any task's store may run the probe.
         .cell_wait = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_1, .args_spawned = arg_1 }),
         .cell_settle = byType(.{ .may_allocate = true, .may_retain_or_release = true }),
+        // The runtime runs the cleanup in whichever resume ends the task.
+        .cleanup_push = byType(.{ .may_allocate = true, .may_retain_or_release = true, .consume_args = arg_0, .args_spawned = arg_0 }),
+        .cleanup_pop = byType(.{ .may_retain_or_release = true }),
 
         .str_is_eq = byType(.none()),
         .str_is_eq_static_small = byType(.none()),

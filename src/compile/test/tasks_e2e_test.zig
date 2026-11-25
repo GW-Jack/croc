@@ -1073,7 +1073,7 @@ const Twin = struct {
 const plan_loops = Twin{
     .tasks_path = "test/postcheck/plan_loops_tasks/app.roc",
     .none_path = "test/postcheck/plan_loops_none/app.roc",
-    .cases = &.{ "basic", "limits", "spawn", "background", "break", "return", "try", "nested", "children", "after_break", "supervise", "shared" },
+    .cases = &.{ "basic", "limits", "spawn", "background", "break", "return", "try", "nested", "children", "after_break", "supervise", "shared", "cleanups" },
 };
 
 /// A program whose tasks wait on shared state, so its `None` build runs tasks
@@ -1081,7 +1081,7 @@ const plan_loops = Twin{
 const shared_waits = Twin{
     .tasks_path = "test/postcheck/shared_waits_tasks/app.roc",
     .none_path = "test/postcheck/shared_waits_none/app.roc",
-    .cases = &.{ "queue", "body", "body_first", "nested", "cancelled", "oldest" },
+    .cases = &.{ "queue", "body", "body_first", "nested", "cancelled", "oldest", "cleaned" },
 };
 
 /// The program the inspection functions run. Tests run one at a time.
@@ -1384,7 +1384,7 @@ fn recordQueue(lowered: *const lir.CheckedPipeline.LoweredProgram) E2eError!void
 /// Record one run, and return how many resumes it made.
 fn recordQueueRun(lowered: *const lir.CheckedPipeline.LoweredProgram, name: []const u8, mode: task_test_host.Mode, cancel_after: ?u32) E2eError!u32 {
     errdefer std.log.err("queue run {s}, {s}, cancelled after {?d}", .{ name, @tagName(mode), cancel_after });
-    const outcome = try queueCase(Run, lowered, name, mode, cancel_after);
+    const outcome = try queueCase(Run, lowered, name, mode, cancel_after, true);
     errdefer outcome.deinit();
     try queue_runs.append(std.testing.allocator, .{ .name = name, .mode = mode, .cancel_after = cancel_after, .outcome = outcome });
     var resumes: u32 = 0;
@@ -1392,7 +1392,7 @@ fn recordQueueRun(lowered: *const lir.CheckedPipeline.LoweredProgram, name: []co
     return resumes;
 }
 
-fn queueCase(comptime R: type, program: R.Program, name: []const u8, mode: task_test_host.Mode, cancel_after: ?u32) E2eError!CaseOutcome {
+fn queueCase(comptime R: type, program: R.Program, name: []const u8, mode: task_test_host.Mode, cancel_after: ?u32, frees_all: bool) E2eError!CaseOutcome {
     root_url = name;
     defer root_url = url;
     var run: R = undefined;
@@ -1416,7 +1416,7 @@ fn queueCase(comptime R: type, program: R.Program, name: []const u8, mode: task_
     const outcome = try CaseOutcome.init(if (done) result.asSlice() else "", run.host.trace.items);
     errdefer outcome.deinit();
     if (done) result.decref(run.runtime.get_ops());
-    try run.runtime.checkForLeaks();
+    if (frees_all) try run.runtime.checkForLeaks();
     return outcome;
 }
 
@@ -1455,7 +1455,7 @@ fn expectQueueOutcome(want: QueueRun, got: CaseOutcome) E2eError!void {
 fn compareQueueRuns(comptime R: type, program: R.Program) E2eError!void {
     for (queue_runs.items) |want| {
         errdefer std.log.err("queue run {s}, {s}, cancelled after {?d}, differs from the interpreter's", .{ want.name, @tagName(want.mode), want.cancel_after });
-        const got = try queueCase(R, program, want.name, want.mode, want.cancel_after);
+        const got = try queueCase(R, program, want.name, want.mode, want.cancel_after, true);
         defer got.deinit();
         try expectQueueOutcome(want, got);
     }
@@ -1593,4 +1593,63 @@ test "supervise! restarts a crashing function up to its limit and then crashes w
 test "supervise! restarts a crashing function up to its limit and then crashes with its message, on LLVM" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     try harness.runAppPathLoweredInspection(plan_loops.tasks_path, plan_loop_options, superviseCrashLlvm);
+}
+
+// Cleanups that a crash runs (design.md "Shared State", "Cleanups."): a supervised
+// function's, each time it crashes, innermost first and after those of its
+// entries. One entry is parked when the body crashes, if fetches pause.
+
+fn cleanupsAfterCrash(comptime R: type, program: R.Program) E2eError!void {
+    for ([_]task_test_host.Mode{ .ready, .pause }, [_][]const u8{
+        "done inner 0 outer 0 inner 1 outer 1 outer 2 ",
+        "done entry inner 0 outer 0 entry inner 1 outer 1 outer 2 ",
+    }) |mode, want| {
+        // The frames a crash leaves hold a handle, and what it holds.
+        const got = try queueCase(R, program, "cleanups_crash", mode, null, false);
+        defer got.deinit();
+        try std.testing.expectEqualStrings(want, got.result);
+    }
+}
+
+fn cleanupsAfterCrashInterpreter(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    cleanupsAfterCrash(Run, lowered) catch |err| {
+        std.log.err("cleanups after a crash failed on the interpreter: {s}", .{@errorName(err)});
+        return error.TestUnexpectedResult;
+    };
+}
+
+fn cleanupsAfterCrashDev(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    var program: DevProgram = undefined;
+    program.init(lowered) catch return error.TestUnexpectedResult;
+    defer program.deinit();
+    cleanupsAfterCrash(DevRun, &program) catch |err| {
+        std.log.err("cleanups after a crash failed on the dev backend: {s}", .{@errorName(err)});
+        return error.TestUnexpectedResult;
+    };
+}
+
+fn cleanupsAfterCrashLlvm(lowered: *const lir.CheckedPipeline.LoweredProgram) harness.LowerToLirHarnessError!void {
+    var program: LlvmProgram = undefined;
+    program.init(lowered) catch return error.TestUnexpectedResult;
+    defer program.deinit();
+    cleanupsAfterCrash(LlvmRun, &program) catch |err| {
+        std.log.err("cleanups after a crash failed on LLVM: {s}", .{@errorName(err)});
+        return error.TestUnexpectedResult;
+    };
+}
+
+test "a supervised crash runs its task's cleanups, innermost first and after its entries', on the interpreter" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    try harness.runAppPathLoweredInspection(plan_loops.tasks_path, plan_loop_options, cleanupsAfterCrashInterpreter);
+}
+
+test "a supervised crash runs its task's cleanups, innermost first and after its entries', on the dev backend" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    if (comptime !@import("backend").host_lir_codegen_available) return error.SkipZigTest;
+    try harness.runAppPathLoweredInspection(plan_loops.tasks_path, plan_loop_options, cleanupsAfterCrashDev);
+}
+
+test "a supervised crash runs its task's cleanups, innermost first and after its entries', on LLVM" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    try harness.runAppPathLoweredInspection(plan_loops.tasks_path, plan_loop_options, cleanupsAfterCrashLlvm);
 }

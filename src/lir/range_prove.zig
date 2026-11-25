@@ -8165,6 +8165,8 @@ const Pass = struct {
             .cell_lock,
             .cell_wait,
             .cell_settle,
+            .cleanup_push,
+            .cleanup_pop,
             .compare,
             .crash,
             => try self.bindFresh(s.target),

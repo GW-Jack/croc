@@ -19,6 +19,7 @@ main! = |name| {
 		"nested" => nested!()
 		"cancelled" => cancelled!()
 		"oldest" => oldest!()
+		"cleaned" => cleaned!()
 		_ => "unknown"
 	}
 	Host.log!("end ${name}")
@@ -218,4 +219,34 @@ oldest! = || {
 		$joined = Str.concat($joined, body)
 	}
 	$joined
+}
+
+# Leaving a loop cancels an entry that waits inside two cleanups, which put back
+# the permit that another entry waits for.
+cleaned! : () => Str
+cleaned! = || {
+	permits = Shared.new!(1)
+	order = Shared.new!("")
+	never = Shared.new!(0)
+	hold! : Str -> (() => Str)
+	hold! = |name| || {
+		permits.update!(|n| if (n == 0) Wait else Set(n - 1, {}))
+		permits.finally!(
+			|n| n + 1,
+			|| order.finally!(
+				|text| "${text}${name} outer ",
+				|| order.on_failure!(
+					|text| "${text}${name} inner ",
+					|| {
+						Host.log!("hold ${name}")
+						never.update!(|n| if (n == 0) Wait else Keep({}))
+						name
+					},
+				),
+			),
+		)
+	}
+	first = exit_at!([hold!("a"), hold!("b"), || "put"])
+	second = exit_at!([hold!("c"), || "put"])
+	"${first} ${second} ${permits.get!().to_str()} ${order.get!()}"
 }

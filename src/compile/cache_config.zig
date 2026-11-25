@@ -456,7 +456,9 @@ pub const Constants = struct {
     /// `cell_settle!`, whose operations join the low-level ones.
     /// 216: `cell_lock!` and its operation join them.
     /// 217: `task_run` and `task_run_end` join the low-level operations.
-    pub const CACHE_VERSION = 217;
+    /// 218: recorded running-set helpers include `cleanup_push!` and
+    /// `cleanup_pop!`, whose operations join the low-level ones.
+    pub const CACHE_VERSION = 218;
 };
 
 /// Configuration for the Roc cache system.

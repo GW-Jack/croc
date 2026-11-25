@@ -1622,6 +1622,17 @@ pub fn roc_builtins_cell_settle(cell: *anyopaque, stored: bool) callconv(.c) voi
     task.cellSettle(cell, stored);
 }
 
+/// The code that follows runs the body of a `finally!` or `on_failure!` (design.md
+/// "Shared State", "Cleanups."). Takes `cleanup`.
+pub fn roc_builtins_cleanup_push(cleanup: [*]u8) callconv(.c) void {
+    task.cleanupPush(in_process_host.ops(), cleanup);
+}
+
+/// The body returned: the cleanup pushed last is dropped.
+pub fn roc_builtins_cleanup_pop() callconv(.c) void {
+    task.cleanupPop();
+}
+
 /// Enter the loaded dev-shim code image that contains the generated callsite.
 pub fn roc_builtins_hot_reload_enter() callconv(.c) ?*anyopaque {
     if (comptime @hasDecl(@import("root"), "roc_hot_reload_enter")) {

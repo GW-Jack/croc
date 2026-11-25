@@ -1281,6 +1281,8 @@ const exemptions = [_]Exemption{
     .{ .op = .cell_lock, .reason = running_set_reason },
     .{ .op = .cell_wait, .reason = running_set_reason },
     .{ .op = .cell_settle, .reason = running_set_reason },
+    .{ .op = .cleanup_push, .reason = running_set_reason },
+    .{ .op = .cleanup_pop, .reason = running_set_reason },
 };
 
 /// Why the running-set operations are exempt. `group_arrival` needs no entry:
