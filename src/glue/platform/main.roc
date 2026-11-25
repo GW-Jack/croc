@@ -12,6 +12,7 @@ platform ""
 		AbiWidth,
 		ArgShape,
 		CallableSignature,
+		ConcurrencyMode,
 		File,
 		FunctionInfo,
 		FunctionSignature,
@@ -50,6 +51,7 @@ import AbiTagUnionLayout
 import AbiWidth
 import ArgShape
 import CallableSignature
+import ConcurrencyMode
 import ModuleTypeInfo
 import FunctionInfo
 import HostedFunctionInfo

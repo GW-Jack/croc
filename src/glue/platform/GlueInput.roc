@@ -1,3 +1,4 @@
+import ConcurrencyMode
 import HostedFunctionInfo
 import ProvidesEntry
 import TypeInfo
@@ -16,6 +17,7 @@ import Types
 ## sorts by HostedFunctionInfo.index, matching the compiler-emitted index order.
 ## It does not derive ABI shape or inspect source syntax.
 GlueInput := {
+	concurrency : ConcurrencyMode,
 	hosted_functions : List(HostedFunctionInfo),
 	provides_entries : List(ProvidesEntry),
 	types : List(TypeInfo),
@@ -25,10 +27,12 @@ GlueInput := {
 		var $hosted_functions = []
 		var $types = []
 		var $provides_entries = []
+		var $concurrency = NoConcurrency
 
 		for types in types_list {
 			$types = types.types
 			$provides_entries = types.provides_entries
+			$concurrency = types.concurrency
 
 			for mod in types.modules {
 				for func in mod.hosted_functions {
@@ -40,6 +44,7 @@ GlueInput := {
 						name: "${mod.name}.${func.name}",
 						ret_fields: func.ret_fields,
 						ret_type_id: func.ret_type_id,
+						suspending: func.suspending,
 						type_str: func.type_str,
 					}
 
@@ -49,6 +54,7 @@ GlueInput := {
 		}
 
 		{
+			concurrency: $concurrency,
 			hosted_functions: List.sort_with($hosted_functions, compare_by_index),
 			provides_entries: $provides_entries,
 			types: $types,

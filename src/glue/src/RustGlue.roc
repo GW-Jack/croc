@@ -26,7 +26,11 @@ make_glue : List(Types) -> Try(List(File), Str)
 make_glue = |types_list| {
 	input = GlueInput.from_types(types_list)
 	type_table = TypeTable.from_list(input.types)
-	rust_content = generate_rust_file(input.hosted_functions, type_table, input.provides_entries)
+	tasks = match input.concurrency {
+		Tasks => Bool.True
+		NoConcurrency => Bool.False
+	}
+	rust_content = generate_rust_file(input.hosted_functions, type_table, input.provides_entries, tasks)
 
 	Ok([{ name: "roc_platform_abi.rs", content: rust_content }])
 }
@@ -879,8 +883,8 @@ generate_payload_struct_decl_rust = |doc, struct_name, type_table, duplicate_nam
 # =============================================================================
 
 ## Generate the complete Rust source file
-generate_rust_file : List(HostedFunctionInfo), TypeTable, List(ProvidesEntry) -> Str
-generate_rust_file = |hosted_functions, type_table, provides_list| {
+generate_rust_file : List(HostedFunctionInfo), TypeTable, List(ProvidesEntry), Bool -> Str
+generate_rust_file = |hosted_functions, type_table, provides_list, tasks| {
 	duplicate_names = duplicate_type_names(type_table)
 	preferred_names = preferred_type_names_rust(hosted_functions, provides_list, type_table, duplicate_names)
 
@@ -908,11 +912,12 @@ generate_rust_file = |hosted_functions, type_table, provides_list| {
 		.concat("\n")
 		.concat(generate_runtime_symbol_externs_rust)
 		.concat("\n")
-		.concat(generate_hosted_symbol_externs_rust(hosted_functions, type_table, duplicate_names, preferred_names))
+		.concat(if tasks { generate_task_symbol_externs_rust.concat("\n") } else { "" })
+		.concat(generate_hosted_symbol_externs_rust(hosted_functions, type_table, duplicate_names, preferred_names, tasks))
 		.concat("\n")
 		.concat(generate_host_helpers_rust)
 		.concat("\n")
-		.concat(generate_entrypoint_externs_rust(provides_list, type_table, duplicate_names, preferred_names))
+		.concat(generate_entrypoint_externs_rust(provides_list, type_table, duplicate_names, preferred_names, tasks))
 }
 
 ## File header comment
@@ -3062,9 +3067,89 @@ generate_runtime_symbol_externs_rust =
 	\\}
 	\\
 
+## A `Tasks` platform's task ABI (design.md "Host Contract", "Glue").
+generate_task_symbol_externs_rust : Str
+generate_task_symbol_externs_rust =
+	\\// Tasks
+	\\//
+	\\// The platform declares `concurrency: Tasks`. A provided procedure returns its task, and a
+	\\// suspending hosted function returns `RocPoll::Pending` when it finishes later: the host then
+	\\// writes its result once and calls `roc_task_wake` once.
+	\\
+	\\/// A task. The host only passes it back to the calls below.
+	\\#[repr(C)]
+	\\pub struct RocTask {
+	\\    _data: [u8; 0],
+	\\    _marker: core::marker::PhantomData<(*mut u8, core::marker::PhantomPinned)>,
+	\\}
+	\\
+	\\/// What a suspending hosted function returns.
+	\\#[repr(u32)]
+	\\#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+	\\pub enum RocPoll {
+	\\    Ready = 0,
+	\\    Pending = 1,
+	\\}
+	\\
+	\\/// What `roc_task_resume` returns.
+	\\#[repr(u32)]
+	\\#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+	\\pub enum RocTaskStatus {
+	\\    Pending = 0,
+	\\    Done = 1,
+	\\    Cancelled = 2,
+	\\    Crashed = 3,
+	\\}
+	\\
+	\\const _: () = assert!(core::mem::size_of::<RocPoll>() == 4, "RocPoll size mismatch");
+	\\const _: () = assert!(core::mem::size_of::<RocTaskStatus>() == 4, "RocTaskStatus size mismatch");
+	\\
+	\\#[allow(improper_ctypes)]
+	\\unsafe extern "C" {
+	\\    // The program defines these.
+	\\    pub fn roc_task_resume(task: *mut RocTask) -> RocTaskStatus;
+	\\    pub fn roc_task_wake(task: *mut RocTask);
+	\\    pub fn roc_task_cancel(task: *mut RocTask);
+	\\    pub fn roc_task_free(task: *mut RocTask);
+	\\    pub fn roc_task_crash_message(task: *mut RocTask, len: *mut usize) -> *const u8;
+	\\
+	\\    // The host defines these.
+	\\    pub fn roc_task_ready(task: *mut RocTask);
+	\\    pub fn roc_task_abort(task: *mut RocTask);
+	\\}
+	\\
+
+## The Rust type of a pointer to a value of `type_id`: `*mut c_void` when the
+## type has no bytes, as a task's result pointer is.
+result_pointer_rust : TypeTable, List(Str), TypeNamePlan.PreferredNames, U64 -> Str
+result_pointer_rust = |type_table, duplicate_names, preferred_names, type_id|
+	if type_table.is_unit(type_id) {
+		"*mut c_void"
+	} else {
+		"*mut ${type_id_to_rust(type_table, duplicate_names, preferred_names, type_id)}"
+	}
+
+## `params` with `first` before them.
+prepend_params_rust : Str, Str -> Str
+prepend_params_rust = |first, params|
+	if params == "" {
+		first
+	} else {
+		"${first}, ${params}"
+	}
+
+## `params` with `last` after them.
+append_param_rust : Str, Str -> Str
+append_param_rust = |params, last|
+	if params == "" {
+		last
+	} else {
+		"${params}, ${last}"
+	}
+
 ## Generate direct extern declarations for hosted symbols.
-generate_hosted_symbol_externs_rust : List(HostedFunctionInfo), TypeTable, List(Str), TypeNamePlan.PreferredNames -> Str
-generate_hosted_symbol_externs_rust = |hosted_functions, type_table, duplicate_names, preferred_names| {
+generate_hosted_symbol_externs_rust : List(HostedFunctionInfo), TypeTable, List(Str), TypeNamePlan.PreferredNames, Bool -> Str
+generate_hosted_symbol_externs_rust = |hosted_functions, type_table, duplicate_names, preferred_names, tasks| {
 	if List.is_empty(hosted_functions) {
 		return ""
 	}
@@ -3073,18 +3158,24 @@ generate_hosted_symbol_externs_rust = |hosted_functions, type_table, duplicate_n
 
 	for func in hosted_functions {
 		params = direct_hosted_param_list_rust(type_table, duplicate_names, preferred_names, func)
-		ret_rust = type_id_to_rust(type_table, duplicate_names, preferred_names, func.ret_type_id)
-		ret_suffix = if ret_rust == "()" {
-			""
+		suspends = tasks and func.suspending
+		signature = if suspends {
+			out_rust = result_pointer_rust(type_table, duplicate_names, preferred_names, func.ret_type_id)
+			"(${prepend_params_rust("task: *mut RocTask, out: ${out_rust}", params)}) -> RocPoll"
 		} else {
-			" -> ${ret_rust}"
+			ret_rust = type_id_to_rust(type_table, duplicate_names, preferred_names, func.ret_type_id)
+			if ret_rust == "()" {
+				"(${params})"
+			} else {
+				"(${params}) -> ${ret_rust}"
+			}
 		}
 
-		ownership = hosted_ownership_doc_rust(type_table, duplicate_names, preferred_names, func)
+		ownership = hosted_ownership_doc_rust(type_table, duplicate_names, preferred_names, func, suspends)
 
 		$result = Str.concat(
 			$result,
-			"    /// Hosted symbol for ${func.name}\n    /// Roc signature: ${func.type_str}\n${ownership}    pub fn ${func.ffi_symbol}(${params})${ret_suffix};\n\n",
+			"    /// Hosted symbol for ${func.name}\n    /// Roc signature: ${func.type_str}\n${ownership}    pub fn ${func.ffi_symbol}${signature};\n\n",
 		)
 	}
 
@@ -3097,8 +3188,8 @@ generate_hosted_symbol_externs_rust = |hosted_functions, type_table, duplicate_n
 ## A host author reads this at the signature, which is where the ownership rule
 ## has to be legible: for a container the release is the generated helper, not
 ## the container's own shallow `decref`.
-hosted_ownership_doc_rust : TypeTable, List(Str), TypeNamePlan.PreferredNames, HostedFunctionInfo -> Str
-hosted_ownership_doc_rust = |type_table, duplicate_names, preferred_names, func| {
+hosted_ownership_doc_rust : TypeTable, List(Str), TypeNamePlan.PreferredNames, HostedFunctionInfo, Bool -> Str
+hosted_ownership_doc_rust = |type_table, duplicate_names, preferred_names, func, suspends| {
 	arg_shape = ArgShape.from_table(type_table)
 	use_args_wrapper = arg_shape.single_arg_is_anonymous_record(func.arg_type_ids)
 
@@ -3128,31 +3219,40 @@ hosted_ownership_doc_rust = |type_table, duplicate_names, preferred_names, func|
 
 	arg_doc = if $arg_lines == "" {
 		""
+	} else if suspends {
+		"    /// Owned arguments. Release each exactly once, even when the call finishes later,\n    /// unless it is moved into storage or into the result:\n${$arg_lines}"
 	} else {
 		"    /// Owned arguments. Release each exactly once before returning, unless it is\n    /// moved into storage or into the result:\n${$arg_lines}"
 	}
 
-	ret_doc = if is_type_refcounted(type_table, func.ret_type_id) {
-		"    /// The result is owned by Roc: return exactly one owned reference.\n"
-	} else {
+	ret_doc = if !is_type_refcounted(type_table, func.ret_type_id) {
 		""
+	} else if suspends {
+		"    /// The result is owned by Roc: write exactly one owned reference to `out`.\n"
+	} else {
+		"    /// The result is owned by Roc: return exactly one owned reference.\n"
 	}
 
 	Str.concat(arg_doc, ret_doc)
 }
 
-generate_provided_decl_rust : ProvidesEntry, TypeTable, List(Str), TypeNamePlan.PreferredNames -> Str
-generate_provided_decl_rust = |entry, type_table, duplicate_names, preferred_names| {
+generate_provided_decl_rust : ProvidesEntry, TypeTable, List(Str), TypeNamePlan.PreferredNames, Bool -> Str
+generate_provided_decl_rust = |entry, type_table, duplicate_names, preferred_names, tasks| {
 	match entry.exported {
 		ProvidedProcedure(func) => {
 			params = direct_param_list_rust(type_table, duplicate_names, preferred_names, func.args)
-			ret_rust = type_id_to_rust(type_table, duplicate_names, preferred_names, func.ret)
-			ret_suffix = if ret_rust == "()" {
-				""
+			signature = if tasks {
+				out_rust = result_pointer_rust(type_table, duplicate_names, preferred_names, func.ret)
+				"(${append_param_rust(params, "result_out: ${out_rust}")}) -> *mut RocTask"
 			} else {
-				" -> ${ret_rust}"
+				ret_rust = type_id_to_rust(type_table, duplicate_names, preferred_names, func.ret)
+				if ret_rust == "()" {
+					"(${params})"
+				} else {
+					"(${params}) -> ${ret_rust}"
+				}
 			}
-			"    /// Entrypoint: ${entry.name}\n    pub fn ${entry.ffi_symbol}(${params})${ret_suffix};\n\n"
+			"    /// Entrypoint: ${entry.name}\n    pub fn ${entry.ffi_symbol}${signature};\n\n"
 		}
 		ProvidedData(type_id) => {
 			value_rust = type_id_to_rust(type_table, duplicate_names, preferred_names, type_id)
@@ -3184,8 +3284,8 @@ generate_provided_owned_wrapper_rust = |entry, type_table, duplicate_names, pref
 }
 
 ## Generate extern declarations for entrypoints from the provides clause.
-generate_entrypoint_externs_rust : List(ProvidesEntry), TypeTable, List(Str), TypeNamePlan.PreferredNames -> Str
-generate_entrypoint_externs_rust = |provides_list, type_table, duplicate_names, preferred_names| {
+generate_entrypoint_externs_rust : List(ProvidesEntry), TypeTable, List(Str), TypeNamePlan.PreferredNames, Bool -> Str
+generate_entrypoint_externs_rust = |provides_list, type_table, duplicate_names, preferred_names, tasks| {
 	if List.is_empty(provides_list) {
 		return ""
 	}
@@ -3194,8 +3294,13 @@ generate_entrypoint_externs_rust = |provides_list, type_table, duplicate_names, 
 	var $wrappers = ""
 
 	for entry in provides_list {
-		$result = Str.concat($result, generate_provided_decl_rust(entry, type_table, duplicate_names, preferred_names))
-		$wrappers = Str.concat($wrappers, generate_provided_owned_wrapper_rust(entry, type_table, duplicate_names, preferred_names))
+		$result = Str.concat($result, generate_provided_decl_rust(entry, type_table, duplicate_names, preferred_names, tasks))
+		# A task's result arrives through `result_out` once it is done, so there is no returned value to own.
+		$wrappers = if tasks {
+			$wrappers
+		} else {
+			Str.concat($wrappers, generate_provided_owned_wrapper_rust(entry, type_table, duplicate_names, preferred_names))
+		}
 	}
 
 	Str.concat(Str.concat($result, "}\n\n"), $wrappers)

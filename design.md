@@ -35119,6 +35119,32 @@ These symbols join the fixed runtime set, and the glue templates of a
 host of a mode with tasks must define both, and a `ParallelTasks` host
 `roc_task_thread_slot`.
 
+**Glue.** Glue's input carries the platform's mode and each hosted
+function's marker, both from checking, never from a type's shape:
+`Types.concurrency` is `NoConcurrency` or `Tasks`, from the platform
+header, and `HostedFunctionInfo.suspending` is the declaration's
+`suspending` marker. For a `Tasks` platform, every template:
+
+- declares `RocTask` as a handle the host never looks inside;
+- declares `RocPoll` (`ROC_READY` 0, `ROC_PENDING` 1) and `RocTaskStatus`
+  (`ROC_TASK_PENDING` 0, `ROC_TASK_DONE` 1, `ROC_TASK_CANCELLED` 2,
+  `ROC_TASK_CRASHED` 3), each 32 bits wide;
+- declares a suspending hosted function as returning `RocPoll` and taking
+  the task, then a pointer to its result, then its arguments. The pointer
+  is there even when the result has no bytes;
+- declares a provided procedure as taking its arguments and then a pointer
+  to its result, and returning its `RocTask *`. A provided value is
+  unchanged;
+- declares the program's `roc_task_resume`, `roc_task_wake`,
+  `roc_task_cancel`, `roc_task_free` and `roc_task_crash_message`, and the
+  host's `roc_task_ready` and `roc_task_abort`.
+
+A hosted function without the marker is declared as in a platform of any
+other mode. A platform of another mode gets none of this, so its glue is
+unchanged. The glue ABI locks compile each language's bindings for a
+`Tasks` platform on that language's lock targets, and the Zig lock checks
+the declared values and signatures against the runtime's own definitions.
+
 A host keeps these obligations. Breaking one is undefined behavior, like a
 `roc_alloc` that returns null; the conformance harness (The Task Runtime)
 checks them.

@@ -23,7 +23,11 @@ make_glue : List(Types) -> Try(List(File), Str)
 make_glue = |types_list| {
 	input = GlueInput.from_types(types_list)
 	type_table = TypeTable.from_list(input.types)
-	header_content = generate_c_header(input.hosted_functions, type_table, input.provides_entries)
+	tasks = match input.concurrency {
+		Tasks => Bool.True
+		NoConcurrency => Bool.False
+	}
+	header_content = generate_c_header(input.hosted_functions, type_table, input.provides_entries, tasks)
 
 	Ok([{ name: "roc_platform_abi.h", content: header_content }])
 }
@@ -565,8 +569,8 @@ expect name_to_c_field_ident("struct") == "struct_field"
 # Header Generation
 # =============================================================================
 
-generate_c_header : List(HostedFunctionInfo), TypeTable, List(ProvidesEntry) -> Str
-generate_c_header = |hosted_functions, type_table, provides_list| {
+generate_c_header : List(HostedFunctionInfo), TypeTable, List(ProvidesEntry), Bool -> Str
+generate_c_header = |hosted_functions, type_table, provides_list, tasks| {
 	duplicate_records = duplicate_record_names(type_table)
 	duplicate_tags = duplicate_tag_union_names(type_table)
 	preferred_names = preferred_type_names_c(hosted_functions, provides_list, type_table, duplicate_records, duplicate_tags)
@@ -577,8 +581,8 @@ generate_c_header = |hosted_functions, type_table, provides_list| {
 	type_aliases = generate_platform_type_aliases_c(hosted_functions, provides_list, type_table, duplicate_records, duplicate_tags, preferred_names)
 	args_structs = generate_all_args_structs(hosted_functions, type_table, duplicate_records, duplicate_tags, preferred_names)
 	hosted_fn_fields = generate_hosted_fn_fields(hosted_functions)
-	hosted_symbol_decls = generate_hosted_symbol_decls(hosted_functions, type_table, duplicate_records, duplicate_tags, preferred_names)
-	provided_symbol_decls = generate_provided_symbol_decls(provides_list, type_table, duplicate_records, duplicate_tags, preferred_names)
+	hosted_symbol_decls = generate_hosted_symbol_decls(hosted_functions, type_table, duplicate_records, duplicate_tags, preferred_names, tasks)
+	provided_symbol_decls = generate_provided_symbol_decls(provides_list, type_table, duplicate_records, duplicate_tags, preferred_names, tasks)
 
 	header_guard_top
 		.concat(includes_section)
@@ -594,6 +598,7 @@ generate_c_header = |hosted_functions, type_table, provides_list| {
 		.concat(args_structs)
 		.concat("\n")
 		.concat(runtime_symbol_decls)
+		.concat(if tasks { task_symbol_decls } else { "" })
 		.concat(hosted_symbol_decls)
 		.concat(provided_symbol_decls)
 		.concat(hosted_functions_registry(hosted_fn_fields))
@@ -1143,8 +1148,36 @@ runtime_symbol_decls =
 		"/* The host defines these linker symbols. Compiled Roc code calls them directly. */\n\n#if defined(__GNUC__) || defined(__clang__)\n#define ROC_RETURNS_NONNULL __attribute__((returns_nonnull))\n#else\n#define ROC_RETURNS_NONNULL\n#endif\n\n/* Returns `length` bytes aligned to `alignment`. Never returns NULL: Roc writes through\n   the result without checking it, so a host that cannot allocate must stop the Roc\n   program and not return, exactly as roc_crashed does. */\nROC_RETURNS_NONNULL void* roc_alloc(size_t length, size_t alignment);\nvoid roc_dealloc(void* ptr, size_t alignment);\n/* Never returns NULL, under the same rule as roc_alloc. */\nROC_RETURNS_NONNULL void* roc_realloc(void* ptr, size_t new_length, size_t alignment);\nvoid roc_dbg(const uint8_t* bytes, size_t len);\nvoid roc_expect_failed(const uint8_t* bytes, size_t len);\nvoid roc_crashed(const uint8_t* bytes, size_t len);\n",
 	)
 
-generate_hosted_symbol_decls : List(HostedFunctionInfo), TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames -> Str
-generate_hosted_symbol_decls = |hosted_functions, type_table, duplicate_records, duplicate_tags, preferred_names| {
+## Declarations for a `Tasks` platform's task ABI (design.md "Host Contract",
+## "Glue").
+task_symbol_decls : Str
+task_symbol_decls =
+	section(
+		"Tasks",
+		"/* The platform declares `concurrency: Tasks`. A provided procedure returns its task, and a\n   suspending hosted function returns ROC_PENDING when it finishes later: the host then writes\n   its result once and calls roc_task_wake once. */\n\ntypedef struct RocTask RocTask;\n\ntypedef enum { ROC_READY = 0, ROC_PENDING = 1 } RocPoll;\n\ntypedef enum {\n    ROC_TASK_PENDING = 0,\n    ROC_TASK_DONE = 1,\n    ROC_TASK_CANCELLED = 2,\n    ROC_TASK_CRASHED = 3\n} RocTaskStatus;\n\nROC_STATIC_ASSERT(sizeof(RocPoll) == 4, \"RocPoll must be 32 bits\");\nROC_STATIC_ASSERT(sizeof(RocTaskStatus) == 4, \"RocTaskStatus must be 32 bits\");\n\n/* The program defines these. */\nRocTaskStatus roc_task_resume(RocTask* task);\nvoid roc_task_wake(RocTask* task);\nvoid roc_task_cancel(RocTask* task);\nvoid roc_task_free(RocTask* task);\nconst uint8_t* roc_task_crash_message(RocTask* task, size_t* len);\n\n/* The host defines these. */\nvoid roc_task_ready(RocTask* task);\nvoid roc_task_abort(RocTask* task);\n",
+	)
+
+## The C type of a pointer to a value of `type_id`: `void*` when the type has
+## no bytes, as a task's result pointer is.
+result_pointer_c : TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames, U64 -> Str
+result_pointer_c = |type_table, duplicate_records, duplicate_tags, preferred_names, type_id|
+	if type_table.is_unit(type_id) {
+		"void*"
+	} else {
+		"${type_id_to_c(type_table, duplicate_records, duplicate_tags, preferred_names, type_id)}*"
+	}
+
+## `params` with `first` before them, where `params` is "void" for none.
+prepend_params_c : Str, Str -> Str
+prepend_params_c = |first, params|
+	if params == "void" {
+		first
+	} else {
+		"${first}, ${params}"
+	}
+
+generate_hosted_symbol_decls : List(HostedFunctionInfo), TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames, Bool -> Str
+generate_hosted_symbol_decls = |hosted_functions, type_table, duplicate_records, duplicate_tags, preferred_names, tasks| {
 	if List.is_empty(hosted_functions) {
 		return ""
 	}
@@ -1152,15 +1185,21 @@ generate_hosted_symbol_decls = |hosted_functions, type_table, duplicate_records,
 	var $decls = ""
 	for func in hosted_functions {
 		params = direct_hosted_param_list(type_table, duplicate_records, duplicate_tags, preferred_names, func)
-		ret_c = type_id_to_c(type_table, duplicate_records, duplicate_tags, preferred_names, func.ret_type_id)
-		$decls = Str.concat($decls, "/* ${func.name}: ${func.type_str} */\nextern ${ret_c} ${func.ffi_symbol}(${params});\n\n")
+		decl = if tasks and func.suspending {
+			out_c = result_pointer_c(type_table, duplicate_records, duplicate_tags, preferred_names, func.ret_type_id)
+			"extern RocPoll ${func.ffi_symbol}(${prepend_params_c("RocTask* task, ${out_c} out", params)});"
+		} else {
+			ret_c = type_id_to_c(type_table, duplicate_records, duplicate_tags, preferred_names, func.ret_type_id)
+			"extern ${ret_c} ${func.ffi_symbol}(${params});"
+		}
+		$decls = Str.concat($decls, "/* ${func.name}: ${func.type_str} */\n${decl}\n\n")
 	}
 
 	section("Hosted Symbols", $decls)
 }
 
-generate_provided_symbol_decls : List(ProvidesEntry), TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames -> Str
-generate_provided_symbol_decls = |provides_list, type_table, duplicate_records, duplicate_tags, preferred_names| {
+generate_provided_symbol_decls : List(ProvidesEntry), TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames, Bool -> Str
+generate_provided_symbol_decls = |provides_list, type_table, duplicate_records, duplicate_tags, preferred_names, tasks| {
 	if List.is_empty(provides_list) {
 		return ""
 	}
@@ -1170,8 +1209,19 @@ generate_provided_symbol_decls = |provides_list, type_table, duplicate_records, 
 		match entry.exported {
 			ProvidedProcedure(func) => {
 				params = direct_param_list(type_table, duplicate_records, duplicate_tags, preferred_names, func.args)
-				ret_c = type_id_to_c(type_table, duplicate_records, duplicate_tags, preferred_names, func.ret)
-				$decls = Str.concat($decls, "/* Entrypoint: ${entry.name} */\nextern ${ret_c} ${entry.ffi_symbol}(${params});\n\n")
+				decl = if tasks {
+					out_c = result_pointer_c(type_table, duplicate_records, duplicate_tags, preferred_names, func.ret)
+					with_out = if params == "void" {
+						"${out_c} result_out"
+					} else {
+						"${params}, ${out_c} result_out"
+					}
+					"extern RocTask* ${entry.ffi_symbol}(${with_out});"
+				} else {
+					ret_c = type_id_to_c(type_table, duplicate_records, duplicate_tags, preferred_names, func.ret)
+					"extern ${ret_c} ${entry.ffi_symbol}(${params});"
+				}
+				$decls = Str.concat($decls, "/* Entrypoint: ${entry.name} */\n${decl}\n\n")
 			}
 			ProvidedData(type_id) => {
 				value_c = type_id_to_c(type_table, duplicate_records, duplicate_tags, preferred_names, type_id)
