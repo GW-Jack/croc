@@ -266,8 +266,10 @@ pub const Task = union(enum) {
     ret,
     /// Pop the left operand of a short-circuit operator.
     short_circuit: struct { is_and: bool, rhs: ExprId, join: LIR.JoinPointId },
-    /// Pop the scrutinee of a match and compile its branches.
-    match_start: ExprId,
+    /// Pop the scrutinee of a match and compile its branches. `binders` are
+    /// what the match merges: those it reassigns that were bound before its
+    /// scrutinee, which may declare more.
+    match_start: struct { expr: ExprId, binders: []const BinderId },
     /// Continue a match's decision-tree emission with the statement that
     /// answers its outstanding request (null on its first step).
     match_advance: struct { state: *Match.State, input: ?CFStmtId },
@@ -1374,16 +1376,21 @@ pub const Builder = struct {
     /// only restores the binders' starting values for each branch.
     pub const MergeEnd = enum { joined, tail };
 
+    /// Those of a construct's reassigned binders that are bound here, where
+    /// the construct starts. One that isn't is declared inside it, and goes
+    /// out of scope with it.
+    fn boundBinders(self: *Builder, plan_binders: []const BinderId) Allocator.Error![]const BinderId {
+        var bound: std.ArrayList(BinderId) = .empty;
+        for (plan_binders) |binder| {
+            if (self.binders.contains(binder)) try bound.append(self.program.arena.allocator(), binder);
+        }
+        return bound.items;
+    }
+
     /// Start a merge of `binders`, recording their current values.
     pub fn beginMerge(self: *Builder, plan_binders: []const BinderId, end: MergeEnd) Allocator.Error!?MergeId {
-        // A binder the construct reassigns but that is not bound before it
-        // is declared inside it, and goes out of scope with it.
         const arena = self.program.arena.allocator();
-        var in_scope: std.ArrayList(BinderId) = .empty;
-        for (plan_binders) |binder| {
-            if (self.binders.contains(binder)) try in_scope.append(arena, binder);
-        }
-        const binders = in_scope.items;
+        const binders = try self.boundBinders(plan_binders);
         if (binders.len == 0) return null;
         const pre = try arena.alloc(LocalId, binders.len);
         for (binders, pre) |binder, *before| before.* = self.binders.get(binder).?;
@@ -3736,7 +3743,7 @@ pub const Builder = struct {
                 try self.pushValue(try self.unitValue());
             },
             .if_test => |test_| try self.ifTest(test_.expr, test_.index, test_.join, test_.merge),
-            .match_start => |expr| try self.matchStart(expr),
+            .match_start => |start| try self.matchStart(start.expr, start.binders),
             .short_circuit => |sc| try self.shortCircuit(sc.is_and, sc.rhs, sc.join),
             .match_advance => |advance| try self.matchAdvance(advance.state, advance.input),
             .match_guard_done => |done| {
@@ -4227,7 +4234,7 @@ pub const Builder = struct {
                     try self.push(.discard);
                     return try self.push(.{ .expr = match.cond });
                 }
-                try self.push(.{ .match_start = expr_id });
+                try self.push(.{ .match_start = .{ .expr = expr_id, .binders = try self.boundBinders(try self.bodies().stateMergeBinders(expr_id)) } });
                 try self.push(.{ .expr = match.cond });
             },
             .binop => |binop| switch (binop.op) {
@@ -10321,7 +10328,7 @@ pub const Builder = struct {
         return try self.comptimeFailure(self.view.view.exhaustiveness_sites.lookupByMatchExpr(expr_id));
     }
 
-    pub fn matchStart(self: *Builder, expr_id: ExprId) Allocator.Error!void {
+    pub fn matchStart(self: *Builder, expr_id: ExprId, merge_binders: []const BinderId) Allocator.Error!void {
         const scrutinee = self.popValue();
         const match = self.bodies().exprData(expr_id).match_;
         const scrutinee_ty = try self.valueType(match.cond);
@@ -10335,7 +10342,6 @@ pub const Builder = struct {
             .remainder = undefined,
             .comptime_failure = try self.comptimeMatchFailure(expr_id, match),
         };
-        const merge_binders = try self.bodies().stateMergeBinders(expr_id);
         if (tail) {
             // Each branch returns; nothing reads the construct's own value,
             // and each branch starts from the binder values the construct

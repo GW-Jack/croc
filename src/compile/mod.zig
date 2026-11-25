@@ -237,6 +237,7 @@ test "compile tests" {
     std.testing.refAllDecls(@import("test/issue_12585_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12631_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12624_test.zig"));
+    std.testing.refAllDecls(@import("test/boxy_match_merge_test.zig"));
     std.testing.refAllDecls(@import("test/boxy_dictionary_evidence_order_test.zig"));
     std.testing.refAllDecls(@import("test/boxy_return_construction_test.zig"));
     std.testing.refAllDecls(@import("test/boxy_unary_argument_test.zig"));
