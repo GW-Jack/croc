@@ -106,14 +106,14 @@ NO CHANGE
 							(e-num (value "2")))))
 				(s-reassign
 					(p-var-assign (ident "sum_"))
-					(e-dispatch-call (method "plus") (constraint-fn-var 258)
+					(e-dispatch-call (method "plus") (constraint-fn-var 257)
 						(receiver
 							(e-lookup-local
 								(p-var-assign (ident "sum_"))))
 						(args
 							(e-lookup-local
 								(p-assign (ident "sum"))))))
-				(e-dispatch-call (method "plus") (constraint-fn-var 260)
+				(e-dispatch-call (method "plus") (constraint-fn-var 258)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "sum"))))

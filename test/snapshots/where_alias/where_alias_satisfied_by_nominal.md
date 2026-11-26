@@ -116,7 +116,7 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-assign (ident "value")))
-			(e-dispatch-call (method "to_str") (constraint-fn-var 314)
+			(e-dispatch-call (method "to_str") (constraint-fn-var 307)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "value"))))
@@ -131,7 +131,7 @@ NO CHANGE
 					(ty-lookup (name "Stringable") (local))))))
 	(d-let
 		(p-assign (ident "main"))
-		(e-call (constraint-fn-var 328)
+		(e-call (constraint-fn-var 316)
 			(e-lookup-local
 				(p-assign (ident "stringify")))
 			(e-nominal (nominal "Name")

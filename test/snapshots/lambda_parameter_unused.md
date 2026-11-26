@@ -272,33 +272,33 @@ main! = |_| {
 			(e-block
 				(s-let
 					(p-assign (ident "result1"))
-					(e-call (constraint-fn-var 333)
+					(e-call (constraint-fn-var 331)
 						(e-lookup-local
 							(p-assign (ident "add")))
 						(e-num (value "5"))))
 				(s-let
 					(p-assign (ident "result2"))
-					(e-call (constraint-fn-var 336)
+					(e-call (constraint-fn-var 333)
 						(e-lookup-local
 							(p-assign (ident "multiply")))
 						(e-num (value "3"))))
 				(s-let
 					(p-assign (ident "result3"))
-					(e-call (constraint-fn-var 340)
+					(e-call (constraint-fn-var 335)
 						(e-lookup-local
 							(p-assign (ident "process")))
 						(e-num (value "7"))))
 				(s-let
 					(p-assign (ident "result4"))
-					(e-call (constraint-fn-var 343)
+					(e-call (constraint-fn-var 337)
 						(e-lookup-local
 							(p-assign (ident "double")))
 						(e-num (value "4"))))
-				(e-dispatch-call (method "plus") (constraint-fn-var 344)
+				(e-dispatch-call (method "plus") (constraint-fn-var 338)
 					(receiver
-						(e-dispatch-call (method "plus") (constraint-fn-var 344)
+						(e-dispatch-call (method "plus") (constraint-fn-var 338)
 							(receiver
-								(e-dispatch-call (method "plus") (constraint-fn-var 344)
+								(e-dispatch-call (method "plus") (constraint-fn-var 338)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "result1"))))

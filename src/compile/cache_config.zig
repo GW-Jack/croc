@@ -472,7 +472,9 @@ pub const Constants = struct {
     /// 227: `erased_reuse_none` joins the low-level operations.
     /// 228: `task_hand` joins them.
     /// 229: a module records whether it refers to `Shared.update!`.
-    pub const CACHE_VERSION = 229;
+    /// 230: upstream's CIR node and checked-artifact layout changes merged
+    /// with the stack's concurrency nodes.
+    pub const CACHE_VERSION = 230;
 };
 
 /// Configuration for the Roc cache system.

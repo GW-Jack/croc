@@ -55,7 +55,7 @@ NO CHANGE
 							(e-lookup-local
 								(p-assign (ident "value"))))
 						(args))
-					(e-dispatch-call (method "convert") (constraint-fn-var 246)
+					(e-dispatch-call (method "convert") (constraint-fn-var 245)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "value"))))

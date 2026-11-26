@@ -72,7 +72,7 @@ EndOfFile,
 				(p-assign (ident "_args")))
 			(e-block
 				(s-expr
-					(e-call (constraint-fn-var 272)
+					(e-call (constraint-fn-var 270)
 						(e-lookup-local
 							(p-assign (ident "echo!")))
 						(e-string

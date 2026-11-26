@@ -235,7 +235,7 @@ effectful! = |shared, f!| shared.modify!(f!)
 		(e-lambda
 			(args
 				(p-assign (ident "list")))
-			(e-dispatch-call (method "update!") (constraint-fn-var 363)
+			(e-dispatch-call (method "update!") (constraint-fn-var 355)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "list"))))
@@ -291,7 +291,7 @@ effectful! = |shared, f!| shared.modify!(f!)
 		(e-lambda
 			(args
 				(p-assign (ident "permits")))
-			(e-dispatch-call (method "update!") (constraint-fn-var 408)
+			(e-dispatch-call (method "update!") (constraint-fn-var 380)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "permits"))))
@@ -302,7 +302,7 @@ effectful! = |shared, f!| shared.modify!(f!)
 						(e-if
 							(if-branches
 								(if-branch
-									(e-dispatch-call (method "is_gt") (constraint-fn-var 419)
+									(e-dispatch-call (method "is_gt") (constraint-fn-var 384)
 										(receiver
 											(e-lookup-local
 												(p-assign (ident "n"))))
@@ -310,7 +310,7 @@ effectful! = |shared, f!| shared.modify!(f!)
 											(e-num (value "0"))))
 									(e-tag (name "Set")
 										(args
-											(e-dispatch-call (method "minus") (constraint-fn-var 425)
+											(e-dispatch-call (method "minus") (constraint-fn-var 387)
 												(receiver
 													(e-lookup-local
 														(p-assign (ident "n"))))
@@ -328,7 +328,7 @@ effectful! = |shared, f!| shared.modify!(f!)
 		(p-assign (ident "made!"))
 		(e-lambda
 			(args)
-			(e-call (constraint-fn-var 440)
+			(e-call (constraint-fn-var 399)
 				(e-lookup-external
 					(builtin))
 				(e-string
@@ -338,7 +338,7 @@ effectful! = |shared, f!| shared.modify!(f!)
 		(e-lambda
 			(args
 				(p-assign (ident "shared")))
-			(e-dispatch-call (method "get!") (constraint-fn-var 448)
+			(e-dispatch-call (method "get!") (constraint-fn-var 407)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "shared"))))

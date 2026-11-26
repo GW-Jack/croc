@@ -287,7 +287,7 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-assign (ident "files")))
-			(e-dispatch-call (method "len") (constraint-fn-var 384)
+			(e-dispatch-call (method "len") (constraint-fn-var 379)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "files"))))

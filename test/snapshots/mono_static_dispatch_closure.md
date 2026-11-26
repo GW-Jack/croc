@@ -89,13 +89,13 @@ EndOfFile,
 								(p-assign (ident "y")))))))))
 	(d-let
 		(p-assign (ident "add_five"))
-		(e-call (constraint-fn-var 262)
+		(e-call (constraint-fn-var 261)
 			(e-lookup-local
 				(p-assign (ident "make_adder")))
 			(e-typed-int (value "5") (type "I64"))))
 	(d-let
 		(p-assign (ident "result"))
-		(e-call (constraint-fn-var 269)
+		(e-call (constraint-fn-var 265)
 			(e-lookup-local
 				(p-assign (ident "add_five")))
 			(e-typed-int (value "10") (type "I64")))))

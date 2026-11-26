@@ -168,7 +168,7 @@ expect getName(Wrapper.WithRecord({ name: "hello" })) == "hello"
 	(s-expect
 		(e-method-eq (negated "false")
 			(lhs
-				(e-call (constraint-fn-var 330)
+				(e-call (constraint-fn-var 312)
 					(e-lookup-local
 						(p-assign (ident "getName")))
 					(e-nominal (nominal "Wrapper")
@@ -182,7 +182,7 @@ expect getName(Wrapper.WithRecord({ name: "hello" })) == "hello"
 	(s-expect
 		(e-method-eq (negated "false")
 			(lhs
-				(e-call (constraint-fn-var 352)
+				(e-call (constraint-fn-var 322)
 					(e-lookup-local
 						(p-assign (ident "getName")))
 					(e-nominal (nominal "Wrapper")

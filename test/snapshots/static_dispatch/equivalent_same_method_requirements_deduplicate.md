@@ -78,7 +78,7 @@ f = |value| {
 						(args)))
 				(s-let
 					(p-assign (ident "_second"))
-					(e-dispatch-call (method "convert") (constraint-fn-var 251)
+					(e-dispatch-call (method "convert") (constraint-fn-var 250)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "value"))))

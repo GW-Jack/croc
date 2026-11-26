@@ -133,7 +133,7 @@ main = {
 		(e-block
 			(s-let
 				(p-assign (ident "int_list"))
-				(e-call (constraint-fn-var 305)
+				(e-call (constraint-fn-var 297)
 					(e-lookup-local
 						(p-assign (ident "shorthand")))
 					(e-list
@@ -143,7 +143,7 @@ main = {
 							(e-num (value "3"))))))
 			(s-let
 				(p-assign (ident "string_list"))
-				(e-call (constraint-fn-var 313)
+				(e-call (constraint-fn-var 301)
 					(e-lookup-local
 						(p-assign (ident "shorthand")))
 					(e-list
