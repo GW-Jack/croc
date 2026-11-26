@@ -50,6 +50,10 @@ else
 /// `naked.JmpBuf` it filled. macOS uses the Linux routines, which save exactly the
 /// callee-saved registers of the SysV x86_64 and AAPCS64 calling conventions
 /// that macOS also follows, so the object needs no `_setjmp` from libSystem.
+/// A target without such routines (32-bit ones among them) has none to
+/// give: using any of them there is a compile error naming the target.
+/// `task_crash_exit.native` is false on those targets, so the crash exit
+/// never asks.
 pub const naked = if (has_windows_x64_impl)
     @import("windows.zig")
 else if (has_windows_aarch64_impl)
@@ -57,7 +61,16 @@ else if (has_windows_aarch64_impl)
 else if (has_linux_impl or (has_macos_impl and (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64)))
     @import("linux.zig")
 else
-    @compileError("no naked setjmp routines on this platform");
+    NoNakedRoutines;
+
+/// `naked` on a target without naked routines: every member is a compile
+/// error, so a use the crash exit's `native` check missed cannot build.
+const NoNakedRoutines = struct {
+    const message = "src/sljmp has no naked setjmp routines for " ++ @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag);
+    pub const JmpBuf = @compileError(message);
+    pub const setjmp_routine = @compileError(message);
+    pub const longjmp = @compileError(message);
+};
 
 /// Restores execution context from the buffer, causing setjmp to return with the given value.
 pub const longjmp = if (has_windows_x64_impl)

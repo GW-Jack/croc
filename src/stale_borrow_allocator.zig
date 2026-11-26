@@ -107,9 +107,11 @@ pub const Config = struct {
     max_poisoned_bytes: usize = 64 * 1024 * 1024,
     /// The most page-protected allocations held, at most `protected_capacity`.
     max_protected: usize = protected_capacity,
-    /// The most bytes of page-protected allocations held. On Linux their pages
-    /// are also discarded, so they cost address space but no memory.
-    max_protected_bytes: usize = if (host == .linux) 4 * 1024 * 1024 * 1024 else 256 * 1024 * 1024,
+    /// The most bytes of page-protected allocations held. On 64-bit Linux
+    /// their pages are also discarded, so they cost address space but no
+    /// memory. A 32-bit process has 4 GiB of address space in all, so it holds
+    /// what other hosts hold.
+    max_protected_bytes: usize = if (host == .linux and @bitSizeOf(usize) == 64) 4 * 1024 * 1024 * 1024 else 256 * 1024 * 1024,
 };
 
 const Entry = struct {

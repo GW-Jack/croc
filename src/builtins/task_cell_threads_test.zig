@@ -28,6 +28,9 @@ const Status = task_mod.Status;
 const worker_count = 4;
 const task_count = 32;
 const step_count = 24;
+comptime {
+    std.debug.assert(2 * step_count <= std.math.maxInt(i32)); // rationale: Cell.stored is an isize, 32 bits on the smallest target
+}
 const rounds: u64 = if (builtin.sanitize_thread) 60 else 1500;
 
 const test_host = struct {
@@ -83,8 +86,11 @@ fn acquire(lock: *std.atomic.Mutex) void {
 const Cell = struct {
     value: i64 = 0,
     empty: bool = false,
-    /// What the stores to it add up to.
-    stored: std.atomic.Value(i64) = .init(0),
+    /// What the stores to it add up to. A word, which every target updates
+    /// atomically (32-bit ARM has no 64-bit atomics): each of the
+    /// `step_count` steps adds between -2 and 2, so the sum stays within
+    /// ±2 * `step_count`, far inside an `isize`.
+    stored: std.atomic.Value(isize) = .init(0),
 };
 
 const Answer = enum(u8) { add, keep, crash };
@@ -217,7 +223,7 @@ fn scriptCall(ops: *RocOps, ret: ?[*]u8, args: ?[*]const u8, capture: ?[*]u8, _:
         if (step.answer == .crash) ops.crash("an update crashed");
         if (step.answer == .add) {
             step.cell.value += step.amount;
-            _ = step.cell.stored.fetchAdd(step.amount, .monotonic);
+            _ = step.cell.stored.fetchAdd(@intCast(step.amount), .monotonic);
         }
         step.cell.empty = false;
         dev_wrappers.roc_builtins_cell_settle(step.cell, step.answer == .add, false);
@@ -273,7 +279,7 @@ fn runRound(seed: u64) (std.Thread.SpawnError || error{ TestUnexpectedResult, Te
     }
     try runReady(seed, seed % 2 == 0);
     for (&cells) |*cell| {
-        if (!cell.empty) try std.testing.expectEqual(cell.stored.load(.monotonic), cell.value);
+        if (!cell.empty) try std.testing.expectEqual(@as(i64, cell.stored.load(.monotonic)), cell.value);
     }
     for (&runners) |*runner| {
         if (runner.ended != null) continue;
