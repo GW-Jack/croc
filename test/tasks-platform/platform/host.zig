@@ -48,7 +48,12 @@ fn io() std.Io {
 /// results, so the count is atomic and the backing allocator is libc's
 /// thread-safe `malloc` (P6).
 const HostEnv = struct {
-    live_allocations: std.atomic.Value(i64) = .init(0),
+    /// A word, which every target updates atomically (32-bit ARM has no
+    /// 64-bit atomics). Each live allocation holds at least one distinct
+    /// byte of address space, so the count is below `maxInt(usize)`, and a
+    /// release follows its allocation, so it never goes below zero: it fits
+    /// an `isize` on every target.
+    live_allocations: std.atomic.Value(isize) = .init(0),
 
     pub fn rocAllocator(_: *HostEnv) std.mem.Allocator {
         return switch (g_alloc_mode) {

@@ -143,7 +143,7 @@ fn taskReady(task: *RocTask) callconv(.c) void {
 }
 
 fn worker(id: usize) void {
-    var rng: u64 = 0x9e3779b97f4a7c15 *% (id + 1);
+    var rng: u64 = 0x9e3779b97f4a7c15 *% (@as(u64, id) + 1);
     while (!all_done.load(.acquire)) {
         var index = id;
         while (index < task_count) : (index += worker_count) {
