@@ -135,11 +135,11 @@ main = ThingAlias.from_u64(41).value() + 1
 				(ty-lookup (name "U64") (builtin)))))
 	(d-let
 		(p-assign (ident "main"))
-		(e-dispatch-call (method "plus") (constraint-fn-var 317)
+		(e-dispatch-call (method "plus") (constraint-fn-var 301)
 			(receiver
-				(e-dispatch-call (method "value") (constraint-fn-var 314)
+				(e-dispatch-call (method "value") (constraint-fn-var 300)
 					(receiver
-						(e-call (constraint-fn-var 312)
+						(e-call (constraint-fn-var 299)
 							(e-lookup-local
 								(p-assign (ident "where_clause_alias_type_dispatch_issue_9875.Thing.from_u64")))
 							(e-num (value "41"))))

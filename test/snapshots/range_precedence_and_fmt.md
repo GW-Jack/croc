@@ -48,7 +48,7 @@ r = 1..<n + 1
 		(e-num (value "3")))
 	(d-let
 		(p-assign (ident "r"))
-		(e-dispatch-call (method "range_exclusive_to") (constraint-fn-var 251)
+		(e-dispatch-call (method "range_exclusive_to") (constraint-fn-var 249)
 			(receiver
 				(e-num (value "1")))
 			(args

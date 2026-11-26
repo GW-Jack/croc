@@ -288,7 +288,7 @@ Hello :: {}.{
 						(p-assign (ident "#interp_0"))
 						(e-lookup-local
 							(p-assign (ident "name"))))
-					(e-interpolation (constraint-fn-var 268) (dispatcher-var 16)
+					(e-interpolation (constraint-fn-var 266) (dispatcher-var 16)
 						(first
 							(e-literal (string "Hello ")))
 						(parts

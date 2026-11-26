@@ -173,7 +173,7 @@ expect result == result
 				(e-lambda
 					(args
 						(p-assign (ident "n")))
-					(e-dispatch-call (method "is_gt") (constraint-fn-var 282)
+					(e-dispatch-call (method "is_gt") (constraint-fn-var 281)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "n"))))

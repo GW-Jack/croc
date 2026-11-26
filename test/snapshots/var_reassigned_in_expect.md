@@ -314,7 +314,7 @@ NO CHANGE
 								(p-assign (ident "balance"))))
 						(s-reassign
 							(p-var-assign (ident "$left"))
-							(e-dispatch-call (method "minus") (constraint-fn-var 336)
+							(e-dispatch-call (method "minus") (constraint-fn-var 334)
 								(receiver
 									(e-lookup-local
 										(p-var-assign (ident "$left"))))
@@ -330,7 +330,7 @@ NO CHANGE
 							(e-block
 								(s-reassign
 									(p-var-assign (ident "$left"))
-									(e-dispatch-call (method "plus") (constraint-fn-var 382)
+									(e-dispatch-call (method "plus") (constraint-fn-var 365)
 										(receiver
 											(e-lookup-local
 												(p-var-assign (ident "$left"))))
@@ -361,15 +361,15 @@ NO CHANGE
 						(e-tag (name "True"))))
 				(s-reassign
 					(p-var-assign (ident "$count"))
-					(e-dispatch-call (method "plus") (constraint-fn-var 406)
+					(e-dispatch-call (method "plus") (constraint-fn-var 383)
 						(receiver
 							(e-lookup-local
 								(p-var-assign (ident "$count"))))
 						(args
 							(e-num (value "1")))))
-				(e-dispatch-call (method "plus") (constraint-fn-var 382)
+				(e-dispatch-call (method "plus") (constraint-fn-var 365)
 					(receiver
-						(e-dispatch-call (method "minus") (constraint-fn-var 336)
+						(e-dispatch-call (method "minus") (constraint-fn-var 334)
 							(receiver
 								(e-lookup-local
 									(p-var-assign (ident "$remaining"))))

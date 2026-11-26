@@ -88,8 +88,12 @@ const checked_reports_layout: [32]u8 = check.rootLayoutVersionHash(check.Checked
 /// types that carry no iterator representation fields.
 /// Version 57 stores absent optional ids and indices as zero. Version 58
 /// gives the remaining absences explicit representations.
+/// Version 59 stores sealed type stores whose dead descriptors, pool rows and
+/// merged-away variables sealing removed, renumbering the variables checking
+/// made with every variable checking recorded outside the store. Version 60
+/// stores each checked type's identity-variable fact.
 /// Platform-pairing entries share it.
-const checked_envelope_version: u32 = 58;
+const checked_envelope_version: u32 = 60;
 
 /// Version of the canonicalized-module envelope: its magic, header layout, and
 /// body order and alignment. Version 5 rejects builtin-conflicting import
@@ -191,8 +195,8 @@ test "module_env_layout golden value" {
     // an *intentional* layout change, bump `Constants.CACHE_VERSION` and replace the
     // golden bytes below with the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x8e, 0x80, 0x31, 0x22, 0xcc, 0x17, 0xa7, 0x87, 0x78, 0x03, 0x6c, 0x52, 0x78, 0x13, 0xea, 0x37,
-        0xe0, 0x2c, 0xd4, 0x30, 0x62, 0x07, 0x76, 0xf3, 0x10, 0x1b, 0xef, 0x84, 0xa1, 0x1a, 0xd1, 0x28,
+        0x88, 0xc6, 0xb6, 0x58, 0xc1, 0xb8, 0x06, 0x2f, 0x9a, 0x67, 0x4b, 0xf8, 0x23, 0x2c, 0xa4, 0x52,
+        0x92, 0x37, 0x45, 0xf5, 0xdd, 0xa5, 0x0d, 0xc3, 0xdc, 0x0c, 0xbb, 0xc6, 0xed, 0xb1, 0x8f, 0x42,
     };
     try std.testing.expectEqualSlices(u8, &golden, &module_env_layout);
 }

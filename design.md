@@ -2493,7 +2493,8 @@ roots (`CompileTimeRootTable.fromModule`), after it has published the
 module's dispatch plans: a numeral with a `from_numeral` plan is not in value
 form, and a literal with a conversion root always has such a plan, so the
 conversion roots published later decide nothing. Deciding reads the checked
-types and changes none.
+types and changes none. The walk classifies each part by its node kind before it decodes the
+part, so a part that cannot be in value form is never decoded.
 
 A lookup is decided last, once every root of the module exists with its
 request eligibility: publication resolves it from checked CIR to the root it
@@ -7094,10 +7095,11 @@ sealed. It consists of exactly these parts:
   nothing else does.
 
 **Sealing.** Checking canonicalizes the solver store in place as its last
-write before sealing it (`types.Store.canonicalizeAndSeal`). Every slot comes
-to name its class's storage root directly; every variable a descriptor, a type
-argument or record field pool, or a nominal declaration holds becomes its
-class's checked representative; and every record and tag union row a reader
+write before sealing it (`types.Store.canonicalizeAndSealReached`). Every class
+comes to be stored at its checked representative, which every other member
+names directly; every variable a descriptor, a type argument or record field
+pool, or a nominal declaration holds becomes its class's checked
+representative; and every record and tag union row a reader
 can name absorbs the rows its extension chain reaches, so such a row is flat
 and its extension is never itself a row. Canonicalization walks the slots
 once, the variable and field pools once, and the live descriptors once. The
@@ -7118,8 +7120,56 @@ cost nothing to seal. Reading a sealed row whose extension is a row is a
 compiler bug, asserted in debug builds. When no row's extension is a row,
 there is nothing to flatten and no trace runs. A static-dispatch constraint
 keeps the function variable checking recorded for it, because that variable
-identifies the constraint; a reader resolves it with one slot read. The
-checked type id of a source type is its checked representative's bit pattern,
+identifies the constraint; a reader resolves it with one slot read.
+
+Canonicalization then closes the gaps the store's dead entries leave. The
+sealed store is the same store with its gaps closed, not a second
+representation. Every class survives, stored at its checked representative:
+the slot pass makes the representative's slot hold the descriptor and every
+other member's slot name the representative. A variable survives when
+canonicalization made it (every variable below the count the store held when
+checking began, which covers every CIR node's variable), when it is a
+class's representative, when a holder outside the store names it, or when a
+surviving static-dispatch constraint or interpolation row names it as its
+own variable. Every variable the store's descriptors, pools and nominal
+declarations hold is a representative, so this is complete. Every other
+variable dies: a merged-away member nothing names. A pool or identity row
+survives when a surviving descriptor names it, directly, through a tag's
+argument range or through a constraint's numeral and interpolation rows, or
+when a nominal declaration's formals name it. A constraint row also survives
+when a holder names its index, or when a holder names its function variable,
+because a reader finds a constraint by the function variable checking
+recorded at its dispatch site. A derived-map selection survives with its
+class.
+
+Every column keeps its survivors in their original order and slides each down
+to its rank: the number of survivors before it, read from the column's
+liveness bit set as a running count per mask word plus a population count
+within the word. No translation table is built, a survivor only ever moves
+down, so each column closes in place in one forward pass, a range shared by
+two descriptors stays shared, and anything sorted by index stays sorted.
+Variables below the canonical count keep their numbers. Representatives are
+marked in the slot and descriptor passes above; the pool and identity rows
+are marked by one more pass over the live descriptors once flattening has
+made every row final, and one pass over the constraint pool keeps the rows
+holders reach by function variable. Closing then
+walks each column once: the pools first, rewriting their variables to
+representatives and renumbering them as they move, then the slots, which
+name only representatives and so are renumbered without reading one another,
+then the descriptors.
+
+The holders outside the store are exactly what checking recorded before
+sealing: the `ModuleEnv` side tables and CIR node payloads that name a
+variable or a constraint index (`ModuleEnv.visitSealHolders`) and the
+checking problems (`problem.Store.visitSealHolders`). A holder keeps the
+variable it recorded, representative or not, since several holders identify
+a relation by its raw variable; checking hands each one to sealing once to
+keep it alive and once to renumber it. Snapshots name variables only as keys
+of their own presentation stores and are not holders. Everything published
+after sealing (`CheckedTypeStore`, `sealed_var_facts`, type keys) is sized
+and numbered by the sealed store.
+
+The checked type id of a source type is its checked representative's bit pattern,
 so a rendered payload's children
 alias the store's own variable pools and every reader receives
 representatives. Five columns beside the module's synthesized-type store
@@ -7292,7 +7342,8 @@ checking. When checking completes (`checkFileInternal`, after
 the dispatch relation merges and `finalizeLiteralDispatchResolutions`),
 the checker records, in the module's own check task, every node that is
 erroneous in its own right (`ModuleEnv.erroneous_nodes`,
-`Check.recordErroneousNodes`): a runtime error node; an expression or
+`Check.recordErroneousNodes`), other than a runtime error node, which is
+erroneous by its kind alone: an expression or
 pattern whose type reaches erroneous content (a top-level definition's
 pattern is read at the definition's type); a call whose function constraint
 type, or an interpolation whose assembler type, reaches erroneous content; a
@@ -7310,12 +7361,13 @@ after checking, are on-demand analyses of the sealed module
   checked error or unreachable, propagated through evaluation order), inspect
   elision, and the state merges and loop mutations Monotype threads through
   control flow;
-- per module: whether an expression contains a diagnostic error (its own
-  `erroneous_nodes` entry, any child's, a dispatch total resolution rejected,
-  and, when a dispatch was rejected, a resolved local constant reference to
-  an erroneous value; the constant-following part crosses definitions, so it
-  is one slot for the module), and which templates and nested procedure sites
-  are single-source calls.
+- per module: which templates and nested procedure sites are single-source
+  calls.
+
+Publication alone asks whether an expression contains a diagnostic error (its
+own `erroneous_nodes` entry, a runtime error, a retired expression, or any
+child's), and only
+before it seals template references; see "Static Dispatch In Monotype".
 
 There is no propagation pass over finished bodies during checking or
 checked module assembly, and no analysis result is serialized.
@@ -7349,8 +7401,11 @@ consumer that needs one entry per type asks the module's view for the one id
 its key index holds for the type's key (`canonicalId`) or compares two ids
 with `sameType`. A type that reaches an identity variable is identified by
 its id alone, because its key names its variables only by position. Whether
-a type reaches an identity variable is found by walking the types it reaches,
-never through its key.
+a type reaches an identity variable is stored with the type, never read
+through its key: publication marks it on each source type when it first
+reaches that type (`SealedVarFacts.identity_variables`), and a synthesized
+type settles it from its children once its payload is filled
+(`CheckedTypeRoot.identity`).
 
 A synthesized type's key is computed on first demand through its own key
 slot, like a source type's. A synthesized function type records that its key
@@ -7524,8 +7579,8 @@ cache entry stores one: a cache hit recomputes each result on its first demand.
   strongly connected component of the module's call graph, never per root.
 - Per-module slots: the key index (one over source types, one over
   synthesized types), interface capabilities, the method registry view,
-  provided exports, the nodes whose dispatch plan cannot run, diagnostic
-  errors, and single-source calls.
+  provided exports, the nodes whose dispatch plan cannot run, and
+  single-source calls.
 
 A slot (`collections.OnceSlot`) is a state word with three states: empty,
 claimed and done; a claimed word also records whether a consumer is parked on
@@ -7645,6 +7700,22 @@ of a node's shape costs what reading the node costs:
   declaration bits (a top-level definition's pattern, a rejected method
   declaration, a promoted procedure's pattern, a recursive value
   declaration and its binders, a scheme-alias binder, a field default).
+  While it visits each reached node it also lists, by kind, the nodes
+  publication looks for: calls, statically dispatched expressions, value
+  lookups, binding statements and lambdas, and whether a runtime error
+  node is reached. Publication's retired-call, dispatch-plan,
+  dispatch-constraint, dispatch-type-root, resolved-reference and
+  local-pattern-role passes read those lists instead of scanning every node
+  of the module.
+  The index also records each reached node's parent and, bottom up as it
+  finishes each unit, which expressions have a subtree made only of
+  literals and constructions (`ModuleIndex.inertExprs`). Template
+  reference collection and nested procedure site collection skip such a
+  subtree whole, after clearing from that set every subtree holding a
+  literal with a conversion plan or an expression where the walk records
+  something of its own (a generalized local scope, a nested function use,
+  a callable-derived scheme): nothing in what is skipped would be
+  recorded, so every collected list keeps its contents and order.
   The analyses themselves are computed on first demand. A unit's analyses
   keep their memos in dense arrays indexed by position in the unit and
   touch each node of the unit once per analysis; divergence is decided for
@@ -13862,12 +13933,13 @@ No other use observes a copy of its remaining labels. This does not apply to
 a rest binder, a shared extension, or a relation that changes field kind or
 tag provenance.
 
-When a pattern introduces a previously absent tag into an inferred open
-row, every existing reference to the old extension must see the new tag.
-The row may combine adjacent disjoint tag runs, but an absorbed part remains
-valid in isolation, and a marked entry copied out of it remains the same
-diagnostic fact (Pattern-Only Tags). A bounded or rigid tail cannot be
-extended by this rule.
+When a field access or pattern introduces a previously absent member into an
+inferred open row, every existing reference to the old extension must see the
+new member. The row may combine adjacent disjoint runs of members, but an
+absorbed part remains valid in isolation, and a marked tag copied out of it
+remains the same diagnostic fact (Pattern-Only Tags). A later demand for a
+member one of those runs holds binds to that entry and leaves the row as it
+is. A bounded or rigid tail cannot be extended by this rule.
 
 A use of a top-level value is therefore never a widening of the value: no
 row coercion and no `ModuleEnv` record exist for value uses. Where a
@@ -21356,9 +21428,8 @@ type. Reading the source-value cell neither commits the field kind nor relates
 the value to its storage slot; ordinary interface relations and relation freeze
 retain ownership of those decisions.
 
-The per-expression `contains_diagnostic_error` flag ("Per-Expression Checking
-Data") excludes rejected
-expression sites from this relation table; an error-containing checked type is
+Whether an expression contains a diagnostic error ("Per-Expression Checking
+Data") excludes rejected expression sites from this relation table; an error-containing checked type is
 not a valid specialization constraint and never reaches Monotype instantiation.
 Monotype consumes both relation sources before applying defaults or sealing a
 specialization request. It does not scan a checked body to rediscover them.
@@ -23372,40 +23443,28 @@ ineligible method's decision; neither stage branches on `rejected` to choose
 inspection's rendering. The program still reports the declaration's diagnostic
 and cannot be mistaken for valid.
 
-Checked-module construction computes the `contains_diagnostic_error` column
-once every source runtime error and rejected binding use is explicit in the
-bodies: after rejected procedure uses are rewritten to `runtime_error` and
+Checked-module publication computes which reached nodes contain a diagnostic
+error once every source runtime error and rejected binding use is explicit in
+the bodies: after reference resolution retires rejected procedure uses and
 before template references are sealed, because sealing excludes erroneous sites
-from the specialization-interface relation table. Compile-time roots take their
-context-free request eligibility from solved types when the root table is
-built, and each computation of the column only removes eligibility. Runtime
-divergence is computed once, after total dispatch resolution, because rejected
-and unreachable dispatch resolutions diverge.
+from the specialization-interface relation table. A diagnostic error starts
+only at a node checking recorded as erroneous (`ModuleEnv.erroneous_nodes`), at
+a runtime error node, or at an expression reference resolution retired. The
+module index records whether the bodies reach a runtime error node as it
+visits each one, so a module with none of the three contains no diagnostic
+error, and publication answers without walking its bodies. The result is publication scratch, released when
+publication finishes and never serialized. Runtime divergence is computed once,
+after total dispatch resolution, because rejected and unreachable dispatch
+resolutions diverge.
 
-Total dispatch resolution also records a diagnostic-error seed on that exact
-checked expression. A literal's earlier `custom_dispatch` selection proves its
-callable relation, but its selected declaration can subsequently be rejected,
-including by final strict-demand cycle checking. These seeds cannot join the
-ordinary computation: a generic-codec requirement forwarded through the
-enclosing templates' evidence chains takes precedence over a rejected concrete
-target, and those chains come from sealing, which consumes the ordinary column.
-Once all plans are resolved, checked-module construction propagates these seeds through the existing body
-diagnostic analysis before creating compile-time root requests. The conversion
-root and any enclosing constant root evaluate to the checked error they reach;
-independent roots evaluate normally. `unreachable` is not a diagnostic
-seed. The existing `contains_diagnostic_error` field carries this state through serialization;
-the resolution pass merely records whether recovery propagation is needed, so
-successful modules allocate no new index and perform no additional traversal.
-The ordinary body scan is specialized at compile time to omit recovery-graph
-bookkeeping. Error propagation only removes newly erroneous root requests; it
-does not repeat the already-completed context-free type traversal.
-On that recovery path, resolved local constant references supply initializer
-dependencies as well as the ordinary expression, pattern, and statement edges.
-The body traversal records reverse edges in contiguous scratch storage, and a
-monotone worklist propagates each new error once. References through delayed
-function bodies may form cycles; their provisional traversal answers are not
-final until the worklist closes the graph. Independent cycles remain error-free.
-This scratch is released before compile-time evaluation and is never serialized.
+A dispatch whose total resolution is a checked error is not a diagnostic-error
+seed. A literal's earlier `custom_dispatch` selection proves its callable
+relation, but its selected declaration can subsequently be rejected, including
+by final strict-demand cycle checking, and a generic-codec requirement
+forwarded through the enclosing templates' evidence chains takes precedence
+over a rejected concrete target. Lowering crashes for the rejected dispatch, so
+the conversion root and any enclosing constant root evaluate to the checked
+error they reach, and independent roots evaluate normally.
 
 `checked_error` and `unreachable` are rejected, non-returning
 dispatches. Monotype lowers both to an ordinary Roc runtime crash instead of a

@@ -189,7 +189,7 @@ y = x == x
 								(pattern (degenerate false)
 									(p-applied-tag)))
 							(value
-								(e-dispatch-call (method "frob") (constraint-fn-var 333)
+								(e-dispatch-call (method "frob") (constraint-fn-var 325)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "v"))))

@@ -117,7 +117,7 @@ describe = |value| match value {
 								(e-block
 									(s-let
 										(p-assign (ident "#interp_0"))
-										(e-dispatch-call (method "to_str") (constraint-fn-var 313)
+										(e-dispatch-call (method "to_str") (constraint-fn-var 309)
 											(receiver
 												(e-lookup-local
 													(p-assign (ident "first"))))
@@ -130,9 +130,9 @@ describe = |value| match value {
 												(p-assign (ident "#interp_0")))
 											(e-literal (string ""))))))
 							(guard
-								(e-dispatch-call (method "is_gt") (constraint-fn-var 309)
+								(e-dispatch-call (method "is_gt") (constraint-fn-var 306)
 									(receiver
-										(e-call (constraint-fn-var 308)
+										(e-call (constraint-fn-var 305)
 											(e-lookup-external
 												(builtin))
 											(e-lookup-local
@@ -150,7 +150,7 @@ describe = |value| match value {
 								(e-block
 									(s-let
 										(p-assign (ident "#interp_1"))
-										(e-dispatch-call (method "to_str") (constraint-fn-var 313)
+										(e-dispatch-call (method "to_str") (constraint-fn-var 309)
 											(receiver
 												(e-lookup-local
 													(p-assign (ident "x"))))

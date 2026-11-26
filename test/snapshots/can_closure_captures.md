@@ -203,7 +203,7 @@ main = (captureSimple, captureMultiple, outerFn, useClosure)
 						(e-lambda
 							(args
 								(p-underscore))
-							(e-dispatch-call (method "plus") (constraint-fn-var 300)
+							(e-dispatch-call (method "plus") (constraint-fn-var 299)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "level1"))))
@@ -227,7 +227,7 @@ main = (captureSimple, captureMultiple, outerFn, useClosure)
 						(p-assign (ident "n")))))))
 	(d-let
 		(p-assign (ident "useClosure"))
-		(e-call (constraint-fn-var 309)
+		(e-call (constraint-fn-var 307)
 			(e-lookup-local
 				(p-assign (ident "makeClosure")))
 			(e-num (value "100"))))

@@ -96,7 +96,7 @@ NO CHANGE
 				(e-num (value "2")))))
 	(d-let
 		(p-assign (ident "diff"))
-		(e-dispatch-call (method "minus") (constraint-fn-var 273)
+		(e-dispatch-call (method "minus") (constraint-fn-var 272)
 			(receiver
 				(e-num (value "5")))
 			(args
@@ -130,7 +130,7 @@ NO CHANGE
 							(e-num (value "1"))))))))
 	(d-let
 		(p-assign (ident "negated"))
-		(e-dispatch-call (method "negate") (constraint-fn-var 332)
+		(e-dispatch-call (method "negate") (constraint-fn-var 307)
 			(receiver
 				(e-lookup-local
 					(p-assign (ident "sum"))))
