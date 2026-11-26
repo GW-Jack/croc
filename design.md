@@ -36058,11 +36058,11 @@ until the root reports a terminal status.
 
 **Crash exits.** A crash inside a task exits back to the `roc_task_resume`
 that is running it.
-- On targets `src/sljmp` supports, before running a record, the resume
-  saves a jump buffer in the task and makes the task the process's
-  *running task*.
-- On every other target, including wasm, a crash ends the process as it
-  does without tasks.
+- On targets with `src/sljmp`'s naked routines (x86_64 and aarch64 on
+  Linux, macOS and Windows), before running a record, the resume saves a
+  jump buffer in the task and makes the task the process's *running task*.
+- On every other target, including wasm and 32-bit ones, a crash ends the
+  process as it does without tasks.
 
 A crash while a task is running does two things:
 - it copies its message into an allocation the task owns. `roc_alloc`
