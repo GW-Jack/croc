@@ -4417,14 +4417,19 @@ const Lowerer = struct {
             try self.result.root_metadata.append(self.allocator, metadata);
             if (root.request.abi == .compile_time) {
                 const ret_layout = try self.layoutOfType(entry.ret);
+                const stored_ty = try self.declaredRootType(entry.ret, self.solved.lifted.getFn(self.solved.lifted.rootsView()[root.request_index].fn_id).ret);
                 try self.result.const_roots.append(self.allocator, .{
                     .root_order = root.request.order,
                     .owner = root.owner,
                     .request = root.request,
                     .proc = proc,
                     .ret_layout = ret_layout,
-                    .ret_type = try self.constTypeOfType(try self.declaredRootType(entry.ret, self.solved.lifted.getFn(self.solved.lifted.rootsView()[root.request_index].fn_id).ret)),
+                    .ret_type = try self.constTypeOfType(stored_ty),
                     .plan = try self.constPlanOfType(entry.ret),
+                    .stored = if (stored_ty == entry.ret) null else .{
+                        .ret_layout = try self.layoutOfType(stored_ty),
+                        .plan = try self.constPlanOfType(stored_ty),
+                    },
                     .value_slot = if (completed_values.get(root.request_index)) |value_root|
                         try self.comptimeValueSlot(value_root, entry.ret, ret_layout)
                     else
@@ -6024,8 +6029,10 @@ const Lowerer = struct {
             .stored => {
                 // Frozen straight from the stored node its request names: no
                 // initializer builds it.
-                const stored_request = switch (self.solved.lifted.static_data_values.get(@backingInt(candidate.static_data))) {
-                    .stored => |stored| stored,
+                const module: check.CheckedModule.ModuleId, const node: check.CheckedModule.ConstNodeId = switch (self.solved.lifted.static_data_values.get(@backingInt(candidate.static_data))) {
+                    .stored => |stored| .{ check.CheckedModule.constModuleId(stored.const_locator), stored.node orelse Common.invariant("a stored list's static data request named no stored node") },
+                    .stored_root => |root| .{ root.module, root.node },
+                    .stored_image => |image| .{ image.module, image.node },
                     .inline_literal => Common.invariant("a stored list's static data request named a value-form expression"),
                 };
                 const result_id: LIR.StaticDataId = @fromBackingInt(@intCast(@as(u32, @intCast(self.result.static_data_values.items.len))));
@@ -6033,8 +6040,8 @@ const Lowerer = struct {
                     .initializer = .none,
                     .layout_idx = layout_idx,
                     .stored = .{
-                        .module = check.CheckedModule.constModuleId(stored_request.const_locator),
-                        .node = stored_request.node orelse Common.invariant("a stored list's static data request named no stored node"),
+                        .module = module,
+                        .node = node,
                         .plan = try self.constPlanOfType(ty),
                     },
                 });
@@ -7821,6 +7828,12 @@ const Lowerer = struct {
     /// Immediate candidates touch no shared static-data inventory, so the
     /// same rule governs worker admission and actual expression lowering.
     fn staticDataCandidateIsImmediate(self: *Lowerer, candidate: Mono.StaticDataCandidate, layout_idx: layout.Idx) bool {
+        // A stored value is frozen from its store, whatever its layout: no
+        // expression builds it (design.md "Stored Images").
+        switch (candidate.value) {
+            .runtime => {},
+            .stored => return false,
+        }
         const candidate_layout = self.result.layouts.getLayout(layout_idx);
         return switch (candidate_layout.tag) {
             .scalar => candidate_layout.getScalar().tag != .str or !candidate.storage.needsTargetStorage(self.result.layouts.targetUsize()),
@@ -11797,7 +11810,7 @@ const Lowerer = struct {
             if (self.comptime_site) |site| {
                 return try self.l.result.store.addCFStmt(try self.l.comptimeExhaustivenessFailed(site), self.where.glue());
             }
-            return try self.l.result.store.addCFStmt(.{ .runtime_error = {} }, self.where.glue());
+            return try self.l.patternMatchFailed(self.where);
         }
 
         pub fn lirLocalForOcc(self: *const MatchTreeCtx, _: match_tree.Step, ty: Type.TypeId, _: ?LIR.LocalId) Common.LowerError!LIR.LocalId {
@@ -12703,13 +12716,22 @@ const Lowerer = struct {
         const crash = if (comptime_site) |site|
             try self.result.store.addCFStmt(try self.comptimeExhaustivenessFailed(site), where.glue())
         else
-            try self.result.store.addCFStmt(.{ .runtime_error = {} }, where.glue());
+            try self.patternMatchFailed(where);
         const matched = try self.lowerPatternThen(where, pat_id, source, next, miss, next);
         return try self.result.store.addCFStmt(.{ .join = .{
             .id = miss.join_id,
             .params = LIR.LocalSpan.empty(),
             .body = crash,
             .remainder = matched,
+        } }, where.glue());
+    }
+
+    /// The terminal of a failed match or destructure with no compile-time
+    /// exhaustiveness site: the crash every strategy reports for a value no
+    /// pattern matches.
+    fn patternMatchFailed(self: *Lowerer, where: LowerSite) Common.LowerError!LIR.CFStmtId {
+        return try self.result.store.addCFStmt(.{ .crash = .{
+            .msg = .{ .literal = try self.result.store.insertString("pattern match failed") },
         } }, where.glue());
     }
 

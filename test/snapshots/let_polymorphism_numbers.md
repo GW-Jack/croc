@@ -249,7 +249,7 @@ main = |_| {
 			(args
 				(p-underscore))
 			(e-block
-				(e-dispatch-call (method "plus") (constraint-fn-var 310)
+				(e-dispatch-call (method "plus") (constraint-fn-var 311)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "int_add"))))

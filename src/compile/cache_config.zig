@@ -474,7 +474,9 @@ pub const Constants = struct {
     /// 229: a module records whether it refers to `Shared.update!`.
     /// 230: upstream's CIR node and checked-artifact layout changes merged
     /// with the stack's concurrency nodes.
-    pub const CACHE_VERSION = 230;
+    /// 231: upstream's literal-only expression bits and compacted type-store
+    /// slots merged with the stack's concurrency nodes.
+    pub const CACHE_VERSION = 231;
 };
 
 /// Configuration for the Roc cache system.
