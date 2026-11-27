@@ -26,12 +26,15 @@ function trapIf(condition, why) {
  * `chunk`: how many bytes the reader of the output stream takes at a time, each
  * on a later turn. Without it, it takes each write at once. `closeAfter`: the
  * reader goes away once it has taken this many bytes. `cancel`: a promise after
- * which the caller cancels `run`.
+ * which the caller cancels `run`. `cancelWhen`: the caller cancels `run` the
+ * first time it waits in a state, `{ stdout, stderr, timers }`, for which this
+ * returns true. A test that needs the program to have reached some point before
+ * it is cancelled says so here rather than guessing how long that takes.
  *
  * @param {WebAssembly.Module} module
- * @param {{ chunk?: number, closeAfter?: number, cancel?: Promise<void> }} [options]
+ * @param {{ chunk?: number, closeAfter?: number, cancel?: Promise<void>, cancelWhen?: (state: { stdout: string, stderr: string, timers: string[] }) => boolean }} [options]
  */
-export async function run(module, { chunk = 0, closeAfter = Infinity, cancel } = {}) {
+export async function run(module, { chunk = 0, closeAfter = Infinity, cancel, cancelWhen } = {}) {
   const handles = new Map();
   let lastHandle = 0;
   let exports;
@@ -208,6 +211,7 @@ export async function run(module, { chunk = 0, closeAfter = Infinity, cancel } =
   /** The next event of a set, waiting for one. */
   const nextEvent = async (set) => {
     for (;;) {
+      if (!cancelRequested && cancelWhen?.({ ...text, timers })) cancelRequested = true;
       if (cancelRequested && !cancelDelivered) {
         cancelDelivered = true;
         return [EVENT.taskCancelled, 0, 0];
