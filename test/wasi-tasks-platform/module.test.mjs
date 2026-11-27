@@ -12,7 +12,6 @@ const [app, queue, crash, forever] = await Promise.all(process.argv.slice(2).map
 
 const slept = "slept 0\nslept 1\nslept 45\nslept 90\n0 1 45 90 early 136\n";
 const took = [0, 1, 2, 3].map((i) => `took item ${i}, too long to be stored inline\n`).join("");
-const after = (millis) => new Promise((resolve) => setTimeout(resolve, millis));
 
 test("tasks sleep at the same time, and a race abandons the timer that lost", async () => {
   const outcome = await run(app);
@@ -51,8 +50,12 @@ test("a crash traps, with its message on the error stream", async () => {
 });
 
 test("cancelling run cancels its timers and frees everything", async () => {
+  // Cancel once every task is waiting: three on their timers, one on shared
+  // state. A fixed delay raced the reader on hosts with coarse timers, where the
+  // last task's line was still being taken one byte a turn when it ran out.
+  const waiting = ({ timers }) => timers.length === 3;
   for (const options of [{}, { chunk: 1 }]) {
-    const { status, stdout, stderr, timers } = await run(forever, { ...options, cancel: after(60) });
+    const { status, stdout, stderr, timers } = await run(forever, { ...options, cancelWhen: waiting });
     assert.deepEqual([status, stdout, stderr, timers], ["cancelled", "running\nrunning too\n", "", ["cancelled", "cancelled", "cancelled"]]);
   }
 });
