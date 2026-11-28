@@ -103,14 +103,14 @@ main! = |_| {
 		(e-lambda
 			(args
 				(p-assign (ident "n")))
-			(e-dispatch-call (method "plus") (constraint-fn-var 295)
+			(e-dispatch-call (method "plus") (constraint-fn-var 357)
 				(receiver
 					(e-num (value "1")))
 				(args
-					(e-call (constraint-fn-var 297)
+					(e-call (constraint-fn-var 359)
 						(e-lookup-local
 							(p-assign (ident "recurse")))
-						(e-dispatch-call (method "plus") (constraint-fn-var 295)
+						(e-dispatch-call (method "plus") (constraint-fn-var 357)
 							(receiver
 								(e-lookup-local
 									(p-assign (ident "n"))))
@@ -126,7 +126,7 @@ main! = |_| {
 			(e-block
 				(s-let
 					(p-underscore)
-					(e-call (constraint-fn-var 301)
+					(e-call (constraint-fn-var 363)
 						(e-lookup-local
 							(p-assign (ident "recurse")))
 						(e-num (value "0"))))

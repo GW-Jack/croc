@@ -245,7 +245,7 @@ NO CHANGE
 					(e-num (value "0")))
 				(s-for-bang
 					(p-assign (ident "x"))
-					(e-call (constraint-fn-var 351)
+					(e-call (constraint-fn-var 413)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local
@@ -253,7 +253,7 @@ NO CHANGE
 					(e-block
 						(s-reassign
 							(p-var-assign (ident "$sum"))
-							(e-dispatch-call (method "plus") (constraint-fn-var 441)
+							(e-dispatch-call (method "plus") (constraint-fn-var 503)
 								(receiver
 									(e-lookup-local
 										(p-var-assign (ident "$sum"))))
@@ -280,9 +280,9 @@ NO CHANGE
 					(e-num (value "0")))
 				(s-for-bang
 					(p-assign (ident "x"))
-					(e-dispatch-call (method "limit") (constraint-fn-var 450)
+					(e-dispatch-call (method "limit") (constraint-fn-var 512)
 						(receiver
-							(e-dispatch-call (method "concurrently") (constraint-fn-var 447)
+							(e-dispatch-call (method "concurrently") (constraint-fn-var 509)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "fs"))))
@@ -292,7 +292,7 @@ NO CHANGE
 					(e-block
 						(s-reassign
 							(p-var-assign (ident "$sum"))
-							(e-dispatch-call (method "plus") (constraint-fn-var 441)
+							(e-dispatch-call (method "plus") (constraint-fn-var 503)
 								(receiver
 									(e-lookup-local
 										(p-var-assign (ident "$sum"))))
@@ -319,7 +319,7 @@ NO CHANGE
 					(e-runtime-error (tag "erroneous_value_expr")))
 				(s-for-bang
 					(p-assign (ident "x"))
-					(e-call (constraint-fn-var 504)
+					(e-call (constraint-fn-var 566)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local

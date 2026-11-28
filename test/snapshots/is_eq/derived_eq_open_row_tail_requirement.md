@@ -174,7 +174,7 @@ checks = (same(Yes(1), Yes(1)), is_nope(Yes(2)), value == None)
 		(p-assign (ident "checks"))
 		(e-tuple
 			(elems
-				(e-call (constraint-fn-var 331)
+				(e-call (constraint-fn-var 393)
 					(e-lookup-local
 						(p-assign (ident "same")))
 					(e-tag (name "Yes")
@@ -183,7 +183,7 @@ checks = (same(Yes(1), Yes(1)), is_nope(Yes(2)), value == None)
 					(e-tag (name "Yes")
 						(args
 							(e-num (value "1")))))
-				(e-call (constraint-fn-var 338)
+				(e-call (constraint-fn-var 400)
 					(e-lookup-local
 						(p-assign (ident "is_nope")))
 					(e-tag (name "Yes")

@@ -476,7 +476,8 @@ pub const Constants = struct {
     /// with the stack's concurrency nodes.
     /// 231: upstream's literal-only expression bits and compacted type-store
     /// slots merged with the stack's concurrency nodes.
-    pub const CACHE_VERSION = 231;
+    /// 232: Builtin has the `Concurrent` library types over `Shared`.
+    pub const CACHE_VERSION = 232;
 };
 
 /// Configuration for the Roc cache system.

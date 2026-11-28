@@ -324,7 +324,7 @@ NO CHANGE
 		(e-lambda
 			(args)
 			(e-runtime-error (tag "erroneous_value_expr")
-				(e-call (constraint-fn-var 344)
+				(e-call (constraint-fn-var 406)
 					(e-lookup-external
 						(builtin))
 					(e-list
@@ -336,7 +336,7 @@ NO CHANGE
 		(p-assign (ident "pair!"))
 		(e-lambda
 			(args)
-			(e-call (constraint-fn-var 371)
+			(e-call (constraint-fn-var 433)
 				(e-lookup-external
 					(builtin))
 				(e-lambda
@@ -350,7 +350,7 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-assign (ident "f")))
-			(e-call (constraint-fn-var 385)
+			(e-call (constraint-fn-var 447)
 				(e-lookup-external
 					(builtin))
 				(e-lookup-local
@@ -376,7 +376,7 @@ NO CHANGE
 		(p-assign (ident "supervised!"))
 		(e-lambda
 			(args)
-			(e-call (constraint-fn-var 405)
+			(e-call (constraint-fn-var 467)
 				(e-lookup-external
 					(builtin))
 				(e-record

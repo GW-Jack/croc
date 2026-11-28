@@ -79,7 +79,7 @@ NO CHANGE
 		(p-assign (ident "b1"))
 		(e-tag (name "Yep")
 			(args
-				(e-call (constraint-fn-var 265)
+				(e-call (constraint-fn-var 327)
 					(e-lookup-external
 						(builtin))
 					(e-num (value "3")))))

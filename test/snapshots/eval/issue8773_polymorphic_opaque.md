@@ -191,7 +191,7 @@ NO CHANGE
 		(e-match
 			(match
 				(cond
-					(e-call (constraint-fn-var 349)
+					(e-call (constraint-fn-var 411)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local
@@ -202,7 +202,7 @@ NO CHANGE
 							(pattern (degenerate false)
 								(p-applied-tag)))
 						(value
-							(e-call (constraint-fn-var 354)
+							(e-call (constraint-fn-var 416)
 								(e-lookup-local
 									(p-assign (ident "get_text")))
 								(e-lookup-local

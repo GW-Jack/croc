@@ -4183,6 +4183,374 @@ Builtin :: [].{
 		## the process, such as WebAssembly, the function is never restarted.
 		supervise! : { max_restarts : U64 }, (() => item) => item
 		supervise! = |{ max_restarts }, f| Concurrently.run_supervised!(max_restarts, f)
+
+		## A queue of at most `capacity` items that tasks share, first in, first
+		## out. [Concurrent.Queue.push!] waits while it is full and [Concurrent.Queue.pop!]
+		## while it is empty. Once it is closed, pushes stop and pops finish when the
+		## items left run out.
+		Queue(item) :: [Queue(Shared({ items : List(item), capacity : U64, closed : Bool }))].{
+
+			## Makes an empty, open queue that holds at most `capacity` items. A queue
+			## of capacity 0 never takes one.
+			new! : U64 => Concurrent.Queue(item)
+			new! = |capacity| Queue(Shared.new!({ items: [], capacity, closed: Bool.False }))
+
+			## Adds the item at the back, waiting while the queue is full. A closed
+			## queue takes nothing.
+			push! : Concurrent.Queue(item), item => [Pushed, Closed]
+			push! = |Queue(cell), item| cell.update!(
+				|queue| if queue.closed {
+					Keep(Closed)
+				} else if queue.items.len() >= queue.capacity {
+					Wait
+				} else {
+					Set({ ..queue, items: queue.items.append(item) }, Pushed)
+				},
+			)
+
+			## Adds the item at the back if there is room, without waiting.
+			try_push! : Concurrent.Queue(item), item => [Pushed, Full, Closed]
+			try_push! = |Queue(cell), item| cell.update!(
+				|queue| if queue.closed {
+					Keep(Closed)
+				} else if queue.items.len() >= queue.capacity {
+					Keep(Full)
+				} else {
+					Set({ ..queue, items: queue.items.append(item) }, Pushed)
+				},
+			)
+
+			## Takes the item at the front, waiting while the queue is empty and open.
+			pop! : Concurrent.Queue(item) => [Item(item), Closed]
+			pop! = |Queue(cell)| cell.update!(
+				|queue| match queue.items {
+					[first, .. as rest] => Set({ ..queue, items: rest }, Item(first))
+					[] => if queue.closed {
+						Keep(Closed)
+					} else {
+						Wait
+					}
+				},
+			)
+
+			## Closes the queue: later pushes take nothing, and pops take what is left.
+			close! : Concurrent.Queue(item) => {}
+			close! = |Queue(cell)| cell.modify!(|queue| { ..queue, closed: Bool.True })
+
+			## Calls `body` and closes the queue however it ends: when it returns, when
+			## its task is cancelled, and when it crashes. A producer that wraps its
+			## work in it never leaves readers waiting.
+			closing! : Concurrent.Queue(item), (() => answer) => answer
+			closing! = |Queue(cell), body| cell.finally!(|queue| { ..queue, closed: Bool.True }, body)
+
+			## The items popped from the queue until it is closed and empty, so a
+			## `for!` loop can read it.
+			stream : Concurrent.Queue(item) -> Stream(item)
+			stream = |queue| Stream.custom(
+				queue,
+				Err(Unknown),
+				|source| match Concurrent.Queue.pop!(source) {
+					Item(item) => Ok((item, source))
+					Closed => Err(NoMore)
+				},
+			)
+		}
+
+		## One answer that one task gives and others wait for. If the task answering
+		## is cancelled or crashes first, the reply is dropped instead.
+		Reply(answer) :: [Reply(Shared([Pending, Done(answer), Dropped]))].{
+
+			## Makes a reply that nothing has answered yet.
+			new! : () => Concurrent.Reply(answer)
+			new! = || Reply(Shared.new!(Pending))
+
+			## Answers with what `produce` returns. If its task is cancelled in
+			## `produce`, or `produce` crashes, the reply is dropped, so waiters stop
+			## waiting. Answering a reply that was already answered crashes.
+			answer! : Concurrent.Reply(answer), (() => answer) => {}
+			answer! = |Reply(cell), produce| {
+				answered = cell.on_failure!(
+					|reply| match reply {
+						Pending => Dropped
+						Done(_) => reply
+						Dropped => reply
+					},
+					|| {
+						value = produce()
+						cell.update!(
+							|reply| match reply {
+								Pending => Set(Done(value), Answered)
+								Done(_) => Keep(AlreadyAnswered)
+								Dropped => Keep(AlreadyAnswered)
+							},
+						)
+					},
+				)
+				match answered {
+					Answered => {}
+					AlreadyAnswered => crash "Concurrent.Reply.answer!: this reply was already answered"
+				}
+			}
+
+			## Waits for the answer, or for the reply to be dropped.
+			wait! : Concurrent.Reply(answer) => [Done(answer), Dropped]
+			wait! = |Reply(cell)| cell.update!(
+				|reply| match reply {
+					Pending => Wait
+					Done(value) => Keep(Done(value))
+					Dropped => Keep(Dropped)
+				},
+			)
+		}
+
+		## A count of permits. A task holds one while it runs a function, so at most
+		## that many run at once.
+		Semaphore :: [Semaphore(Shared(U64))].{
+
+			## Makes a semaphore with `permits` permits.
+			new! : U64 => Concurrent.Semaphore
+			new! = |permits| Semaphore(Shared.new!(permits))
+
+			## Waits for a permit, calls `body` holding it, and gives it back however
+			## `body` ends.
+			with! : Concurrent.Semaphore, (() => answer) => answer
+			with! = |Semaphore(permits), body| {
+				permits.update!(
+					|left| if left == 0 {
+						Wait
+					} else {
+						Set(left - 1, {})
+					},
+				)
+				permits.finally!(|left| left + 1, body)
+			}
+
+			## Calls `body` holding a permit if one is free, without waiting.
+			try_with! : Concurrent.Semaphore, (() => answer) => [Ran(answer), Busy]
+			try_with! = |Semaphore(permits), body| {
+				taken = permits.update!(
+					|left| if left == 0 {
+						Keep(Busy)
+					} else {
+						Set(left - 1, Taken)
+					},
+				)
+				match taken {
+					Taken => Ran(permits.finally!(|left| left + 1, body))
+					Busy => Busy
+				}
+			}
+		}
+
+		## Resources that tasks borrow one at a time each, such as connections. A
+		## resource whose borrower is cancelled or crashes is counted as lost, and the
+		## next borrower opens a replacement.
+		Pool(resource) :: [Pool(Shared({ free : List(resource), lost : U64 }))].{
+
+			## Makes a pool of these resources.
+			new! : List(resource) => Concurrent.Pool(resource)
+			new! = |resources| Pool(Shared.new!({ free: resources, lost: 0 }))
+
+			## Borrows a resource, waiting while none is free, calls `run!` with it,
+			## and puts it back. Where a resource was lost, `open!` makes its
+			## replacement. If the task is cancelled or crashes while it opens or uses
+			## the resource, that resource is lost.
+			with! : Concurrent.Pool(resource), (() => resource), (resource => answer) => answer
+			with! = |Pool(cell), open!, run!| {
+				taken = cell.update!(
+					|pool| match pool.free {
+						[first, .. as rest] => Set({ ..pool, free: rest }, Free(first))
+						[] => if pool.lost > 0 {
+							Set({ ..pool, lost: pool.lost - 1 }, Lost)
+						} else {
+							Wait
+						}
+					},
+				)
+				cell.on_failure!(
+					|pool| { ..pool, lost: pool.lost + 1 },
+					|| {
+						resource = match taken {
+							Free(free) => free
+							Lost => open!()
+						}
+						answer = run!(resource)
+						cell.modify!(|pool| { ..pool, free: pool.free.append(resource) })
+						answer
+					},
+				)
+			}
+		}
+
+		## A count that tasks wait to see reach zero.
+		Latch :: [Latch(Shared(U64))].{
+
+			## Makes a latch that opens after `count` count-downs.
+			new! : U64 => Concurrent.Latch
+			new! = |count| Latch(Shared.new!(count))
+
+			## Counts down once. Counting down an open latch crashes, and so does every
+			## later use of it.
+			count_down! : Concurrent.Latch => {}
+			count_down! = |Latch(left)| left.modify!(|count| count - 1)
+
+			## Calls `body` and counts down however it ends.
+			counting_down! : Concurrent.Latch, (() => answer) => answer
+			counting_down! = |Latch(left), body| left.finally!(|count| count - 1, body)
+
+			## Waits until the count is zero.
+			wait! : Concurrent.Latch => {}
+			wait! = |Latch(left)| left.update!(
+				|count| if count == 0 {
+					Keep({})
+				} else {
+					Wait
+				},
+			)
+		}
+
+		## A meeting point for `parties` tasks: each waits until all have arrived,
+		## and then the next round begins.
+		Barrier :: [Barrier({ parties : U64, cell : Shared({ arrived : U64, round : U64 }) })].{
+
+			## Makes a barrier for `parties` tasks. A barrier for 0 parties never opens.
+			new! : U64 => Concurrent.Barrier
+			new! = |parties| Barrier({ parties, cell: Shared.new!({ arrived: 0, round: 0 }) })
+
+			## Arrives, and waits until every party of this round has. A task that is
+			## cancelled while it waits takes its arrival back, so the barrier doesn't
+			## open early for the others.
+			arrive_and_wait! : Concurrent.Barrier => {}
+			arrive_and_wait! = |Barrier({ parties, cell })| {
+				arrival = cell.update!(
+					|barrier| if barrier.arrived + 1 == parties {
+						Set({ arrived: 0, round: barrier.round + 1 }, Released)
+					} else {
+						Set({ ..barrier, arrived: barrier.arrived + 1 }, Waiting(barrier.round))
+					},
+				)
+				match arrival {
+					Released => {}
+					Waiting(round) =>
+						cell.on_failure!(
+							|barrier| if barrier.round == round {
+								{ ..barrier, arrived: barrier.arrived - 1 }
+							} else {
+								barrier
+							},
+							|| cell.update!(
+								|barrier| if barrier.round == round {
+									Wait
+								} else {
+									Keep({})
+								},
+							),
+						)
+				}
+			}
+		}
+
+		## A value that one task publishes and others watch for changes. Each
+		## version replaces the last, and a watcher may skip versions between those
+		## it sees, but never misses the latest.
+		Watch(value) :: [Watch(Shared({ version : U64, value : value }))].{
+
+			## Makes a watch whose version 0 is `value`.
+			new! : value => Concurrent.Watch(value)
+			new! = |value| Watch(Shared.new!({ version: 0, value }))
+
+			## Publishes `value` as the next version.
+			publish! : Concurrent.Watch(value), value => {}
+			publish! = |Watch(cell), value| cell.modify!(|watched| { version: watched.version + 1, value })
+
+			## The latest version and its value.
+			current! : Concurrent.Watch(value) => { version : U64, value : value }
+			current! = |Watch(cell)| cell.get!()
+
+			## Waits for a version other than `seen`, the one this task saw last, and
+			## returns the latest.
+			changed! : Concurrent.Watch(value), U64 => { version : U64, value : value }
+			changed! = |Watch(cell), seen| cell.update!(
+				|watched| if watched.version == seen {
+					Wait
+				} else {
+					Keep(watched)
+				},
+			)
+		}
+
+		## A lock that many readers can hold at once, or one writer alone. A writer
+		## that waits goes first: readers that arrive after it wait too.
+		RwLock :: [RwLock(Shared({ readers : U64, writing : Bool, writers_waiting : U64 }))].{
+
+			## Makes a lock that nothing holds.
+			new! : () => Concurrent.RwLock
+			new! = || RwLock(Shared.new!({ readers: 0, writing: Bool.False, writers_waiting: 0 }))
+
+			## Waits until no writer holds or waits for the lock, then calls `body` as
+			## a reader, and lets go however it ends.
+			read! : Concurrent.RwLock, (() => answer) => answer
+			read! = |RwLock(cell), body| {
+				cell.update!(
+					|lock| if lock.writing or lock.writers_waiting > 0 {
+						Wait
+					} else {
+						Set({ ..lock, readers: lock.readers + 1 }, {})
+					},
+				)
+				cell.finally!(|lock| { ..lock, readers: lock.readers - 1 }, body)
+			}
+
+			## Waits until nothing holds the lock, then calls `body` as its writer, and
+			## lets go however it ends. A writer cancelled while it waits withdraws its
+			## claim, so readers aren't blocked by it.
+			write! : Concurrent.RwLock, (() => answer) => answer
+			write! = |RwLock(cell), body| {
+				cell.modify!(|lock| { ..lock, writers_waiting: lock.writers_waiting + 1 })
+				cell.on_failure!(
+					|lock| { ..lock, writers_waiting: lock.writers_waiting - 1 },
+					|| cell.update!(
+						|lock| if lock.writing or lock.readers > 0 {
+							Wait
+						} else {
+							Set({ ..lock, writing: Bool.True, writers_waiting: lock.writers_waiting - 1 }, {})
+						},
+					),
+				)
+				cell.finally!(|lock| { ..lock, writing: Bool.False }, body)
+			}
+		}
+
+		## Values loaded once for each key, however many tasks ask for one at once.
+		Memo(key, value) :: [Memo(Shared(Dict(key, [Loading, Ready(value)])))].{
+
+			## Makes a memo that has loaded nothing.
+			new! : () => Concurrent.Memo(key, value)
+			new! = || Memo(Shared.new!(Dict.empty()))
+
+			## The value for `key`. The first task to ask loads it with `load!`, and
+			## others asking meanwhile wait for it. If that task is cancelled or crashes
+			## while it loads, one of the waiting tasks loads the key instead.
+			get! : Concurrent.Memo(key, value), key, (key => value) => value
+				where [key.is_eq : key, key -> Bool, key.to_hash : key, Hasher -> Hasher]
+			get! = |Memo(cell), key, load!| {
+				found = cell.update!(
+					|entries| match entries.get(key) {
+						Ok(Ready(value)) => Keep(Found(value))
+						Ok(Loading) => Wait
+						Err(KeyNotFound) => Set(entries.insert(key, Loading), Load)
+					},
+				)
+				match found {
+					Found(value) => value
+					Load => {
+						value = cell.on_failure!(|entries| entries.remove(key), || load!(key))
+						cell.modify!(|entries| entries.insert(key, Ready(value)))
+						value
+					}
+				}
+			}
+		}
 	}
 
 	## A handle to state that tasks share. It can be captured, passed and stored
@@ -4272,6 +4640,7 @@ Builtin :: [].{
 			Concurrently.cleanup_pop!()
 			answer
 		}
+
 	}
 
 	## A type has a default sort order when its module provides

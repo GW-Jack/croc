@@ -83,7 +83,7 @@ _ = function(value)
 			(args
 				(p-assign (ident "convertible")))
 			(e-block
-				(e-dispatch-call (method "to_str") (constraint-fn-var 273)
+				(e-dispatch-call (method "to_str") (constraint-fn-var 335)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "convertible"))))
@@ -103,7 +103,7 @@ _ = function(value)
 			(e-literal (string "my string"))))
 	(d-let
 		(p-underscore)
-		(e-call (constraint-fn-var 279)
+		(e-call (constraint-fn-var 341)
 			(e-lookup-local
 				(p-assign (ident "function")))
 			(e-lookup-local
