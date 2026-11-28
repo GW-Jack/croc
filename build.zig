@@ -621,9 +621,10 @@ fn debugBuildsWithSha(target: ResolvedTarget) bool {
 }
 
 /// The target for everything that is compiled to run on this machine during
-/// the build: tools, generators and their tests. It is this machine's OS and
-/// ABI at the CPU the default target gets, baseline x86-64 with the Debug
-/// floor of `withSha256Floor`, rather than the CPU `b.graph.host` detected.
+/// the build: tools, generators and their tests. It is this machine's OS at
+/// the CPU and ABI the default target gets: baseline x86-64 with the Debug
+/// floor of `withSha256Floor`, rather than the CPU `b.graph.host` detected,
+/// and musl on Linux, rather than the native ABI.
 ///
 /// Zig keys each compilation on its target CPU, so a tool compiled for the
 /// detected CPU is a cache miss on a machine with a different one, and so is
@@ -633,10 +634,19 @@ fn debugBuildsWithSha(target: ResolvedTarget) bool {
 /// jobs recompiled the tools and most test binaries instead of reusing them.
 /// ci/tidy.zig bans compiling for `b.graph.host` for that reason.
 ///
+/// The native ABI is a cache key from the machine too. A tool that links libc
+/// for the native glibc ABI makes Zig run the system C compiler to find the
+/// libc installation, and the crt directory it reports is part of the key;
+/// when that run fails, Zig uses its bundled glibc, which keys differently
+/// again. musl is built by Zig itself, so a tool's key does not depend on the
+/// runner's C compiler, and a static musl tool runs on any Linux.
+///
 /// Other architectures keep the detected CPU, as the default target does.
 fn hostToolTarget(b: *std.Build, optimize: OptimizeMode) ResolvedTarget {
     if (builtin.target.cpu.arch != .x86_64) return b.graph.host;
-    return withSha256Floor(b, b.resolveTargetQuery(.{ .cpu_model = .baseline }), optimize);
+    var query: std.Target.Query = .{ .cpu_model = .baseline };
+    if (builtin.target.os.tag == .linux) query.abi = .musl;
+    return withSha256Floor(b, b.resolveTargetQuery(query), optimize);
 }
 
 /// Raise an aarch64 compiler target's CPU floor to include the SHA-256
