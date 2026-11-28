@@ -92,8 +92,28 @@ const checked_reports_layout: [32]u8 = check.rootLayoutVersionHash(check.Checked
 /// merged-away variables sealing removed, renumbering the variables checking
 /// made with every variable checking recorded outside the store. Version 60
 /// stores each checked type's identity-variable fact.
+/// Version 61 combines version 60 with these: a compile-time root whose value
+/// is data alone is stored as an image with the type it was stored at, and
+/// each strategy's entry is filed under its own key; each closed instance of a
+/// polymorphic constant is stored as a `constant_instance` root of its own,
+/// with the canonical instantiation's roots; for each use of a name a
+/// destructuring scheme alias binds, the variables of the name's scheme are
+/// recorded, with a constant's instances at the substitutions checking
+/// recorded for those uses and for dispatches to methods bound to polymorphic
+/// callable bindings; for each `to_inspect` override whose inspection instance
+/// is closed, that use's edge and the constant instances it names are
+/// recorded; and value-form bytes literals and files imported as `Str` are
+/// stored as images.
+/// Version 66 combines version 61 with these: each part holding no function
+/// of a stored value holding one is stored as an image of its own, no stored
+/// list is stored as packed bytes, and the `zst`, `scalar` and `str`
+/// constant store node forms, which no producer writes, are gone.
+/// Version 67 combines version 66 with these: a polymorphic constant's
+/// instance roots are evaluated by the compilation's own strategy, so a
+/// literal argument root records no function-holding flag, and a Solved
+/// program's data root is stored as an image at its declared rows' layout.
 /// Platform-pairing entries share it.
-const checked_envelope_version: u32 = 60;
+const checked_envelope_version: u32 = 67;
 
 /// Version of the canonicalized-module envelope: its magic, header layout, and
 /// body order and alignment. Version 5 rejects builtin-conflicting import
@@ -195,8 +215,8 @@ test "module_env_layout golden value" {
     // an *intentional* layout change, bump `Constants.CACHE_VERSION` and replace the
     // golden bytes below with the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x88, 0xc6, 0xb6, 0x58, 0xc1, 0xb8, 0x06, 0x2f, 0x9a, 0x67, 0x4b, 0xf8, 0x23, 0x2c, 0xa4, 0x52,
-        0x92, 0x37, 0x45, 0xf5, 0xdd, 0xa5, 0x0d, 0xc3, 0xdc, 0x0c, 0xbb, 0xc6, 0xed, 0xb1, 0x8f, 0x42,
+        0x44, 0xF5, 0x0C, 0x40, 0x11, 0x86, 0x3F, 0x8A, 0x79, 0xDC, 0xBE, 0xB3, 0xE5, 0x24, 0xE5, 0xEF,
+        0xCF, 0xEB, 0x7F, 0x5B, 0x37, 0xF9, 0xD3, 0x0F, 0x21, 0x45, 0x0D, 0xB4, 0xF0, 0x46, 0xF9, 0xA9,
     };
     try std.testing.expectEqualSlices(u8, &golden, &module_env_layout);
 }

@@ -1899,6 +1899,27 @@ pub fn initWithSourceDigest(
     };
 }
 
+/// Move the node store, the identifier and string literal bytes and every
+/// side list into allocations that hold exactly their entries. Checking
+/// calls this when it finishes the module, so the module keeps no growth room
+/// for the rest of the build; a list that grows again afterwards regrows from
+/// its length.
+pub fn releaseUnusedCapacity(self: *Self) std.mem.Allocator.Error!void {
+    try self.store.releaseUnusedCapacity();
+    try self.common.strings.buffer.releaseUnusedCapacity(self.gpa);
+    try self.common.line_starts.releaseUnusedCapacity(self.gpa);
+    try self.common.idents.interner.bytes.releaseUnusedCapacity(self.gpa);
+    try self.common.idents.interner.ends.releaseUnusedCapacity(self.gpa);
+    inline for (@typeInfo(Self).@"struct".field_names, @typeInfo(Self).@"struct".field_types) |name, field_type| {
+        if (comptime isSideList(field_type)) try @field(self, name).releaseUnusedCapacity(self.gpa);
+    }
+}
+
+/// Whether `T` is one of the module's own growable side lists.
+fn isSideList(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "Range") and @hasDecl(T, "releaseUnusedCapacity");
+}
+
 /// Deinitialize the module environment.
 pub fn deinit(self: *Self) void {
     self.common.deinit(self.gpa);
@@ -5607,8 +5628,13 @@ pub const addStatement = storeAdder("addStatement");
 /// Add a new pattern to the node store.
 pub const addPattern = storeAdder("addPattern");
 
-/// Add a new expression to the node store.
-pub const addExpr = storeAdder("addExpr");
+/// Add an expression, recording whether its subtree is literal-only
+/// (`NodeStore.exprIsLiteralOnly`).
+pub fn addExpr(self: *Self, expr: CIR.Expr, region: Region) std.mem.Allocator.Error!CIR.Expr.Idx {
+    const idx = try storeAdder("addExpr")(self, expr, region);
+    try self.store.recordLiteralOnly(idx, expr);
+    return idx;
+}
 
 /// Reserve one contiguous field-access path plus its enclosing expression.
 pub fn startFieldAccessPath(self: *Self, segment_count: u32) std.mem.Allocator.Error!NodeStore.FieldAccessPathBuilder {

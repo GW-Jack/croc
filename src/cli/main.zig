@@ -268,9 +268,9 @@ const CliBuildEnvOptions = struct {
     source_dir_override: ?[]const u8 = null,
     post_check_publication_mode: compile.build.PostCheckPublicationMode = .executable_artifacts,
     runtime_lowering: ?compile.build.RuntimeLoweringConfig = null,
-    /// The strategy the command's runtime program lowers under
-    /// (`Coordinator.specialization_strategy`), which every command names: a
-    /// command with no runtime consumer names `.boxy`, as `roc check` does.
+    /// The command's compile-time and runtime strategy
+    /// (`Coordinator.specialization_strategy`). Commands without a runtime
+    /// consumer default to `.boxy` but may explicitly select `.lss`.
     specialization_strategy: base.SpecializationStrategy,
     /// The bundle URL a URL/installed root came from; becomes the root's
     /// package identity in place of the extracted path.
@@ -6129,7 +6129,7 @@ fn writeDevRunImageToSharedMemory(
         );
         return error.UnsupportedTarget;
     } else {
-        const native_target = backend.HostLirCodeGen.roc_target;
+        const native_target = backend.LirCodeGenMod.host_lir_codegen_target;
         if (!devShimTargetCompatible(selected_target, native_target)) {
             return rejectRunTargetNotExecutable(ctx, selected_target);
         }
@@ -6908,6 +6908,9 @@ const RunUnits = struct {
     root_image: ?[]align(backend.dev.UnitImage.alignment.toByteUnits()) u8,
     /// The root program's LIR, when this run lowered it.
     root: ?lir.CheckedPipeline.LoweredProgram,
+    /// The images the units' pool imports name, in the run's build
+    /// environment's constant stores.
+    pool_source: BuildPoolSource,
 
     /// Release the images, once the run image holds their code.
     fn releaseCode(self: *RunUnits, gpa: Allocator) void {
@@ -6919,6 +6922,7 @@ const RunUnits = struct {
 
     fn deinit(self: *RunUnits, gpa: Allocator) void {
         self.releaseCode(gpa);
+        self.pool_source.deinit();
         if (self.root) |*program| program.deinit();
         self.root = null;
         compile.watch_inputs.deinit(gpa, self.watch_inputs);
@@ -7062,9 +7066,12 @@ fn lowerRunUnits(
     updateHashBytes(&identity, "roc-run-unit-images-v1");
     identity.update(&interface_identity);
 
+    var pool_source = try BuildPoolSource.init(ctx.gpa, build_env);
+    errdefer pool_source.deinit();
     const owned_library = library.?;
     library = null;
     return .{
+        .pool_source = pool_source,
         .target = target,
         .hot_reload = hot_reload,
         .root_artifact = root_artifact,
@@ -7185,7 +7192,7 @@ fn writeComposedRunImage(
     if (comptime !backend.host_lir_codegen_available) {
         unreachable; // `unitImageRunApplies` selects composed runs only on hosts whose units carry images
     } else {
-        if (!devShimTargetCompatible(units.target, backend.HostLirCodeGen.roc_target)) {
+        if (!devShimTargetCompatible(units.target, backend.LirCodeGenMod.host_lir_codegen_target)) {
             return rejectRunTargetNotExecutable(ctx, units.target);
         }
         reporter.begin("Run Image");
@@ -7221,6 +7228,7 @@ fn writeComposedRunImage(
             .host_symbols = try fast_dev_link.sortedUnion(ctx.arena, &.{ units.hosted_symbols, &host_symbols.runtime_symbols, sorted_shim_builtins, support_imports }),
             .shim_builtins = sorted_shim_builtins,
             .function_table_entry_size = if (target_arch == .aarch64) 8 else 12,
+            .pool = units.pool_source.source(),
         };
         var plan = run_image_link.plan(ctx.gpa, ctx.io.std_io, link_inputs) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -7313,6 +7321,9 @@ fn writeComposedRunImage(
             .{ .name = "Sites filled", .count = timing.sites_patched },
             .{ .name = "Host sites", .count = timing.host_sites },
             .{ .name = "Rebased words", .count = timing.rebases },
+            .{ .name = "Stored images named", .count = timing.pool_named },
+            .{ .name = "Stored images placed", .count = timing.pool_placed },
+            .{ .name = "Stored image bytes", .count = timing.pool_bytes },
         });
         return .{ .descriptor = descriptor, .descriptor_offset = descriptor_offset };
     }
@@ -10607,6 +10618,34 @@ fn finishBuildCommand(
 /// The objects of every module of a `.boxy` build other than the root
 /// program's, materialized for linking, and the hosted symbols they
 /// reference.
+/// The constant pool's source for this build's unit images: the images
+/// every checked module of the build stores, by digest (design.md
+/// "Constant Pool").
+const BuildPoolSource = struct {
+    index: check.ConstStore.ImageIndex,
+
+    fn init(gpa: Allocator, build_env: *BuildEnv) Allocator.Error!BuildPoolSource {
+        var self: BuildPoolSource = .{ .index = .init(gpa) };
+        errdefer self.index.deinit();
+        try build_env.registerConstStores(&self.index);
+        return self;
+    }
+
+    fn deinit(self: *BuildPoolSource) void {
+        self.index.deinit();
+    }
+
+    fn source(self: *BuildPoolSource) backend.dev.UnitImage.PoolSource {
+        return .{ .context = self, .find = find };
+    }
+
+    fn find(context: *anyopaque, digest: [32]u8) error{OutOfMemory}!?backend.dev.UnitImage.PoolImage {
+        const self: *BuildPoolSource = @ptrCast(@alignCast(context));
+        const image = try self.index.find(digest) orelse return null;
+        return .{ .bytes = image.bytes, .pointers = image.pointers, .alignment = image.alignment };
+    }
+};
+
 const BoxyLibraryObjects = struct {
     /// Every library unit's pieces, in unit order; empty for a fast dev
     /// link, which reads `images` instead.
@@ -12415,6 +12454,8 @@ const FastDevLink = struct {
             },
         };
 
+        var pool_source = try BuildPoolSource.init(ctx.gpa, build_env);
+        defer pool_source.deinit();
         var timing: patch_link.Timing = .{};
         var outcome: patch_link.Outcome = .{};
         const linked: patch_link.LinkError!void = switch (self.spec.format) {
@@ -12424,6 +12465,7 @@ const FastDevLink = struct {
                 .units = units,
                 .root = library.images.len,
                 .host_required = self.spec.host_required,
+                .pool = pool_source.source(),
             }, &self.output, build_env.postCheckExecutor(), &timing, &outcome),
             .macho => macho_patch_link.link(ctx.gpa, ctx.arena, ctx.io.std_io, .{
                 .host = macho_host_prelink.View.init(record_bytes) catch unreachable, // the job or the prelink admitted the record
@@ -12431,6 +12473,7 @@ const FastDevLink = struct {
                 .units = units,
                 .root = library.images.len,
                 .host_required = self.spec.host_required,
+                .pool = pool_source.source(),
             }, &self.output, build_env.postCheckExecutor(), &timing, &outcome),
             .coff => coff_patch_link.link(ctx.gpa, ctx.arena, ctx.io.std_io, .{
                 .host = coff_host_prelink.View.init(record_bytes) catch unreachable, // the job or the prelink admitted the record
@@ -12438,6 +12481,7 @@ const FastDevLink = struct {
                 .units = units,
                 .root = library.images.len,
                 .host_required = self.spec.host_required,
+                .pool = pool_source.source(),
             }, &self.output, build_env.postCheckExecutor(), &timing, &outcome),
         };
         linked catch |err| {
@@ -12484,6 +12528,9 @@ const FastDevLink = struct {
             .{ .name = "Patch sites", .count = timing.sites_patched },
             .{ .name = "References fixed", .count = timing.refs_fixed },
             .{ .name = "Hole bytes dropped", .count = timing.hole_bytes },
+            .{ .name = "Stored images named", .count = timing.pool_named },
+            .{ .name = "Stored images placed", .count = timing.pool_placed },
+            .{ .name = "Stored image bytes", .count = timing.pool_bytes },
         });
     }
 };
@@ -15847,9 +15894,19 @@ const LoadedUnitImages = struct {
     hosted_stubs: ?backend.dev.ExecutableMemory = null,
     /// What the images' code is run for, which a hosted stub's crash names.
     hosted_unavailable_while: []const u8 = "evaluating at compile time",
+    /// The stored images the loaded images' pool imports name, placed once
+    /// each (design.md "Constant Pool"), and the build's constant stores
+    /// they are found in when this owns them.
+    pool: ?backend.dev.UnitImageLoader.Pool = null,
+    owned_pool_source: ?*BuildPoolSource = null,
 
     fn deinit(self: *LoadedUnitImages) void {
         for (self.loaded.items) |*image| image.unload();
+        if (self.pool) |*pool| pool.deinit();
+        if (self.owned_pool_source) |source| {
+            source.deinit();
+            self.gpa.destroy(source);
+        }
         self.loaded.deinit(self.gpa);
         self.exports.deinit(self.gpa);
         self.hosted.deinit(self.gpa);
@@ -15874,6 +15931,22 @@ const LoadedUnitImages = struct {
         }
     };
 
+    /// Bind the loaded images' pool imports to the images `source` finds.
+    fn attachPool(self: *LoadedUnitImages, source: backend.dev.UnitImage.PoolSource) void {
+        std.debug.assert(self.pool == null);
+        self.pool = .{ .gpa = self.gpa, .source = source };
+    }
+
+    /// Bind the loaded images' pool imports to the images the constant
+    /// stores of `build_env`'s checked modules hold.
+    fn attachBuildPool(self: *LoadedUnitImages, build_env: *BuildEnv) Allocator.Error!void {
+        const source = try self.gpa.create(BuildPoolSource);
+        errdefer self.gpa.destroy(source);
+        source.* = try BuildPoolSource.init(self.gpa, build_env);
+        self.owned_pool_source = source;
+        self.attachPool(source.source());
+    }
+
     /// Load the image in `bytes`, which outlives it, binding its expect-site
     /// base to `site_base`, and record what it exports. `code_locations` is
     /// the image's `CodeLocations`, or empty. The returned image is valid
@@ -15888,7 +15961,7 @@ const LoadedUnitImages = struct {
         var context: LoadContext = .{ .images = self, .site_base = site_base };
         var diagnostic: backend.dev.UnitImageLoader.Diagnostic = .{};
         try self.loaded.ensureUnusedCapacity(self.gpa, 1);
-        var loaded = backend.dev.UnitImageLoader.load(self.gpa, view, .{ .context = &context, .resolve = LoadContext.resolve }, &diagnostic) catch |err| switch (err) {
+        var loaded = backend.dev.UnitImageLoader.load(self.gpa, view, .{ .context = &context, .resolve = LoadContext.resolve, .pool = if (self.pool) |*pool| pool else null }, &diagnostic) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.FlushInstructionCacheFailed => return error.FlushInstructionCacheFailed,
             error.UndefinedImport => base.invariant("unit image invariant violated: a unit's image imports {s}, which nothing loaded defines", .{diagnostic.name}),
@@ -16014,6 +16087,7 @@ fn prepareUnitImageTests(
     const target = inProcessUnitTarget();
     var program: UnitImageTestProgram = .{ .gpa = ctx.gpa, .tables = RunUnitTables.init(ctx), .images = .{ .gpa = ctx.gpa } };
     errdefer program.deinit();
+    try program.images.attachBuildPool(build_env);
     program.tables.digests = try build_env.boxyLinkDigests();
     const cache_manager = build_env.cache_manager orelse base.invariant("roc test invariant violated: a test run from unit images has no cache manager", .{});
     const root_artifact = build_env.rootModuleCheckedArtifact() orelse base.invariant("roc test invariant violated: a planned test program has no root module", .{});
@@ -17256,6 +17330,7 @@ fn buildWatchChildArgv(ctx: *CliCtx, arg0: []const u8, command: WatchCommand, in
     switch (command) {
         .check => |args| {
             try argv.append(ctx.gpa, "check");
+            if (args.specialization_strategy) |strategy| try argv.append(ctx.gpa, if (strategy == .lss) "--specialize=yes" else "--specialize=no");
             if (args.main) |main_path| try appendOwnedArg(ctx.gpa, &argv, &owned, "--main={s}", .{main_path});
             if (args.time) try argv.append(ctx.gpa, "--time");
             if (args.timings) try argv.append(ctx.gpa, "--timings");
@@ -17302,6 +17377,21 @@ fn buildWatchChildArgv(ctx: *CliCtx, arg0: []const u8, command: WatchCommand, in
         .argv = try argv.toOwnedSlice(ctx.gpa),
         .owned = try owned.toOwnedSlice(ctx.gpa),
     };
+}
+
+test "watch check child argv preserves the compile-time strategy" {
+    var io = Io.create(std.testing.io);
+    var ctx = CliCtx.init(std.testing.allocator, std.testing.allocator, &io, .check);
+    ctx.initIo();
+    defer ctx.deinit();
+
+    for ([_]?base.SpecializationStrategy{ null, .boxy, .lss }) |strategy| {
+        var child_argv = try buildWatchChildArgv(&ctx, "roc", .{ .check = .{ .specialization_strategy = strategy } }, "watch-inputs");
+        defer child_argv.deinit(std.testing.allocator);
+        const parsed = try cli_args.parse(std.testing.allocator, std.testing.io, child_argv.argv[1..]);
+        defer parsed.deinit(std.testing.allocator);
+        try std.testing.expectEqual(strategy, parsed.check.specialization_strategy);
+    }
 }
 
 test "watch child argv forwards every dependency replacement" {
@@ -19164,6 +19254,7 @@ const UnitImageGlueGenerator = struct {
         // the rest after everything they depend on, then the root unit.
         const order = try unitLoadOrder(ctx.gpa, build_env, library.artifacts);
         defer ctx.gpa.free(order);
+        self.images.attachPool(units.pool_source.source());
         for (order) |index| _ = try self.images.load(library.images[index], 0, &.{});
         _ = try self.images.load(units.root_image.?, 0, &.{});
         reporter.end();
@@ -21224,6 +21315,7 @@ fn checkFileWithBuildEnvPreserved(
     main_source_url: ?[]const u8,
     timings: bool,
     cache_config: CacheConfig,
+    specialization_strategy: base.SpecializationStrategy,
     max_threads: ?usize,
     resolution_config: compile.package_resolution.Config,
     source_dir_override: ?[]const u8,
@@ -21243,8 +21335,7 @@ fn checkFileWithBuildEnvPreserved(
         .timings = timings,
         .resolution_config = resolution_config,
         .track_watch_inputs = track_watch_inputs,
-        // A check has no runtime consumer.
-        .specialization_strategy = .boxy,
+        .specialization_strategy = specialization_strategy,
         .source_dir_override = source_dir_override,
         .root_source_url = root_source_url,
         .main_source_url = main_source_url,
@@ -21276,6 +21367,7 @@ fn checkFileWithBuildEnv(
     main_source_url: ?[]const u8,
     timings: bool,
     cache_config: CacheConfig,
+    specialization_strategy: base.SpecializationStrategy,
     max_threads: ?usize,
     resolution_config: compile.package_resolution.Config,
     source_dir_override: ?[]const u8,
@@ -21291,8 +21383,7 @@ fn checkFileWithBuildEnv(
         .verbose_cache = cache_config.verbose,
         .timings = timings,
         .resolution_config = resolution_config,
-        // A check has no runtime consumer.
-        .specialization_strategy = .boxy,
+        .specialization_strategy = specialization_strategy,
         .source_dir_override = source_dir_override,
         .root_source_url = root_source_url,
         .main_source_url = main_source_url,
@@ -21458,6 +21549,7 @@ fn rocCheckDefaultApp(
         null,
         args.timings,
         cache_config,
+        args.specialization_strategy orelse .boxy,
         args.max_threads,
         resolutionConfigFromLimits(args.resolve_limits),
         original_source_dir,
@@ -21504,6 +21596,7 @@ fn rocCheckDefaultAppPreserved(
         null,
         args.timings,
         cache_config,
+        args.specialization_strategy orelse .boxy,
         args.max_threads,
         resolutionConfigFromLimits(args.resolve_limits),
         original_source_dir,
@@ -21604,6 +21697,7 @@ fn rocCheck(ctx: *CliCtx, args_in: cli_args.CheckArgs, arg0: []const u8) RocChec
             args.main_source_url,
             args.timings,
             cache_config,
+            args.specialization_strategy orelse .boxy,
             args.max_threads,
             resolutionConfigFromLimits(args.resolve_limits),
             null,
@@ -21644,6 +21738,7 @@ fn rocCheck(ctx: *CliCtx, args_in: cli_args.CheckArgs, arg0: []const u8) RocChec
             args.main_source_url,
             args.timings,
             cache_config,
+            args.specialization_strategy orelse .boxy,
             args.max_threads,
             resolutionConfigFromLimits(args.resolve_limits),
             null,
@@ -22043,6 +22138,7 @@ fn bumpCheckSide(
         null,
         false,
         cache_config,
+        .boxy,
         null,
         resolutionConfigFromLimits(args.resolve_limits),
         null,
@@ -22595,6 +22691,7 @@ fn rocDocs(ctx: *CliCtx, args_in: cli_args.DocsArgs) CliMainError!void {
         args.main_source_url,
         false,
         cache_config,
+        .boxy,
         null, // max_threads: use default (single-threaded for now)
         resolutionConfigFromLimits(args.resolve_limits),
         null,
