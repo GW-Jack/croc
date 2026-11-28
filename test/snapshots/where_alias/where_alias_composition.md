@@ -92,7 +92,7 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-assign (ident "value")))
-			(e-dispatch-call (method "to_str") (constraint-fn-var 311)
+			(e-dispatch-call (method "to_str") (constraint-fn-var 373)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "value"))))

@@ -201,7 +201,7 @@ NO CHANGE
 				(e-record
 					(fields
 						(field (name "count")
-							(e-dispatch-call (method "plus") (constraint-fn-var 351)
+							(e-dispatch-call (method "plus") (constraint-fn-var 413)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "count"))))
@@ -293,9 +293,9 @@ NO CHANGE
 	(s-expect
 		(e-method-eq (negated "false")
 			(lhs
-				(e-dispatch-call (method "count_of") (constraint-fn-var 380)
+				(e-dispatch-call (method "count_of") (constraint-fn-var 442)
 					(receiver
-						(e-dispatch-call (method "bump") (constraint-fn-var 379)
+						(e-dispatch-call (method "bump") (constraint-fn-var 441)
 							(receiver
 								(e-nominal (nominal "Counter")
 									(e-record
@@ -314,9 +314,9 @@ NO CHANGE
 	(s-expect
 		(e-method-eq (negated "false")
 			(lhs
-				(e-dispatch-call (method "to_num") (constraint-fn-var 388)
+				(e-dispatch-call (method "to_num") (constraint-fn-var 450)
 					(receiver
-						(e-dispatch-call (method "toggle") (constraint-fn-var 387)
+						(e-dispatch-call (method "toggle") (constraint-fn-var 449)
 							(receiver
 								(e-nominal (nominal "expect_in_associated_block.Counter.Flag")
 									(e-tag (name "Off"))))

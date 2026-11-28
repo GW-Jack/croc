@@ -218,7 +218,7 @@ NO CHANGE
 					(e-num (value "0")))
 				(s-for-bang
 					(p-assign (ident "x"))
-					(e-call (constraint-fn-var 397)
+					(e-call (constraint-fn-var 459)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local
@@ -235,7 +235,7 @@ NO CHANGE
 										(capture (ident "f")))
 									(e-lambda
 										(args)
-										(e-call (constraint-fn-var 487)
+										(e-call (constraint-fn-var 549)
 											(e-lookup-local
 												(p-assign (ident "f"))))))))
 						(s-expr
@@ -244,7 +244,7 @@ NO CHANGE
 									(p-assign (ident "f")))))
 						(s-reassign
 							(p-var-assign (ident "$sum"))
-							(e-dispatch-call (method "plus") (constraint-fn-var 488)
+							(e-dispatch-call (method "plus") (constraint-fn-var 550)
 								(receiver
 									(e-lookup-local
 										(p-var-assign (ident "$sum"))))
@@ -276,7 +276,7 @@ NO CHANGE
 					(e-num (value "0")))
 				(s-for-bang
 					(p-assign (ident "x"))
-					(e-call (constraint-fn-var 509)
+					(e-call (constraint-fn-var 571)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local
@@ -300,7 +300,7 @@ NO CHANGE
 															(p-applied-tag)))
 													(value
 														(e-spawn
-															(e-call (constraint-fn-var 578)
+															(e-call (constraint-fn-var 640)
 																(e-lookup-local
 																	(p-assign (ident "make")))
 																(e-lookup-local
@@ -316,7 +316,7 @@ NO CHANGE
 							(e-if
 								(if-branches
 									(if-branch
-										(e-dispatch-call (method "is_gt") (constraint-fn-var 583)
+										(e-dispatch-call (method "is_gt") (constraint-fn-var 645)
 											(receiver
 												(e-lookup-local
 													(p-assign (ident "x"))))
@@ -324,7 +324,7 @@ NO CHANGE
 												(e-num (value "10"))))
 										(e-block
 											(e-spawn
-												(e-call (constraint-fn-var 586)
+												(e-call (constraint-fn-var 648)
 													(e-lookup-local
 														(p-assign (ident "make")))
 													(e-lookup-local
@@ -333,7 +333,7 @@ NO CHANGE
 									(e-empty_record))))
 						(s-reassign
 							(p-var-assign (ident "$sum"))
-							(e-dispatch-call (method "plus") (constraint-fn-var 488)
+							(e-dispatch-call (method "plus") (constraint-fn-var 550)
 								(receiver
 									(e-lookup-local
 										(p-var-assign (ident "$sum"))))

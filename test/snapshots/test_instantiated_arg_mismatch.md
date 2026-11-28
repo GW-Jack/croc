@@ -89,7 +89,7 @@ EndOfFile,
 						(p-assign (ident "x")))
 					(e-lookup-local
 						(p-assign (ident "y")))))))
-	(e-call (constraint-fn-var 266)
+	(e-call (constraint-fn-var 328)
 		(e-lookup-local
 			(p-assign (ident "pair")))
 		(e-runtime-error (tag "erroneous_value_expr"))

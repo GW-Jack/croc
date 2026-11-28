@@ -36321,6 +36321,44 @@ What is dropped late is a tracked cell that a sweep has yet to find, with its
 state. A crash's frames leak what they hold (Child Tasks, Crashes), so a cell
 they hold is not freed itself, but if it's tracked its state is.
 
+**The library.** The library types over `Shared` are Builtin code written with
+`new!`, `update!`, `get!`, `modify!`, `finally!` and `on_failure!` alone, so they
+need nothing more from the runtime, the IR or a backend, and they wait, clean up
+and are released as any update does. Each is a tag union over handles, nested in
+`Concurrent`: `Concurrent.Queue(item)`, `Concurrent.Reply(answer)`, `Concurrent.Semaphore`,
+`Concurrent.Pool(resource)`, `Concurrent.Latch`, `Concurrent.Barrier`, `Concurrent.Watch(value)`,
+`Concurrent.RwLock` and `Concurrent.Memo(key, value)`. They are nested because a
+top-level Builtin type reserves its name for modules, so a top-level `Queue`
+would make every application module named `Queue` an error; a nested type a
+program also declares only shadows it, with the builtin-shadowing warning. They
+are nested in `Concurrent`, not `Shared`, because a nested type's associated
+items are in its parent's scope, which no name may shadow: `Shared` has a `new!`
+and a `get!` of its own, and `Concurrent` has none of the library's names.
+
+What each does when its task is cancelled or crashes is one cleanup:
+
+| Type | While the task is... | What happens |
+|---|---|---|
+| `Queue` | waiting in `push!` or `pop!` | nothing: a `Wait` took nothing |
+| `Queue` | inside `closing!` | the queue closes, so readers finish and writers stop |
+| `Reply` | inside `answer!` | the reply becomes `Dropped`, and waiters stop waiting |
+| `Semaphore` | holding a permit | the permit comes back |
+| `Pool` | opening or using a resource | the resource is counted as lost, and a later borrower opens a replacement |
+| `Latch` | inside `counting_down!` | the count goes down anyway |
+| `Barrier` | waiting for the others | its arrival is withdrawn, so the barrier doesn't open early |
+| `Watch` | anywhere | nothing: watchers hold nothing |
+| `RwLock` | reading or writing | the lock is let go |
+| `RwLock` | waiting to write | its claim is withdrawn, so readers aren't blocked by it |
+| `Memo` | loading a key | the key is unmarked, and one of the tasks waiting for it loads it |
+
+They follow the Shared State RFC's library, with these differences. `Watch` also
+has `current!`, which returns the latest version without waiting, so a watcher
+has a version to start from. `Breaker` and `Bucket` are not in Builtin: they read
+an `Instant`, and `Bucket` sleeps, and Builtin has neither a clock nor a sleep,
+so they belong to the packages of platforms that do. A queue of capacity 0 and a
+barrier for 0 parties never take an item or open; a task that waits on one forever
+is a stall like any other.
+
 **Warnings.** `shared_state_warnings.zig` reports three uses of shared state. It
 reads the checked module after every solver rule, and only where a name or a
 method call refers to a function of `Shared`. A handle is known by the immutable
@@ -36374,7 +36412,8 @@ A Boxy program of a platform without tasks keeps the helpers' bodies.
 both strategies, with poison, and waiting under `.lss` in programs of every
 mode and under `.boxy` in programs with tasks. In a `.boxy` program without
 tasks a `Wait` crashes with the deadlock message. Cleanups run where tasks do, and
-cells are tracked there. The update and probe forms come next.
+cells are tracked there. The library types are built on every backend and
+strategy, as Builtin code. The update and probe forms come next.
 
 ### Host Contract
 

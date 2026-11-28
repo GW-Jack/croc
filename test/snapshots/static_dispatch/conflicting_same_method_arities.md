@@ -93,12 +93,12 @@ NO CHANGE
 				(p-assign (ident "value")))
 			(e-tuple
 				(elems
-					(e-dispatch-call (method "convert") (constraint-fn-var 245)
+					(e-dispatch-call (method "convert") (constraint-fn-var 307)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "value"))))
 						(args))
-					(e-dispatch-call (method "convert") (constraint-fn-var 246)
+					(e-dispatch-call (method "convert") (constraint-fn-var 308)
 						(receiver
 							(e-runtime-error (tag "erroneous_value_expr")))
 						(args

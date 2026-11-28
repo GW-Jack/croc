@@ -88,7 +88,7 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-assign (ident "input")))
-			(e-call (constraint-fn-var 330)
+			(e-call (constraint-fn-var 392)
 				(e-lookup-external
 					(builtin))
 				(e-lookup-local
@@ -108,7 +108,7 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-assign (ident "input")))
-			(e-call (constraint-fn-var 460)
+			(e-call (constraint-fn-var 522)
 				(e-lookup-external
 					(builtin))
 				(e-lookup-local

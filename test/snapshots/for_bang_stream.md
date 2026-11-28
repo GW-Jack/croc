@@ -358,7 +358,7 @@ top_level = {
 					(e-block
 						(s-reassign
 							(p-var-assign (ident "$total"))
-							(e-dispatch-call (method "plus") (constraint-fn-var 398)
+							(e-dispatch-call (method "plus") (constraint-fn-var 460)
 								(receiver
 									(e-lookup-local
 										(p-var-assign (ident "$total"))))
@@ -416,7 +416,7 @@ top_level = {
 					(e-block
 						(s-reassign
 							(p-var-assign (ident "$total"))
-							(e-dispatch-call (method "plus") (constraint-fn-var 469)
+							(e-dispatch-call (method "plus") (constraint-fn-var 531)
 								(receiver
 									(e-lookup-local
 										(p-var-assign (ident "$total"))))

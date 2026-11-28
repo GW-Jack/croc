@@ -267,12 +267,12 @@ pause! = |permits, work!| {
 			(e-block
 				(s-let
 					(p-assign (ident "seen"))
-					(e-call (constraint-fn-var 352)
+					(e-call (constraint-fn-var 414)
 						(e-lookup-external
 							(builtin))
 						(e-num (value "0"))))
 				(s-expr
-					(e-dispatch-call (method "modify!") (constraint-fn-var 354)
+					(e-dispatch-call (method "modify!") (constraint-fn-var 416)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "seen"))))
@@ -280,13 +280,13 @@ pause! = |permits, work!| {
 							(e-lambda
 								(args
 									(p-assign (ident "n")))
-								(e-dispatch-call (method "plus") (constraint-fn-var 362)
+								(e-dispatch-call (method "plus") (constraint-fn-var 424)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "n"))))
 									(args
 										(e-num (value "1"))))))))
-				(e-dispatch-call (method "get!") (constraint-fn-var 365)
+				(e-dispatch-call (method "get!") (constraint-fn-var 427)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "seen"))))
@@ -302,12 +302,12 @@ pause! = |permits, work!| {
 			(e-block
 				(s-let
 					(p-assign (ident "n"))
-					(e-dispatch-call (method "get!") (constraint-fn-var 378)
+					(e-dispatch-call (method "get!") (constraint-fn-var 440)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "count"))))
 						(args)))
-				(e-dispatch-call (method "modify!") (constraint-fn-var 381)
+				(e-dispatch-call (method "modify!") (constraint-fn-var 443)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "count"))))
@@ -318,7 +318,7 @@ pause! = |permits, work!| {
 							(e-lambda
 								(args
 									(p-underscore))
-								(e-dispatch-call (method "minus") (constraint-fn-var 384)
+								(e-dispatch-call (method "minus") (constraint-fn-var 446)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "n"))))
@@ -337,7 +337,7 @@ pause! = |permits, work!| {
 				(p-assign (ident "work!")))
 			(e-block
 				(s-expr
-					(e-dispatch-call (method "update!") (constraint-fn-var 395)
+					(e-dispatch-call (method "update!") (constraint-fn-var 457)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "permits"))))
@@ -360,7 +360,7 @@ pause! = |permits, work!| {
 										(e-block
 											(e-tag (name "Set")
 												(args
-													(e-dispatch-call (method "minus") (constraint-fn-var 384)
+													(e-dispatch-call (method "minus") (constraint-fn-var 446)
 														(receiver
 															(e-lookup-local
 																(p-assign (ident "n"))))
@@ -368,10 +368,10 @@ pause! = |permits, work!| {
 															(e-num (value "1"))))
 													(e-empty_record))))))))))
 				(s-expr
-					(e-call (constraint-fn-var 413)
+					(e-call (constraint-fn-var 475)
 						(e-lookup-local
 							(p-assign (ident "work!")))))
-				(e-dispatch-call (method "finally!") (constraint-fn-var 415)
+				(e-dispatch-call (method "finally!") (constraint-fn-var 477)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "permits"))))
@@ -379,7 +379,7 @@ pause! = |permits, work!| {
 						(e-lambda
 							(args
 								(p-assign (ident "n")))
-							(e-dispatch-call (method "plus") (constraint-fn-var 370)
+							(e-dispatch-call (method "plus") (constraint-fn-var 432)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "n"))))
